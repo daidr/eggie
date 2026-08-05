@@ -24,13 +24,13 @@ use eggie_protocol::{
     TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit, TerminalSize, TerminalSnapshot,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context,
+    AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
     DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions,
     Pixels, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    SystemNotification, SystemNotificationAction, TitlebarOptions, TouchPhase, WeakEntity, Window,
-    WindowBounds, WindowControlArea, WindowOptions, canvas, div, point, prelude::*, px, quad,
-    relative, rgb, rgba, size,
+    Stateful, SystemNotification, SystemNotificationAction, TitlebarOptions, TouchPhase,
+    WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, canvas, div,
+    linear_color_stop, linear_gradient, point, prelude::*, px, quad, relative, rgb, rgba, size,
 };
 use std::{
     borrow::Cow,
@@ -46,12 +46,12 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const TAB_BAR_HEIGHT: f32 = 36.;
 const TITLEBAR_HEIGHT: f32 = TAB_BAR_HEIGHT;
-const TAB_MIN_WIDTH: f32 = 80.;
+const TAB_MIN_WIDTH: f32 = 140.;
 const TAB_MAX_WIDTH: f32 = 220.;
 const TAB_BAR_PADDING: f32 = 5.;
 const TAB_GAP: f32 = 5.;
-const TAB_TITLE_FONT_SIZE: f32 = 12.;
-const TAB_CLOSE_ICON_SIZE: f32 = 12.;
+const TAB_TITLE_FONT_SIZE: f32 = 11.;
+const TAB_CLOSE_ICON_SIZE: f32 = 10.;
 const TAB_DROP_INDICATOR_WIDTH: f32 = 2.;
 const TAB_DROP_INDICATOR_OFFSET: f32 = (TAB_GAP + TAB_DROP_INDICATOR_WIDTH) / 2.;
 const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 40.;
@@ -369,6 +369,7 @@ pub struct EggieApp {
     moving_window: bool,
     tab_drop_target: Option<TabDropTarget>,
     right_sidebar_scroll_handle: ScrollHandle,
+    tab_bar_scroll_handles: RefCell<HashMap<GroupId, ScrollHandle>>,
     focus_handle: FocusHandle,
     notification_routes: NotificationRoutes,
     allow_osc_clipboard_read: bool,
@@ -611,6 +612,7 @@ impl EggieApp {
             moving_window: false,
             tab_drop_target: None,
             right_sidebar_scroll_handle: ScrollHandle::new(),
+            tab_bar_scroll_handles: RefCell::new(HashMap::new()),
             focus_handle: cx.focus_handle(),
             notification_routes,
             allow_osc_clipboard_read: config.allow_osc_clipboard_read,
@@ -2547,17 +2549,15 @@ impl EggieApp {
         cx.notify();
     }
 
-    fn render_window_drag_region(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut titlebar = div()
-            .id("window-drag-region")
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_end()
-            .w_full()
-            .h(px(TITLEBAR_HEIGHT))
-            .pl(px(72.))
-            .pr_2()
+    /// Attach the manual window-drag handlers Eggie uses under `app_owns_titlebar_drag`.
+    ///
+    /// On macOS the `WindowControlArea::Drag` marker is a no-op; dragging is driven entirely by
+    /// these handlers (press arms `moving_window`, the first move starts the OS drag, and a
+    /// double click zooms). The marker is kept for Windows portability. Apply this only to blank
+    /// sibling elements without interactive children, so tab clicks and drag-reordering stay
+    /// unaffected by the drag hitbox.
+    fn with_window_drag_handlers(element: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        element
             .window_control_area(WindowControlArea::Drag)
             .on_mouse_down(
                 MouseButton::Left,
@@ -2577,7 +2577,23 @@ impl EggieApp {
                 if event.click_count() == 2 {
                     window.titlebar_double_click();
                 }
-            });
+            })
+    }
+
+    fn render_window_drag_region(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut titlebar = Self::with_window_drag_handlers(
+            div()
+                .id("window-drag-region")
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_end()
+                .w_full()
+                .h(px(TITLEBAR_HEIGHT))
+                .pl(px(72.))
+                .pr_2(),
+            cx,
+        );
         if !self.left_sidebar_collapsed {
             titlebar = titlebar.child(icon_button(
                 IconName::PanelLeftOpen,
@@ -2622,32 +2638,15 @@ impl EggieApp {
         group_id: GroupId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .id(format!("traffic-light-tab-bar-{group_id}"))
-            .flex_none()
-            .w(px(TRAFFIC_LIGHT_INSET_WIDTH))
-            .h_full()
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|app, _, _, _| app.moving_window = true),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|app, _, _, _| app.moving_window = false),
-            )
-            .on_mouse_move(cx.listener(|app, _, window, _| {
-                if app.moving_window {
-                    app.moving_window = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    window.titlebar_double_click();
-                }
-            })
-            .into_any_element()
+        Self::with_window_drag_handlers(
+            div()
+                .id(format!("traffic-light-tab-bar-{group_id}"))
+                .flex_none()
+                .w(px(TRAFFIC_LIGHT_INSET_WIDTH))
+                .h_full(),
+            cx,
+        )
+        .into_any_element()
     }
 
     fn show_native_tab_context_menu(
@@ -2954,7 +2953,7 @@ impl EggieApp {
     }
 
     fn render_layout(&self, node: &LayoutNode, cx: &mut Context<Self>) -> AnyElement {
-        self.render_layout_with_outer_edges(node, true, true, true, cx)
+        self.render_layout_with_outer_edges(node, true, true, true, true, cx)
     }
 
     fn render_layout_with_outer_edges(
@@ -2963,6 +2962,7 @@ impl EggieApp {
         touches_left_edge: bool,
         touches_right_edge: bool,
         touches_bottom_edge: bool,
+        touches_top_edge: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
@@ -2971,6 +2971,7 @@ impl EggieApp {
                 touches_left_edge,
                 touches_right_edge,
                 touches_bottom_edge,
+                touches_top_edge,
                 cx,
             ),
             LayoutNode::Split {
@@ -2994,6 +2995,7 @@ impl EggieApp {
                                 touches_left_edge,
                                 touches_right_edge && !horizontal,
                                 touches_bottom_edge && horizontal,
+                                touches_top_edge,
                                 cx,
                             )),
                     )
@@ -3006,6 +3008,7 @@ impl EggieApp {
                                 touches_left_edge && !horizontal,
                                 touches_right_edge,
                                 touches_bottom_edge,
+                                touches_top_edge && horizontal,
                                 cx,
                             )),
                     )
@@ -3020,6 +3023,7 @@ impl EggieApp {
         touches_left_edge: bool,
         touches_right_edge: bool,
         touches_bottom_edge: bool,
+        touches_top_edge: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let group_id = group.id;
@@ -3052,6 +3056,24 @@ impl EggieApp {
                     cx.listener(|app, _, _, cx| app.toggle_left_sidebar(cx)),
                 ));
         }
+        // Tabs and the trailing drag/drop strip live in a horizontally scrollable strip so tabs
+        // keep their minimum width and overflow into a scroll instead of being squeezed. The
+        // `+` and collapse controls stay outside this strip so they never scroll away.
+        let scroll_handle = self
+            .tab_bar_scroll_handles
+            .borrow_mut()
+            .entry(group_id)
+            .or_insert_with(ScrollHandle::new)
+            .clone();
+        let mut tabs_scroll = div()
+            .id(format!("tabbar-scroll-{group_id}"))
+            .flex()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_x_scroll()
+            .track_scroll(&scroll_handle);
         for (tab_index, item) in group.items.iter().enumerate() {
             let item_id = item.id;
             let active = group.active_item_id == Some(item.id);
@@ -3066,17 +3088,18 @@ impl EggieApp {
                 active,
                 colors: self.colors,
             };
-            tabs = tabs.child(
+            tabs_scroll = tabs_scroll.child(
                 div()
                     .id(format!("tab-{item_id}"))
                     .flex()
                     .items_center()
                     .relative()
+                    .flex_shrink_0()
                     .min_w(px(TAB_MIN_WIDTH))
                     .max_w(px(TAB_MAX_WIDTH))
                     .h_full()
-                    .pl_3()
-                    .pr_2()
+                    .pl_2()
+                    .pr_1()
                     .gap_2()
                     .text_size(px(TAB_TITLE_FONT_SIZE))
                     .rounded_md()
@@ -3157,32 +3180,92 @@ impl EggieApp {
         }
         let item_count = group.items.len();
         let show_empty_group_insertion = item_count == 0 && tab_insertion_index == Some(0);
-        tabs = tabs
-            .child(
+        let mut trailing_space = div()
+            .id(format!("tabbar-trailing-space-{group_id}"))
+            .flex_1()
+            .relative()
+            .h_full()
+            .on_drag_move::<DraggedTab>(cx.listener(move |app, event, window, cx| {
+                cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+                app.update_tab_bar_trailing_drop_target(group_id, item_count, event, cx)
+            }))
+            .on_drop(cx.listener(|app, dragged_tab: &DraggedTab, _, cx| {
+                app.handle_tab_drop(dragged_tab, cx)
+            }))
+            .when(show_empty_group_insertion, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(TAB_DROP_INDICATOR_WIDTH))
+                        .bg(rgb(self.colors.accent)),
+                )
+            });
+        // Only a tab bar flush against the top window edge doubles as a drag region; a lower
+        // group's tab bar sits mid-window and must not move the window.
+        if touches_top_edge {
+            trailing_space = Self::with_window_drag_handlers(trailing_space, cx);
+        }
+        // Fade masks on the left/right edges of the scroll strip indicate that more tabs are
+        // available off-screen. They are plain visual overlays with no hitbox, so wheel/trackpad
+        // scrolling and tab clicks pass straight through to the scroll container beneath.
+        let offset_x = -f32::from(scroll_handle.offset().x);
+        let max_offset_x = f32::from(scroll_handle.max_offset().x);
+        let show_left_mask = offset_x > 0.5;
+        let show_right_mask = offset_x < max_offset_x - 0.5;
+        let panel_color = rgb(self.colors.panel);
+        let mask_width = px(24.);
+        let mut scroll_wrapper = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(tabs_scroll.child(trailing_space));
+        if show_left_mask {
+            scroll_wrapper = scroll_wrapper.child(
                 div()
-                    .id(format!("tabbar-trailing-space-{group_id}"))
-                    .flex_1()
-                    .relative()
-                    .h_full()
-                    .on_drag_move::<DraggedTab>(cx.listener(move |app, event, window, cx| {
-                        cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
-                        app.update_tab_bar_trailing_drop_target(group_id, item_count, event, cx)
-                    }))
-                    .on_drop(cx.listener(|app, dragged_tab: &DraggedTab, _, cx| {
-                        app.handle_tab_drop(dragged_tab, cx)
-                    }))
-                    .when(show_empty_group_insertion, |element| {
-                        element.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(TAB_DROP_INDICATOR_WIDTH))
-                                .bg(rgb(self.colors.accent)),
-                        )
-                    }),
-            )
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(mask_width)
+                    .bg(linear_gradient(
+                        90.,
+                        linear_color_stop(panel_color, 0.),
+                        linear_color_stop(panel_color.opacity(0.), 1.),
+                    )),
+            );
+        }
+        if show_right_mask {
+            scroll_wrapper = scroll_wrapper.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(mask_width)
+                    .bg(linear_gradient(
+                        270.,
+                        linear_color_stop(panel_color, 0.),
+                        linear_color_stop(panel_color.opacity(0.), 1.),
+                    )),
+            );
+        }
+        // A fixed gap between the scrollable tab strip and the new-tab button gives the user a
+        // reliable grab handle to move the window, even when the tab bar is packed full.
+        let mut tab_bar_drag_gap = div()
+            .id(format!("tabbar-drag-gap-{group_id}"))
+            .flex_none()
+            .w(px(40.))
+            .h_full();
+        if touches_top_edge {
+            tab_bar_drag_gap = Self::with_window_drag_handlers(tab_bar_drag_gap, cx);
+        }
+        tabs = tabs
+            .child(scroll_wrapper)
+            .child(tab_bar_drag_gap)
             .child(top_bar_icon_button(
                 IconName::Add,
                 format!("new-terminal-{group_id}"),
