@@ -11,8 +11,10 @@ anyhow.workspace = true
 eggie-daemon.workspace = true
 eggie-domain.workspace = true
 eggie-protocol.workspace = true
+futures = "0.3"
 gpui.workspace = true
 gpui_platform.workspace = true
+libc.workspace = true
 parking_lot.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
@@ -23,6 +25,7 @@ unicode-width.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
 cocoa = "=0.26.0"
 core-foundation = "0.10.1"
 core-graphics = "0.24.0"

@@ -1,0 +1,833 @@
+use crate::settings::Language;
+
+impl Language {
+    // --- Common dialog buttons ---------------------------------------------------------------
+
+    pub(crate) fn ok(self) -> &'static str {
+        match self {
+            Self::English => "OK",
+            Self::SimplifiedChinese => "确定",
+        }
+    }
+
+    pub(crate) fn cancel(self) -> &'static str {
+        match self {
+            Self::English => "Cancel",
+            Self::SimplifiedChinese => "取消",
+        }
+    }
+
+    pub(crate) fn open(self) -> &'static str {
+        match self {
+            Self::English => "Open",
+            Self::SimplifiedChinese => "打开",
+        }
+    }
+
+    pub(crate) fn dismiss(self) -> &'static str {
+        match self {
+            Self::English => "Dismiss",
+            Self::SimplifiedChinese => "关闭",
+        }
+    }
+
+    // --- App dialogs -------------------------------------------------------------------------
+
+    pub(crate) fn allow_url_open_title(self) -> &'static str {
+        match self {
+            Self::English => "Allow terminal to open this URL?",
+            Self::SimplifiedChinese => "允许终端打开此 URL？",
+        }
+    }
+
+    pub(crate) fn url_open_detail(self) -> &'static str {
+        match self {
+            Self::English => "A process in this terminal wants to open:",
+            Self::SimplifiedChinese => "此终端中的某个进程想要打开：",
+        }
+    }
+
+    pub(crate) fn open_hyperlink_title(self) -> &'static str {
+        match self {
+            Self::English => "Open terminal hyperlink?",
+            Self::SimplifiedChinese => "打开终端超链接？",
+        }
+    }
+
+    pub(crate) fn hyperlink_open_detail(self) -> &'static str {
+        match self {
+            Self::English => "A link in this terminal points to:",
+            Self::SimplifiedChinese => "此终端中的链接指向：",
+        }
+    }
+
+    pub(crate) fn choose_receive_files_prompt(self) -> &'static str {
+        match self {
+            Self::English => "Choose where to receive terminal files",
+            Self::SimplifiedChinese => "选择接收终端文件的位置",
+        }
+    }
+
+    pub(crate) fn close_window_title(self) -> &'static str {
+        match self {
+            Self::English => "Close this Eggie window?",
+            Self::SimplifiedChinese => "关闭此 Eggie 窗口？",
+        }
+    }
+
+    pub(crate) fn close_window_message(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Choose whether its terminal sessions should terminate or stay attached to the daemon."
+            }
+            Self::SimplifiedChinese => "选择其终端会话应终止还是保持连接到守护进程。",
+        }
+    }
+
+    pub(crate) fn terminate_all(self) -> &'static str {
+        match self {
+            Self::English => "Terminate All",
+            Self::SimplifiedChinese => "全部终止",
+        }
+    }
+
+    pub(crate) fn detach(self) -> &'static str {
+        match self {
+            Self::English => "Detach",
+            Self::SimplifiedChinese => "分离",
+        }
+    }
+
+    pub(crate) fn new_project_title(self) -> &'static str {
+        match self {
+            Self::English => "New Project",
+            Self::SimplifiedChinese => "新建项目",
+        }
+    }
+
+    pub(crate) fn new_project_message(self) -> &'static str {
+        match self {
+            Self::English => "Enter a name for the project.",
+            Self::SimplifiedChinese => "输入项目名称。",
+        }
+    }
+
+    pub(crate) fn project_name_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Project name",
+            Self::SimplifiedChinese => "项目名称",
+        }
+    }
+
+    pub(crate) fn set_working_directory_prompt(self) -> &'static str {
+        match self {
+            Self::English => "Set Project Working Directory",
+            Self::SimplifiedChinese => "设置项目工作目录",
+        }
+    }
+
+    pub(crate) fn rename_project_title(self) -> &'static str {
+        match self {
+            Self::English => "Rename Project",
+            Self::SimplifiedChinese => "重命名项目",
+        }
+    }
+
+    pub(crate) fn rename_project_message(self) -> &'static str {
+        match self {
+            Self::English => "Enter a new name for the project.",
+            Self::SimplifiedChinese => "输入项目的新名称。",
+        }
+    }
+
+    // --- Section labels ----------------------------------------------------------------------
+
+    pub(crate) fn projects_label(self) -> &'static str {
+        match self {
+            Self::English => "PROJECTS",
+            Self::SimplifiedChinese => "项目",
+        }
+    }
+
+    pub(crate) fn ports_label(self) -> &'static str {
+        match self {
+            Self::English => "PORTS",
+            Self::SimplifiedChinese => "端口",
+        }
+    }
+
+    pub(crate) fn current_directory_label(self) -> &'static str {
+        match self {
+            Self::English => "CURRENT DIRECTORY",
+            Self::SimplifiedChinese => "当前目录",
+        }
+    }
+
+    pub(crate) fn source_control_label(self) -> &'static str {
+        match self {
+            Self::English => "SOURCE CONTROL",
+            Self::SimplifiedChinese => "源代码管理",
+        }
+    }
+
+    pub(crate) fn processes_label(self) -> &'static str {
+        match self {
+            Self::English => "PROCESSES",
+            Self::SimplifiedChinese => "进程",
+        }
+    }
+
+    // --- Right sidebar tabs ------------------------------------------------------------------
+
+    pub(crate) fn info_tab(self) -> &'static str {
+        match self {
+            Self::English => "Info",
+            Self::SimplifiedChinese => "信息",
+        }
+    }
+
+    pub(crate) fn files_tab(self) -> &'static str {
+        match self {
+            Self::English => "Files",
+            Self::SimplifiedChinese => "文件",
+        }
+    }
+
+    pub(crate) fn git_tab(self) -> &'static str {
+        match self {
+            Self::English => "Git",
+            Self::SimplifiedChinese => "Git",
+        }
+    }
+
+    // --- Right sidebar content ---------------------------------------------------------------
+
+    pub(crate) fn current_directory(self) -> &'static str {
+        match self {
+            Self::English => "Current directory",
+            Self::SimplifiedChinese => "当前目录",
+        }
+    }
+
+    pub(crate) fn initial_directory(self) -> &'static str {
+        match self {
+            Self::English => "Initial directory",
+            Self::SimplifiedChinese => "初始目录",
+        }
+    }
+
+    pub(crate) fn loading_ports(self) -> &'static str {
+        match self {
+            Self::English => "Loading port information…",
+            Self::SimplifiedChinese => "正在加载端口信息…",
+        }
+    }
+
+    pub(crate) fn loading_process_info(self) -> &'static str {
+        match self {
+            Self::English => "Loading process information…",
+            Self::SimplifiedChinese => "正在加载进程信息…",
+        }
+    }
+
+    pub(crate) fn file_tree_scaffold_note(self) -> &'static str {
+        match self {
+            Self::English => {
+                "File-tree service is scaffolded for current, initial, and locked roots."
+            }
+            Self::SimplifiedChinese => "文件树服务已为当前、初始和锁定根目录搭建。",
+        }
+    }
+
+    pub(crate) fn git_scaffold_note(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Git status, diff, staging, commit, branch, pull, and push services are scaffolded."
+            }
+            Self::SimplifiedChinese => "Git 状态、差异、暂存、提交、分支、拉取和推送服务已搭建。",
+        }
+    }
+
+    pub(crate) fn no_running_processes(self) -> &'static str {
+        match self {
+            Self::English => "No running processes.",
+            Self::SimplifiedChinese => "没有正在运行的进程。",
+        }
+    }
+
+    pub(crate) fn pid_label(self) -> &'static str {
+        match self {
+            Self::English => "PID",
+            Self::SimplifiedChinese => "PID",
+        }
+    }
+
+    // --- Progress states ---------------------------------------------------------------------
+
+    pub(crate) fn progress_complete(self) -> &'static str {
+        match self {
+            Self::English => "Complete",
+            Self::SimplifiedChinese => "已完成",
+        }
+    }
+
+    pub(crate) fn progress_running(self) -> &'static str {
+        match self {
+            Self::English => "Running",
+            Self::SimplifiedChinese => "运行中",
+        }
+    }
+
+    pub(crate) fn progress_error(self) -> &'static str {
+        match self {
+            Self::English => "Error",
+            Self::SimplifiedChinese => "错误",
+        }
+    }
+
+    pub(crate) fn progress_indeterminate(self) -> &'static str {
+        match self {
+            Self::English => "Indeterminate",
+            Self::SimplifiedChinese => "不确定",
+        }
+    }
+
+    pub(crate) fn progress_paused(self) -> &'static str {
+        match self {
+            Self::English => "Paused",
+            Self::SimplifiedChinese => "已暂停",
+        }
+    }
+
+    pub(crate) fn updated_just_now(self) -> &'static str {
+        match self {
+            Self::English => "updated just now",
+            Self::SimplifiedChinese => "刚刚更新",
+        }
+    }
+
+    pub(crate) fn updated_seconds_ago(self, seconds: u64) -> String {
+        match self {
+            Self::English => format!("updated {seconds}s ago"),
+            Self::SimplifiedChinese => format!("{seconds} 秒前更新"),
+        }
+    }
+
+    pub(crate) fn updated_minutes_ago(self, minutes: u64) -> String {
+        match self {
+            Self::English => format!("updated {minutes}m ago"),
+            Self::SimplifiedChinese => format!("{minutes} 分钟前更新"),
+        }
+    }
+
+    pub(crate) fn updated_hours_ago(self, hours: u64) -> String {
+        match self {
+            Self::English => format!("updated {hours}h ago"),
+            Self::SimplifiedChinese => format!("{hours} 小时前更新"),
+        }
+    }
+
+    // --- Native context menus ----------------------------------------------------------------
+
+    pub(crate) fn split_up(self) -> &'static str {
+        match self {
+            Self::English => "Split Up",
+            Self::SimplifiedChinese => "向上拆分",
+        }
+    }
+
+    pub(crate) fn split_down(self) -> &'static str {
+        match self {
+            Self::English => "Split Down",
+            Self::SimplifiedChinese => "向下拆分",
+        }
+    }
+
+    pub(crate) fn split_left(self) -> &'static str {
+        match self {
+            Self::English => "Split Left",
+            Self::SimplifiedChinese => "向左拆分",
+        }
+    }
+
+    pub(crate) fn split_right(self) -> &'static str {
+        match self {
+            Self::English => "Split Right",
+            Self::SimplifiedChinese => "向右拆分",
+        }
+    }
+
+    pub(crate) fn move_up(self) -> &'static str {
+        match self {
+            Self::English => "Move Up",
+            Self::SimplifiedChinese => "上移",
+        }
+    }
+
+    pub(crate) fn move_down(self) -> &'static str {
+        match self {
+            Self::English => "Move Down",
+            Self::SimplifiedChinese => "下移",
+        }
+    }
+
+    pub(crate) fn move_left(self) -> &'static str {
+        match self {
+            Self::English => "Move Left",
+            Self::SimplifiedChinese => "左移",
+        }
+    }
+
+    pub(crate) fn move_right(self) -> &'static str {
+        match self {
+            Self::English => "Move Right",
+            Self::SimplifiedChinese => "右移",
+        }
+    }
+
+    pub(crate) fn split_and_move(self) -> &'static str {
+        match self {
+            Self::English => "Split and Move",
+            Self::SimplifiedChinese => "拆分和移动",
+        }
+    }
+
+    pub(crate) fn edit_name(self) -> &'static str {
+        match self {
+            Self::English => "Edit Name",
+            Self::SimplifiedChinese => "编辑名称",
+        }
+    }
+
+    pub(crate) fn set_root(self) -> &'static str {
+        match self {
+            Self::English => "Set Working Directory…",
+            Self::SimplifiedChinese => "设置工作目录…",
+        }
+    }
+
+    pub(crate) fn close_tabs(self, count: usize) -> String {
+        match self {
+            Self::English => format!("Close {count} tab{}", if count == 1 { "" } else { "s" }),
+            Self::SimplifiedChinese => format!("关闭 {} 个标签页", count),
+        }
+    }
+
+    pub(crate) fn delete_project(self) -> &'static str {
+        match self {
+            Self::English => "Delete Project",
+            Self::SimplifiedChinese => "删除项目",
+        }
+    }
+
+    pub(crate) fn terminate(self) -> &'static str {
+        match self {
+            Self::English => "Terminate",
+            Self::SimplifiedChinese => "终止",
+        }
+    }
+
+    pub(crate) fn force_kill(self) -> &'static str {
+        match self {
+            Self::English => "Force Kill",
+            Self::SimplifiedChinese => "强制结束",
+        }
+    }
+
+    pub(crate) fn copy_pid(self) -> &'static str {
+        match self {
+            Self::English => "Copy PID",
+            Self::SimplifiedChinese => "复制 PID",
+        }
+    }
+
+    pub(crate) fn copy_executable_path(self) -> &'static str {
+        match self {
+            Self::English => "Copy Executable Path",
+            Self::SimplifiedChinese => "复制可执行文件路径",
+        }
+    }
+
+    // --- Settings window ---------------------------------------------------------------------
+
+    pub(crate) fn settings_title(self) -> &'static str {
+        match self {
+            Self::English => "Settings",
+            Self::SimplifiedChinese => "设置",
+        }
+    }
+
+    pub(crate) fn settings_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Settings…",
+            Self::SimplifiedChinese => "设置…",
+        }
+    }
+
+    pub(crate) fn hide_eggie(self) -> &'static str {
+        match self {
+            Self::English => "Hide Eggie",
+            Self::SimplifiedChinese => "隐藏 Eggie",
+        }
+    }
+
+    pub(crate) fn hide_others(self) -> &'static str {
+        match self {
+            Self::English => "Hide Others",
+            Self::SimplifiedChinese => "隐藏其他",
+        }
+    }
+
+    pub(crate) fn show_all(self) -> &'static str {
+        match self {
+            Self::English => "Show All",
+            Self::SimplifiedChinese => "全部显示",
+        }
+    }
+
+    pub(crate) fn quit_eggie(self) -> &'static str {
+        match self {
+            Self::English => "Quit Eggie",
+            Self::SimplifiedChinese => "退出 Eggie",
+        }
+    }
+
+    pub(crate) fn edit_menu(self) -> &'static str {
+        match self {
+            Self::English => "Edit",
+            Self::SimplifiedChinese => "编辑",
+        }
+    }
+
+    pub(crate) fn copy(self) -> &'static str {
+        match self {
+            Self::English => "Copy",
+            Self::SimplifiedChinese => "拷贝",
+        }
+    }
+
+    pub(crate) fn paste(self) -> &'static str {
+        match self {
+            Self::English => "Paste",
+            Self::SimplifiedChinese => "粘贴",
+        }
+    }
+
+    pub(crate) fn select_all(self) -> &'static str {
+        match self {
+            Self::English => "Select All",
+            Self::SimplifiedChinese => "全选",
+        }
+    }
+
+    pub(crate) fn settings_window_title(self) -> String {
+        match self {
+            Self::English => "Eggie — Settings".to_owned(),
+            Self::SimplifiedChinese => "Eggie — 设置".to_owned(),
+        }
+    }
+
+    pub(crate) fn appearance_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "Appearance",
+            Self::SimplifiedChinese => "外观",
+        }
+    }
+
+    pub(crate) fn general_section(self) -> &'static str {
+        match self {
+            Self::English => "General",
+            Self::SimplifiedChinese => "通用",
+        }
+    }
+
+    pub(crate) fn appearance_section(self) -> &'static str {
+        match self {
+            Self::English => "Appearance",
+            Self::SimplifiedChinese => "外观",
+        }
+    }
+
+    pub(crate) fn theme_section(self) -> &'static str {
+        match self {
+            Self::English => "Theme",
+            Self::SimplifiedChinese => "主题",
+        }
+    }
+
+    pub(crate) fn terminal_text_section(self) -> &'static str {
+        match self {
+            Self::English => "Terminal text",
+            Self::SimplifiedChinese => "终端文本",
+        }
+    }
+
+    pub(crate) fn terminal_layout_section(self) -> &'static str {
+        match self {
+            Self::English => "Terminal layout",
+            Self::SimplifiedChinese => "终端布局",
+        }
+    }
+
+    pub(crate) fn progress_indicators_section(self) -> &'static str {
+        match self {
+            Self::English => "Progress indicators",
+            Self::SimplifiedChinese => "进度指示器",
+        }
+    }
+
+    pub(crate) fn terminal_security_section(self) -> &'static str {
+        match self {
+            Self::English => "Terminal security",
+            Self::SimplifiedChinese => "终端安全",
+        }
+    }
+
+    pub(crate) fn language_row(self) -> &'static str {
+        match self {
+            Self::English => "Language",
+            Self::SimplifiedChinese => "语言",
+        }
+    }
+
+    pub(crate) fn language_description(self) -> &'static str {
+        match self {
+            Self::English => "Choose the interface language.",
+            Self::SimplifiedChinese => "选择界面语言。",
+        }
+    }
+
+    pub(crate) fn theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Theme",
+            Self::SimplifiedChinese => "主题",
+        }
+    }
+
+    pub(crate) fn theme_description(self) -> &'static str {
+        match self {
+            Self::English => "Choose dark, light, or follow the macOS appearance.",
+            Self::SimplifiedChinese => "选择深色、浅色，或跟随 macOS 外观。",
+        }
+    }
+
+    pub(crate) fn dark_theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Dark theme",
+            Self::SimplifiedChinese => "深色主题",
+        }
+    }
+
+    pub(crate) fn dark_theme_description(self) -> &'static str {
+        match self {
+            Self::English => "Used in Dark mode and when the system appearance is dark.",
+            Self::SimplifiedChinese => "在深色模式和系统外观为深色时使用。",
+        }
+    }
+
+    pub(crate) fn light_theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Light theme",
+            Self::SimplifiedChinese => "浅色主题",
+        }
+    }
+
+    pub(crate) fn light_theme_description(self) -> &'static str {
+        match self {
+            Self::English => "Used in Light mode and when the system appearance is light.",
+            Self::SimplifiedChinese => "在浅色模式和系统外观为浅色时使用。",
+        }
+    }
+
+    pub(crate) fn minimum_contrast_row(self) -> &'static str {
+        match self {
+            Self::English => "Minimum contrast",
+            Self::SimplifiedChinese => "最小对比度",
+        }
+    }
+
+    pub(crate) fn minimum_contrast_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Minimum WCAG contrast ratio between text and each cell background. Emoji and terminal graphics are unchanged."
+            }
+            Self::SimplifiedChinese => {
+                "文本与每个单元格背景之间的最小 WCAG 对比度。Emoji 和终端图形不受影响。"
+            }
+        }
+    }
+
+    pub(crate) fn font_row(self) -> &'static str {
+        match self {
+            Self::English => "Font",
+            Self::SimplifiedChinese => "字体",
+        }
+    }
+
+    pub(crate) fn font_description(self) -> &'static str {
+        match self {
+            Self::English => "Only installed monospaced fonts are listed.",
+            Self::SimplifiedChinese => "仅列出已安装的等宽字体。",
+        }
+    }
+
+    pub(crate) fn font_size_row(self) -> &'static str {
+        match self {
+            Self::English => "Font size",
+            Self::SimplifiedChinese => "字号",
+        }
+    }
+
+    pub(crate) fn font_size_description(self) -> &'static str {
+        match self {
+            Self::English => "Applied to every terminal and used when calculating the PTY grid.",
+            Self::SimplifiedChinese => "应用于所有终端，并用于计算 PTY 网格。",
+        }
+    }
+
+    pub(crate) fn horizontal_padding_row(self) -> &'static str {
+        match self {
+            Self::English => "Horizontal padding",
+            Self::SimplifiedChinese => "水平内边距",
+        }
+    }
+
+    pub(crate) fn horizontal_padding_description(self) -> &'static str {
+        match self {
+            Self::English => "Left and right padding around the terminal grid.",
+            Self::SimplifiedChinese => "终端网格左右两侧的内边距。",
+        }
+    }
+
+    pub(crate) fn vertical_padding_row(self) -> &'static str {
+        match self {
+            Self::English => "Vertical padding",
+            Self::SimplifiedChinese => "垂直内边距",
+        }
+    }
+
+    pub(crate) fn vertical_padding_description(self) -> &'static str {
+        match self {
+            Self::English => "Top and bottom padding around the terminal grid.",
+            Self::SimplifiedChinese => "终端网格上下两侧的内边距。",
+        }
+    }
+
+    pub(crate) fn completed_timeout_row(self) -> &'static str {
+        match self {
+            Self::English => "Completed timeout",
+            Self::SimplifiedChinese => "完成超时",
+        }
+    }
+
+    pub(crate) fn completed_timeout_description(self) -> &'static str {
+        match self {
+            Self::English => "Hide completed OSC 9;4 progress after this delay.",
+            Self::SimplifiedChinese => "在此延迟后隐藏已完成的 OSC 9;4 进度。",
+        }
+    }
+
+    pub(crate) fn inactive_timeout_row(self) -> &'static str {
+        match self {
+            Self::English => "Inactive timeout",
+            Self::SimplifiedChinese => "不活动超时",
+        }
+    }
+
+    pub(crate) fn inactive_timeout_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Hide running, error, paused, or indeterminate progress when no update arrives for this long."
+            }
+            Self::SimplifiedChinese => "当长时间没有更新时，隐藏运行中、错误、已暂停或不确定的进度。",
+        }
+    }
+
+    pub(crate) fn osc_clipboard_read_row(self) -> &'static str {
+        match self {
+            Self::English => "OSC clipboard read",
+            Self::SimplifiedChinese => "OSC 剪贴板读取",
+        }
+    }
+
+    pub(crate) fn osc_clipboard_read_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Allow terminal programs to read the system clipboard through OSC 52 or OSC 5522. Writes remain enabled."
+            }
+            Self::SimplifiedChinese => {
+                "允许终端程序通过 OSC 52 或 OSC 5522 读取系统剪贴板。写入保持启用。"
+            }
+        }
+    }
+
+    pub(crate) fn block(self) -> &'static str {
+        match self {
+            Self::English => "Block",
+            Self::SimplifiedChinese => "阻止",
+        }
+    }
+
+    pub(crate) fn allow(self) -> &'static str {
+        match self {
+            Self::English => "Allow",
+            Self::SimplifiedChinese => "允许",
+        }
+    }
+
+    pub(crate) fn terminal_preview_label(self) -> &'static str {
+        match self {
+            Self::English => "TERMINAL PREVIEW",
+            Self::SimplifiedChinese => "终端预览",
+        }
+    }
+
+    pub(crate) fn search_dark_themes(self) -> &'static str {
+        match self {
+            Self::English => "Search dark themes",
+            Self::SimplifiedChinese => "搜索深色主题",
+        }
+    }
+
+    pub(crate) fn search_light_themes(self) -> &'static str {
+        match self {
+            Self::English => "Search light themes",
+            Self::SimplifiedChinese => "搜索浅色主题",
+        }
+    }
+
+    pub(crate) fn search_fonts(self) -> &'static str {
+        match self {
+            Self::English => "Search fonts",
+            Self::SimplifiedChinese => "搜索字体",
+        }
+    }
+
+    pub(crate) fn no_matches(self) -> &'static str {
+        match self {
+            Self::English => "No matches",
+            Self::SimplifiedChinese => "无匹配项",
+        }
+    }
+
+    pub(crate) fn theme_mode_dark(self) -> &'static str {
+        match self {
+            Self::English => "Dark",
+            Self::SimplifiedChinese => "深色",
+        }
+    }
+
+    pub(crate) fn theme_mode_light(self) -> &'static str {
+        match self {
+            Self::English => "Light",
+            Self::SimplifiedChinese => "浅色",
+        }
+    }
+
+    pub(crate) fn theme_mode_system(self) -> &'static str {
+        match self {
+            Self::English => "System",
+            Self::SimplifiedChinese => "跟随系统",
+        }
+    }
+}

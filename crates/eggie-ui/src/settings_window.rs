@@ -1,7 +1,9 @@
+use std::sync::OnceLock;
+
 use crate::{
     icons::{IconName, icon},
     settings::{
-        AppSettings, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS,
+        AppSettings, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS,
         MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS,
         MIN_TERMINAL_PADDING, SettingsStore, TerminalTheme, ThemeMode, UiColors,
         minimum_contrast_rgb, theme_catalog,
@@ -11,8 +13,11 @@ use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
-    actions, anchored, deferred, div, font, point, prelude::*, px, rgb, size,
+    actions, anchored, deferred, div, point, prelude::*, px, rgb, size,
 };
+
+#[cfg(not(target_os = "macos"))]
+use gpui::font;
 
 actions!(
     eggie,
@@ -86,25 +91,37 @@ pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
         KeyBinding::new("cmd-v", TerminalPaste, None),
         KeyBinding::new("cmd-a", TerminalSelectAll, None),
     ]);
-    cx.set_menus([
+    let language = settings.read(cx).config().language;
+    cx.set_menus(build_menus(language));
+
+    let settings_for_observer = settings.clone();
+    cx.observe(&settings, move |_, cx| {
+        let language = settings_for_observer.read(cx).config().language;
+        cx.set_menus(build_menus(language));
+    })
+    .detach();
+}
+
+fn build_menus(language: Language) -> [Menu; 2] {
+    [
         Menu::new("Eggie").items([
-            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action(language.settings_menu_item(), OpenSettings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Eggie", Hide),
-            MenuItem::action("Hide Others", HideOthers),
-            MenuItem::action("Show All", ShowAll),
+            MenuItem::action(language.hide_eggie(), Hide),
+            MenuItem::action(language.hide_others(), HideOthers),
+            MenuItem::action(language.show_all(), ShowAll),
             MenuItem::separator(),
-            MenuItem::action("Quit Eggie", Quit),
+            MenuItem::action(language.quit_eggie(), Quit),
         ]),
-        Menu::new("Edit").items([
-            MenuItem::os_action("Copy", TerminalCopy, OsAction::Copy),
-            MenuItem::os_action("Paste", TerminalPaste, OsAction::Paste),
+        Menu::new(language.edit_menu()).items([
+            MenuItem::os_action(language.copy(), TerminalCopy, OsAction::Copy),
+            MenuItem::os_action(language.paste(), TerminalPaste, OsAction::Paste),
             MenuItem::separator(),
-            MenuItem::os_action("Select All", TerminalSelectAll, OsAction::SelectAll),
+            MenuItem::os_action(language.select_all(), TerminalSelectAll, OsAction::SelectAll),
         ]),
-    ]);
+    ]
 }
 
 fn open_settings_window(settings: Entity<SettingsStore>, cx: &mut App) {
@@ -120,10 +137,11 @@ fn open_settings_window(settings: Entity<SettingsStore>, cx: &mut App) {
     }
 
     let fonts = monospace_font_names(cx);
+    let language = settings.read(cx).config().language;
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("Eggie — Settings".into()),
+                title: Some(language.settings_window_title().into()),
                 appears_transparent: true,
                 traffic_light_position: Some(gpui::point(
                     px(SETTINGS_TRAFFIC_LIGHT_LEFT),
@@ -145,6 +163,59 @@ fn open_settings_window(settings: Entity<SettingsStore>, cx: &mut App) {
 }
 
 fn monospace_font_names(cx: &App) -> Vec<String> {
+    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| monospace_font_names_uncached(cx))
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn monospace_font_names_uncached(_cx: &App) -> Vec<String> {
+    use core_foundation::{array::CFArray, base::TCFType};
+    use core_text::font_collection::create_for_all_families;
+    use core_text::font_descriptor::{CTFontDescriptor, SymbolicTraitAccessors, TraitAccessors};
+    use std::collections::HashSet;
+
+    let collection = create_for_all_families();
+    let descriptors: Option<CFArray<CTFontDescriptor>> = unsafe {
+        unsafe extern "C" {
+            fn CTFontCollectionCreateMatchingFontDescriptors(
+                collection: core_text::font_collection::CTFontCollectionRef,
+            ) -> core_foundation::array::CFArrayRef;
+        }
+        let array_ref =
+            CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
+        if array_ref.is_null() {
+            None
+        } else {
+            Some(CFArray::wrap_under_create_rule(array_ref))
+        }
+    };
+
+    let Some(descriptors) = descriptors else {
+        return Vec::new();
+    };
+
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for descriptor in descriptors.into_iter() {
+        if !descriptor.traits().symbolic_traits().is_monospace() {
+            continue;
+        }
+        let name = descriptor.family_name();
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    names.sort_unstable_by_key(|name| name.to_lowercase());
+    if !names.iter().any(|name| name == "Menlo") {
+        names.insert(0, "Menlo".to_owned());
+    }
+    names
+}
+
+#[cfg(not(target_os = "macos"))]
+fn monospace_font_names_uncached(cx: &App) -> Vec<String> {
     let text_system = cx.text_system();
     let mut names = text_system
         .all_font_names()
@@ -224,6 +295,12 @@ impl SettingsWindow {
         });
     }
 
+    fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.language = language, cx)
+        });
+    }
+
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(
@@ -286,6 +363,7 @@ impl SettingsWindow {
     }
 
     fn render_mode_control(&self, selected: ThemeMode, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
         ThemeMode::ALL
             .into_iter()
             .fold(
@@ -297,6 +375,11 @@ impl SettingsWindow {
                     .border_1()
                     .border_color(rgb(self.colors.border)),
                 |control, mode| {
+                    let label = match mode {
+                        ThemeMode::Dark => language.theme_mode_dark(),
+                        ThemeMode::Light => language.theme_mode_light(),
+                        ThemeMode::System => language.theme_mode_system(),
+                    };
                     control.child(
                         div()
                             .id(format!("theme-mode-{}", mode.label()))
@@ -315,7 +398,7 @@ impl SettingsWindow {
                             .on_click(cx.listener(move |settings, _, _, cx| {
                                 settings.set_theme_mode(mode, cx)
                             }))
-                            .child(mode.label()),
+                            .child(label),
                     )
                 },
             )
@@ -327,7 +410,8 @@ impl SettingsWindow {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        [(false, "Block"), (true, "Allow")]
+        let language = self.settings.read(cx).config().language;
+        [(false, language.block()), (true, language.allow())]
             .into_iter()
             .fold(
                 div()
@@ -357,6 +441,47 @@ impl SettingsWindow {
                                 settings.set_osc_clipboard_read(value, cx)
                             }))
                             .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_language_control(
+        &self,
+        selected: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        Language::ALL
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, language| {
+                    control.child(
+                        div()
+                            .id(format!("language-{}", language.label()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(selected == language, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_language(language, cx)
+                            }))
+                            .child(language.label()),
                     )
                 },
             )
@@ -516,19 +641,20 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let config = self.settings.read(cx).config();
+        let language = config.language;
         let (search_placeholder, current, items) = match kind {
             SelectorKind::DarkTheme => (
-                "Search dark themes",
+                language.search_dark_themes(),
                 config.dark_theme.clone(),
                 self.dark_theme_names.clone(),
             ),
             SelectorKind::LightTheme => (
-                "Search light themes",
+                language.search_light_themes(),
                 config.light_theme.clone(),
                 self.light_theme_names.clone(),
             ),
             SelectorKind::Font => (
-                "Search fonts",
+                language.search_fonts(),
                 config.font_family.clone(),
                 self.font_names.clone(),
             ),
@@ -605,7 +731,7 @@ impl SettingsWindow {
                     .items_center()
                     .justify_center()
                     .text_color(rgb(self.colors.muted))
-                    .child("No matches"),
+                    .child(language.no_matches()),
             );
         }
 
@@ -988,6 +1114,7 @@ impl SettingsWindow {
     }
 
     fn render_terminal_preview(&self, config: &AppSettings, theme: &TerminalTheme) -> AnyElement {
+        let language = config.language;
         let foreground =
             minimum_contrast_rgb(theme.foreground, theme.background, config.minimum_contrast);
         let command =
@@ -1006,7 +1133,7 @@ impl SettingsWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(self.colors.muted))
-                    .child("TERMINAL PREVIEW"),
+                    .child(language.terminal_preview_label()),
             )
             .child(
                 div()
@@ -1037,6 +1164,8 @@ impl gpui::Render for SettingsWindow {
         let theme = config.effective_theme(is_dark_appearance(window.appearance()));
         self.colors = UiColors::from_theme(theme);
 
+        let language = config.language;
+        let language_control = self.render_language_control(language, cx);
         let mode_control = self.render_mode_control(config.theme_mode, cx);
         let dark_selector = self.render_selector(
             "dark-theme-selector",
@@ -1131,7 +1260,7 @@ impl gpui::Render for SettingsWindow {
                             window.titlebar_double_click();
                         }
                     })
-                    .child(div().text_size(px(15.)).font_weight(gpui::FontWeight::SEMIBOLD).child("Settings")),
+                    .child(div().text_size(px(15.)).font_weight(gpui::FontWeight::SEMIBOLD).child(language.settings_title())),
             )
             .child(
                 div()
@@ -1160,8 +1289,8 @@ impl gpui::Render for SettingsWindow {
                                     .rounded_lg()
                                     .bg(rgb(self.colors.panel_alt))
                                     .text_color(rgb(self.colors.accent))
-                                    .child(icon(IconName::Settings))
-                                    .child("Appearance"),
+                                    .child(icon(IconName::Appearance))
+                                    .child(language.appearance_sidebar()),
                             ),
                     )
                     .child(
@@ -1199,32 +1328,42 @@ impl gpui::Render for SettingsWindow {
                                                         div()
                                                             .text_size(px(18.))
                                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .child("Appearance"),
+                                                            .child(language.appearance_section()),
                                                     )
                                                     .child(settings_section(
-                                                        "Theme",
+                                                        language.general_section(),
+                                                        vec![settings_row(
+                                                            language.language_row(),
+                                                            language.language_description(),
+                                                            language_control,
+                                                            self.colors,
+                                                        )],
+                                                        self.colors,
+                                                    ))
+                                                    .child(settings_section(
+                                                        language.theme_section(),
                                                         vec![
                                                             settings_row(
-                                                                "Theme",
-                                                                "Choose dark, light, or follow the macOS appearance.",
+                                                                language.theme_row(),
+                                                                language.theme_description(),
                                                                 mode_control,
                                                                 self.colors,
                                                             ),
                                                             settings_row(
-                                                                "Dark theme",
-                                                                "Used in Dark mode and when the system appearance is dark.",
+                                                                language.dark_theme_row(),
+                                                                language.dark_theme_description(),
                                                                 dark_selector,
                                                                 self.colors,
                                                             ),
                                                             settings_row(
-                                                                "Light theme",
-                                                                "Used in Light mode and when the system appearance is light.",
+                                                                language.light_theme_row(),
+                                                                language.light_theme_description(),
                                                                 light_selector,
                                                                 self.colors,
                                                             ),
                                                             settings_row(
-                                                                "Minimum contrast",
-                                                                "Minimum WCAG contrast ratio between text and each cell background. Emoji and terminal graphics are unchanged.",
+                                                                language.minimum_contrast_row(),
+                                                                language.minimum_contrast_description(),
                                                                 minimum_contrast_control,
                                                                 self.colors,
                                                             ),
@@ -1232,17 +1371,17 @@ impl gpui::Render for SettingsWindow {
                                                         self.colors,
                                                     ))
                                                     .child(settings_section(
-                                                        "Terminal text",
+                                                        language.terminal_text_section(),
                                                         vec![
                                                             settings_row(
-                                                                "Font",
-                                                                "Only installed monospaced fonts are listed.",
+                                                                language.font_row(),
+                                                                language.font_description(),
                                                                 font_selector,
                                                                 self.colors,
                                                             ),
                                                             settings_row(
-                                                                "Font size",
-                                                                "Applied to every terminal and used when calculating the PTY grid.",
+                                                                language.font_size_row(),
+                                                                language.font_size_description(),
                                                                 font_size_control,
                                                                 self.colors,
                                                             ),
@@ -1250,17 +1389,17 @@ impl gpui::Render for SettingsWindow {
                                                         self.colors,
                                                     ))
                                                     .child(settings_section(
-                                                        "Terminal layout",
+                                                        language.terminal_layout_section(),
                                                         vec![
                                                             settings_row(
-                                                                "Horizontal padding",
-                                                                "Left and right padding around the terminal grid.",
+                                                                language.horizontal_padding_row(),
+                                                                language.horizontal_padding_description(),
                                                                 horizontal_padding_control,
                                                                 self.colors,
                                                             ),
                                                             settings_row(
-                                                                "Vertical padding",
-                                                                "Top and bottom padding around the terminal grid.",
+                                                                language.vertical_padding_row(),
+                                                                language.vertical_padding_description(),
                                                                 vertical_padding_control,
                                                                 self.colors,
                                                             ),
@@ -1268,17 +1407,17 @@ impl gpui::Render for SettingsWindow {
                                                         self.colors,
                                                     ))
                                                     .child(settings_section(
-                                                        "Progress indicators",
+                                                        language.progress_indicators_section(),
                                                         vec![
                                                             settings_row(
-                                                                "Completed timeout",
-                                                                "Hide completed OSC 9;4 progress after this delay.",
+                                                                language.completed_timeout_row(),
+                                                                language.completed_timeout_description(),
                                                                 progress_complete_timeout_control,
                                                                 self.colors,
                                                             ),
                                                             settings_row(
-                                                                "Inactive timeout",
-                                                                "Hide running, error, paused, or indeterminate progress when no update arrives for this long.",
+                                                                language.inactive_timeout_row(),
+                                                                language.inactive_timeout_description(),
                                                                 progress_stale_timeout_control,
                                                                 self.colors,
                                                             ),
@@ -1286,10 +1425,10 @@ impl gpui::Render for SettingsWindow {
                                                         self.colors,
                                                     ))
                                                     .child(settings_section(
-                                                        "Terminal security",
+                                                        language.terminal_security_section(),
                                                         vec![settings_row(
-                                                            "OSC clipboard read",
-                                                            "Allow terminal programs to read the system clipboard through OSC 52 or OSC 5522. Writes remain enabled.",
+                                                            language.osc_clipboard_read_row(),
+                                                            language.osc_clipboard_read_description(),
                                                             osc_clipboard_read_control,
                                                             self.colors,
                                                         )],

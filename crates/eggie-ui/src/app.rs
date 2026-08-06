@@ -1,7 +1,10 @@
 use crate::icons::{IconName, icon, icon_sized};
 use crate::input_latency::InputLatencyTracker;
-use crate::native_menu::{NativeTabMenuCommand, prepare_tab_menu};
-use crate::settings::{SettingsStore, TerminalTheme, UiColors, system_uses_dark_appearance};
+use crate::native_menu::{
+    NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand,
+    prepare_process_menu, prepare_project_menu, prepare_tab_menu,
+};
+use crate::settings::{Language, SettingsStore, TerminalTheme, UiColors, system_uses_dark_appearance};
 use crate::settings_window::{TerminalCopy, TerminalPaste, TerminalSelectAll, is_dark_appearance};
 use crate::terminal_renderer::{
     MetalTerminalRenderer, TerminalImageData, TerminalImeState, TerminalInputContext,
@@ -11,8 +14,8 @@ use crate::terminal_renderer::{
 use alacritty_terminal::term::cell::Flags;
 use eggie_daemon::{DaemonClient, DaemonInputSender};
 use eggie_domain::{
-    Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, SessionId, SplitAxis, TabGroup,
-    TabItem,
+    Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
+    TabGroup, TabItem,
 };
 use eggie_protocol::{
     ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionSummary,
@@ -44,6 +47,18 @@ use std::{
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+#[cfg(target_os = "macos")]
+use cocoa::{
+    base::{id, nil},
+    foundation::{NSInteger, NSPoint, NSRect, NSString, NSSize},
+};
+#[cfg(target_os = "macos")]
+use objc::{class, msg_send, sel, sel_impl};
+#[cfg(target_os = "macos")]
+use block::ConcreteBlock;
+#[cfg(target_os = "macos")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
 const TAB_BAR_HEIGHT: f32 = 36.;
 const TITLEBAR_HEIGHT: f32 = TAB_BAR_HEIGHT;
 const TAB_MIN_WIDTH: f32 = 140.;
@@ -54,7 +69,7 @@ const TAB_TITLE_FONT_SIZE: f32 = 11.;
 const TAB_CLOSE_ICON_SIZE: f32 = 10.;
 const TAB_DROP_INDICATOR_WIDTH: f32 = 2.;
 const TAB_DROP_INDICATOR_OFFSET: f32 = (TAB_GAP + TAB_DROP_INDICATOR_WIDTH) / 2.;
-const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 40.;
+const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 28.;
 const ITEM_ICON_SLOT_SIZE: f32 = 16.;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
 const CONTENT_SPLIT_EDGE_FACTOR: f32 = 0.1;
@@ -234,11 +249,12 @@ impl DraggedTab {
         div()
             .flex()
             .items_center()
-            .w(px(TAB_MAX_WIDTH))
+            .min_w(px(TAB_MIN_WIDTH))
+            .max_w(px(TAB_MAX_WIDTH))
             .h(px(TAB_BAR_HEIGHT - TAB_BAR_PADDING * 2.))
-            .min_w_0()
             .overflow_hidden()
-            .px_3()
+            .pl_2()
+            .pr_1()
             .gap_2()
             .text_size(px(TAB_TITLE_FONT_SIZE))
             .rounded_md()
@@ -346,6 +362,7 @@ pub struct EggieApp {
     pending_progress_updates: HashMap<SessionId, TerminalProgressUpdate>,
     projects: Vec<ProjectWorkspace>,
     active_project: usize,
+    collapsed_projects: HashSet<ProjectId>,
     sessions: Vec<SessionSummary>,
     snapshots: HashMap<SessionId, Arc<TerminalSnapshot>>,
     terminal_sizes: HashMap<SessionId, TerminalSize>,
@@ -373,8 +390,120 @@ pub struct EggieApp {
     focus_handle: FocusHandle,
     notification_routes: NotificationRoutes,
     allow_osc_clipboard_read: bool,
+    language: Language,
     closing: bool,
     poll_error: Option<String>,
+}
+
+/// Show a native macOS text-input alert and return the entered string, or `None` if cancelled.
+///
+/// Uses `beginSheetModalForWindow` (asynchronous) so it does not block GPUI's event loop or
+/// re-enter the app's `RefCell` borrow while a mouse event is being dispatched.
+#[cfg(target_os = "macos")]
+fn prompt_for_text(
+    window: &Window,
+    title: &str,
+    message: &str,
+    placeholder: Option<&str>,
+    ok_label: &str,
+    cancel_label: &str,
+) -> futures::channel::oneshot::Receiver<Option<String>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+
+    unsafe {
+        let alert: id = msg_send![class!(NSAlert), alloc];
+        let alert: id = msg_send![alert, init];
+        let _: () = msg_send![
+            alert,
+            setMessageText: NSString::alloc(nil).init_str(title)
+        ];
+        let _: () = msg_send![
+            alert,
+            setInformativeText: NSString::alloc(nil).init_str(message)
+        ];
+
+        let text_field: id = msg_send![class!(NSTextField), alloc];
+        let text_field: id = msg_send![
+            text_field,
+            initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(260., 24.))
+        ];
+        if let Some(placeholder) = placeholder {
+            let _: () = msg_send![
+                text_field,
+                setPlaceholderString: NSString::alloc(nil).init_str(placeholder)
+            ];
+        }
+        let _: () = msg_send![alert, setAccessoryView: text_field];
+
+        let _: id = msg_send![alert, addButtonWithTitle: NSString::alloc(nil).init_str(ok_label)];
+        let cancel_button: id =
+            msg_send![alert, addButtonWithTitle: NSString::alloc(nil).init_str(cancel_label)];
+        let _: () = msg_send![
+            cancel_button,
+            setKeyEquivalent: NSString::alloc(nil).init_str("\u{1b}")
+        ];
+
+        let native_window = match HasWindowHandle::window_handle(window) {
+            Ok(handle) => match handle.as_raw() {
+                RawWindowHandle::AppKit(appkit) => {
+                    let ns_view = appkit.ns_view.as_ptr() as id;
+                    if ns_view == nil {
+                        nil
+                    } else {
+                        msg_send![ns_view, window]
+                    }
+                }
+                _ => nil,
+            },
+            Err(_) => nil,
+        };
+
+        if native_window == nil {
+            let _ = tx.send(None);
+            return rx;
+        }
+
+        let tx = std::cell::Cell::new(Some(tx));
+        let block = ConcreteBlock::new(move |response: NSInteger| {
+            let result = if response == 1000 {
+                let value: id = msg_send![text_field, stringValue];
+                let bytes: *const std::os::raw::c_char = msg_send![value, UTF8String];
+                if bytes.is_null() {
+                    None
+                } else {
+                    Some(std::ffi::CStr::from_ptr(bytes).to_string_lossy().into_owned())
+                }
+            } else {
+                None
+            };
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(result);
+            }
+        });
+        let block = block.copy();
+
+        let _: () = msg_send![
+            alert,
+            beginSheetModalForWindow: native_window
+            completionHandler: block
+        ];
+    }
+
+    rx
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prompt_for_text(
+    _window: &Window,
+    _title: &str,
+    _message: &str,
+    _placeholder: Option<&str>,
+    _ok_label: &str,
+    _cancel_label: &str,
+) -> futures::channel::oneshot::Receiver<Option<String>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let _ = tx.send(None);
+    rx
 }
 
 impl EggieApp {
@@ -384,21 +513,18 @@ impl EggieApp {
             .config()
             .effective_theme(system_uses_dark_appearance())
             .appearance();
-        let mut project = Project::from_root(project_root.clone());
-        let mut sessions = match client.request(ClientRequest::ListSessions) {
-            Ok(DaemonResponse::Sessions { sessions }) => sessions
-                .into_iter()
-                .filter(|session| session.initial_directory == project_root)
-                .collect::<Vec<_>>(),
+        let all_sessions = match client.request(ClientRequest::ListSessions) {
+            Ok(DaemonResponse::Sessions { sessions }) => sessions,
             _ => Vec::new(),
         };
-        if let Some(existing) = sessions.first() {
-            project.id = existing.project_id;
-        } else {
+        // If there are no existing sessions at all, start with a default "Home" project whose
+        // terminals open in the user's home directory.
+        let (project, sessions) = if all_sessions.is_empty() {
+            let project = Project::new("Home".to_owned());
             let response = client
                 .request(ClientRequest::CreateSession {
                     project_id: project.id,
-                    cwd: project_root,
+                    cwd: project.effective_root(),
                     size: TerminalSize::default(),
                     appearance: initial_appearance,
                 })
@@ -407,8 +533,32 @@ impl EggieApp {
                 DaemonResponse::SessionCreated { session } => session,
                 response => panic!("unexpected create-session response: {response:?}"),
             };
-            sessions.push(session);
-        }
+            (project, vec![session])
+        } else {
+            let mut project = Project::from_root(project_root.clone());
+            let mut sessions = all_sessions
+                .into_iter()
+                .filter(|session| session.initial_directory == project_root)
+                .collect::<Vec<_>>();
+            if let Some(existing) = sessions.first() {
+                project.id = existing.project_id;
+            } else {
+                let response = client
+                    .request(ClientRequest::CreateSession {
+                        project_id: project.id,
+                        cwd: project_root,
+                        size: TerminalSize::default(),
+                        appearance: initial_appearance,
+                    })
+                    .expect("failed to create initial terminal session");
+                let session = match response {
+                    DaemonResponse::SessionCreated { session } => session,
+                    response => panic!("unexpected create-session response: {response:?}"),
+                };
+                sessions.push(session);
+            }
+            (project, sessions)
+        };
         for session in &sessions {
             if let Err(error) = client.request(ClientRequest::SetAppearance {
                 session_id: session.id,
@@ -589,6 +739,7 @@ impl EggieApp {
                 active_group_id,
             }],
             active_project: 0,
+            collapsed_projects: HashSet::new(),
             sessions,
             snapshots,
             terminal_sizes: HashMap::new(),
@@ -616,6 +767,7 @@ impl EggieApp {
             focus_handle: cx.focus_handle(),
             notification_routes,
             allow_osc_clipboard_read: config.allow_osc_clipboard_read,
+            language: config.language,
             closing: false,
             poll_error: None,
         };
@@ -792,7 +944,7 @@ impl EggieApp {
                     .close_response_requested
                     .then(|| SystemNotificationAction {
                         id: "close".into(),
-                        label: "Dismiss".into(),
+                        label: self.language.dismiss().into(),
                     })
                     .into_iter()
                     .collect();
@@ -860,12 +1012,13 @@ impl EggieApp {
                     .detach();
             }
             TerminalOscEventPayload::OpenUrl { url, .. } => {
-                let detail = format!("A process in this terminal wants to open:\n{url}");
+                let language = self.language;
+                let detail = format!("{}\n{url}", language.url_open_detail());
                 let prompt = window.prompt(
                     PromptLevel::Warning,
-                    "Allow terminal to open this URL?",
+                    language.allow_url_open_title(),
                     Some(&detail),
-                    &["Open", "Cancel"],
+                    &[language.open(), language.cancel()],
                     cx,
                 );
                 window
@@ -909,7 +1062,7 @@ impl EggieApp {
                         files: false,
                         directories: true,
                         multiple: false,
-                        prompt: Some("Choose where to receive terminal files".into()),
+                        prompt: Some(self.language.choose_receive_files_prompt().to_owned().into()),
                     });
                     window
                         .spawn(cx, async move |_| {
@@ -1097,7 +1250,8 @@ impl EggieApp {
             TerminalProgressState::Normal | TerminalProgressState::Indeterminate => colors.accent,
         };
         let phase = (self.progress_animation_epoch.elapsed().as_secs_f32() * 0.8).fract();
-        let accessibility_label: SharedString = progress_label(progress).into();
+        let language = self.language;
+        let accessibility_label: SharedString = progress_label(progress, language).into();
         let tooltip_progress = progress;
         div()
             .id(element_id)
@@ -1111,7 +1265,7 @@ impl EggieApp {
             .aria_label(accessibility_label)
             .tooltip(move |_, cx| {
                 cx.new(|_| ProgressTooltip {
-                    text: progress_label(tooltip_progress).into(),
+                    text: progress_label(tooltip_progress, language).into(),
                     colors,
                 })
                 .into()
@@ -1532,11 +1686,16 @@ impl EggieApp {
                 if app.closing || app.sessions.is_empty() {
                     return true;
                 }
+                let language = app.language;
                 let prompt = window.prompt(
                     PromptLevel::Warning,
-                    "Close this Eggie window?",
-                    Some("Choose whether its terminal sessions should terminate or stay attached to the daemon."),
-                    &["Terminate All", "Detach", "Cancel"],
+                    language.close_window_title(),
+                    Some(language.close_window_message()),
+                    &[
+                        language.terminate_all(),
+                        language.detach(),
+                        language.cancel(),
+                    ],
                     cx,
                 );
                 let app = cx.entity().downgrade();
@@ -1682,7 +1841,7 @@ impl EggieApp {
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
-                cwd: project.root,
+                cwd: project.effective_root(),
                 size: TerminalSize::default(),
                 appearance: self.terminal_appearance,
             })
@@ -1713,79 +1872,52 @@ impl EggieApp {
     }
 
     fn prompt_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open Project".into()),
-        });
+        let language = self.language;
+        let receiver = prompt_for_text(
+            window,
+            language.new_project_title(),
+            language.new_project_message(),
+            Some(language.project_name_placeholder()),
+            language.ok(),
+            language.cancel(),
+        );
         let app = cx.entity().downgrade();
         window
             .spawn(cx, async move |cx| {
-                let mut paths = paths.await.ok()?.ok()??;
-                let root = paths.pop()?;
-                app.update(cx, |app, cx| app.attach_project(root, cx))
+                let name = receiver.await.ok()??;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                app.update(cx, |app, cx| app.add_project(name.to_owned(), cx))
                     .ok()?;
                 Some(())
             })
             .detach();
     }
 
-    fn attach_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if let Some(index) = self
-            .projects
-            .iter()
-            .position(|workspace| workspace.project.root == root)
-        {
-            self.active_project = index;
-            self.ensure_snapshot_watchers(cx);
-            self.sync_terminal_focus();
-            cx.notify();
-            return;
-        }
-
-        let mut project = Project::from_root(root.clone());
-        let mut project_sessions = self
-            .sessions
-            .iter()
-            .filter(|session| session.initial_directory == root)
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(existing) = project_sessions.first() {
-            project.id = existing.project_id;
-        } else if let Ok(DaemonResponse::SessionCreated { session }) =
+    fn add_project(&mut self, name: String, cx: &mut Context<Self>) {
+        let project = Project::new(name);
+        let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
-                cwd: root,
+                cwd: project.effective_root(),
                 size: TerminalSize::default(),
                 appearance: self.terminal_appearance,
             })
-        {
-            self.sessions.push(session.clone());
-            project_sessions.push(session);
-        } else {
+        else {
             return;
-        }
-
-        let mut iter = project_sessions.iter();
-        let first = iter.next().expect("attached project must have a terminal");
-        let mut layout = LayoutNode::group(TabItem::terminal(first.id, first.title.clone()));
+        };
+        self.sessions.push(session.clone());
+        let layout = LayoutNode::group(TabItem::terminal(session.id, session.title.clone()));
         let active_group_id = layout.first_group_id();
-        let group = layout
-            .find_group_mut(active_group_id)
-            .expect("new layout must contain a group");
-        for session in iter {
-            group.add_item(TabItem::terminal(session.id, session.title.clone()));
-        }
         self.projects.push(ProjectWorkspace {
             project,
             layout,
             active_group_id,
         });
-        for session in &project_sessions {
-            self.configure_session_progress(session.id);
-            self.configure_session_osc_policy(session.id);
-        }
+        self.configure_session_progress(session.id);
+        self.configure_session_osc_policy(session.id);
         self.active_project = self.projects.len() - 1;
         self.ensure_snapshot_watchers(cx);
         self.ensure_progress_watchers(cx);
@@ -1801,6 +1933,220 @@ impl EggieApp {
             self.sync_terminal_focus();
             cx.notify();
         }
+    }
+
+    fn toggle_project_collapsed(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        if self.collapsed_projects.contains(&project_id) {
+            self.collapsed_projects.remove(&project_id);
+        } else {
+            self.collapsed_projects.insert(project_id);
+        }
+        cx.notify();
+    }
+
+    fn prompt_set_project_root(
+        &mut self,
+        project_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.language.set_working_directory_prompt().to_owned().into()),
+        });
+        let app = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            let mut paths = paths.await.ok()?.ok()??;
+            let root = paths.pop()?;
+            app.update(cx, move |app, cx| {
+                if let Some(workspace) = app.projects.get_mut(project_index) {
+                    workspace.project.root = Some(root);
+                    cx.notify();
+                }
+            })
+            .ok()?;
+            Some(())
+        })
+        .detach();
+    }
+
+    fn show_project_context_menu(
+        &mut self,
+        project_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let Some(workspace) = self.projects.get(project_index) else {
+            return;
+        };
+        let tab_count = workspace.layout.item_count();
+        let Some(menu) = prepare_project_menu(window, tab_count, self.language) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Some(command) = menu.show() else {
+                return;
+            };
+            this.update(cx, move |app, cx| {
+                if app.projects.get(project_index).is_none() {
+                    return;
+                }
+                match command {
+                    NativeProjectMenuCommand::EditName => {
+                        app.prompt_rename_project(project_index, cx);
+                    }
+                    NativeProjectMenuCommand::SetRoot => {
+                        app.prompt_set_project_root(project_index, cx);
+                    }
+                    NativeProjectMenuCommand::CloseTabs => {
+                        app.close_project_tabs(project_index, cx);
+                    }
+                    NativeProjectMenuCommand::DeleteProject => {
+                        app.delete_project(project_index, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_process_context_menu(
+        &mut self,
+        pid: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let Some(menu) = prepare_process_menu(window, self.language) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Some(command) = menu.show() else {
+                return;
+            };
+            this.update(cx, move |app, cx| {
+                app.handle_process_menu_command(command, pid, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn handle_process_menu_command(
+        &mut self,
+        command: NativeProcessMenuCommand,
+        pid: u32,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            NativeProcessMenuCommand::Terminate => {
+                kill_process(pid, libc::SIGTERM);
+            }
+            NativeProcessMenuCommand::ForceKill => {
+                kill_process(pid, libc::SIGKILL);
+            }
+            NativeProcessMenuCommand::CopyPid => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(pid.to_string()));
+            }
+            NativeProcessMenuCommand::CopyExecutablePath => {
+                if let Some(path) = executable_path_for_pid(pid) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
+                }
+            }
+        }
+    }
+
+    fn prompt_rename_project(&mut self, project_index: usize, cx: &mut Context<Self>) {
+        let Some(workspace) = self.projects.get(project_index) else {
+            return;
+        };
+        let current_name = workspace.project.name.clone();
+        let language = self.language;
+        let Some(window) = cx.active_window() else {
+            return;
+        };
+        let app = cx.entity().downgrade();
+        window
+            .update(cx, |_, window, cx| {
+                let receiver = prompt_for_text(
+                    window,
+                    language.rename_project_title(),
+                    language.rename_project_message(),
+                    Some(&current_name),
+                    language.ok(),
+                    language.cancel(),
+                );
+                cx.spawn(async move |cx| {
+                    let name = receiver.await.ok()??;
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    app.update(cx, move |app, cx| {
+                        if let Some(workspace) = app.projects.get_mut(project_index) {
+                            workspace.project.name = name.to_owned();
+                            cx.notify();
+                        }
+                    })
+                    .ok()?;
+                    Some(())
+                })
+                .detach();
+            })
+            .ok();
+    }
+
+    fn close_project_tabs(&mut self, project_index: usize, cx: &mut Context<Self>) {
+        let Some(workspace) = self.projects.get(project_index) else {
+            return;
+        };
+        let items_to_close: Vec<(GroupId, ItemId)> = workspace
+            .layout
+            .terminal_items()
+            .filter_map(|item| {
+                item.session_id.and_then(|session_id| {
+                    workspace
+                        .layout
+                        .find_terminal_item(session_id)
+                })
+            })
+            .collect();
+        for (group_id, item_id) in items_to_close {
+            self.close_item(group_id, item_id, cx);
+        }
+    }
+
+    fn delete_project(&mut self, project_index: usize, cx: &mut Context<Self>) {
+        if project_index >= self.projects.len() {
+            return;
+        }
+        let workspace = self.projects.remove(project_index);
+        let items_to_close: Vec<(GroupId, ItemId)> = workspace
+            .layout
+            .terminal_items()
+            .filter_map(|item| {
+                item.session_id.and_then(|session_id| {
+                    workspace
+                        .layout
+                        .find_terminal_item(session_id)
+                })
+            })
+            .collect();
+        for (group_id, item_id) in items_to_close {
+            self.close_item(group_id, item_id, cx);
+        }
+        self.collapsed_projects.remove(&workspace.project.id);
+        if self.projects.is_empty() {
+            self.add_project("Home".to_owned(), cx);
+        } else if self.active_project >= self.projects.len() {
+            self.active_project = self.projects.len() - 1;
+        }
+        self.ensure_snapshot_watchers(cx);
+        self.sync_terminal_focus();
+        cx.notify();
     }
 
     fn activate_item(
@@ -2007,12 +2353,13 @@ impl EggieApp {
             if url_has_safe_external_scheme(&url) {
                 cx.open_url(&url);
             } else {
-                let detail = format!("A link in this terminal points to:\n{url}");
+                let language = self.language;
+                let detail = format!("{}\n{url}", language.hyperlink_open_detail());
                 let prompt = window.prompt(
                     PromptLevel::Warning,
-                    "Open terminal hyperlink?",
+                    language.open_hyperlink_title(),
                     Some(&detail),
-                    &["Open", "Cancel"],
+                    &[language.open(), language.cancel()],
                     cx,
                 );
                 window
@@ -2670,7 +3017,7 @@ impl EggieApp {
                 .neighbor_group_id(group_id, direction)
                 .is_some()
         });
-        let Some(menu) = prepare_tab_menu(window, move_enabled) else {
+        let Some(menu) = prepare_tab_menu(window, move_enabled, self.language) else {
             return;
         };
         // AppKit menus are modal and run a nested event loop. Start the menu from a foreground
@@ -2869,7 +3216,7 @@ impl EggieApp {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(section_label("PROJECTS", self.colors))
+                        .child(section_label(self.language.projects_label(), self.colors))
                         .child(icon_button(
                             IconName::Add,
                             "add-project",
@@ -2879,6 +3226,9 @@ impl EggieApp {
                 ),
             );
         for (index, workspace) in self.projects.iter().enumerate() {
+            let project_id = workspace.project.id;
+            let collapsed = self.collapsed_projects.contains(&project_id);
+            let project_index = index;
             panel = panel.child(
                 div()
                     .id(format!("project-{index}"))
@@ -2891,45 +3241,86 @@ impl EggieApp {
                     .px_2()
                     .py_1()
                     .rounded_md()
+                    .mb_1()
                     .when(index == self.active_project, |element| {
                         element.bg(rgb(self.colors.panel_alt))
                     })
+                    .hover({
+                        let colors = self.colors;
+                        move |element| element.bg(rgb(colors.hover))
+                    })
                     .cursor_pointer()
-                    .on_click(cx.listener(move |app, _, _, cx| app.activate_project(index, cx)))
-                    .child(div().flex_none().child(icon(IconName::Folder)))
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.activate_project(project_index, cx);
+                        app.toggle_project_collapsed(project_id, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |app, _, window, cx| {
+                            app.show_project_context_menu(project_index, window, cx)
+                        }),
+                    )
+                    .child(div().flex_none().child(icon(if collapsed {
+                        IconName::Folder
+                    } else {
+                        IconName::FolderOpen
+                    })))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .child(workspace.project.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(self.colors.muted))
+                            .child(icon_sized(
+                                if collapsed {
+                                    IconName::ArrowUp
+                                } else {
+                                    IconName::ArrowDown
+                                },
+                                14.,
+                            )),
                     ),
             );
-            for session in self
-                .sessions
-                .iter()
-                .filter(|session| session.project_id == workspace.project.id)
-            {
-                let active = self.active_session_id() == Some(session.id);
-                let session_id = session.id;
-                panel = panel.child(
-                    div()
-                        .id(format!("sidebar-session-{session_id}"))
-                        .flex()
-                        .items_center()
-                        .min_w_0()
-                        .overflow_hidden()
+            if !collapsed {
+                for session in self
+                    .sessions
+                    .iter()
+                    .filter(|session| session.project_id == workspace.project.id)
+                {
+                    let active = self.active_session_id() == Some(session.id);
+                    let session_id = session.id;
+                    panel = panel.child(
+                        div()
+                            .id(format!("sidebar-session-{session_id}"))
+                            .flex()
+                            .items_center()
+                            .min_w_0()
+                            .overflow_hidden()
                         .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
                         .gap_2()
                         .ml_5()
                         .mr_3()
                         .px_2()
+                        .rounded_md()
+                        .mb_1()
                         .text_size(px(12.))
                         .text_color(rgb(if active {
                             self.colors.text
                         } else {
                             self.colors.muted
                         }))
+                        .when(active, |element| {
+                            element.bg(rgb(self.colors.panel_alt))
+                        })
+                        .hover({
+                            let colors = self.colors;
+                            move |element| element.bg(rgb(colors.hover))
+                        })
                         .cursor_pointer()
                         .on_click(cx.listener(move |app, _, window, cx| {
                             app.activate_session(index, session_id, window, cx)
@@ -2948,6 +3339,7 @@ impl EggieApp {
                         ),
                 );
             }
+        }
         }
         panel.into_any_element()
     }
@@ -3274,10 +3666,15 @@ impl EggieApp {
                 false,
                 cx.listener(move |app, _, _, cx| app.new_terminal(group_id, None, cx)),
             ));
-        if self.right_sidebar_collapsed && is_top_right_group {
+        if is_top_right_group {
+            let right_sidebar_icon = if self.right_sidebar_collapsed {
+                IconName::PanelRightOpen
+            } else {
+                IconName::PanelRightClose
+            };
             tabs = tabs.child(top_bar_icon_button(
-                IconName::PanelRightOpen,
-                format!("expand-right-sidebar-{group_id}"),
+                right_sidebar_icon,
+                format!("toggle-right-sidebar-{group_id}"),
                 self.colors,
                 false,
                 false,
@@ -3491,10 +3888,11 @@ impl EggieApp {
     }
 
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.language;
         let tabs = [
-            (RightTab::Info, "Info", IconName::Info),
-            (RightTab::Files, "Files", IconName::Folder),
-            (RightTab::Git, "Git", IconName::GitBranch),
+            (RightTab::Info, language.info_tab(), IconName::Info),
+            (RightTab::Files, language.files_tab(), IconName::Folder),
+            (RightTab::Git, language.git_tab(), IconName::GitBranch),
         ]
         .into_iter()
         .fold(
@@ -3503,14 +3901,8 @@ impl EggieApp {
                 .flex_none()
                 .items_center()
                 .h(px(TAB_BAR_HEIGHT))
-                .child(top_bar_icon_button(
-                    IconName::PanelRightClose,
-                    "collapse-right-sidebar",
-                    self.colors,
-                    false,
-                    false,
-                    cx.listener(|app, _, _, cx| app.toggle_right_sidebar(cx)),
-                )),
+                .p(px(TAB_BAR_PADDING))
+                .gap(px(TAB_GAP)),
             |tabs, (tab, title, tab_icon)| {
                 tabs.child(
                     div()
@@ -3521,6 +3913,7 @@ impl EggieApp {
                         .items_center()
                         .justify_center()
                         .gap_1()
+                        .rounded_lg()
                         .cursor_pointer()
                         .when(self.right_tab == tab, |element| {
                             element
@@ -3559,7 +3952,7 @@ impl EggieApp {
                             .track_scroll(&self.right_sidebar_scroll_handle)
                             .p_4()
                             .text_size(px(12.))
-                            .child(self.render_right_content()),
+                            .child(self.render_right_content(cx)),
                     )
                     .child(self.render_right_sidebar_scrollbar()),
             )
@@ -3608,7 +4001,7 @@ impl EggieApp {
         .into_any_element()
     }
 
-    fn render_right_content(&self) -> AnyElement {
+    fn render_right_content(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.right_tab {
             RightTab::Info => {
                 let session = self
@@ -3617,21 +4010,21 @@ impl EggieApp {
                 let mut content = div().flex().flex_col().gap_4();
                 if let Some(session) = session {
                     content = content
-                        .child(process_summary(&session.current_process, self.colors))
+                        .child(process_summary(&session.current_process, self.colors, self.language))
                         .child(info_row(
-                            "Current directory",
+                            self.language.current_directory(),
                             session.current_directory.display().to_string(),
                             self.colors,
                         ))
                         .child(info_row(
-                            "Initial directory",
+                            self.language.initial_directory(),
                             session.initial_directory.display().to_string(),
                             self.colors,
                         ));
                     if let Some(inspection) = self.session_inspections.get(&session.id) {
                         content =
-                            content.child(process_section(&inspection.processes, self.colors));
-                        if let Some(ports) = ports_section(inspection, self.colors) {
+                            content.child(process_section(&inspection.processes, self.colors, self.language, cx));
+                        if let Some(ports) = ports_section(inspection, self.colors, self.language) {
                             content = content.child(ports);
                         }
                     } else {
@@ -3639,14 +4032,14 @@ impl EggieApp {
                             .session_inspection_errors
                             .get(&session.id)
                             .cloned()
-                            .unwrap_or_else(|| "Loading process information…".to_owned());
+                            .unwrap_or_else(|| self.language.loading_process_info().to_owned());
                         content = content
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child(process_section_header(self.colors))
+                                    .child(process_section_header(self.colors, self.language))
                                     .child(placeholder(status, self.colors)),
                             )
                             .child(
@@ -3654,9 +4047,9 @@ impl EggieApp {
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child(section_label("PORTS", self.colors))
+                                    .child(section_label(self.language.ports_label(), self.colors))
                                     .child(placeholder(
-                                        "Loading port information…",
+                                        self.language.loading_ports(),
                                         self.colors,
                                     )),
                             );
@@ -3668,9 +4061,9 @@ impl EggieApp {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(section_label("CURRENT DIRECTORY", self.colors))
+                .child(section_label(self.language.current_directory_label(), self.colors))
                 .child(placeholder(
-                    "File-tree service is scaffolded for current, initial, and locked roots.",
+                    self.language.file_tree_scaffold_note(),
                     self.colors,
                 ))
                 .into_any_element(),
@@ -3678,9 +4071,9 @@ impl EggieApp {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(section_label("SOURCE CONTROL", self.colors))
+                .child(section_label(self.language.source_control_label(), self.colors))
                 .child(placeholder(
-                    "Git status, diff, staging, commit, branch, pull, and push services are scaffolded.",
+                    self.language.git_scaffold_note(),
                     self.colors,
                 ))
                 .into_any_element(),
@@ -3726,6 +4119,7 @@ impl gpui::Render for EggieApp {
                 self.configure_session_osc_policy(session_id);
             }
         }
+        self.language = config.language;
         div()
             .id("eggie-workspace")
             .relative()
@@ -3854,13 +4248,13 @@ fn terminal_container_borders(
     }
 }
 
-fn progress_label(progress: TerminalProgress) -> String {
+fn progress_label(progress: TerminalProgress, language: Language) -> String {
     let status = match (progress.state, progress.percent) {
-        (TerminalProgressState::Normal, Some(100)) => "Complete",
-        (TerminalProgressState::Normal, _) => "Running",
-        (TerminalProgressState::Error, _) => "Error",
-        (TerminalProgressState::Indeterminate, _) => "Indeterminate",
-        (TerminalProgressState::Paused, _) => "Paused",
+        (TerminalProgressState::Normal, Some(100)) => language.progress_complete(),
+        (TerminalProgressState::Normal, _) => language.progress_running(),
+        (TerminalProgressState::Error, _) => language.progress_error(),
+        (TerminalProgressState::Indeterminate, _) => language.progress_indeterminate(),
+        (TerminalProgressState::Paused, _) => language.progress_paused(),
     };
     let percent = progress
         .percent
@@ -3873,10 +4267,10 @@ fn progress_label(progress: TerminalProgress) -> String {
         .min(u128::from(u64::MAX)) as u64;
     let elapsed_seconds = now.saturating_sub(progress.updated_at_unix_ms) / 1_000;
     let recency = match elapsed_seconds {
-        0..=1 => "updated just now".to_owned(),
-        2..=59 => format!("updated {elapsed_seconds}s ago"),
-        60..=3_599 => format!("updated {}m ago", elapsed_seconds / 60),
-        _ => format!("updated {}h ago", elapsed_seconds / 3_600),
+        0..=1 => language.updated_just_now().to_owned(),
+        2..=59 => language.updated_seconds_ago(elapsed_seconds),
+        60..=3_599 => language.updated_minutes_ago(elapsed_seconds / 60),
+        _ => language.updated_hours_ago(elapsed_seconds / 3_600),
     };
     format!("{status}{percent} · {recency}")
 }
@@ -4536,6 +4930,34 @@ struct ProcessTreeRow {
     branch_has_next: Vec<bool>,
 }
 
+fn kill_process(pid: u32, signal: i32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn executable_path_for_pid(pid: u32) -> Option<String> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::pid_t,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    String::from_utf8(buffer).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn executable_path_for_pid(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()?.to_str().map(str::to_owned)
+}
+
 fn process_tree_rows(processes: &[ProcessInfo]) -> Vec<ProcessTreeRow> {
     fn sort_indices(indices: &mut [usize], processes: &[ProcessInfo]) {
         indices.sort_by(|left, right| {
@@ -4628,16 +5050,35 @@ fn process_tree_rows(processes: &[ProcessInfo]) -> Vec<ProcessTreeRow> {
     rows
 }
 
-fn process_section(processes: &[ProcessInfo], colors: UiColors) -> AnyElement {
+fn process_section(
+    processes: &[ProcessInfo],
+    colors: UiColors,
+    language: Language,
+    cx: &mut Context<EggieApp>,
+) -> AnyElement {
     let body = if processes.is_empty() {
-        placeholder("No running processes.", colors).into_any_element()
+        placeholder(language.no_running_processes(), colors).into_any_element()
     } else {
+        let pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        let root_pids: HashSet<u32> = processes
+            .iter()
+            .filter(|p| match p.parent_pid {
+                Some(parent) => parent == p.pid || !pids.contains(&parent),
+                None => true,
+            })
+            .map(|p| p.pid)
+            .collect();
+
         let mut rows = div().flex().flex_col();
         for row in process_tree_rows(processes) {
+            let process = &processes[row.process_index];
+            let is_root = root_pids.contains(&process.pid);
             rows = rows.child(process_info_row(
-                &processes[row.process_index],
+                process,
                 row.branch_has_next,
                 colors,
+                is_root,
+                cx,
             ));
         }
         rows.into_any_element()
@@ -4646,21 +5087,25 @@ fn process_section(processes: &[ProcessInfo], colors: UiColors) -> AnyElement {
         .flex()
         .flex_col()
         .gap_1()
-        .child(process_section_header(colors))
+        .child(process_section_header(colors, language))
         .child(body)
         .into_any_element()
 }
 
-fn process_section_header(colors: UiColors) -> impl IntoElement {
+fn process_section_header(colors: UiColors, language: Language) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .text_size(px(10.))
         .text_color(rgb(colors.muted))
-        .child("PROCESSES")
+        .child(language.processes_label())
 }
 
-fn ports_section(inspection: &SessionInspection, colors: UiColors) -> Option<AnyElement> {
+fn ports_section(
+    inspection: &SessionInspection,
+    colors: UiColors,
+    language: Language,
+) -> Option<AnyElement> {
     if inspection.ports.is_empty() {
         return None;
     }
@@ -4679,7 +5124,7 @@ fn ports_section(inspection: &SessionInspection, colors: UiColors) -> Option<Any
             .flex()
             .flex_col()
             .gap_1()
-            .child(section_label("PORTS", colors))
+            .child(section_label(language.ports_label(), colors))
             .child(rows)
             .into_any_element(),
     )
@@ -4695,7 +5140,11 @@ fn info_row(label: &'static str, value: String, colors: UiColors) -> impl IntoEl
         .child(div().min_w_0().truncate().child(value))
 }
 
-fn process_summary(process: &eggie_protocol::ProcessSummary, colors: UiColors) -> impl IntoElement {
+fn process_summary(
+    process: &eggie_protocol::ProcessSummary,
+    colors: UiColors,
+    language: Language,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -4712,7 +5161,7 @@ fn process_summary(process: &eggie_protocol::ProcessSummary, colors: UiColors) -
             div()
                 .text_size(px(11.))
                 .text_color(rgb(colors.muted))
-                .child(format!("PID {}", process.pid)),
+                .child(format!("{} {}", language.pid_label(), process.pid)),
         )
 }
 
@@ -4720,39 +5169,65 @@ fn process_info_row(
     process: &ProcessInfo,
     branch_has_next: Vec<bool>,
     colors: UiColors,
+    is_root: bool,
+    cx: &mut Context<EggieApp>,
 ) -> impl IntoElement {
-    div()
+    let pid = process.pid;
+    let mut content = div()
+        .id(format!("process-row-{pid}"))
         .flex()
+        .flex_1()
         .items_center()
         .min_w_0()
         .h(px(PROCESS_ROW_HEIGHT))
-        .text_size(px(12.))
+        .rounded_md()
+        .ml_neg_1()
+        .mr_neg_2();
+
+    if !is_root {
+        content = content
+            .cursor_pointer()
+            .hover(|element| element.bg(rgb(colors.hover)))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |app, _, window, cx| {
+                app.show_process_context_menu(pid, window, cx);
+            }));
+    }
+
+    content = content
         .child(
             div()
-                .flex()
-                .flex_1()
-                .items_center()
+                .ml_1()
                 .min_w_0()
-                .child(process_tree_connector(branch_has_next, colors))
-                .child(div().min_w_0().truncate().child(process.name.clone()))
-                .child(
-                    div()
-                        .ml_1()
-                        .flex_shrink_0()
-                        .text_size(px(10.))
-                        .text_color(rgb(colors.muted))
-                        .child(process.pid.to_string()),
-                ),
+                .truncate()
+                .child(process.name.clone()),
         )
         .child(
             div()
-                .ml_2()
+                .ml_1()
+                .flex_shrink_0()
+                .text_size(px(10.))
+                .text_color(rgb(colors.muted))
+                .child(process.pid.to_string()),
+        )
+        .child(
+            div()
+                .ml_auto()
+                .mr_2()
                 .flex_shrink_0()
                 .text_right()
                 .text_size(px(10.))
                 .text_color(rgb(colors.muted))
                 .child(format_process_metrics(process)),
-        )
+        );
+
+    div()
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(PROCESS_ROW_HEIGHT))
+        .text_size(px(12.))
+        .child(process_tree_connector(branch_has_next, colors))
+        .child(content)
 }
 
 fn process_tree_connector(branch_has_next: Vec<bool>, colors: UiColors) -> AnyElement {
@@ -4900,8 +5375,8 @@ fn icon_button(
         .flex()
         .items_center()
         .justify_center()
-        .size(px(28.))
-        .rounded_md()
+        .size(px(24.))
+        .rounded_lg()
         .text_color(rgb(colors.muted))
         .cursor_pointer()
         .hover(move |element| {
@@ -5288,13 +5763,14 @@ mod tests {
             background: 0,
             panel: 0,
             panel_alt: 0,
+            hover: 0,
             border: 0,
             text: 0,
             muted: 0,
             accent: 0,
         };
 
-        assert!(ports_section(&inspection, colors).is_none());
+        assert!(ports_section(&inspection, colors, Language::English).is_none());
     }
 
     #[test]
@@ -5544,18 +6020,24 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let label = progress_label(TerminalProgress {
-            state: TerminalProgressState::Paused,
-            percent: Some(73),
-            updated_at_unix_ms: now.saturating_sub(3_000),
-        });
+        let label = progress_label(
+            TerminalProgress {
+                state: TerminalProgressState::Paused,
+                percent: Some(73),
+                updated_at_unix_ms: now.saturating_sub(3_000),
+            },
+            Language::English,
+        );
         assert_eq!(label, "Paused · 73% · updated 3s ago");
 
-        let completed = progress_label(TerminalProgress {
-            state: TerminalProgressState::Normal,
-            percent: Some(100),
-            updated_at_unix_ms: now,
-        });
+        let completed = progress_label(
+            TerminalProgress {
+                state: TerminalProgressState::Normal,
+                percent: Some(100),
+                updated_at_unix_ms: now,
+            },
+            Language::English,
+        );
         assert!(completed.starts_with("Complete · 100% · updated"));
     }
 }

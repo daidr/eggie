@@ -7,12 +7,49 @@ pub(crate) enum NativeTabMenuCommand {
     Move(Direction),
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) use macos::NativeTabMenu;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeProjectMenuCommand {
+    EditName,
+    SetRoot,
+    CloseTabs,
+    DeleteProject,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeProcessMenuCommand {
+    Terminate,
+    ForceKill,
+    CopyPid,
+    CopyExecutablePath,
+}
 
 #[cfg(target_os = "macos")]
-pub(crate) fn prepare_tab_menu(window: &Window, move_enabled: [bool; 4]) -> Option<NativeTabMenu> {
-    macos::NativeTabMenu::prepare(window, move_enabled)
+pub(crate) use macos::{NativeProcessMenu, NativeProjectMenu, NativeTabMenu};
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_tab_menu(
+    window: &Window,
+    move_enabled: [bool; 4],
+    language: crate::settings::Language,
+) -> Option<NativeTabMenu> {
+    macos::NativeTabMenu::prepare(window, move_enabled, language)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_project_menu(
+    window: &Window,
+    tab_count: usize,
+    language: crate::settings::Language,
+) -> Option<NativeProjectMenu> {
+    macos::NativeProjectMenu::prepare(window, tab_count, language)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_process_menu(
+    window: &Window,
+    language: crate::settings::Language,
+) -> Option<NativeProcessMenu> {
+    macos::NativeProcessMenu::prepare(window, language)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -26,17 +63,55 @@ impl NativeTabMenu {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn prepare_tab_menu(_: &Window, _: [bool; 4]) -> Option<NativeTabMenu> {
+pub(crate) fn prepare_tab_menu(
+    _: &Window,
+    _: [bool; 4],
+    _: crate::settings::Language,
+) -> Option<NativeTabMenu> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeProjectMenu;
+
+#[cfg(not(target_os = "macos"))]
+impl NativeProjectMenu {
+    pub(crate) fn show(self) -> Option<NativeProjectMenuCommand> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_project_menu(
+    _: &Window,
+    _: usize,
+    _: crate::settings::Language,
+) -> Option<NativeProjectMenu> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeProcessMenu;
+
+#[cfg(not(target_os = "macos"))]
+impl NativeProcessMenu {
+    pub(crate) fn show(self) -> Option<NativeProcessMenuCommand> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_process_menu(_: &Window, _: crate::settings::Language) -> Option<NativeProcessMenu> {
     None
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::NativeTabMenuCommand;
+    use super::{NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand};
     use cocoa::{
         appkit::{NSApp, NSMenu, NSMenuItem},
         base::{NO, YES, id, nil},
-        foundation::{NSAutoreleasePool, NSString},
+        foundation::{NSAutoreleasePool, NSString, NSPoint},
     };
     use eggie_domain::Direction;
     use gpui::Window;
@@ -58,10 +133,15 @@ mod macos {
         view: id,
         event: id,
         move_enabled: [bool; 4],
+        language: crate::settings::Language,
     }
 
     impl NativeTabMenu {
-        pub(super) fn prepare(window: &Window, move_enabled: [bool; 4]) -> Option<Self> {
+        pub(super) fn prepare(
+            window: &Window,
+            move_enabled: [bool; 4],
+            language: crate::settings::Language,
+        ) -> Option<Self> {
             let window_handle = HasWindowHandle::window_handle(window).ok()?;
             let RawWindowHandle::AppKit(appkit_handle) = window_handle.as_raw() else {
                 return None;
@@ -79,6 +159,7 @@ mod macos {
                 view,
                 event,
                 move_enabled,
+                language,
             })
         }
 
@@ -87,7 +168,7 @@ mod macos {
         /// `NSMenu` runs a nested event loop. Calling this from a GPUI listener lets unrelated
         /// foreground tasks re-enter GPUI while its `RefCell` is already mutably borrowed.
         pub(crate) fn show(self) -> Option<NativeTabMenuCommand> {
-            show_tab_menu(self.view, self.event, self.move_enabled)
+            show_tab_menu(self.view, self.event, self.move_enabled, self.language)
         }
     }
 
@@ -121,7 +202,24 @@ mod macos {
         })
     }
 
-    fn show_tab_menu(view: id, event: id, move_enabled: [bool; 4]) -> Option<NativeTabMenuCommand> {
+    /// Show a menu at the event's mouse location.
+    ///
+    /// Uses `popUpMenuPositioningItem:atLocation:inView:` instead of
+    /// `popUpContextMenu:withEvent:forView:`. The latter triggers macOS's
+    /// contextual-menu pipeline which auto-appends an "AutoFill" submenu when
+    /// the window's first responder handles text input (our terminal view).
+    unsafe fn pop_up_menu(menu: id, event: id, view: id) {
+        let window_point: NSPoint = msg_send![event, locationInWindow];
+        let menu_point: NSPoint = msg_send![view, convertPoint: window_point fromView: nil];
+        let _: bool = msg_send![menu, popUpMenuPositioningItem: nil atLocation: menu_point inView: view];
+    }
+
+    fn show_tab_menu(
+        view: id,
+        event: id,
+        move_enabled: [bool; 4],
+        language: crate::settings::Language,
+    ) -> Option<NativeTabMenuCommand> {
         let selected = unsafe {
             let pool = NSAutoreleasePool::new(nil);
             let target: id = msg_send![menu_target_class(), new];
@@ -132,10 +230,10 @@ mod macos {
             submenu.setAutoenablesItems(NO);
 
             let directions = [
-                (Direction::Up, "向上拆分", "上移"),
-                (Direction::Down, "向下拆分", "下移"),
-                (Direction::Left, "向左拆分", "左移"),
-                (Direction::Right, "向右拆分", "右移"),
+                (Direction::Up, language.split_up(), language.move_up()),
+                (Direction::Down, language.split_down(), language.move_down()),
+                (Direction::Left, language.split_left(), language.move_left()),
+                (Direction::Right, language.split_right(), language.move_right()),
             ];
             for (index, (_, split_label, _)) in directions.iter().enumerate() {
                 submenu.addItem_(menu_item(split_label, index as isize, true, target));
@@ -151,14 +249,13 @@ mod macos {
             }
 
             let parent = NSMenuItem::new(nil).autorelease();
-            let title = NSString::alloc(nil).init_str("拆分和移动");
+            let title = NSString::alloc(nil).init_str(language.split_and_move());
             let _: () = msg_send![parent, setTitle: title];
             let _: () = msg_send![title, release];
             parent.setSubmenu_(submenu);
             menu.addItem_(parent);
 
-            let _: () =
-                msg_send![class!(NSMenu), popUpContextMenu: menu withEvent: event forView: view];
+            pop_up_menu(menu, event, view);
             let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
             let _: () = msg_send![target, release];
             pool.drain();
@@ -195,6 +292,178 @@ mod macos {
         match tag {
             0..=3 => Some(NativeTabMenuCommand::Split(direction)),
             4..=7 => Some(NativeTabMenuCommand::Move(direction)),
+            _ => None,
+        }
+    }
+
+    // --- Project context menu ---------------------------------------------------------------
+
+    pub(crate) struct NativeProjectMenu {
+        view: id,
+        event: id,
+        tab_count: usize,
+        language: crate::settings::Language,
+    }
+
+    impl NativeProjectMenu {
+        pub(super) fn prepare(
+            window: &Window,
+            tab_count: usize,
+            language: crate::settings::Language,
+        ) -> Option<Self> {
+            let window_handle = HasWindowHandle::window_handle(window).ok()?;
+            let RawWindowHandle::AppKit(appkit_handle) = window_handle.as_raw() else {
+                return None;
+            };
+            let view = appkit_handle.ns_view.as_ptr() as id;
+            let event: id = unsafe { msg_send![NSApp(), currentEvent] };
+            if view == nil || event == nil {
+                return None;
+            }
+            unsafe {
+                let _: id = msg_send![view, retain];
+                let _: id = msg_send![event, retain];
+            }
+            Some(Self {
+                view,
+                event,
+                tab_count,
+                language,
+            })
+        }
+
+        pub(crate) fn show(self) -> Option<NativeProjectMenuCommand> {
+            show_project_menu(self.view, self.event, self.tab_count, self.language)
+        }
+    }
+
+    impl Drop for NativeProjectMenu {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.event, release];
+                let _: () = msg_send![self.view, release];
+            }
+        }
+    }
+
+    fn show_project_menu(
+        view: id,
+        event: id,
+        tab_count: usize,
+        language: crate::settings::Language,
+    ) -> Option<NativeProjectMenuCommand> {
+        let selected = unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let target: id = msg_send![menu_target_class(), new];
+            (*target).set_ivar(SELECTED_COMMAND_IVAR, NO_SELECTION);
+            let menu = NSMenu::new(nil).autorelease();
+            menu.setAutoenablesItems(NO);
+
+            menu.addItem_(menu_item(language.edit_name(), 0, true, target));
+            menu.addItem_(menu_item(language.set_root(), 1, true, target));
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            let close_label = language.close_tabs(tab_count);
+            menu.addItem_(menu_item(&close_label, 2, tab_count > 0, target));
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            menu.addItem_(menu_item(language.delete_project(), 3, true, target));
+
+            pop_up_menu(menu, event, view);
+            let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
+            let _: () = msg_send![target, release];
+            pool.drain();
+            selected
+        };
+
+        project_command_from_tag(selected)
+    }
+
+    fn project_command_from_tag(tag: isize) -> Option<NativeProjectMenuCommand> {
+        match tag {
+            0 => Some(NativeProjectMenuCommand::EditName),
+            1 => Some(NativeProjectMenuCommand::SetRoot),
+            2 => Some(NativeProjectMenuCommand::CloseTabs),
+            3 => Some(NativeProjectMenuCommand::DeleteProject),
+            _ => None,
+        }
+    }
+
+    // --- Process context menu ---------------------------------------------------------------
+
+    pub(crate) struct NativeProcessMenu {
+        view: id,
+        event: id,
+        language: crate::settings::Language,
+    }
+
+    impl NativeProcessMenu {
+        pub(super) fn prepare(
+            window: &Window,
+            language: crate::settings::Language,
+        ) -> Option<Self> {
+            let window_handle = HasWindowHandle::window_handle(window).ok()?;
+            let RawWindowHandle::AppKit(appkit_handle) = window_handle.as_raw() else {
+                return None;
+            };
+            let view = appkit_handle.ns_view.as_ptr() as id;
+            let event: id = unsafe { msg_send![NSApp(), currentEvent] };
+            if view == nil || event == nil {
+                return None;
+            }
+            unsafe {
+                let _: id = msg_send![view, retain];
+                let _: id = msg_send![event, retain];
+            }
+            Some(Self { view, event, language })
+        }
+
+        pub(crate) fn show(self) -> Option<NativeProcessMenuCommand> {
+            show_process_menu(self.view, self.event, self.language)
+        }
+    }
+
+    impl Drop for NativeProcessMenu {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.event, release];
+                let _: () = msg_send![self.view, release];
+            }
+        }
+    }
+
+    fn show_process_menu(
+        view: id,
+        event: id,
+        language: crate::settings::Language,
+    ) -> Option<NativeProcessMenuCommand> {
+        let selected = unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let target: id = msg_send![menu_target_class(), new];
+            (*target).set_ivar(SELECTED_COMMAND_IVAR, NO_SELECTION);
+            let menu = NSMenu::new(nil).autorelease();
+            menu.setAutoenablesItems(NO);
+
+            menu.addItem_(menu_item(language.terminate(), 0, true, target));
+            menu.addItem_(menu_item(language.force_kill(), 1, true, target));
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            menu.addItem_(menu_item(language.copy_pid(), 2, true, target));
+            menu.addItem_(menu_item(language.copy_executable_path(), 3, true, target));
+
+            pop_up_menu(menu, event, view);
+            let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
+            let _: () = msg_send![target, release];
+            pool.drain();
+            selected
+        };
+
+        process_command_from_tag(selected)
+    }
+
+    fn process_command_from_tag(tag: isize) -> Option<NativeProcessMenuCommand> {
+        match tag {
+            0 => Some(NativeProcessMenuCommand::Terminate),
+            1 => Some(NativeProcessMenuCommand::ForceKill),
+            2 => Some(NativeProcessMenuCommand::CopyPid),
+            3 => Some(NativeProcessMenuCommand::CopyExecutablePath),
             _ => None,
         }
     }
