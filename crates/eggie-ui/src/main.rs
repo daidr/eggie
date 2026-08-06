@@ -1,4 +1,5 @@
 mod app;
+mod i18n;
 mod icons;
 mod input_latency;
 #[cfg(target_os = "macos")]

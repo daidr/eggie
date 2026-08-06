@@ -5,11 +5,14 @@ pub(crate) const FONT_FAMILY: &str = "Hugeicons Stroke Rounded";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IconName {
     Add,
+    Appearance,
     ArrowDown,
+    ArrowUp,
     Browser,
     Close,
     File,
     Folder,
+    FolderOpen,
     GitBranch,
     Info,
     PanelLeftClose,
@@ -25,11 +28,14 @@ impl IconName {
     pub(crate) fn glyph(self) -> char {
         match self {
             Self::Add => '\u{F150C}',
+            Self::Appearance => '\u{F1A23}',
             Self::ArrowDown => '\u{F15FC}',
+            Self::ArrowUp => '\u{F1632}',
             Self::Browser => '\u{F17C8}',
             Self::Close => '\u{F18BC}',
             Self::File => '\u{F1C6A}',
             Self::Folder => '\u{F1D01}',
+            Self::FolderOpen => '\u{F1D02}',
             Self::GitBranch => '\u{F1D6B}',
             Self::Info => '\u{F1E70}',
             Self::PanelLeftClose => '\u{F22AE}',

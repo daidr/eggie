@@ -48,9 +48,29 @@ impl ThemeMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Language {
+    #[default]
+    English,
+    SimplifiedChinese,
+}
+
+impl Language {
+    pub(crate) const ALL: [Self; 2] = [Self::English, Self::SimplifiedChinese];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::SimplifiedChinese => "简体中文",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
+    pub(crate) language: Language,
     pub(crate) theme_mode: ThemeMode,
     pub(crate) dark_theme: String,
     pub(crate) light_theme: String,
@@ -67,6 +87,7 @@ pub(crate) struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            language: Language::default(),
             theme_mode: ThemeMode::System,
             dark_theme: DEFAULT_DARK_THEME.to_owned(),
             light_theme: DEFAULT_LIGHT_THEME.to_owned(),
@@ -389,6 +410,7 @@ pub(crate) struct UiColors {
     pub(crate) background: u32,
     pub(crate) panel: u32,
     pub(crate) panel_alt: u32,
+    pub(crate) hover: u32,
     pub(crate) border: u32,
     pub(crate) text: u32,
     pub(crate) muted: u32,
@@ -409,6 +431,11 @@ impl UiColors {
                 theme.background,
                 theme.foreground,
                 if dark { 0.075 } else { 0.06 },
+            ),
+            hover: mix(
+                theme.background,
+                theme.foreground,
+                if dark { 0.1 } else { 0.085 },
             ),
             border: mix(
                 theme.background,
@@ -454,6 +481,7 @@ mod tests {
             std::env::temp_dir().join(format!("eggie-settings-{}", uuid::Uuid::new_v4()));
         let path = directory.join("settings.json");
         let mut config = AppSettings {
+            language: Language::English,
             theme_mode: ThemeMode::Light,
             dark_theme: "Catppuccin Mocha".to_owned(),
             light_theme: "Ayu Light".to_owned(),

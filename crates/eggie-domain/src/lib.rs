@@ -11,7 +11,9 @@ pub type SessionId = Uuid;
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
-    pub root: PathBuf,
+    /// Default working directory for new terminals in this project. `None` means the user's home
+    /// directory is used.
+    pub root: Option<PathBuf>,
 }
 
 impl Project {
@@ -24,9 +26,33 @@ impl Project {
         Self {
             id: Uuid::new_v4(),
             name,
-            root,
+            root: Some(root),
         }
     }
+
+    /// Create a project with only a name and no default working directory. New terminals will
+    /// start in the user's home directory until a root is set.
+    pub fn new(name: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            root: None,
+        }
+    }
+
+    /// The working directory to use for new terminals: the configured root, or the user's home
+    /// directory if none is set.
+    pub fn effective_root(&self) -> PathBuf {
+        self.root
+            .clone()
+            .unwrap_or_else(|| home_dir())
+    }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +433,37 @@ impl LayoutNode {
         let mut groups = Vec::new();
         self.collect_group_rects(NormalizedRect::FULL, &mut groups);
         groups.into_iter().map(|(group_id, _)| group_id).collect()
+    }
+
+    /// Total number of tab items across all groups in this layout.
+    pub fn item_count(&self) -> usize {
+        match self {
+            Self::Group { group } => group.items.len(),
+            Self::Split { first, second, .. } => first.item_count() + second.item_count(),
+        }
+    }
+
+    /// Iterate over all terminal items across all groups.
+    pub fn terminal_items(&self) -> impl Iterator<Item = &TabItem> {
+        let mut items = Vec::new();
+        self.collect_terminal_items(&mut items);
+        items.into_iter()
+    }
+
+    fn collect_terminal_items<'a>(&'a self, items: &mut Vec<&'a TabItem>) {
+        match self {
+            Self::Group { group } => {
+                for item in &group.items {
+                    if matches!(item.kind, ItemKind::Terminal) {
+                        items.push(item);
+                    }
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.collect_terminal_items(items);
+                second.collect_terminal_items(items);
+            }
+        }
     }
 
     fn collect_group_rects(
