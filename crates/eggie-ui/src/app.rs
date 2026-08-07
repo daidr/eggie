@@ -15,7 +15,7 @@ use alacritty_terminal::term::cell::Flags;
 use eggie_daemon::{DaemonClient, DaemonInputSender};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
-    TabGroup, TabItem,
+    SplitId, TabGroup, TabItem,
 };
 use eggie_protocol::{
     ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionSummary,
@@ -80,6 +80,9 @@ const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 300.;
 const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 220.;
 const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 520.;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 5.;
+// The split divider has a wide invisible grab area for easy clicking, and a thin visible line.
+const SPLIT_DIVIDER_HANDLE_WIDTH: f32 = 8.;
+const SPLIT_DIVIDER_LINE_WIDTH: f32 = 2.;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 8.;
 const SIDEBAR_SCROLLBAR_THUMB_WIDTH: f32 = 4.;
 const SIDEBAR_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 24.;
@@ -267,6 +270,9 @@ impl DraggedTab {
             }))
             .text_color(rgb(self.colors.text))
             .shadow_lg()
+            // Semi-transparent so the drop target and tabs underneath the cursor stay visible while
+            // dragging.
+            .opacity(0.7)
             .child(
                 div()
                     .flex_none()
@@ -383,6 +389,12 @@ pub struct EggieApp {
     left_sidebar_collapsed: bool,
     right_sidebar_collapsed: bool,
     resizing_sidebar: Option<SidebarEdge>,
+    resizing_split: Option<SplitId>,
+    // Shared with the split container's prepaint listener, which records the on-screen bounds of
+    // each split so `resize_split` can turn a mouse position into a ratio. This MUST be an `Rc` so
+    // the render-time `.clone()` shares the same map; cloning a bare `RefCell` would copy the map
+    // and the listener would write into a throwaway the resize handler never sees.
+    split_bounds: Rc<RefCell<HashMap<SplitId, Bounds<Pixels>>>>,
     moving_window: bool,
     tab_drop_target: Option<TabDropTarget>,
     right_sidebar_scroll_handle: ScrollHandle,
@@ -760,6 +772,8 @@ impl EggieApp {
             left_sidebar_collapsed: false,
             right_sidebar_collapsed: false,
             resizing_sidebar: None,
+            resizing_split: None,
+            split_bounds: Rc::new(RefCell::new(HashMap::new())),
             moving_window: false,
             tab_drop_target: None,
             right_sidebar_scroll_handle: ScrollHandle::new(),
@@ -2896,6 +2910,55 @@ impl EggieApp {
         cx.notify();
     }
 
+    fn start_split_resize(&mut self, split_id: SplitId, cx: &mut Context<Self>) {
+        self.resizing_split = Some(split_id);
+        cx.stop_propagation();
+    }
+
+    fn resize_split(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(split_id) = self.resizing_split else {
+            return;
+        };
+        if !event.dragging() {
+            self.resizing_split = None;
+            return;
+        }
+
+        let Some(bounds) = self.split_bounds.borrow().get(&split_id).copied() else {
+            return;
+        };
+
+        let layout = self.workspace().layout.clone();
+        let Some(axis) = layout.split_axis(split_id) else {
+            return;
+        };
+
+        let ratio = match axis {
+            SplitAxis::Horizontal => {
+                let width = f32::from(bounds.size.width);
+                if width <= 0. {
+                    return;
+                }
+                (f32::from(event.position.x - bounds.left()) / width).clamp(0.05, 0.95)
+            }
+            SplitAxis::Vertical => {
+                let height = f32::from(bounds.size.height);
+                if height <= 0. {
+                    return;
+                }
+                (f32::from(event.position.y - bounds.top()) / height).clamp(0.05, 0.95)
+            }
+        };
+
+        self.workspace_mut().layout.set_split_ratio(split_id, ratio);
+        cx.notify();
+    }
+
     /// Attach the manual window-drag handlers Eggie uses under `app_owns_titlebar_drag`.
     ///
     /// On macOS the `WindowControlArea::Drag` marker is a no-op; dragging is driven entirely by
@@ -2976,6 +3039,61 @@ impl EggieApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |app, event, _, cx| app.start_sidebar_resize(edge, event, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_split_divider(
+        &self,
+        axis: SplitAxis,
+        split_id: SplitId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let horizontal = axis == SplitAxis::Horizontal;
+        // The handle is a wide, transparent grab area so it is easy to click, while the visible
+        // line inside it stays thin. Filling the whole grab area with the accent color would make
+        // the divider look far too thick.
+        let handle = SPLIT_DIVIDER_HANDLE_WIDTH;
+        let line = SPLIT_DIVIDER_LINE_WIDTH;
+        let group_name: SharedString = format!("split-divider-{split_id}").into();
+        let mut divider = div()
+            .id(format!("split-divider-{split_id}"))
+            .group(group_name.clone())
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center();
+        let mut visible = div();
+        if horizontal {
+            // Symmetric negative margins straddle the handle across the seam so it is centered on
+            // it and consumes zero net layout width (same trick as the sidebar resize handle).
+            // Rendered after the first pane, it stacks above both panes and receives mouse events.
+            divider = divider
+                .w(px(handle))
+                .h_full()
+                .ml(px(-handle / 2.))
+                .mr(px(-handle / 2.))
+                .cursor_col_resize();
+            visible = visible.w(px(line)).h_full();
+        } else {
+            divider = divider
+                .h(px(handle))
+                .w_full()
+                .mt(px(-handle / 2.))
+                .mb(px(-handle / 2.))
+                .cursor_row_resize();
+            visible = visible.h(px(line)).w_full();
+        }
+        divider
+            .child(
+                // A thin line, centered on the seam, that lights up in the accent color while the
+                // grab area is hovered. `group_hover` reacts to hovering the surrounding handle,
+                // not just the line itself.
+                visible.group_hover(group_name, |style| style.bg(rgb(self.colors.accent))),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |app, _, _, cx| app.start_split_resize(split_id, cx)),
             )
             .into_any_element()
     }
@@ -3200,6 +3318,42 @@ impl EggieApp {
         cx.notify();
     }
 
+    /// Order a project's sessions to match the reading order of its layout tree — left-to-right,
+    /// top-to-bottom, and within a tab group by tab order. This keeps the sidebar list in sync with
+    /// how the terminals are actually arranged in the main area (splits and tab reordering), rather
+    /// than showing them in creation order.
+    ///
+    /// Sessions that belong to the project but are absent from the layout tree (which should not
+    /// normally happen) are appended afterwards in their existing order so a terminal can never
+    /// silently disappear from the sidebar.
+    fn sidebar_sessions_in_layout_order<'a>(
+        &'a self,
+        workspace: &'a ProjectWorkspace,
+    ) -> Vec<&'a SessionSummary> {
+        let project_id = workspace.project.id;
+
+        // Reading-order position of each session within the layout tree.
+        let mut layout_rank: HashMap<SessionId, usize> = HashMap::new();
+        for item in workspace.layout.terminal_items() {
+            if let Some(session_id) = item.session_id {
+                let next_rank = layout_rank.len();
+                layout_rank.entry(session_id).or_insert(next_rank);
+            }
+        }
+        let orphan_rank = layout_rank.len();
+
+        let mut sessions: Vec<&SessionSummary> = self
+            .sessions
+            .iter()
+            .filter(|session| session.project_id == project_id)
+            .collect();
+
+        // Stable sort keeps orphan sessions (rank = len) in their original relative order, appended
+        // after everything the layout knows about.
+        sessions.sort_by_key(|session| layout_rank.get(&session.id).copied().unwrap_or(orphan_rank));
+        sessions
+    }
+
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div()
             .flex()
@@ -3287,11 +3441,7 @@ impl EggieApp {
                     ),
             );
             if !collapsed {
-                for session in self
-                    .sessions
-                    .iter()
-                    .filter(|session| session.project_id == workspace.project.id)
-                {
+                for session in self.sidebar_sessions_in_layout_order(workspace) {
                     let active = self.active_session_id() == Some(session.id);
                     let session_id = session.id;
                     panel = panel.child(
@@ -3367,21 +3517,45 @@ impl EggieApp {
                 cx,
             ),
             LayoutNode::Split {
+                id,
                 axis,
+                ratio,
                 first,
                 second,
-                ..
             } => {
                 let horizontal = *axis == SplitAxis::Horizontal;
+                let ratio = ratio.clamp(0.05, 0.95);
+                // Identify the split by its own stable id, not the first group inside it: nested
+                // splits share the same "first group" and would otherwise collide, so dragging an
+                // inner divider would resize the outer split instead.
+                let split_id = *id;
+                let split_bounds = self.split_bounds.clone();
                 div()
                     .flex()
                     .when(!horizontal, |element| element.flex_col())
                     .size_full()
                     .min_w_0()
+                    .on_children_prepainted(move |children, _, _| {
+                        if children.len() < 2 {
+                            return;
+                        }
+                        // Use the first and last children (the two panes) to compute the split
+                        // container's bounds. The middle child is the drag handle, whose negative
+                        // margins would otherwise skew the union.
+                        let bounds = children[0].union(&children[children.len() - 1]);
+                        split_bounds.borrow_mut().insert(split_id, bounds);
+                    })
                     .child(
                         div()
-                            .flex_1()
+                            .flex_grow(ratio)
+                            .flex_shrink_0()
+                            // Force the flex basis to zero so `flex_grow` distributes the *entire*
+                            // container along the split axis in proportion to `ratio`. Without this
+                            // the panes keep their large intrinsic (content) size as the basis and
+                            // `ratio` only splits the leftover space, so dragging barely moves them.
+                            .flex_basis(relative(0.))
                             .min_w_0()
+                            .min_h_0()
                             .child(self.render_layout_with_outer_edges(
                                 first,
                                 touches_left_edge,
@@ -3391,10 +3565,14 @@ impl EggieApp {
                                 cx,
                             )),
                     )
+                    .child(self.render_split_divider(*axis, split_id, cx))
                     .child(
                         div()
-                            .flex_1()
+                            .flex_grow(1.0 - ratio)
+                            .flex_shrink_0()
+                            .flex_basis(relative(0.))
                             .min_w_0()
+                            .min_h_0()
                             .child(self.render_layout_with_outer_edges(
                                 second,
                                 touches_left_edge && !horizontal,
@@ -3469,7 +3647,10 @@ impl EggieApp {
         for (tab_index, item) in group.items.iter().enumerate() {
             let item_id = item.id;
             let active = group.active_item_id == Some(item.id);
-            let show_insertion_before = tab_insertion_index == Some(tab_index);
+            // The first tab's "before" indicator sits at a negative offset that the scroll strip's
+            // overflow would clip, so it is drawn once on the non-clipping scroll wrapper instead
+            // (see below). Every other tab draws its own indicator in the preceding gap.
+            let show_insertion_before = tab_insertion_index == Some(tab_index) && tab_index != 0;
             let show_insertion_after = tab_insertion_index == Some(group.items.len())
                 && tab_index + 1 == group.items.len();
             let dragged_tab = DraggedTab {
@@ -3547,6 +3728,8 @@ impl EggieApp {
                             .child(icon_sized(IconName::Close, TAB_CLOSE_ICON_SIZE)),
                     )
                     .when(show_insertion_before, |element| {
+                        // Centered in the gap before this tab. (The first tab is handled on the
+                        // scroll wrapper to avoid overflow clipping — see `show_insertion_before`.)
                         element.child(
                             div()
                                 .absolute()
@@ -3643,6 +3826,21 @@ impl EggieApp {
                         linear_color_stop(panel_color, 0.),
                         linear_color_stop(panel_color.opacity(0.), 1.),
                     )),
+            );
+        }
+        // The indicator for inserting before the FIRST tab lives on the (non-clipping) scroll
+        // wrapper rather than inside the scroll strip: at the strip's x=0 origin its negative
+        // offset would fall outside the overflow viewport and be clipped away. Drawn here it lands
+        // at the very same spot — in the tab bar's left padding — without being cut off.
+        if item_count > 0 && tab_insertion_index == Some(0) {
+            scroll_wrapper = scroll_wrapper.child(
+                div()
+                    .absolute()
+                    .left(px(-TAB_DROP_INDICATOR_OFFSET))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(TAB_DROP_INDICATOR_WIDTH))
+                    .bg(rgb(self.colors.accent)),
             );
         }
         // A fixed gap between the scrollable tab strip and the new-tab button gives the user a
@@ -3788,6 +3986,18 @@ impl EggieApp {
             self.left_sidebar_collapsed,
             self.right_sidebar_collapsed,
         );
+        // The tab bar sits above the content region, so a vertical split seam drawn only on the
+        // content region leaves a gap at tab-bar height. Extend the same left/right seam border up
+        // through the tab bar. Skip the side that is rounded (an outer layout edge), where the
+        // content region's rounded corner owns the look and a straight tab-bar border would spoil it.
+        tabs = tabs
+            .border_color(rgb(self.colors.border))
+            .when(borders.left && !corners.top_left, |element| {
+                element.border_l_1()
+            })
+            .when(borders.right && !corners.top_right, |element| {
+                element.border_r_1()
+            });
         let mut content_region = div()
             .flex_1()
             .min_h_0()
@@ -4143,12 +4353,14 @@ impl gpui::Render for EggieApp {
             }))
             .on_mouse_move(cx.listener(|app, event, window, cx| {
                 app.resize_sidebar(event, window, cx);
+                app.resize_split(event, window, cx);
                 app.update_terminal_selection_drag(event, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|app, _, _, cx| {
                     app.resizing_sidebar = None;
+                    app.resizing_split = None;
                     app.clear_tab_drop_target(cx);
                     app.finish_terminal_selection_drag(cx);
                 }),

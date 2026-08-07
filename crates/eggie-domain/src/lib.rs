@@ -6,6 +6,9 @@ pub type ProjectId = Uuid;
 pub type GroupId = Uuid;
 pub type ItemId = Uuid;
 pub type SessionId = Uuid;
+/// Identity of a split node in a [`LayoutNode`] tree. Distinct from [`GroupId`] so a split is never
+/// confused with the groups it contains.
+pub type SplitId = Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
@@ -165,6 +168,14 @@ pub enum LayoutNode {
         group: TabGroup,
     },
     Split {
+        /// Stable, globally unique identity for this split.
+        ///
+        /// A split must NOT be identified by the first group inside its `first` subtree: when the
+        /// `first` subtree is itself a split, the outer and inner splits would derive the same
+        /// "first group" and collide, so resizing the inner divider would move the outer one. This
+        /// explicit id sidesteps that entirely.
+        #[serde(default = "Uuid::new_v4")]
+        id: SplitId,
         axis: SplitAxis,
         ratio: f32,
         first: Box<LayoutNode>,
@@ -241,6 +252,59 @@ impl LayoutNode {
         }
     }
 
+    /// Returns this node's [`SplitId`] if it is a split, or `None` for a group.
+    pub fn split_id(&self) -> Option<SplitId> {
+        match self {
+            Self::Group { .. } => None,
+            Self::Split { id, .. } => Some(*id),
+        }
+    }
+
+    /// Returns the ratio of the split with the given [`SplitId`].
+    pub fn split_ratio(&self, split_id: SplitId) -> Option<f32> {
+        match self {
+            Self::Group { .. } => None,
+            Self::Split { id, ratio, .. } if *id == split_id => Some(*ratio),
+            Self::Split { first, second, .. } => first
+                .split_ratio(split_id)
+                .or_else(|| second.split_ratio(split_id)),
+        }
+    }
+
+    /// Returns the axis of the split with the given [`SplitId`].
+    pub fn split_axis(&self, split_id: SplitId) -> Option<SplitAxis> {
+        match self {
+            Self::Group { .. } => None,
+            Self::Split { id, axis, .. } if *id == split_id => Some(*axis),
+            Self::Split { first, second, .. } => first
+                .split_axis(split_id)
+                .or_else(|| second.split_axis(split_id)),
+        }
+    }
+
+    /// Updates the ratio of the split with the given [`SplitId`].
+    ///
+    /// Returns `true` if a matching split was found and updated. The ratio is clamped to
+    /// `0.05..=0.95` so neither pane can collapse entirely.
+    pub fn set_split_ratio(&mut self, split_id: SplitId, ratio: f32) -> bool {
+        let ratio = ratio.clamp(0.05, 0.95);
+        match self {
+            Self::Group { .. } => false,
+            Self::Split {
+                id,
+                ratio: current,
+                ..
+            } if *id == split_id => {
+                *current = ratio;
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.set_split_ratio(split_id, ratio)
+                    || second.set_split_ratio(split_id, ratio)
+            }
+        }
+    }
+
     pub fn top_left_group_id(&self) -> GroupId {
         match self {
             Self::Group { group } => group.id,
@@ -302,6 +366,7 @@ impl LayoutNode {
                     (old_group, new_group)
                 };
                 *self = Self::Split {
+                    id: Uuid::new_v4(),
                     axis: direction.axis(),
                     ratio: 0.5,
                     first,
@@ -478,6 +543,7 @@ impl LayoutNode {
                 ratio,
                 first,
                 second,
+                ..
             } => {
                 let ratio = ratio.clamp(0.05, 0.95);
                 let (first_rect, second_rect) = rect.split(*axis, ratio);
@@ -517,6 +583,7 @@ impl LayoutNode {
             Self::Group { group } if group.id == group_id && group.items.is_empty() => None,
             Self::Group { .. } => Some(self),
             Self::Split {
+                id,
                 axis,
                 ratio,
                 first,
@@ -525,7 +592,10 @@ impl LayoutNode {
                 first.without_empty_group(group_id),
                 second.without_empty_group(group_id),
             ) {
+                // Both subtrees survive: keep this split with its original id so a live drag
+                // targeting it is not invalidated by an unrelated group closing elsewhere.
                 (Some(first), Some(second)) => Some(Self::Split {
+                    id,
                     axis,
                     ratio,
                     first: Box::new(first),
@@ -895,5 +965,62 @@ mod tests {
             None
         );
         assert_eq!(layout.find_group(group_id).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn nested_splits_have_distinct_ids_and_resize_independently() {
+        // Build: root Horizontal split, whose `first` child is itself a Vertical split. The inner
+        // split's first group is also the root's first group, so identifying a split by its first
+        // group would make the two collide. Each must instead have its own id.
+        let top_left = TabItem::terminal(Uuid::new_v4(), "top-left");
+        let mut layout = LayoutNode::group(top_left);
+        let left_group = layout.first_group_id();
+
+        // Split to the right first -> outer Horizontal split (left column / right).
+        layout
+            .split_group_direction(
+                left_group,
+                Direction::Right,
+                TabItem::terminal(Uuid::new_v4(), "right"),
+            )
+            .unwrap();
+        // Then split the left group downward -> inner Vertical split nested in the outer's `first`.
+        layout
+            .split_group_direction(
+                left_group,
+                Direction::Down,
+                TabItem::terminal(Uuid::new_v4(), "bottom-left"),
+            )
+            .unwrap();
+
+        let (outer_id, inner_id) = match &layout {
+            LayoutNode::Split {
+                id: outer_id,
+                axis: SplitAxis::Horizontal,
+                first,
+                ..
+            } => match first.as_ref() {
+                LayoutNode::Split {
+                    id: inner_id,
+                    axis: SplitAxis::Vertical,
+                    ..
+                } => (*outer_id, *inner_id),
+                other => panic!("expected inner vertical split, got {other:?}"),
+            },
+            other => panic!("expected outer horizontal split, got {other:?}"),
+        };
+
+        assert_ne!(outer_id, inner_id, "nested splits must not share an id");
+        assert_eq!(layout.split_axis(outer_id), Some(SplitAxis::Horizontal));
+        assert_eq!(layout.split_axis(inner_id), Some(SplitAxis::Vertical));
+
+        // Resizing the inner split must not touch the outer split's ratio, and vice versa.
+        assert!(layout.set_split_ratio(inner_id, 0.3));
+        assert_eq!(layout.split_ratio(inner_id), Some(0.3));
+        assert_eq!(layout.split_ratio(outer_id), Some(0.5));
+
+        assert!(layout.set_split_ratio(outer_id, 0.7));
+        assert_eq!(layout.split_ratio(outer_id), Some(0.7));
+        assert_eq!(layout.split_ratio(inner_id), Some(0.3));
     }
 }
