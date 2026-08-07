@@ -527,10 +527,24 @@ impl Language {
         }
     }
 
+    pub(crate) fn general_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "General",
+            Self::SimplifiedChinese => "通用",
+        }
+    }
+
     pub(crate) fn appearance_sidebar(self) -> &'static str {
         match self {
             Self::English => "Appearance",
             Self::SimplifiedChinese => "外观",
+        }
+    }
+
+    pub(crate) fn advanced_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "Advanced",
+            Self::SimplifiedChinese => "高级",
         }
     }
 
@@ -580,6 +594,13 @@ impl Language {
         match self {
             Self::English => "Terminal security",
             Self::SimplifiedChinese => "终端安全",
+        }
+    }
+
+    pub(crate) fn advanced_section(self) -> &'static str {
+        match self {
+            Self::English => "Advanced",
+            Self::SimplifiedChinese => "高级",
         }
     }
 

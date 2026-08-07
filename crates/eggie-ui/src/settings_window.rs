@@ -77,6 +77,18 @@ enum ProgressTimeoutKind {
     Stale,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsSection {
+    #[default]
+    General,
+    Appearance,
+    Advanced,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 3] = [Self::General, Self::Appearance, Self::Advanced];
+}
+
 pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
     let settings_for_action = settings.clone();
     cx.on_action(move |_: &OpenSettings, cx| open_settings_window(settings_for_action.clone(), cx));
@@ -253,6 +265,7 @@ struct SettingsWindow {
     settings_scroll_handle: ScrollHandle,
     selector_bounds: [Option<Bounds<Pixels>>; 3],
     moving_window: bool,
+    selected_section: SettingsSection,
 }
 
 impl SettingsWindow {
@@ -280,6 +293,7 @@ impl SettingsWindow {
             settings_scroll_handle: ScrollHandle::new(),
             selector_bounds: [None; 3],
             moving_window: false,
+            selected_section: SettingsSection::default(),
         }
     }
 
@@ -1275,23 +1289,55 @@ impl gpui::Render for SettingsWindow {
                             .w(px(SETTINGS_SIDEBAR_WIDTH))
                             .h_full()
                             .p_2()
+                            .gap_1()
                             .border_r_1()
                             .border_color(rgb(self.colors.border))
                             .bg(rgb(self.colors.panel))
-                            .child(
+                            .children(SettingsSection::ALL.map(|section| {
+                                let (id, label, icon_name) = match section {
+                                    SettingsSection::General => (
+                                        "settings-sidebar-general",
+                                        language.general_sidebar(),
+                                        IconName::Settings,
+                                    ),
+                                    SettingsSection::Appearance => (
+                                        "settings-sidebar-appearance",
+                                        language.appearance_sidebar(),
+                                        IconName::Appearance,
+                                    ),
+                                    SettingsSection::Advanced => (
+                                        "settings-sidebar-advanced",
+                                        language.advanced_sidebar(),
+                                        IconName::Info,
+                                    ),
+                                };
+                                let selected = self.selected_section == section;
                                 div()
-                                    .id("settings-sidebar-appearance")
+                                    .id(id)
                                     .flex()
                                     .items_center()
                                     .gap_2()
                                     .h(px(34.))
                                     .px_2()
                                     .rounded_lg()
-                                    .bg(rgb(self.colors.panel_alt))
-                                    .text_color(rgb(self.colors.accent))
-                                    .child(icon(IconName::Appearance))
-                                    .child(language.appearance_sidebar()),
-                            ),
+                                    .cursor_pointer()
+                                    .when(selected, |element| {
+                                        element
+                                            .bg(rgb(self.colors.panel_alt))
+                                            .text_color(rgb(self.colors.accent))
+                                    })
+                                    .when(!selected, |element| {
+                                        element.hover(|element| {
+                                            element.bg(rgb(self.colors.panel_alt))
+                                        })
+                                    })
+                                    .on_click(cx.listener(move |settings, _, _, cx| {
+                                        settings.selected_section = section;
+                                        cx.notify();
+                                    }))
+                                    .child(icon(icon_name))
+                                    .child(label)
+                            })),
                     )
                     .child(
                         div()
@@ -1328,116 +1374,130 @@ impl gpui::Render for SettingsWindow {
                                                         div()
                                                             .text_size(px(18.))
                                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .child(language.appearance_section()),
+                                                            .child(match self.selected_section {
+                                                                SettingsSection::General => language.general_section(),
+                                                                SettingsSection::Appearance => language.appearance_section(),
+                                                                SettingsSection::Advanced => language.advanced_section(),
+                                                            }),
                                                     )
-                                                    .child(settings_section(
-                                                        language.general_section(),
-                                                        vec![settings_row(
-                                                            language.language_row(),
-                                                            language.language_description(),
-                                                            language_control,
-                                                            self.colors,
-                                                        )],
-                                                        self.colors,
-                                                    ))
-                                                    .child(settings_section(
-                                                        language.theme_section(),
-                                                        vec![
-                                                            settings_row(
-                                                                language.theme_row(),
-                                                                language.theme_description(),
-                                                                mode_control,
-                                                                self.colors,
-                                                            ),
-                                                            settings_row(
-                                                                language.dark_theme_row(),
-                                                                language.dark_theme_description(),
-                                                                dark_selector,
-                                                                self.colors,
-                                                            ),
-                                                            settings_row(
-                                                                language.light_theme_row(),
-                                                                language.light_theme_description(),
-                                                                light_selector,
-                                                                self.colors,
-                                                            ),
-                                                            settings_row(
-                                                                language.minimum_contrast_row(),
-                                                                language.minimum_contrast_description(),
-                                                                minimum_contrast_control,
+                                                    .children(match self.selected_section {
+                                                        SettingsSection::General => vec![
+                                                            settings_section(
+                                                                language.general_section(),
+                                                                vec![settings_row(
+                                                                    language.language_row(),
+                                                                    language.language_description(),
+                                                                    language_control,
+                                                                    self.colors,
+                                                                )],
                                                                 self.colors,
                                                             ),
                                                         ],
-                                                        self.colors,
-                                                    ))
-                                                    .child(settings_section(
-                                                        language.terminal_text_section(),
-                                                        vec![
-                                                            settings_row(
-                                                                language.font_row(),
-                                                                language.font_description(),
-                                                                font_selector,
+                                                        SettingsSection::Appearance => vec![
+                                                            settings_section(
+                                                                language.theme_section(),
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.theme_row(),
+                                                                        language.theme_description(),
+                                                                        mode_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.dark_theme_row(),
+                                                                        language.dark_theme_description(),
+                                                                        dark_selector,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.light_theme_row(),
+                                                                        language.light_theme_description(),
+                                                                        light_selector,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.minimum_contrast_row(),
+                                                                        language.minimum_contrast_description(),
+                                                                        minimum_contrast_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
                                                                 self.colors,
                                                             ),
-                                                            settings_row(
-                                                                language.font_size_row(),
-                                                                language.font_size_description(),
-                                                                font_size_control,
+                                                            settings_section(
+                                                                language.terminal_text_section(),
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.font_row(),
+                                                                        language.font_description(),
+                                                                        font_selector,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.font_size_row(),
+                                                                        language.font_size_description(),
+                                                                        font_size_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
+                                                                language.terminal_layout_section(),
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.horizontal_padding_row(),
+                                                                        language.horizontal_padding_description(),
+                                                                        horizontal_padding_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.vertical_padding_row(),
+                                                                        language.vertical_padding_description(),
+                                                                        vertical_padding_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
                                                                 self.colors,
                                                             ),
                                                         ],
-                                                        self.colors,
-                                                    ))
-                                                    .child(settings_section(
-                                                        language.terminal_layout_section(),
-                                                        vec![
-                                                            settings_row(
-                                                                language.horizontal_padding_row(),
-                                                                language.horizontal_padding_description(),
-                                                                horizontal_padding_control,
+                                                        SettingsSection::Advanced => vec![
+                                                            settings_section(
+                                                                language.progress_indicators_section(),
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.completed_timeout_row(),
+                                                                        language.completed_timeout_description(),
+                                                                        progress_complete_timeout_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.inactive_timeout_row(),
+                                                                        language.inactive_timeout_description(),
+                                                                        progress_stale_timeout_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
                                                                 self.colors,
                                                             ),
-                                                            settings_row(
-                                                                language.vertical_padding_row(),
-                                                                language.vertical_padding_description(),
-                                                                vertical_padding_control,
-                                                                self.colors,
-                                                            ),
-                                                        ],
-                                                        self.colors,
-                                                    ))
-                                                    .child(settings_section(
-                                                        language.progress_indicators_section(),
-                                                        vec![
-                                                            settings_row(
-                                                                language.completed_timeout_row(),
-                                                                language.completed_timeout_description(),
-                                                                progress_complete_timeout_control,
-                                                                self.colors,
-                                                            ),
-                                                            settings_row(
-                                                                language.inactive_timeout_row(),
-                                                                language.inactive_timeout_description(),
-                                                                progress_stale_timeout_control,
+                                                            settings_section(
+                                                                language.terminal_security_section(),
+                                                                vec![settings_row(
+                                                                    language.osc_clipboard_read_row(),
+                                                                    language.osc_clipboard_read_description(),
+                                                                    osc_clipboard_read_control,
+                                                                    self.colors,
+                                                                )],
                                                                 self.colors,
                                                             ),
                                                         ],
-                                                        self.colors,
-                                                    ))
-                                                    .child(settings_section(
-                                                        language.terminal_security_section(),
-                                                        vec![settings_row(
-                                                            language.osc_clipboard_read_row(),
-                                                            language.osc_clipboard_read_description(),
-                                                            osc_clipboard_read_control,
-                                                            self.colors,
-                                                        )],
-                                                        self.colors,
-                                                    )),
+                                                    }),
                                             ),
                                     ),
                             )
-                            .child(terminal_preview),
+                            .when(self.selected_section == SettingsSection::Appearance, |element| {
+                                element.child(terminal_preview)
+                            }),
                     ),
             )
     }
