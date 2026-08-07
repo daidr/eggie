@@ -1,0 +1,104 @@
+# Eggie zsh shell integration — OSC 133 semantic-prompt marker injector.
+#
+# Authored by the Eggie project from the public OSC 133 semantic-prompt protocol
+# (FinalTerm / iTerm2 / kitty de-facto standard). This file is NOT derived from
+# any GPL-licensed integration script.
+#
+# This autoloaded function makes zsh report OSC 133 marks so Eggie's terminal
+# knows which grid line the prompt starts on, where the input area begins, and
+# where command output runs. Eggie uses the prompt-start line to clear exactly
+# the prompt region on resize (letting the shell redraw it) instead of reflowing
+# it into duplicate fragments.
+#
+# The marks are printed directly (not woven into PS1) so they work regardless of
+# who owns PS1 — including frameworks like Powerlevel10k that fully rebuild PS1
+# each prompt. Crucially, WHERE each mark is emitted determines the grid line
+# Eggie records:
+#   * A (prompt start) is printed from precmd, which runs *before* the prompt is
+#     drawn — so the cursor is on the prompt's FIRST line. This is the line Eggie
+#     needs to start clearing from.
+#   * B (input start) is printed from zle-line-init, which runs *after* the prompt
+#     is drawn — so the cursor is on the input line.
+#
+# OSC 133 marks used:
+#   A (FreshLineAndPrompt) — start of a fresh prompt (cursor on the prompt's first line)
+#   B (InputStart)         — start of the editable input area
+#   C (OutputStart)        — command has started producing output
+#   D;<status> (CommandFinished) — previous command finished with exit status
+
+eggie-integration() {
+    builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+
+    [[ -o interactive ]] || builtin return 0
+    # Run only once per shell.
+    (( ${+_eggie_state} )) && builtin return 0
+    builtin typeset -gi _eggie_state=1
+
+    # Write marks to stdout (fd 1). This is sufficient at the prompt; hardening
+    # against stdout redirection (a dedicated cloexec TTY fd) is a follow-up.
+    builtin typeset -gi _eggie_fd=1
+
+    eggie_precmd() {
+        builtin local -i cmd_status=$?
+        builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+
+        # Close the previous command's output region (if one is open) with its
+        # exit status. _eggie_running is set by preexec.
+        if (( ${+_eggie_running} )); then
+            builtin print -nu $_eggie_fd '\e]133;D;'"$cmd_status"'\a'
+            builtin unset _eggie_running
+        fi
+
+        # Emit prompt-start (A) HERE, before the prompt is drawn, so the cursor is
+        # on the prompt's first line. Eggie records this line and clears from it on
+        # resize. `cl=line` marks the region as clear-and-redraw-safe.
+        builtin print -nu $_eggie_fd '\e]133;A;cl=line\a'
+    }
+
+    eggie_preexec() {
+        builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        # Mark the start of command output and remember that a command is running
+        # so the next precmd can close it with the exit status.
+        builtin print -nu $_eggie_fd '\e]133;C\a'
+        builtin typeset -gi _eggie_running=1
+    }
+
+    # Emit input-start (B) after the prompt has been drawn. zle-line-init fires
+    # regardless of who owns PS1, so this works with Powerlevel10k et al.
+    eggie_line_init() {
+        builtin print -nu $_eggie_fd '\e]133;B\a'
+    }
+
+    # `eggie-integration` runs from .zshenv, i.e. BEFORE .zshrc, when ZLE is not yet
+    # ready and the user's theme has not registered its own hooks. Defer the real
+    # setup to a one-shot precmd: zsh runs precmd functions after .zshrc, just
+    # before the first prompt, by which point ZLE is available and
+    # add-zle-hook-widget works.
+    eggie_deferred_init() {
+        builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        builtin typeset -ag precmd_functions preexec_functions
+        # Keep eggie_precmd FIRST so A is emitted before any theme precmd draws the
+        # prompt, and so the cursor is still on the prompt's first line.
+        precmd_functions=(eggie_precmd ${precmd_functions:#eggie_deferred_init})
+        preexec_functions=(${preexec_functions:#eggie_preexec} eggie_preexec)
+
+        # Register the zle-line-init hook now that ZLE is ready. Prefer the official
+        # add-zle-hook-widget (composes with themes that also hook line-init);
+        # fall back to wrapping the widget directly if it is unavailable.
+        builtin autoload -Uz add-zle-hook-widget 2>/dev/null
+        if (( ${+functions[add-zle-hook-widget]} )); then
+            add-zle-hook-widget line-init eggie_line_init
+        elif (( ${+widgets[zle-line-init]} )); then
+            builtin zle -A zle-line-init eggie_orig_zle_line_init
+            eggie_zle_line_init() { eggie_line_init; builtin zle eggie_orig_zle_line_init -- "$@" }
+            builtin zle -N zle-line-init eggie_zle_line_init
+        else
+            builtin zle -N zle-line-init eggie_line_init
+        fi
+
+        eggie_precmd
+    }
+
+    builtin typeset -ag precmd_functions
+    precmd_functions=(${precmd_functions:#eggie_deferred_init} eggie_deferred_init)
+}

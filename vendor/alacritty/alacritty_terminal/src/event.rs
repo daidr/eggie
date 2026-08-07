@@ -28,7 +28,11 @@ pub enum Event {
     WorkingDirectory(String),
 
     /// Semantic shell-integration marker reported by OSC 133.
-    SemanticPrompt(SemanticPrompt),
+    ///
+    /// The second field is the grid line the cursor was on when the marker was emitted (relative to
+    /// the top of the visible screen; may be negative if in scrollback). Eggie records this so a
+    /// resize can clear exactly the active prompt region instead of guessing its extent.
+    SemanticPrompt(SemanticPrompt, i32),
 
     /// Desktop notification command reported by OSC 9, OSC 99, or OSC 777.
     DesktopNotification(DesktopNotification),
@@ -102,7 +106,9 @@ impl Debug for Event {
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::ProgressReport(progress) => write!(f, "ProgressReport({progress:?})"),
             Event::WorkingDirectory(directory) => write!(f, "WorkingDirectory({directory:?})"),
-            Event::SemanticPrompt(prompt) => write!(f, "SemanticPrompt({prompt:?})"),
+            Event::SemanticPrompt(prompt, line) => {
+                write!(f, "SemanticPrompt({prompt:?}, {line})")
+            }
             Event::DesktopNotification(notification) => {
                 write!(f, "DesktopNotification({notification:?})")
             }
