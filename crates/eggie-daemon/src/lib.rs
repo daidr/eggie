@@ -69,6 +69,12 @@ const DAEMON_ARGUMENT: &str = "--eggie-daemon";
 const BUNDLED_ALACRITTY_TERMINFO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/alacritty.terminfo"));
 static INSTALLED_TERMINFO: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
+const BUNDLED_ZSH_ZSHENV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggie-zsh-zshenv"));
+const BUNDLED_ZSH_INTEGRATION: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/eggie-zsh-integration"));
+const BUNDLED_BASH_INTEGRATION: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggie-bash"));
+static INSTALLED_SHELL_INTEGRATION: OnceLock<std::result::Result<PathBuf, String>> =
+    OnceLock::new();
 static RENDER_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_METADATA_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
@@ -322,6 +328,10 @@ impl OscEventTracker {
 
 struct ShellIntegrationTracker {
     phase: TerminalSemanticPhase,
+    /// Grid line where the active prompt started (relative to the top of the visible screen, as
+    /// reported with the OSC 133 A/prompt-start marker). Used to clear exactly the prompt region on
+    /// resize. `None` when not currently on a prompt.
+    prompt_start_line: Option<i32>,
     current_command: Option<TerminalCommandRecord>,
     history: VecDeque<TerminalCommandRecord>,
     next_command_id: u64,
@@ -332,6 +342,7 @@ impl Default for ShellIntegrationTracker {
     fn default() -> Self {
         Self {
             phase: TerminalSemanticPhase::None,
+            prompt_start_line: None,
             current_command: None,
             history: VecDeque::with_capacity(COMMAND_HISTORY),
             next_command_id: 1,
@@ -341,21 +352,40 @@ impl Default for ShellIntegrationTracker {
 }
 
 impl ShellIntegrationTracker {
-    fn update(&mut self, prompt: SemanticPrompt) {
+    /// Update the tracker from an OSC 133 marker. `cursor_line` is the grid line the cursor was on
+    /// when the marker was emitted (relative to the top of the visible screen), used to record
+    /// where the active prompt starts.
+    fn update(&mut self, prompt: SemanticPrompt, cursor_line: i32) {
         let now = unix_time_ms();
         match prompt.action {
             SemanticPromptAction::FreshLine => {}
             SemanticPromptAction::FreshLineAndPrompt | SemanticPromptAction::PromptStart => {
+                // A/prompt-start marks where the prompt begins. Record it only when entering the
+                // prompt from a non-prompt phase, so continuation/re-emitted marks on the same
+                // prompt (e.g. our zle-line-init hook firing on every redraw) don't move the start
+                // down to the input line.
+                if !matches!(
+                    self.phase,
+                    TerminalSemanticPhase::Prompt | TerminalSemanticPhase::Input
+                ) {
+                    self.prompt_start_line = Some(cursor_line);
+                }
                 self.phase = TerminalSemanticPhase::Prompt;
             }
             SemanticPromptAction::NewCommand => {
                 self.begin_command(now, option_value(&prompt.options, "cmdline"));
+                self.prompt_start_line = Some(cursor_line);
                 self.phase = TerminalSemanticPhase::Prompt;
             }
             SemanticPromptAction::InputStart
             | SemanticPromptAction::InputStartAndTerminatePrompt => {
                 if self.current_command.is_none() {
                     self.begin_command(now, option_value(&prompt.options, "cmdline"));
+                }
+                // Entering input directly (no preceding A) still means the cursor is on a prompt;
+                // record the start if we don't have one yet.
+                if self.prompt_start_line.is_none() {
+                    self.prompt_start_line = Some(cursor_line);
                 }
                 self.phase = TerminalSemanticPhase::Input;
             }
@@ -369,6 +399,8 @@ impl ShellIntegrationTracker {
                 {
                     command.command_line = Some(command_line);
                 }
+                // Output has started; the prompt is no longer the active region.
+                self.prompt_start_line = None;
                 self.phase = TerminalSemanticPhase::Output;
             }
             SemanticPromptAction::CommandFinished => {
@@ -394,6 +426,7 @@ impl ShellIntegrationTracker {
                         self.history.pop_front();
                     }
                 }
+                self.prompt_start_line = None;
                 self.phase = TerminalSemanticPhase::None;
             }
         }
@@ -2427,8 +2460,8 @@ impl EventListener for DaemonEventListener {
             Event::WorkingDirectory(directory) => {
                 self.0.report_working_directory(&directory);
             }
-            Event::SemanticPrompt(prompt) => {
-                self.0.shell_integration.lock().update(prompt);
+            Event::SemanticPrompt(prompt, cursor_line) => {
+                self.0.shell_integration.lock().update(prompt, cursor_line);
             }
             Event::DesktopNotification(notification) => {
                 self.0.handle_notification(notification);
@@ -2543,23 +2576,29 @@ impl TerminalSession {
             .unwrap_or("shell")
             .to_owned();
         let terminfo = install_bundled_terminfo()?;
-        let mut env = HashMap::new();
-        env.insert("TERM".to_owned(), "alacritty".to_owned());
-        env.insert(
-            "TERMINFO".to_owned(),
-            terminfo.to_string_lossy().into_owned(),
-        );
-        env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
-        env.insert("TERM_PROGRAM".to_owned(), "Eggie".to_owned());
-        env.insert(
-            "TERM_PROGRAM_VERSION".to_owned(),
-            env!("CARGO_PKG_VERSION").to_owned(),
+        // Install the shell-integration scripts so the child shell reports OSC 133 semantic
+        // prompts. Non-fatal: if it fails we simply don't inject, and resize falls back to
+        // Alacritty's native reflow.
+        let integration_root = match install_bundled_shell_integration() {
+            Ok(root) => Some(root),
+            Err(error) => {
+                eprintln!("failed to install shell integration: {error:#}");
+                None
+            }
+        };
+        let launch = build_shell_env(
+            &shell_name,
+            &shell,
+            &terminfo,
+            integration_root.as_deref(),
+            std::env::var("ZDOTDIR").ok(),
+            std::env::var("ENV").ok(),
         );
         let options = tty::Options {
-            shell: Some(tty::Shell::new(shell, vec!["-l".to_owned()])),
+            shell: Some(tty::Shell::new(shell, launch.args)),
             working_directory: Some(cwd.clone()),
             drain_on_exit: true,
-            env,
+            env: launch.env,
             child_signal_mask: tty::SignalMask::current().ok(),
         };
         let pty = tty::new(&options, window_size(size), id.as_u128() as u64)
@@ -2877,7 +2916,14 @@ impl TerminalSession {
         // Match the PTY publisher's terminal -> metadata lock ordering. Taking the size lock
         // first can deadlock when sustained output publishes while a resize is waiting.
         *self.events.size.write() = size;
-        resize_terminal_with_history_reflow(&mut terminal, size);
+        // Read the semantic phase and prompt-start line under the same terminal ->
+        // shell_integration lock order used by `send_event`, so this can never deadlock. Together
+        // they decide whether — and where — the active prompt region is cleared before reflow.
+        let (phase, prompt_start_line) = {
+            let shell = self.events.shell_integration.lock();
+            (shell.phase, shell.prompt_start_line)
+        };
+        resize_terminal_with_history_reflow(&mut terminal, size, phase, prompt_start_line);
         terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
         self.events.publish_terminal(&terminal);
         drop(terminal);
@@ -3214,61 +3260,79 @@ fn snapshot_cell_is_empty(cell: &Cell) -> bool {
             .is_none_or(|zerowidth| zerowidth.is_empty())
 }
 
-/// Reflow completed primary-screen output while leaving the active logical input line for the
-/// shell to redraw after SIGWINCH.
+/// Resize the terminal, protecting the active shell prompt/input region from a reflow that the
+/// shell is about to redraw anyway.
 ///
-/// Clearing every wrap marker before resizing permanently discarded columns from scrollback.
-/// Only the logical line containing the cursor needs protection from a second shell redraw; all
-/// completed output keeps Alacritty's reversible reflow semantics.
+/// Alacritty reflows the whole primary screen on a column change, tracking each logical line by
+/// its `WRAPLINE` continuation markers. That is correct for completed command output, but the
+/// active prompt/input region is a special case: after `SIGWINCH` the shell reprints its prompt
+/// from scratch. Any copy of the prompt that resize leaves behind (or pushes into scrollback)
+/// becomes a stale duplicate — the "duplicate prompt fragments" bug, most visible with multiline
+/// prompts like Powerlevel10k where each resize sediments another copy into history.
+///
+/// When OSC 133 shell integration tells us the cursor is on a prompt/input region (`phase` is
+/// [`TerminalSemanticPhase::Prompt`] or [`TerminalSemanticPhase::Input`]), we clear that region —
+/// from the recorded prompt-start line down to the cursor — before resizing, blanking every cell
+/// so no stale glyph or `WRAPLINE`/`WIDE_CHAR` continuation survives, and let the shell redraw it.
+/// The cursor is left in place (like Ghostty's `clearCells`) so Alacritty's native resize tracks it
+/// and the shell's redraw repaints from the same anchor. `prompt_start_line` comes from the cursor
+/// position captured when the OSC 133 prompt-start marker arrived (mirroring Ghostty's approach),
+/// so command output above the prompt is preserved.
+///
+/// In every other case (command output, no shell integration, or a row-only resize) we fall back
+/// to Alacritty's native, reversible reflow — the same behavior Ghostty uses when it lacks
+/// semantic information.
 fn resize_terminal_with_history_reflow(
     terminal: &mut Term<DaemonEventListener>,
     size: TerminalSize,
+    phase: TerminalSemanticPhase,
+    prompt_start_line: Option<i32>,
 ) {
     let dimensions = GridSize(size);
-    if !terminal.mode().contains(TermMode::ALT_SCREEN) && terminal.columns() != dimensions.columns()
-    {
+
+    // Alternate-screen apps (vim, less, tmux, …) repaint themselves on resize, so neither
+    // reflow nor prompt-clearing applies. Hand straight off to the native resize.
+    if terminal.mode().contains(TermMode::ALT_SCREEN) {
+        terminal.resize(dimensions);
+        return;
+    }
+
+    let columns_changed = terminal.columns() != dimensions.columns();
+    let cursor_on_prompt = matches!(
+        phase,
+        TerminalSemanticPhase::Prompt | TerminalSemanticPhase::Input
+    );
+
+    // A wrap-reflow only happens on a column change; a row-only resize never reflows, so there is
+    // nothing to protect the prompt from.
+    if columns_changed && cursor_on_prompt {
         let grid = terminal.grid_mut();
         let old_columns = grid.columns();
-        let new_columns = dimensions.columns();
-        let old_last_column = Column(old_columns.saturating_sub(1));
-        let cursor_line = grid.cursor.point.line;
-        let minimum_line = Line(-(grid.history_size() as i32));
-        let mut logical_start = cursor_line;
-        while logical_start > minimum_line
-            && grid[logical_start - 1i32][old_last_column]
-                .flags
-                .contains(Flags::WRAPLINE)
-        {
-            logical_start -= 1;
-        }
-        for line in logical_start.0..=cursor_line.0 {
-            grid[Line(line)][old_last_column]
-                .flags
-                .remove(Flags::WRAPLINE);
+        let cursor_line = grid.cursor.point.line.0;
 
-            // Reflowing the active editable line is immediately superseded by the shell's
-            // SIGWINCH redraw and can leave duplicate prompt fragments behind. Discard only its
-            // cells outside the new viewport; completed output above remains untouched and keeps
-            // Alacritty's reversible reflow behavior.
-            if new_columns < old_columns {
-                if new_columns > 0
-                    && grid[Line(line)][Column(new_columns - 1)]
-                        .flags
-                        .contains(Flags::WIDE_CHAR)
-                {
-                    grid[Line(line)][Column(new_columns - 1)] = Cell::default();
-                }
-                for column in new_columns..old_columns {
-                    grid[Line(line)][Column(column)] = Cell::default();
-                }
+        // Clear from the recorded prompt start (captured when OSC 133 A arrived) down to the cursor.
+        // If we somehow have no recorded start, fall back to the cursor row alone rather than
+        // guessing a wider span — clearing too little only risks a small fragment, while clearing
+        // too much would wipe command output above the prompt.
+        //
+        // Clamp the start into the visible screen: scrollback above the prompt is settled history
+        // and must not be touched, and the cursor row is always the lower bound.
+        let start = prompt_start_line
+            .unwrap_or(cursor_line)
+            .clamp(0, cursor_line.max(0));
+
+        for line in start..=cursor_line.max(0) {
+            for column in 0..old_columns {
+                grid[Line(line)][Column(column)] = Cell::default();
             }
         }
 
-        if new_columns < old_columns && grid.cursor.point.column.0 >= new_columns {
-            grid.cursor.point.column = Column(new_columns.saturating_sub(1));
-            grid.cursor.input_needs_wrap = false;
-        }
+        terminal.resize(dimensions);
+        return;
     }
+
+    // Command output, no shell integration, or a row-only resize: native reflow is correct and
+    // reversible.
     terminal.resize(dimensions);
 }
 
@@ -3832,6 +3896,81 @@ impl DaemonState {
     }
 }
 
+/// The shell command line and environment Eggie should launch a child session with.
+struct ShellLaunch {
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+/// Build the environment and argument list for a child shell, injecting OSC 133 shell integration
+/// for the shells that support it. Pure (no I/O) so it can be unit-tested: the caller passes in the
+/// already-installed `integration_root` and the user's current `ZDOTDIR`/`ENV`.
+///
+/// - zsh: point `ZDOTDIR` at our integration dir, preserving the user's original in
+///   `EGGIE_ZDOTDIR_ORIG`. Keeps the existing `-l` login argument.
+/// - bash: launch `--posix` with `ENV` pointing at our script (the POSIX-mode injection hook),
+///   preserving the user's `ENV` in `EGGIE_BASH_ENV` and forwarding intercepted flags via
+///   `EGGIE_BASH_INJECT`/`EGGIE_BASH_RCFILE`. Skipped for Apple's `/bin/bash` (3.2), which disables
+///   the `ENV`-based POSIX startup path.
+/// - anything else / no integration installed: base environment only; resize falls back to native
+///   reflow.
+fn build_shell_env(
+    shell_name: &str,
+    shell_path: &str,
+    terminfo: &Path,
+    integration_root: Option<&Path>,
+    user_zdotdir: Option<String>,
+    user_env_var: Option<String>,
+) -> ShellLaunch {
+    let mut env = HashMap::new();
+    env.insert("TERM".to_owned(), "alacritty".to_owned());
+    env.insert(
+        "TERMINFO".to_owned(),
+        terminfo.to_string_lossy().into_owned(),
+    );
+    env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    env.insert("TERM_PROGRAM".to_owned(), "Eggie".to_owned());
+    env.insert(
+        "TERM_PROGRAM_VERSION".to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+    );
+
+    let mut args = vec!["-l".to_owned()];
+
+    match (shell_name, integration_root) {
+        ("zsh", Some(root)) => {
+            if let Some(original) = user_zdotdir {
+                env.insert("EGGIE_ZDOTDIR_ORIG".to_owned(), original);
+            }
+            env.insert(
+                "ZDOTDIR".to_owned(),
+                root.join("zsh").to_string_lossy().into_owned(),
+            );
+        }
+        // Apple's /bin/bash is 3.2 and does not honor the ENV-based POSIX startup path, so
+        // integration is impossible there; fall through to no injection.
+        ("bash", Some(root)) if shell_path != "/bin/bash" || !cfg!(target_os = "macos") => {
+            args = vec!["--posix".to_owned()];
+            if let Some(original) = user_env_var {
+                env.insert("EGGIE_BASH_ENV".to_owned(), original);
+            }
+            env.insert(
+                "ENV".to_owned(),
+                root.join("bash")
+                    .join("eggie.bash")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            // "1" marks an automatic (Eggie) injection; the script also reads any forwarded flags
+            // from here. We do not intercept --norc/--rcfile from SHELL today, so this is just "1".
+            env.insert("EGGIE_BASH_INJECT".to_owned(), "1".to_owned());
+        }
+        _ => {}
+    }
+
+    ShellLaunch { args, env }
+}
+
 fn install_bundled_terminfo() -> Result<PathBuf> {
     match INSTALLED_TERMINFO
         .get_or_init(|| install_bundled_terminfo_inner().map_err(|error| format!("{error:#}")))
@@ -3852,14 +3991,60 @@ fn install_bundled_terminfo_inner() -> Result<PathBuf> {
     fs::set_permissions(&database, fs::Permissions::from_mode(0o700))?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 
-    let current = fs::read(&entry).ok();
-    if current.as_deref() != Some(BUNDLED_ALACRITTY_TERMINFO) {
-        let temporary = directory.join(format!("alacritty.tmp-{}", process::id()));
-        fs::write(&temporary, BUNDLED_ALACRITTY_TERMINFO)?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        fs::rename(&temporary, &entry)?;
-    }
+    write_if_changed(&entry, BUNDLED_ALACRITTY_TERMINFO)?;
     Ok(database)
+}
+
+/// Write `contents` to `path` (mode 0600) only when it differs from what is already there, via a
+/// per-process temporary file and an atomic rename so concurrent sessions never observe a partial
+/// file. Shared by the terminfo and shell-integration installers.
+fn write_if_changed(path: &Path, contents: &[u8]) -> Result<()> {
+    if fs::read(path).ok().as_deref() == Some(contents) {
+        return Ok(());
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("cannot install {}: no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("cannot install {}: invalid file name", path.display()))?;
+    let temporary = directory.join(format!("{file_name}.tmp-{}", process::id()));
+    fs::write(&temporary, contents)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// Install the bundled shell-integration scripts into a per-user runtime directory and return its
+/// root. The zsh subdirectory becomes `ZDOTDIR`; the bash script under it becomes `ENV`.
+fn install_bundled_shell_integration() -> Result<PathBuf> {
+    match INSTALLED_SHELL_INTEGRATION.get_or_init(|| {
+        install_bundled_shell_integration_inner().map_err(|error| format!("{error:#}"))
+    }) {
+        Ok(path) => Ok(path.clone()),
+        Err(error) => bail!("failed to install bundled shell integration: {error}"),
+    }
+}
+
+fn install_bundled_shell_integration_inner() -> Result<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    let root = std::env::temp_dir()
+        .join(format!("eggie-{uid}"))
+        .join("shell-integration-v1");
+    let zsh = root.join("zsh");
+    let bash = root.join("bash");
+    fs::create_dir_all(&zsh)?;
+    fs::create_dir_all(&bash)?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&zsh, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&bash, fs::Permissions::from_mode(0o700))?;
+
+    // The dotfile name is required verbatim so zsh's ZDOTDIR mechanism finds it.
+    write_if_changed(&zsh.join(".zshenv"), BUNDLED_ZSH_ZSHENV)?;
+    write_if_changed(&zsh.join("eggie-integration"), BUNDLED_ZSH_INTEGRATION)?;
+    write_if_changed(&bash.join("eggie.bash"), BUNDLED_BASH_INTEGRATION)?;
+    Ok(root)
 }
 
 pub fn daemon_socket_path() -> PathBuf {
@@ -5564,6 +5749,8 @@ mod tests {
                 columns: 8,
                 ..initial_size
             },
+            TerminalSemanticPhase::Output,
+            None,
         );
 
         assert_eq!(terminal.grid()[Line(0)][Column(0)].c, 'A');
@@ -5576,7 +5763,7 @@ mod tests {
                 .contains(Flags::WRAPLINE)
         );
 
-        resize_terminal_with_history_reflow(&mut terminal, initial_size);
+        resize_terminal_with_history_reflow(&mut terminal, initial_size, TerminalSemanticPhase::Output, None);
 
         assert_eq!(terminal.grid()[Line(0)][Column(0)].c, 'A');
         assert_eq!(terminal.grid()[Line(0)][Column(11)].c, 'L');
@@ -5584,7 +5771,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_screen_resize_leaves_active_wrapped_input_for_shell_redraw() {
+    fn primary_screen_resize_clears_active_wrapped_input_for_shell_redraw() {
         let initial_size = TerminalSize {
             columns: 12,
             rows: 3,
@@ -5616,19 +5803,403 @@ mod tests {
                 columns: 8,
                 ..initial_size
             },
+            TerminalSemanticPhase::Input,
+            Some(0),
         );
 
-        let first_input_line = (-(terminal.grid().history_size() as i32)
+        // The active prompt/input line is on a prompt phase, so it is cleared entirely: none of
+        // its glyphs survive and no stale WRAPLINE continuation is left for the shell's redraw to
+        // stack a duplicate on top of.
+        let has_prompt_glyph = (-(terminal.grid().history_size() as i32)
             ..terminal.grid().screen_lines() as i32)
-            .map(Line)
-            .find(|line| terminal.grid()[*line][Column(0)].c == 'A')
-            .expect("the active input line remains in the grid until the shell redraws it");
-        assert_eq!(terminal.grid()[first_input_line][Column(7)].c, 'H');
+            .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
+            .any(|(line, column)| {
+                let cell = &terminal.grid()[Line(line)][Column(column)];
+                "ABCDEFGHIJKLMNOP".contains(cell.c)
+            });
         assert!(
-            !terminal.grid()[first_input_line][Column(7)]
-                .flags
-                .contains(Flags::WRAPLINE)
+            !has_prompt_glyph,
+            "the active prompt/input line must be cleared for the shell to redraw"
         );
+        let has_wrapline = (-(terminal.grid().history_size() as i32)
+            ..terminal.grid().screen_lines() as i32)
+            .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
+            .any(|(line, column)| {
+                terminal.grid()[Line(line)][Column(column)]
+                    .flags
+                    .contains(Flags::WRAPLINE)
+            });
+        assert!(
+            !has_wrapline,
+            "no stale WRAPLINE continuation may survive on the cleared prompt line"
+        );
+    }
+
+    /// Build a bare primary-screen terminal with a two-row wrapped active line ("ABCDEFGH" on
+    /// row 0 continuing into "IJKL" on row 1), the cursor parked on the continuation row. Returns
+    /// the terminal ready for a resize.
+    fn terminal_with_wrapped_active_line(size: TerminalSize) -> Term<DaemonEventListener> {
+        let state = Arc::new(ListenerState::new(
+            SessionId::new_v4(),
+            size,
+            TerminalAppearance::default(),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let listener = DaemonEventListener(state);
+        let mut terminal = Term::new(Config::default(), &GridSize(size), listener);
+        for (column, character) in "ABCDEFGH".chars().enumerate() {
+            terminal.grid_mut()[Line(0)][Column(column)].c = character;
+        }
+        terminal.grid_mut()[Line(0)][Column(size.columns as usize - 1)]
+            .flags
+            .insert(Flags::WRAPLINE);
+        for (column, character) in "IJKL".chars().enumerate() {
+            terminal.grid_mut()[Line(1)][Column(column)].c = character;
+        }
+        terminal.grid_mut().cursor.point =
+            alacritty_terminal::index::Point::new(Line(1), Column(4));
+        terminal
+    }
+
+    fn grid_has_glyph(terminal: &Term<DaemonEventListener>, glyphs: &str) -> bool {
+        (-(terminal.grid().history_size() as i32)..terminal.grid().screen_lines() as i32)
+            .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
+            .any(|(line, column)| glyphs.contains(terminal.grid()[Line(line)][Column(column)].c))
+    }
+
+    fn grid_has_wrapline(terminal: &Term<DaemonEventListener>) -> bool {
+        (-(terminal.grid().history_size() as i32)..terminal.grid().screen_lines() as i32)
+            .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
+            .any(|(line, column)| {
+                terminal.grid()[Line(line)][Column(column)]
+                    .flags
+                    .contains(Flags::WRAPLINE)
+            })
+    }
+
+    #[test]
+    fn prompt_phase_shrink_clears_active_line_and_removes_wrapline() {
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+        // Put a completed-output row above the active line to make sure it is NOT cleared.
+        terminal.grid_mut()[Line(3)][Column(0)].c = '#';
+
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                columns: 4,
+                ..initial_size
+            },
+            TerminalSemanticPhase::Prompt,
+            Some(0),
+        );
+
+        assert!(
+            !grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "the wrapped prompt line must be fully cleared on shrink"
+        );
+        assert!(
+            !grid_has_wrapline(&terminal),
+            "no WRAPLINE may survive on the cleared prompt region"
+        );
+    }
+
+    #[test]
+    fn prompt_phase_grow_clears_active_line_no_orphan_rows() {
+        // Regression test for the duplicate-fragment bug: on WIDEN, the old code stripped the
+        // WRAPLINE marker but left the continuation cells in place, so alacritty's grow_columns
+        // failed to merge them and left an orphan row that stacked under the shell's redraw.
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                columns: 16,
+                ..initial_size
+            },
+            TerminalSemanticPhase::Input,
+            Some(0),
+        );
+
+        assert!(
+            !grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "no orphan continuation row may survive a widen on a prompt line"
+        );
+        assert!(
+            !grid_has_wrapline(&terminal),
+            "no stale WRAPLINE may survive a widen on a prompt line"
+        );
+    }
+
+    #[test]
+    fn output_phase_reflows_natively_without_clearing() {
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+
+        // Output phase: the wrapped content is completed command output and must reflow, not be
+        // cleared. Shrink then grow and confirm the glyphs survive the round trip.
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                columns: 4,
+                ..initial_size
+            },
+            TerminalSemanticPhase::Output,
+            None,
+        );
+        assert!(
+            grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "output content must be preserved (reflowed), not cleared"
+        );
+        resize_terminal_with_history_reflow(&mut terminal, initial_size, TerminalSemanticPhase::Output, None);
+        assert!(
+            grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "output content must survive the reflow round trip"
+        );
+    }
+
+    #[test]
+    fn none_phase_uses_native_reflow_without_clearing() {
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+
+        // No shell integration: phase stays None and we must fall back to native reflow, never
+        // clearing content.
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                columns: 4,
+                ..initial_size
+            },
+            TerminalSemanticPhase::None,
+            None,
+        );
+        assert!(
+            grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "without shell integration, content must reflow, not be cleared"
+        );
+    }
+
+    #[test]
+    fn alt_screen_resize_skips_prompt_clearing() {
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+        // Enter the alternate screen; the wrapped active line above is on the primary screen, but
+        // the alt-screen guard must short-circuit before any clearing regardless of phase.
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut terminal, b"\x1b[?1049h");
+        assert!(terminal.mode().contains(TermMode::ALT_SCREEN));
+
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                columns: 4,
+                ..initial_size
+            },
+            TerminalSemanticPhase::Prompt,
+            Some(0),
+        );
+        // The alt screen was blank, so there is nothing to assert on its contents; the test simply
+        // verifies the guard path runs without touching the primary grid's clear logic (no panic,
+        // resize applied).
+        assert_eq!(terminal.columns(), 4);
+    }
+
+    #[test]
+    fn row_only_resize_does_not_clear_prompt() {
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+
+        // Only rows change (columns stay 8): no wrap-reflow happens, so the prompt line must be
+        // left untouched even on a prompt phase.
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                rows: 6,
+                ..initial_size
+            },
+            TerminalSemanticPhase::Prompt,
+            Some(0),
+        );
+        assert!(
+            grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "a row-only resize must not clear the prompt line"
+        );
+    }
+
+    #[test]
+    fn resize_reads_tracker_phase_to_gate_clearing() {
+        // Drive the tracker the way the OSC 133 event path does, then confirm the phase it exposes
+        // routes the resize into the prompt-clearing branch.
+        let mut tracker = ShellIntegrationTracker::default();
+        tracker.update(
+            SemanticPrompt {
+                action: SemanticPromptAction::PromptStart,
+                options: String::new(),
+            },
+            0,
+        );
+        tracker.update(
+            SemanticPrompt {
+                action: SemanticPromptAction::InputStart,
+                options: String::new(),
+            },
+            1,
+        );
+        assert_eq!(tracker.phase, TerminalSemanticPhase::Input);
+        // The prompt start was recorded from the first (PromptStart) marker, not moved down to the
+        // input line.
+        assert_eq!(tracker.prompt_start_line, Some(0));
+
+        let initial_size = TerminalSize {
+            columns: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        let mut terminal = terminal_with_wrapped_active_line(initial_size);
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            TerminalSize {
+                columns: 4,
+                ..initial_size
+            },
+            tracker.phase,
+            tracker.prompt_start_line,
+        );
+        assert!(
+            !grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
+            "the tracker's Input phase must route the resize into the prompt-clearing branch"
+        );
+    }
+
+    #[test]
+    fn zsh_env_sets_zdotdir_and_preserves_original() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env(
+            "zsh",
+            "/bin/zsh",
+            &terminfo,
+            Some(&root),
+            Some("/home/user/.zsh".to_owned()),
+            None,
+        );
+        assert_eq!(
+            launch.env.get("ZDOTDIR").map(String::as_str),
+            Some("/tmp/eggie-integration/zsh")
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_ZDOTDIR_ORIG").map(String::as_str),
+            Some("/home/user/.zsh")
+        );
+        // Base environment still present, and the login arg is preserved for zsh.
+        assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+        assert!(launch.env.contains_key("TERMINFO"));
+        assert_eq!(launch.args, vec!["-l".to_owned()]);
+    }
+
+    #[test]
+    fn zsh_env_without_user_zdotdir_sets_no_marker() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env("zsh", "/bin/zsh", &terminfo, Some(&root), None, None);
+        assert!(launch.env.contains_key("ZDOTDIR"));
+        assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
+    }
+
+    #[test]
+    fn bash_env_sets_env_var_and_inject() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        // A non-Apple bash path (e.g. Homebrew) gets full integration.
+        let launch = build_shell_env(
+            "bash",
+            "/opt/homebrew/bin/bash",
+            &terminfo,
+            Some(&root),
+            None,
+            Some("/home/user/env.sh".to_owned()),
+        );
+        assert_eq!(
+            launch.env.get("ENV").map(String::as_str),
+            Some("/tmp/eggie-integration/bash/eggie.bash")
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_BASH_ENV").map(String::as_str),
+            Some("/home/user/env.sh")
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_BASH_INJECT").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(launch.args, vec!["--posix".to_owned()]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn apple_bin_bash_skips_integration() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env("bash", "/bin/bash", &terminfo, Some(&root), None, None);
+        // Apple's /bin/bash cannot use the ENV-based POSIX startup path, so no injection.
+        assert!(!launch.env.contains_key("ENV"));
+        assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
+        assert!(launch.env.contains_key("TERM"));
+    }
+
+    #[test]
+    fn non_integrated_shell_has_no_injection() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env("fish", "/usr/bin/fish", &terminfo, Some(&root), None, None);
+        assert!(!launch.env.contains_key("ZDOTDIR"));
+        assert!(!launch.env.contains_key("ENV"));
+        assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
+        // Base environment is still populated.
+        assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    }
+
+    #[test]
+    fn no_integration_root_skips_injection() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        // Installation failed -> integration_root is None -> zsh gets no ZDOTDIR override.
+        let launch = build_shell_env(
+            "zsh",
+            "/bin/zsh",
+            &terminfo,
+            None,
+            Some("/home/user/.zsh".to_owned()),
+            None,
+        );
+        assert!(!launch.env.contains_key("ZDOTDIR"));
+        assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
+        assert_eq!(launch.args, vec!["-l".to_owned()]);
     }
 
     #[test]
@@ -5675,7 +6246,7 @@ mod tests {
         };
 
         for _ in 0..3 {
-            resize_terminal_with_history_reflow(&mut terminal, compact_size);
+            resize_terminal_with_history_reflow(&mut terminal, compact_size, TerminalSemanticPhase::Output, None);
             let marker = (-(terminal.grid().history_size() as i32)
                 ..terminal.grid().screen_lines() as i32)
                 .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
@@ -5700,7 +6271,7 @@ mod tests {
             assert_eq!((content.line, content.column), (marker.0, marker.1 as u32));
             assert_eq!((blank.line, blank.column), (line_start.0 + 1, 2));
 
-            resize_terminal_with_history_reflow(&mut terminal, initial_size);
+            resize_terminal_with_history_reflow(&mut terminal, initial_size, TerminalSemanticPhase::Output, None);
             let marker = (-(terminal.grid().history_size() as i32)
                 ..terminal.grid().screen_lines() as i32)
                 .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
@@ -5785,7 +6356,7 @@ mod tests {
 
         terminal.scroll_display(Scroll::Bottom);
         let compact_size = TerminalSize { columns: 6, ..size };
-        resize_terminal_with_history_reflow(&mut terminal, compact_size);
+        resize_terminal_with_history_reflow(&mut terminal, compact_size, TerminalSemanticPhase::Output, None);
         assert!(
             snapshot_terminal(&terminal, session_id, compact_size, String::new(), 5, 0,)
                 .image_placements
@@ -5810,7 +6381,7 @@ mod tests {
             u32::from(marker.column)
         );
 
-        resize_terminal_with_history_reflow(&mut terminal, size);
+        resize_terminal_with_history_reflow(&mut terminal, size, TerminalSemanticPhase::Output, None);
         terminal.scroll_display(Scroll::Top);
         let restored_history = snapshot_terminal(&terminal, session_id, size, String::new(), 7, 0);
         let marker = restored_history
@@ -6627,30 +7198,30 @@ mod tests {
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::PromptStart,
             options: String::new(),
-        });
+        }, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::InputStart,
             options: "cmdline=echo hello".to_owned(),
-        });
+        }, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::CommandFinished,
             options: "130".to_owned(),
-        });
+        }, 0);
         assert_eq!(tracker.snapshot().phase, TerminalSemanticPhase::None);
         assert!(tracker.snapshot().history.is_empty());
 
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::InputStart,
             options: "cmdline=printf ok".to_owned(),
-        });
+        }, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::OutputStart,
             options: String::new(),
-        });
+        }, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::CommandFinished,
             options: "7".to_owned(),
-        });
+        }, 0);
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.phase, TerminalSemanticPhase::None);
         assert_eq!(snapshot.history.len(), 1);

@@ -2947,7 +2947,9 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn semantic_prompt(&mut self, prompt: SemanticPrompt) {
-        self.event_proxy.send_event(Event::SemanticPrompt(prompt));
+        let cursor_line = self.grid.cursor.point.line.0;
+        self.event_proxy
+            .send_event(Event::SemanticPrompt(prompt, cursor_line));
     }
 
     #[inline]

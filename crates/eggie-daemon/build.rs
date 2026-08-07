@@ -26,4 +26,17 @@ fn main() {
         .expect("tic did not produce an alacritty terminfo entry");
     fs::copy(compiled, out_dir.join("alacritty.terminfo"))
         .expect("failed to stage compiled Eggie terminfo");
+
+    // Stage the shell-integration scripts into OUT_DIR so lib.rs can embed them
+    // with include_bytes!. Dotfiles (.zshenv) are staged under a plain name for
+    // readability; the runtime installer writes them back under their real names.
+    for (source, staged) in [
+        ("shell-integration/zsh/.zshenv", "eggie-zsh-zshenv"),
+        ("shell-integration/zsh/eggie-integration", "eggie-zsh-integration"),
+        ("shell-integration/bash/eggie.bash", "eggie-bash"),
+    ] {
+        println!("cargo:rerun-if-changed={source}");
+        fs::copy(source, out_dir.join(staged))
+            .unwrap_or_else(|error| panic!("failed to stage {source}: {error}"));
+    }
 }
