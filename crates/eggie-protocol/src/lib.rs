@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -282,6 +282,14 @@ pub enum ClientRequest {
     Scroll {
         session_id: SessionId,
         event: TerminalScrollEvent,
+    },
+    /// Search the terminal grid (including scrollback) for `query`. The daemon runs the search in
+    /// its terminal core, scrolls the viewport so the active match is visible, publishes a fresh
+    /// snapshot, and replies with [`DaemonResponse::SearchResult`]. Coordinates in the reply are
+    /// viewport-relative, matching the snapshot the client renders against.
+    TerminalSearch {
+        session_id: SessionId,
+        request: TerminalSearchRequest,
     },
     Focus {
         session_id: SessionId,
@@ -693,6 +701,63 @@ pub struct TerminalCellPosition {
     pub column: u16,
 }
 
+/// Direction to advance when moving between terminal search matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSearchDirection {
+    /// Toward the end of the buffer (later output).
+    #[default]
+    Forward,
+    /// Toward the start of the buffer (earlier output / scrollback).
+    Backward,
+}
+
+/// A terminal search query issued by the client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSearchRequest {
+    /// The query text. Interpreted literally unless [`Self::regex`] is set.
+    pub query: String,
+    /// When true, `query` is a regular expression; otherwise it is matched literally.
+    #[serde(default)]
+    pub regex: bool,
+    /// Which way to move from the current active match to select the next one.
+    #[serde(default)]
+    pub direction: TerminalSearchDirection,
+    /// When true this is the first query of a session (typing a new pattern) and the search should
+    /// start from the current viewport rather than advancing past the previous active match.
+    #[serde(default)]
+    pub fresh: bool,
+}
+
+/// A single terminal search match, in viewport-relative coordinates. Both endpoints are inclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSearchMatch {
+    #[serde(rename = "s")]
+    pub start: TerminalCellPosition,
+    #[serde(rename = "e")]
+    pub end: TerminalCellPosition,
+}
+
+/// Result of a [`ClientRequest::TerminalSearch`]. When `active` is `None` the query did not match
+/// anywhere in the buffer. `matches` lists every match currently visible in the viewport (which the
+/// daemon has already scrolled so that `active` is on screen); `total` counts all matches across
+/// the whole buffer and `index` is the 0-based position of the active match within that total.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSearchResult {
+    #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<TerminalSearchMatch>,
+    #[serde(rename = "m", default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<TerminalSearchMatch>,
+    #[serde(rename = "i", default)]
+    pub index: usize,
+    #[serde(rename = "n", default)]
+    pub total: usize,
+    /// Revision of the snapshot these coordinates apply to. The client should render the highlight
+    /// against a snapshot with at least this revision.
+    #[serde(rename = "r")]
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshotDelta {
     #[serde(rename = "id")]
@@ -860,6 +925,10 @@ pub enum DaemonResponse {
         session_id: SessionId,
         state: TerminalShellIntegrationState,
     },
+    SearchResult {
+        session_id: SessionId,
+        result: TerminalSearchResult,
+    },
     TerminalImage {
         key: TerminalImageKey,
         width: u32,
@@ -1012,6 +1081,15 @@ mod tests {
                     modifiers: TerminalModifiers::default(),
                 },
             },
+            ClientRequest::TerminalSearch {
+                session_id: Uuid::nil(),
+                request: TerminalSearchRequest {
+                    query: "需要 find".to_owned(),
+                    regex: true,
+                    direction: TerminalSearchDirection::Backward,
+                    fresh: true,
+                },
+            },
             ClientRequest::Focus {
                 session_id: Uuid::nil(),
                 focused: true,
@@ -1078,6 +1156,17 @@ mod tests {
             let decoded: ClientRequest = serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded, request);
         }
+    }
+
+    #[test]
+    fn terminal_search_request_omitted_fields_use_defaults() {
+        // A request that specifies only the query must decode, defaulting regex/fresh to false and
+        // direction to Forward, so partial or older-client payloads don't hard-fail.
+        let decoded: TerminalSearchRequest = serde_json::from_str(r#"{"query":"foo"}"#).unwrap();
+        assert_eq!(decoded.query, "foo");
+        assert!(!decoded.regex);
+        assert!(!decoded.fresh);
+        assert_eq!(decoded.direction, TerminalSearchDirection::Forward);
     }
 
     #[test]

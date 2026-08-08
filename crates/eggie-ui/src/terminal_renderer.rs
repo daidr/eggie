@@ -7,7 +7,8 @@ use crate::{
 };
 use alacritty_terminal::term::cell::Flags;
 use eggie_protocol::{
-    TerminalCell, TerminalColor, TerminalCursorShape, TerminalImageKey, TerminalSnapshot,
+    TerminalCell, TerminalColor, TerminalCursorShape, TerminalImageKey, TerminalSearchMatch,
+    TerminalSearchResult, TerminalSnapshot,
 };
 use gpui::{
     App, Bounds, Element, ElementId, FocusHandle, GlobalElementId, InputHandler,
@@ -70,6 +71,28 @@ pub(crate) struct TerminalRenderOptions {
     ime: Option<TerminalImeState>,
     input: Option<TerminalInputContext>,
     input_latency: InputLatencyTracker,
+    search: Option<TerminalSearchHighlights>,
+}
+
+/// Viewport-relative search highlights to overlay on the terminal grid. `active` is the currently
+/// selected match (drawn in a stronger color); `matches` are all other visible matches.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct TerminalSearchHighlights {
+    pub(crate) active: Option<TerminalSearchMatch>,
+    pub(crate) matches: Vec<TerminalSearchMatch>,
+}
+
+impl TerminalSearchHighlights {
+    pub(crate) fn from_result(result: &TerminalSearchResult) -> Self {
+        Self {
+            active: result.active,
+            matches: result.matches.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active.is_none() && self.matches.is_empty()
+    }
 }
 
 impl TerminalRenderOptions {
@@ -90,7 +113,13 @@ impl TerminalRenderOptions {
             ime,
             input,
             input_latency,
+            search: None,
         }
+    }
+
+    pub(crate) fn with_search(mut self, search: Option<TerminalSearchHighlights>) -> Self {
+        self.search = search.filter(|search| !search.is_empty());
+        self
     }
 }
 
@@ -139,6 +168,7 @@ struct PreparationKey {
     minimum_contrast_bits: u32,
     selection: Option<TerminalSelection>,
     ime: Option<TerminalImeState>,
+    search: Option<TerminalSearchHighlights>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -181,6 +211,7 @@ impl MetalTerminalRenderer {
             ime: options.ime,
             input: options.input,
             input_latency: options.input_latency,
+            search: options.search,
         }
     }
 
@@ -228,6 +259,7 @@ pub(crate) struct MetalTerminalElement {
     ime: Option<TerminalImeState>,
     input: Option<TerminalInputContext>,
     input_latency: InputLatencyTracker,
+    search: Option<TerminalSearchHighlights>,
 }
 
 #[derive(Clone, Debug)]
@@ -661,6 +693,7 @@ impl Element for MetalTerminalElement {
             minimum_contrast_bits: self.minimum_contrast.to_bits(),
             selection: self.selection,
             ime: self.ime.clone(),
+            search: self.search.clone(),
         };
         let cached = self
             .renderer
@@ -689,6 +722,7 @@ impl Element for MetalTerminalElement {
                 self.minimum_contrast,
                 self.selection,
                 self.ime.as_ref(),
+                self.search.as_ref(),
                 &image_cache,
             ));
             drop(image_cache);
@@ -822,6 +856,7 @@ fn prepare_terminal(
     minimum_contrast: f32,
     selection: Option<TerminalSelection>,
     ime: Option<&TerminalImeState>,
+    search: Option<&TerminalSearchHighlights>,
     image_cache: &FxHashMap<TerminalTextureKey, Arc<TerminalImageData>>,
 ) -> PreparedMetalTerminal {
     let palette = TerminalPalette::new(snapshot, theme);
@@ -847,6 +882,9 @@ fn prepare_terminal(
         line_height,
         (accent << 8) | 0x55,
     );
+    // Search highlights sit in the same overlay layer as the selection. Non-active matches use a
+    // muted yellow; the active match uses a stronger orange so it stands out.
+    let mut search_commands = prepare_search(search, snapshot, cell_width, line_height);
     let (mut cursor_background, mut cursor_foreground) =
         if ime.is_some_and(|ime| !ime.text.is_empty()) {
             (Vec::new(), Vec::new())
@@ -870,6 +908,7 @@ fn prepare_terminal(
             + backgrounds.len()
             + images_below_text.len()
             + selection_commands.len()
+            + search_commands.len()
             + cursor_background.len()
             + glyphs.len()
             + decorations.len()
@@ -881,6 +920,7 @@ fn prepare_terminal(
     commands.append(&mut backgrounds);
     commands.append(&mut images_below_text);
     commands.append(&mut selection_commands);
+    commands.append(&mut search_commands);
     commands.append(&mut cursor_background);
     commands.append(&mut glyphs);
     commands.append(&mut decorations);
@@ -1036,6 +1076,93 @@ fn prepare_selection(
         );
     }
     commands
+}
+
+/// Non-active search matches: muted yellow. RGBA packed as `(rgb << 8) | alpha`.
+const SEARCH_MATCH_COLOR: u32 = (0xFFD54F << 8) | 0x66;
+/// The active search match: stronger orange so the current hit stands out.
+const SEARCH_ACTIVE_COLOR: u32 = (0xFF9800 << 8) | 0xBB;
+
+/// Build overlay rectangles for search matches. Non-active matches are drawn first (muted), then
+/// the active match on top (stronger), so an overlapping active highlight always wins visually.
+fn prepare_search(
+    search: Option<&TerminalSearchHighlights>,
+    snapshot: &TerminalSnapshot,
+    cell_width: f32,
+    line_height: f32,
+) -> Vec<MetalCommand> {
+    let Some(search) = search else {
+        return Vec::new();
+    };
+    let rows = snapshot.size.rows;
+    let columns = snapshot.size.columns;
+    if rows == 0 || columns == 0 {
+        return Vec::new();
+    }
+    let mut commands = Vec::with_capacity(search.matches.len() + 1);
+    for search_match in &search.matches {
+        // Skip the match that is also the active one; it is drawn separately on top.
+        if search.active == Some(*search_match) {
+            continue;
+        }
+        push_search_match(
+            &mut commands,
+            *search_match,
+            rows,
+            columns,
+            cell_width,
+            line_height,
+            SEARCH_MATCH_COLOR,
+        );
+    }
+    if let Some(active) = search.active {
+        push_search_match(
+            &mut commands,
+            active,
+            rows,
+            columns,
+            cell_width,
+            line_height,
+            SEARCH_ACTIVE_COLOR,
+        );
+    }
+    commands
+}
+
+/// Push the overlay rectangles for a single (possibly multi-line) match, clamped to the grid.
+fn push_search_match(
+    commands: &mut Vec<MetalCommand>,
+    search_match: TerminalSearchMatch,
+    rows: u16,
+    columns: u16,
+    cell_width: f32,
+    line_height: f32,
+    color: u32,
+) {
+    let mut start = search_match.start;
+    let mut end = search_match.end;
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+    start.line = start.line.min(rows - 1);
+    end.line = end.line.min(rows - 1);
+    start.column = start.column.min(columns - 1);
+    end.column = end.column.min(columns - 1);
+    for line in start.line..=end.line {
+        let first_column = if line == start.line { start.column } else { 0 };
+        let last_column = if line == end.line { end.column } else { columns - 1 };
+        // Guard against first > last (e.g. a multi-row match whose endpoints clamped onto the same
+        // row) so the u16 width computation never underflows.
+        let (lo, hi) = (first_column.min(last_column), first_column.max(last_column));
+        push_rect(
+            commands,
+            lo as f32 * cell_width,
+            line as f32 * line_height,
+            (hi - lo + 1) as f32 * cell_width,
+            line_height,
+            color,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1953,6 +2080,7 @@ mod tests {
             1.,
             None,
             None,
+            None,
             &image_cache,
         );
         let image_index = |id| {
@@ -2136,6 +2264,7 @@ mod tests {
                 14.,
                 0x3399ffff,
                 1.,
+                None,
                 None,
                 None,
                 &image_cache,

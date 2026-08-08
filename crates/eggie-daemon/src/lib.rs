@@ -2,7 +2,7 @@ use alacritty_terminal::{
     event::{Event, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
-    index::{Column, Line},
+    index::{Boundary, Column, Direction, Line, Point, Side},
     sync::FairMutex,
     term::{
         ClipboardType, Config, Osc52, Term, TermMode,
@@ -10,6 +10,7 @@ use alacritty_terminal::{
         color::COUNT,
         kitty_graphics::{ImageKey as KittyImageKey, PixelBuffer},
         point_to_viewport,
+        search::{RegexIter, RegexSearch},
     },
     tty,
     vte::ansi::{
@@ -36,7 +37,8 @@ use eggie_protocol::{
     TerminalMouseTracking, TerminalNotification, TerminalOscEvent, TerminalOscEventPayload,
     TerminalOscEventUpdate, TerminalProgress, TerminalProgressState, TerminalProgressTimeouts,
     TerminalProgressUpdate, TerminalReportedLocation, TerminalScrollEvent, TerminalScrollPhase,
-    TerminalScrollUnit, TerminalSemanticPhase, TerminalShellIntegrationState, TerminalSize,
+    TerminalScrollUnit, TerminalSearchDirection, TerminalSearchMatch, TerminalSearchRequest,
+    TerminalSearchResult, TerminalSemanticPhase, TerminalShellIntegrationState, TerminalSize,
     TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
 };
 use flate2::write::ZlibDecoder;
@@ -55,6 +57,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
+    ops::RangeInclusive,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -2520,6 +2523,20 @@ struct TerminalSession {
     sender: EventLoopSender,
     last_input_sequence: Arc<AtomicU64>,
     mouse_state: Mutex<TerminalMouseState>,
+    search_state: Mutex<TerminalSearchState>,
+}
+
+/// Per-session terminal search cursor. Tracks the last active match (in grid-absolute coordinates)
+/// so `find next`/`find previous` can advance relative to it across requests.
+#[derive(Default)]
+struct TerminalSearchState {
+    /// The query the current cursor position belongs to. Reset the cursor whenever it changes.
+    query: String,
+    regex: bool,
+    /// Grid-absolute range of the current active match, if any. The start keys the match against
+    /// the full-buffer enumeration; the end is where forward navigation advances from (and the
+    /// start where backward navigation does), so overlapping matches are not re-found.
+    active: Option<RangeInclusive<Point>>,
 }
 
 enum TerminalSnapshotUpdate {
@@ -2637,6 +2654,7 @@ impl TerminalSession {
             sender,
             last_input_sequence,
             mouse_state: Mutex::new(TerminalMouseState::default()),
+            search_state: Mutex::new(TerminalSearchState::default()),
         })
     }
 
@@ -2896,6 +2914,146 @@ impl TerminalSession {
         }
         drop(terminal);
         Ok(())
+    }
+
+    fn search(&self, request: TerminalSearchRequest) -> Result<TerminalSearchResult> {
+        let mut terminal = self.terminal.lock();
+
+        // An empty query clears any active search and highlights nothing.
+        if request.query.is_empty() {
+            *self.search_state.lock() = TerminalSearchState::default();
+            drop(terminal);
+            return Ok(TerminalSearchResult {
+                active: None,
+                matches: Vec::new(),
+                index: 0,
+                total: 0,
+                revision: self.events.revision.load(Ordering::Acquire),
+            });
+        }
+
+        let pattern = if request.regex {
+            request.query.clone()
+        } else {
+            regex_escape(&request.query)
+        };
+        let mut regex = match RegexSearch::new(&pattern) {
+            Ok(regex) => regex,
+            // An invalid regex (or a literal that still fails to compile) simply matches nothing.
+            Err(_) => {
+                drop(terminal);
+                return Ok(TerminalSearchResult {
+                    active: None,
+                    matches: Vec::new(),
+                    index: 0,
+                    total: 0,
+                    revision: self.events.revision.load(Ordering::Acquire),
+                });
+            }
+        };
+
+        let direction = match request.direction {
+            TerminalSearchDirection::Forward => Direction::Right,
+            TerminalSearchDirection::Backward => Direction::Left,
+        };
+
+        // Decide whether we are continuing to navigate the same query or starting over. A changed
+        // query/mode, an explicit `fresh` flag, or the very first search all reset the cursor.
+        let previous_active = {
+            let state = self.search_state.lock();
+            let same_query = state.query == request.query && state.regex == request.regex;
+            if request.fresh || !same_query {
+                None
+            } else {
+                state.active.clone()
+            }
+        };
+
+        let display_offset = terminal.grid().display_offset();
+        let last_column = terminal.grid().last_column();
+        let screen_lines = terminal.grid().screen_lines();
+
+        // Choose the origin the search advances from.
+        let origin = match &previous_active {
+            Some(active) => {
+                // Advance past the previous match's far edge so overlapping matches are not
+                // re-found: forward moves one cell past the end, backward one cell before the start.
+                match direction {
+                    Direction::Right => active.end().add(&*terminal, Boundary::None, 1),
+                    Direction::Left => active.start().sub(&*terminal, Boundary::None, 1),
+                }
+            }
+            None => {
+                // Start from the edge of the current viewport so the first match found is the one
+                // closest to what the user is already looking at.
+                let top = Line(-(display_offset as i32));
+                let bottom = Line(screen_lines as i32 - 1 - display_offset as i32);
+                match direction {
+                    Direction::Right => Point::new(top, Column(0)),
+                    Direction::Left => Point::new(bottom, last_column),
+                }
+            }
+        };
+
+        let Some(active_match) =
+            terminal.search_next(&mut regex, origin, direction, Side::Left, None)
+        else {
+            // No match anywhere. Preserve the query so a later navigation keypress with the same
+            // text does not resurrect a stale cursor.
+            let mut state = self.search_state.lock();
+            state.query = request.query.clone();
+            state.regex = request.regex;
+            state.active = None;
+            drop(state);
+            drop(terminal);
+            return Ok(TerminalSearchResult {
+                active: None,
+                matches: Vec::new(),
+                index: 0,
+                total: 0,
+                revision: self.events.revision.load(Ordering::Acquire),
+            });
+        };
+
+        let active_start = *active_match.start();
+
+        // Count every match across the whole buffer and find the active match's ordinal. The
+        // terminal core caps regex complexity internally, so this stays bounded.
+        let (total, index) = count_all_matches(&*terminal, &mut regex, active_start);
+
+        // Remember where we are so the next navigation keypress advances from here.
+        {
+            let mut state = self.search_state.lock();
+            state.query = request.query.clone();
+            state.regex = request.regex;
+            state.active = Some(active_match.clone());
+        }
+
+        // Scroll so the active match is on screen, if it is not already.
+        let target_offset = active_match_display_offset(&*terminal, active_start);
+        if target_offset != display_offset {
+            let delta = target_offset as i32 - display_offset as i32;
+            terminal.scroll_display(Scroll::Delta(delta));
+            self.events.publish_terminal(&terminal);
+        }
+
+        // Collect every match that falls within the (possibly newly scrolled) viewport, in
+        // viewport-relative coordinates, for highlighting.
+        let final_offset = terminal.grid().display_offset();
+        let columns = terminal.grid().columns();
+        let matches = collect_viewport_matches(&*terminal, &mut regex, final_offset, screen_lines);
+        let active =
+            viewport_match_inner(active_match.clone(), final_offset, screen_lines, columns);
+
+        let revision = self.events.revision.load(Ordering::Acquire);
+        drop(terminal);
+        Ok(TerminalSearchResult {
+            active,
+            matches,
+            index,
+            total,
+            revision,
+        })
     }
 
     fn focus(&self, focused: bool) -> Result<()> {
@@ -3489,6 +3647,142 @@ fn snapshot_cursor_shape(shape: CursorShape) -> TerminalCursorShape {
     }
 }
 
+/// Escape a literal search string so it can be compiled as a regex that matches it verbatim.
+fn regex_escape(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len());
+    for c in literal.chars() {
+        if matches!(
+            c,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                | '#'
+                | '&'
+                | '-'
+                | '~'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Count every match in the whole buffer and return `(total, index_of_active)`. `index` is the
+/// 0-based ordinal of the match starting at `active_start`; it defaults to 0 if that match is not
+/// found during the walk (which should not happen for a match the caller just located).
+fn count_all_matches<T>(
+    terminal: &Term<T>,
+    regex: &mut RegexSearch,
+    active_start: Point,
+) -> (usize, usize) {
+    let start = Point::new(terminal.topmost_line(), Column(0));
+    let end = Point::new(terminal.bottommost_line(), terminal.grid().last_column());
+    let mut total = 0usize;
+    let mut index = 0usize;
+    for regex_match in RegexIter::new(start, end, Direction::Right, terminal, regex) {
+        if *regex_match.start() == active_start {
+            index = total;
+        }
+        total += 1;
+    }
+    (total, index)
+}
+
+/// The `display_offset` that brings the match starting at `active_start` fully on screen. If the
+/// match is already visible the current offset is returned unchanged; otherwise the match line is
+/// positioned near the top of the viewport.
+fn active_match_display_offset<T>(terminal: &Term<T>, active_start: Point) -> usize {
+    let display_offset = terminal.grid().display_offset();
+    let screen_lines = terminal.grid().screen_lines() as i32;
+    let history_size = terminal.grid().history_size();
+    let viewport_line = active_start.line.0 + display_offset as i32;
+    if viewport_line >= 0 && viewport_line < screen_lines {
+        return display_offset;
+    }
+    // Place the match line at the viewport top: viewport_line == 0 => offset == -line.
+    let target = (-active_start.line.0).clamp(0, history_size as i32);
+    target as usize
+}
+
+/// Convert a grid-absolute match into a viewport-relative highlight, clamping endpoints to the
+/// visible rows. Returns `None` if the match start is below the viewport or the whole match is
+/// above it. `columns` is the grid width, used to extend a clamped end to the row edge.
+fn viewport_match_inner(
+    regex_match: RangeInclusive<Point>,
+    display_offset: usize,
+    screen_lines: usize,
+    columns: usize,
+) -> Option<TerminalSearchMatch> {
+    if screen_lines == 0 || columns == 0 {
+        return None;
+    }
+    let last_line = (screen_lines - 1) as i32;
+    let last_column = (columns - 1) as u16;
+    let start = *regex_match.start();
+    let end = *regex_match.end();
+    let start_line = start.line.0 + display_offset as i32;
+    let end_line = end.line.0 + display_offset as i32;
+    // Reject a match whose start is below the viewport or whose end is above it (fully off screen).
+    if start_line > last_line || end_line < 0 {
+        return None;
+    }
+    // Clamp each endpoint into the visible rows. When an endpoint is clamped to a different row than
+    // the match actually occupies, extend the highlight to that row's edge (column 0 for a clamped
+    // start, last column for a clamped end) so the rectangle covers the visible portion.
+    let (start_line, start_column) = if start_line < 0 {
+        (0u16, 0u16)
+    } else {
+        (start_line as u16, start.column.0 as u16)
+    };
+    let (end_line, end_column) = if end_line > last_line {
+        (last_line as u16, last_column)
+    } else {
+        (end_line as u16, end.column.0 as u16)
+    };
+    Some(TerminalSearchMatch {
+        start: TerminalCellPosition {
+            line: start_line,
+            column: start_column.min(last_column),
+        },
+        end: TerminalCellPosition {
+            line: end_line,
+            column: end_column.min(last_column),
+        },
+    })
+}
+
+/// Collect all matches whose start falls within the current viewport rows, in viewport coordinates.
+fn collect_viewport_matches<T>(
+    terminal: &Term<T>,
+    regex: &mut RegexSearch,
+    display_offset: usize,
+    screen_lines: usize,
+) -> Vec<TerminalSearchMatch> {
+    // Viewport rows map to grid lines [-display_offset, -display_offset + screen_lines).
+    let top_line = Line(-(display_offset as i32));
+    let bottom_line = Line(screen_lines as i32 - 1 - display_offset as i32);
+    let start = Point::new(top_line, Column(0));
+    let end = Point::new(bottom_line, terminal.grid().last_column());
+    let columns = terminal.grid().columns();
+    RegexIter::new(start, end, Direction::Right, terminal, regex)
+        .filter_map(|regex_match| {
+            viewport_match_inner(regex_match, display_offset, screen_lines, columns)
+        })
+        .collect()
+}
+
+
 fn rgba_from_rgb(color: Rgb) -> u32 {
     u32::from_be_bytes([color.r, color.g, color.b, 0xff])
 }
@@ -3843,6 +4137,13 @@ impl DaemonState {
             ClientRequest::Scroll { session_id, event } => {
                 self.session(session_id)?.scroll(event)?;
                 Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalSearch {
+                session_id,
+                request,
+            } => {
+                let result = self.session(session_id)?.search(request)?;
+                Ok(DaemonResponse::SearchResult { session_id, result })
             }
             ClientRequest::Focus {
                 session_id,
@@ -6495,6 +6796,186 @@ mod tests {
         assert!(flags.contains(Flags::ITALIC));
         assert!(flags.contains(Flags::UNDERLINE));
         assert!(flags.contains(Flags::STRIKEOUT));
+        session.terminate();
+    }
+
+    #[test]
+    fn terminal_search_finds_counts_and_navigates_matches() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        // Print three lines that each contain the needle so the search has multiple matches.
+        session
+            .input(
+                b"printf 'needle one\\nneedle two\\nneedle three\\n'\r".to_vec(),
+                1,
+            )
+            .unwrap();
+
+        // Wait until all three needle lines have been parsed into the snapshot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            let needle_rows = snapshot
+                .cells
+                .iter()
+                .filter(|cell| cell.character == 'n' && cell.column == 0)
+                .count();
+            if needle_rows >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "needle output did not arrive in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // A fresh forward search should find a match and count every occurrence. The exact count
+        // is not asserted because the shell echoes the command line (which also contains the
+        // needle); instead we verify the invariants that must hold regardless of echo.
+        let first = session
+            .search(TerminalSearchRequest {
+                query: "needle".to_owned(),
+                regex: false,
+                direction: TerminalSearchDirection::Forward,
+                fresh: true,
+            })
+            .unwrap();
+        assert!(
+            first.total >= 3,
+            "expected at least three matches for 'needle', got {}",
+            first.total
+        );
+        assert_eq!(first.index, 0, "fresh search should start at the first match");
+        let first_active = first.active.expect("active match should be present");
+        assert!(
+            first.matches.iter().any(|m| *m == first_active),
+            "the active match should be among the visible highlights"
+        );
+        let total = first.total;
+
+        // Advancing forward moves to the next match without changing the total.
+        let second = session
+            .search(TerminalSearchRequest {
+                query: "needle".to_owned(),
+                regex: false,
+                direction: TerminalSearchDirection::Forward,
+                fresh: false,
+            })
+            .unwrap();
+        assert_eq!(second.total, total);
+        assert_eq!(second.index, 1, "forward navigation should advance the index");
+
+        // A query with no matches reports nothing.
+        let missing = session
+            .search(TerminalSearchRequest {
+                query: "this-string-does-not-exist".to_owned(),
+                regex: false,
+                direction: TerminalSearchDirection::Forward,
+                fresh: true,
+            })
+            .unwrap();
+        assert_eq!(missing.total, 0);
+        assert!(missing.active.is_none());
+
+        // A regex search matches the same needles as the literal search.
+        let regex_result = session
+            .search(TerminalSearchRequest {
+                query: "n..dle".to_owned(),
+                regex: true,
+                direction: TerminalSearchDirection::Forward,
+                fresh: true,
+            })
+            .unwrap();
+        assert_eq!(
+            regex_result.total, total,
+            "regex 'n..dle' should match the same cells as literal 'needle'"
+        );
+
+        session.terminate();
+    }
+
+    #[test]
+    fn terminal_search_overlapping_regex_navigation_advances_without_repeat() {
+        // Regression for overlapping matches: navigation must advance past a match's END, so a
+        // pattern like "aa" over "aaaa" does not re-find the same overlapping match, and the
+        // reported index moves forward instead of sticking.
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        session
+            .input(b"printf 'zzzz aaaa zzzz\\n'\r".to_vec(), 1)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            let has_aaaa = snapshot
+                .cells
+                .iter()
+                .any(|cell| cell.character == 'a' && cell.column > 0);
+            if has_aaaa {
+                break;
+            }
+            assert!(Instant::now() < deadline, "aaaa output did not arrive");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let first = session
+            .search(TerminalSearchRequest {
+                query: "aa".to_owned(),
+                regex: true,
+                direction: TerminalSearchDirection::Forward,
+                fresh: true,
+            })
+            .unwrap();
+        let first_active = first.active.expect("first overlapping match should be found");
+        assert_eq!(first.index, 0, "fresh search starts at the first match");
+
+        // Advancing forward must land on a different, later match (no overlap re-find).
+        let second = session
+            .search(TerminalSearchRequest {
+                query: "aa".to_owned(),
+                regex: true,
+                direction: TerminalSearchDirection::Forward,
+                fresh: false,
+            })
+            .unwrap();
+        let second_active = second.active.expect("a second match should exist");
+        assert_ne!(
+            (first_active.start.line, first_active.start.column),
+            (second_active.start.line, second_active.start.column),
+            "forward navigation must not re-find the same overlapping match"
+        );
+        assert_eq!(
+            second.total, first.total,
+            "the total match count is stable across navigation"
+        );
+        assert!(
+            second.index < second.total,
+            "the active index stays within range"
+        );
+
         session.terminate();
     }
 

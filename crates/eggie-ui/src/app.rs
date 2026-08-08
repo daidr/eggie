@@ -5,10 +5,12 @@ use crate::native_menu::{
     prepare_process_menu, prepare_project_menu, prepare_tab_menu,
 };
 use crate::settings::{Language, SettingsStore, TerminalTheme, UiColors, system_uses_dark_appearance};
-use crate::settings_window::{TerminalCopy, TerminalPaste, TerminalSelectAll, is_dark_appearance};
+use crate::settings_window::{TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, is_dark_appearance};
+use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
     MetalTerminalRenderer, TerminalImageData, TerminalImeState, TerminalInputContext,
-    TerminalPoint, TerminalRenderOptions, TerminalSelection, TerminalTextureKey,
+    TerminalPoint, TerminalRenderOptions, TerminalSearchHighlights, TerminalSelection,
+    TerminalTextureKey,
     terminal_background, terminal_cell_metrics,
 };
 use alacritty_terminal::term::cell::Flags;
@@ -24,15 +26,16 @@ use eggie_protocol::{
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
     TerminalMousePosition, TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
     TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollDelta,
-    TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit, TerminalSize, TerminalSnapshot,
+    TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection,
+    TerminalSearchRequest, TerminalSearchResult, TerminalSize, TerminalSnapshot,
 };
 use gpui::{
     AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
     DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions,
     Pixels, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, SystemNotification, SystemNotificationAction, TitlebarOptions, TouchPhase,
-    WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, canvas, div,
+    Stateful, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
+    TouchPhase, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, canvas, div,
     linear_color_stop, linear_gradient, point, prelude::*, px, quad, relative, rgb, rgba, size,
 };
 use std::{
@@ -237,6 +240,21 @@ struct TerminalSelectionDrag {
     dragged: bool,
 }
 
+/// State for the in-terminal search bar (⌘F). At most one search is active at a time, targeting the
+/// currently focused session. Closing the bar or switching sessions resets it.
+struct TerminalSearchUi {
+    /// The session the search bar is bound to.
+    session_id: SessionId,
+    /// The reusable text-input component holding the query text, selection, cursor, and focus.
+    input: Entity<TextInput>,
+    /// Whether the query is interpreted as a regular expression.
+    regex: bool,
+    /// The most recent result from the daemon, used to render highlights and the match counter.
+    result: Option<TerminalSearchResult>,
+    /// Subscription to the input's events; dropped (unsubscribed) when the search bar closes.
+    _subscription: Subscription,
+}
+
 #[derive(Clone, Debug)]
 struct DraggedTab {
     source_group_id: GroupId,
@@ -376,6 +394,7 @@ pub struct EggieApp {
     terminal_viewports: HashMap<GroupId, TerminalViewport>,
     terminal_selections: HashMap<SessionId, TerminalSelection>,
     terminal_selection_drag: Option<TerminalSelectionDrag>,
+    terminal_search: Option<TerminalSearchUi>,
     hyperlink_mouse_down: bool,
     terminal_has_focus: bool,
     terminal_focused_session: Option<SessionId>,
@@ -759,6 +778,7 @@ impl EggieApp {
             terminal_viewports: HashMap::new(),
             terminal_selections: HashMap::new(),
             terminal_selection_drag: None,
+            terminal_search: None,
             hyperlink_mouse_down: false,
             terminal_has_focus: false,
             terminal_focused_session: None,
@@ -2176,6 +2196,17 @@ impl EggieApp {
             workspace.active_group_id = group_id;
             self.focus_handle.focus(window, cx);
             self.terminal_has_focus = true;
+            // The search bar is bound to a specific session; if the newly active session differs,
+            // drop it so stale state and highlights don't linger (its doc contract: switching
+            // sessions resets it).
+            let active_session_id = self.active_session_id();
+            if self
+                .terminal_search
+                .as_ref()
+                .is_some_and(|search| Some(search.session_id) != active_session_id)
+            {
+                self.terminal_search = None;
+            }
             self.ensure_snapshot_watchers(cx);
             self.sync_terminal_focus();
             cx.notify();
@@ -2749,6 +2780,292 @@ impl EggieApp {
         true
     }
 
+    /// Open the in-terminal search bar for the active session (⌘F), or refocus it if already open.
+    fn open_terminal_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.active_session_id() else {
+            return false;
+        };
+        match &self.terminal_search {
+            Some(search) if search.session_id == session_id => {}
+            _ => {
+                let colors = self.colors;
+                let input = cx.new(|cx| {
+                    let mut input = TextInput::new(
+                        window,
+                        cx,
+                        TextInputStyle {
+                            text_color: (colors.text << 8) | 0xff,
+                            placeholder_color: (colors.muted << 8) | 0xff,
+                            cursor_color: (colors.accent << 8) | 0xff,
+                            selection_color: (colors.accent << 8) | 0x55,
+                        },
+                    );
+                    input.set_placeholder(self.language.search_placeholder());
+                    input
+                });
+                let subscription =
+                    cx.subscribe_in(&input, window, Self::on_search_input_event);
+                self.terminal_search = Some(TerminalSearchUi {
+                    session_id,
+                    input,
+                    regex: false,
+                    result: None,
+                    _subscription: subscription,
+                });
+            }
+        }
+        if let Some(search) = &self.terminal_search {
+            let handle = search.input.read(cx).focus_handle();
+            handle.focus(window, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Route events emitted by the search input to search behavior.
+    fn on_search_input_event(
+        &mut self,
+        _input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextInputEvent::Changed => {
+                self.run_terminal_search(TerminalSearchDirection::Forward, true, cx)
+            }
+            TextInputEvent::Confirm => {
+                self.navigate_terminal_search(TerminalSearchDirection::Forward, cx)
+            }
+            TextInputEvent::ConfirmReverse => {
+                self.navigate_terminal_search(TerminalSearchDirection::Backward, cx)
+            }
+            TextInputEvent::Cancel => {
+                // Close and return focus to the terminal (same path as the X button), so keyboard
+                // input keeps working instead of being dropped when the input entity stops rendering.
+                self.close_terminal_search(window, cx);
+            }
+        }
+    }
+
+    /// Close the search bar, drop its highlights, and return focus to the terminal.
+    fn close_terminal_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.terminal_search.take().is_none() {
+            return false;
+        }
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    /// The current query text, or empty if the search bar is closed.
+    fn terminal_search_query(&self, cx: &App) -> String {
+        self.terminal_search
+            .as_ref()
+            .map(|search| search.input.read(cx).content().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Send the current query to the daemon and apply the result (highlights + counter). `fresh`
+    /// restarts the search from the viewport (used when the query text changes); otherwise the
+    /// daemon advances from the previous active match in `direction`.
+    fn run_terminal_search(
+        &mut self,
+        direction: TerminalSearchDirection,
+        fresh: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = &self.terminal_search else {
+            return;
+        };
+        let session_id = search.session_id;
+        let request = TerminalSearchRequest {
+            query: search.input.read(cx).content().to_owned(),
+            regex: search.regex,
+            direction,
+            fresh,
+        };
+        let result = match self.client.request(ClientRequest::TerminalSearch {
+            session_id,
+            request,
+        }) {
+            Ok(DaemonResponse::SearchResult { result, .. }) => result,
+            Ok(_) => return,
+            Err(error) => {
+                self.poll_error = Some(format!("terminal search failed: {error}"));
+                return;
+            }
+        };
+        // The daemon may have scrolled its viewport to reveal the active match and published a new
+        // snapshot; the match coordinates are relative to THAT snapshot. Pull it synchronously when
+        // it is newer than what we hold, so highlights align with the text instead of being painted
+        // over the pre-scroll frame (the async watcher would otherwise land a frame or more later).
+        let stale = self
+            .snapshots
+            .get(&session_id)
+            .is_none_or(|snapshot| snapshot.revision < result.revision);
+        if stale
+            && let Ok(DaemonResponse::Snapshot { snapshot }) =
+                self.client.request(ClientRequest::Snapshot { session_id })
+        {
+            self.snapshots.insert(session_id, snapshot);
+        }
+        if let Some(search) = &mut self.terminal_search {
+            search.result = Some(result);
+        }
+        cx.notify();
+    }
+
+    /// Toggle regex interpretation of the query and re-run the search.
+    fn toggle_terminal_search_regex(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.terminal_search else {
+            return;
+        };
+        search.regex = !search.regex;
+        self.run_terminal_search(TerminalSearchDirection::Forward, true, cx);
+    }
+
+    /// Advance to the next (Enter) or previous (Shift+Enter) match.
+    fn navigate_terminal_search(
+        &mut self,
+        direction: TerminalSearchDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal_search_query(cx).is_empty() {
+            return;
+        }
+        self.run_terminal_search(direction, false, cx);
+    }
+
+    /// Viewport-relative search highlights for `session_id`, if the search bar targets it.
+    fn terminal_search_matches(&self, session_id: SessionId) -> Option<&TerminalSearchResult> {
+        let search = self.terminal_search.as_ref()?;
+        if search.session_id != session_id {
+            return None;
+        }
+        search.result.as_ref()
+    }
+
+    /// Render the floating search bar overlaid on the top-right of the terminal content region.
+    fn render_terminal_search_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let search = self.terminal_search.as_ref()?;
+        let colors = self.colors;
+        let query_is_empty = search.input.read(cx).content().is_empty();
+        let regex = search.regex;
+        let (index, total) = search
+            .result
+            .as_ref()
+            .map(|result| (result.index, result.total))
+            .unwrap_or((0, 0));
+
+        // "3/12" when there are matches, "0/0" for a query with no hits, blank for an empty query.
+        let counter_text = if query_is_empty {
+            String::new()
+        } else if total == 0 {
+            "0/0".to_owned()
+        } else {
+            format!("{}/{}", index + 1, total)
+        };
+        let no_matches = !query_is_empty && total == 0;
+
+        let bar = div()
+            .absolute()
+            .top(px(8.))
+            .right(px(12.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(34.))
+            // Ideal width, but never wider than the container so a narrow split can't overflow it.
+            .w(px(340.))
+            .max_w(relative(0.9))
+            .px_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_md()
+            // Floating overlay over the terminal: occlude blocks every mouse event type (down/up/move/
+            // scroll) plus hover/tooltip for the content region behind, so presses on the bar's chrome
+            // (icon, counter, padding) can't bubble down to terminal_mouse_down and steal focus. One
+            // call, all event types — replaces the earlier left-mouse-down-only stop_propagation patch.
+            .occlude()
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(colors.muted))
+                    .child(icon(IconName::Search)),
+            )
+            // The reusable text-input component owns focus, selection, caret, and editing.
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(48.))
+                    .h_full()
+                    .text_size(px(13.))
+                    .text_color(rgb(colors.text))
+                    .child(search.input.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(38.))
+                    .text_size(px(12.))
+                    .text_color(rgb(if no_matches { 0xE06C75 } else { colors.muted }))
+                    .child(counter_text),
+            )
+            // Regex toggle: `.*` highlighted when active.
+            .child(
+                div()
+                    .id("terminal-search-regex")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(24.))
+                    .rounded_lg()
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .text_color(rgb(if regex { colors.accent } else { colors.muted }))
+                    .when(regex, |element| element.bg(rgb(colors.panel_alt)))
+                    .hover(move |element| element.bg(rgb(colors.hover)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.toggle_terminal_search_regex(cx);
+                    }))
+                    .child(".*"),
+            )
+            .child(icon_button(
+                IconName::ArrowUp,
+                "terminal-search-prev",
+                colors,
+                cx.listener(|app, _, _, cx| {
+                    cx.stop_propagation();
+                    app.navigate_terminal_search(TerminalSearchDirection::Backward, cx);
+                }),
+            ))
+            .child(icon_button(
+                IconName::ArrowDown,
+                "terminal-search-next",
+                colors,
+                cx.listener(|app, _, _, cx| {
+                    cx.stop_propagation();
+                    app.navigate_terminal_search(TerminalSearchDirection::Forward, cx);
+                }),
+            ))
+            .child(icon_button(
+                IconName::Close,
+                "terminal-search-close",
+                colors,
+                cx.listener(|app, _, window, cx| {
+                    cx.stop_propagation();
+                    app.close_terminal_search(window, cx);
+                }),
+            ));
+        Some(bar.into_any_element())
+    }
+
     pub(crate) fn terminal_ime_state(&self, session_id: SessionId) -> Option<&TerminalImeState> {
         self.terminal_ime_states.get(&session_id)
     }
@@ -2802,6 +3119,16 @@ impl EggieApp {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // When the search input is focused it owns keyboard input; never leak keys into the
+        // terminal. The input's own handlers consume the keys; this guard covers the case where the
+        // event bubbles up to the workspace root before the input consumes it.
+        if self
+            .terminal_search
+            .as_ref()
+            .is_some_and(|search| search.input.read(cx).is_focused(window))
+        {
+            return;
+        }
         if is_character_palette_shortcut(event) && self.active_session_id().is_some() {
             window.show_character_palette();
             cx.stop_propagation();
@@ -2825,7 +3152,16 @@ impl EggieApp {
         }
     }
 
-    fn key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Mirror the key_down guard: while the search input is focused it owns keyboard input, so
+        // key releases must not leak into the terminal (e.g. as kitty key-release escape sequences).
+        if self
+            .terminal_search
+            .as_ref()
+            .is_some_and(|search| search.input.read(cx).is_focused(window))
+        {
+            return;
+        }
         let Some(session_id) = self.active_session_id() else {
             return;
         };
@@ -3904,6 +4240,9 @@ impl EggieApp {
                 let snapshot_size = snapshot.size;
                 let selection = self.terminal_selections.get(&session_id).copied();
                 let ime = self.terminal_ime_states.get(&session_id).cloned();
+                let search = self
+                    .terminal_search_matches(session_id)
+                    .map(TerminalSearchHighlights::from_result);
                 let app = cx.entity().downgrade();
                 let input = (self.workspace().active_group_id == group_id)
                     .then(|| TerminalInputContext::new(app.clone(), self.focus_handle.clone()));
@@ -3953,7 +4292,8 @@ impl EggieApp {
                             ime,
                             input,
                             self.input_latency.clone(),
-                        ),
+                        )
+                        .with_search(search),
                     ))
                     .into_any_element()
             })
@@ -4078,6 +4418,19 @@ impl EggieApp {
                     app.handle_tab_drop(dragged_tab, cx)
                 }));
             content_region = content_region.child(overlay);
+        }
+
+        // Overlay the search bar when it is bound to this group's active session.
+        let active_session_id = group.active_item().and_then(|item| item.session_id);
+        if let Some(search_bar) = active_session_id
+            .filter(|session_id| {
+                self.terminal_search
+                    .as_ref()
+                    .is_some_and(|search| search.session_id == *session_id)
+            })
+            .and_then(|_| self.render_terminal_search_bar(cx))
+        {
+            content_region = content_region.child(search_bar);
         }
 
         div()
@@ -4348,6 +4701,11 @@ impl gpui::Render for EggieApp {
             }))
             .on_action(cx.listener(|app, _: &TerminalSelectAll, _, cx| {
                 if app.select_all_active_terminal(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &TerminalFind, window, cx| {
+                if app.open_terminal_search(window, cx) {
                     cx.stop_propagation();
                 }
             }))
