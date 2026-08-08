@@ -1,16 +1,17 @@
 use std::sync::OnceLock;
 
 use crate::{
-    icons::{IconName, icon},
+    icons::{IconName, icon, icon_sized},
     settings::{
         AppSettings, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS,
         MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS,
         MIN_TERMINAL_PADDING, SettingsStore, TerminalTheme, ThemeMode, UiColors,
         minimum_contrast_rgb, theme_catalog,
     },
+    text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu,
+    Anchor, AnyElement, App, Bounds, Context, Entity, KeyBinding, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
     actions, anchored, deferred, div, point, prelude::*, px, rgb, size,
@@ -29,7 +30,8 @@ actions!(
         Quit,
         TerminalCopy,
         TerminalPaste,
-        TerminalSelectAll
+        TerminalSelectAll,
+        TerminalFind
     ]
 );
 
@@ -102,7 +104,11 @@ pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
         KeyBinding::new("cmd-c", TerminalCopy, None),
         KeyBinding::new("cmd-v", TerminalPaste, None),
         KeyBinding::new("cmd-a", TerminalSelectAll, None),
+        KeyBinding::new("cmd-f", TerminalFind, None),
     ]);
+    // Register the text-input keybindings AFTER the terminal's context-less bindings above, so the
+    // `EggieTextInput`-context bindings win the binding-index tiebreak when a text field is focused.
+    crate::text_input::install_keybindings(cx);
     let language = settings.read(cx).config().language;
     cx.set_menus(build_menus(language));
 
@@ -259,8 +265,7 @@ struct SettingsWindow {
     font_names: Vec<String>,
     colors: UiColors,
     open_selector: Option<SelectorKind>,
-    selector_search: String,
-    selector_search_focus: FocusHandle,
+    selector_search_input: Entity<TextInput>,
     selector_scroll_handle: ScrollHandle,
     settings_scroll_handle: ScrollHandle,
     selector_bounds: [Option<Bounds<Pixels>>; 3],
@@ -280,21 +285,92 @@ impl SettingsWindow {
             .detach();
         let system_is_dark = is_dark_appearance(window.appearance());
         let theme = settings.read(cx).config().effective_theme(system_is_dark);
+        let colors = UiColors::from_theme(theme);
+        let selector_search_input = cx.new(|cx| {
+            TextInput::new(
+                window,
+                cx,
+                TextInputStyle {
+                    text_color: (colors.text << 8) | 0xff,
+                    placeholder_color: (colors.muted << 8) | 0xff,
+                    cursor_color: (colors.accent << 8) | 0xff,
+                    selection_color: (colors.accent << 8) | 0x55,
+                },
+            )
+        });
+        cx.subscribe_in(&selector_search_input, window, Self::on_selector_search_event)
+            .detach();
         Self {
             settings,
             dark_theme_names: theme_catalog().dark_names(),
             light_theme_names: theme_catalog().light_names(),
             font_names,
-            colors: UiColors::from_theme(theme),
+            colors,
             open_selector: None,
-            selector_search: String::new(),
-            selector_search_focus: cx.focus_handle(),
+            selector_search_input,
             selector_scroll_handle: ScrollHandle::new(),
             settings_scroll_handle: ScrollHandle::new(),
             selector_bounds: [None; 3],
             moving_window: false,
             selected_section: SettingsSection::default(),
         }
+    }
+
+    /// React to the selector filter input: content changes re-render the filtered list; Enter
+    /// applies the first match; Escape closes the dropdown without changing the selection.
+    fn on_selector_search_event(
+        &mut self,
+        _input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextInputEvent::Changed => {
+                self.selector_scroll_handle
+                    .set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+            }
+            TextInputEvent::Confirm | TextInputEvent::ConfirmReverse => {
+                self.apply_first_selector_match(cx);
+            }
+            TextInputEvent::Cancel => {
+                self.open_selector = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Apply the first item matching the current filter for the open selector, then close it.
+    fn apply_first_selector_match(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = self.open_selector else {
+            return;
+        };
+        let query = self.selector_search_input.read(cx).content().trim().to_owned();
+        let names = match kind {
+            SelectorKind::DarkTheme => &self.dark_theme_names,
+            SelectorKind::LightTheme => &self.light_theme_names,
+            SelectorKind::Font => &self.font_names,
+        };
+        let Some(choice) = names
+            .iter()
+            .find(|item| selector_matches(item, &query))
+            .cloned()
+        else {
+            return;
+        };
+        self.settings.update(cx, |store, cx| {
+            store.update(
+                |config| match kind {
+                    SelectorKind::DarkTheme => config.dark_theme = choice.clone(),
+                    SelectorKind::LightTheme => config.light_theme = choice.clone(),
+                    SelectorKind::Font => config.font_family = choice.clone(),
+                },
+                cx,
+            )
+        });
+        self.open_selector = None;
+        cx.notify();
     }
 
     fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
@@ -569,11 +645,22 @@ impl SettingsWindow {
                             settings.open_selector = None;
                         } else {
                             settings.open_selector = Some(kind);
-                            settings.selector_search.clear();
+                            let language = settings.settings.read(cx).config().language;
+                            let placeholder = match kind {
+                                SelectorKind::DarkTheme => language.search_dark_themes(),
+                                SelectorKind::LightTheme => language.search_light_themes(),
+                                SelectorKind::Font => language.search_fonts(),
+                            };
+                            settings.selector_search_input.update(cx, |input, cx| {
+                                input.set_placeholder(placeholder);
+                                input.set_content("", cx);
+                            });
                             settings
                                 .selector_scroll_handle
                                 .set_offset(point(px(0.), px(0.)));
-                            settings.selector_search_focus.focus(window, cx);
+                            let handle =
+                                settings.selector_search_input.read(cx).focus_handle();
+                            handle.focus(window, cx);
                         }
                         cx.notify();
                     }))
@@ -609,77 +696,34 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn selector_search_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = event.keystroke.key.as_str();
-        let modifiers = event.keystroke.modifiers;
-        let handled = if key == "escape" {
-            self.open_selector = None;
-            true
-        } else if key == "backspace" && !modifiers.platform && !modifiers.control {
-            self.selector_search.pop();
-            true
-        } else if modifiers.platform && key.eq_ignore_ascii_case("v") {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.selector_search
-                    .push_str(&text.replace(['\r', '\n'], " "));
-            }
-            true
-        } else if !modifiers.platform && !modifiers.control {
-            if let Some(text) = event.keystroke.key_char.as_deref() {
-                self.selector_search.push_str(text);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if handled {
-            self.selector_scroll_handle
-                .set_offset(gpui::point(px(0.), px(0.)));
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
     fn render_selector_dropdown(
         &self,
         kind: SelectorKind,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let config = self.settings.read(cx).config();
         let language = config.language;
-        let (search_placeholder, current, items) = match kind {
+        let (current, items) = match kind {
             SelectorKind::DarkTheme => (
-                language.search_dark_themes(),
                 config.dark_theme.clone(),
                 self.dark_theme_names.clone(),
             ),
             SelectorKind::LightTheme => (
-                language.search_light_themes(),
                 config.light_theme.clone(),
                 self.light_theme_names.clone(),
             ),
             SelectorKind::Font => (
-                language.search_fonts(),
                 config.font_family.clone(),
                 self.font_names.clone(),
             ),
         };
-        let query = self.selector_search.trim();
+        let query_owned = self.selector_search_input.read(cx).content().trim().to_owned();
         let items = items
             .into_iter()
-            .filter(|item| selector_matches(item, query))
+            .filter(|item| selector_matches(item, &query_owned))
             .collect::<Vec<_>>();
         let has_items = !items.is_empty();
-        let search_is_focused = self.selector_search_focus.is_focused(window);
 
         let mut list = div()
             .id("settings-selector-list")
@@ -749,66 +793,34 @@ impl SettingsWindow {
             );
         }
 
-        let search_value = if self.selector_search.is_empty() {
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(rgb(self.colors.muted))
-                .child(search_placeholder)
-        } else {
-            div()
-                .min_w_0()
-                .truncate()
-                .child(self.selector_search.clone())
-        };
-        let search_content = div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .gap(px(1.))
-            .child(search_value)
-            .when(search_is_focused, |element| {
-                element.child(
-                    div()
-                        .flex_none()
-                        .w(px(1.))
-                        .h(px(16.))
-                        .bg(rgb(self.colors.accent)),
-                )
-            });
         let search = div()
             .id("settings-selector-search")
             .flex()
             .flex_none()
             .items_center()
             .gap_2()
-            .h(px(36.))
-            .mx_3()
-            .my_2()
+            .h(px(30.))
             .px_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(if search_is_focused {
-                self.colors.accent
-            } else {
-                self.colors.border
-            }))
-            .bg(rgb(self.colors.panel_alt))
-            .cursor_text()
-            .track_focus(&self.selector_search_focus)
-            .on_click(cx.listener(|settings, _, window, cx| {
-                settings.selector_search_focus.focus(window, cx);
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(Self::selector_search_key_down))
+            // Flush against the dropdown's edges: no outer margin/border/radius, just a divider that
+            // separates the search field from the results list below.
+            .border_b_1()
+            .border_color(rgb(self.colors.border))
+            .text_size(px(12.))
             .child(
                 div()
                     .flex_none()
                     .text_color(rgb(self.colors.muted))
-                    .child(icon(IconName::Search)),
+                    .child(icon_sized(IconName::Search, 13.)),
             )
-            .child(search_content);
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .text_color(rgb(self.colors.text))
+                    .child(self.selector_search_input.clone()),
+            );
 
         div()
             .id("settings-selector-dropdown")
@@ -822,6 +834,12 @@ impl SettingsWindow {
             .border_color(rgb(self.colors.border))
             .bg(rgb(self.colors.panel))
             .shadow_lg()
+            // Floating overlay: block every mouse event (and hover/tooltip) for the settings rows
+            // painted behind it, so clicks on the dropdown's blank areas (search padding, list gaps)
+            // can't bubble through and misfire a control underneath. This is the canonical GPUI way —
+            // one call replaces per-event stop_propagation patches. Children paint on top, so the
+            // search input and list items still receive their own events.
+            .occlude()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
                 cx.defer_in(window, move |settings, _, cx| {

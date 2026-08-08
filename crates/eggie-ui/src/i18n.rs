@@ -824,6 +824,13 @@ impl Language {
         }
     }
 
+    pub(crate) fn search_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Find",
+            Self::SimplifiedChinese => "查找",
+        }
+    }
+
     pub(crate) fn no_matches(self) -> &'static str {
         match self {
             Self::English => "No matches",

@@ -10,6 +10,7 @@ mod settings;
 mod settings_window;
 mod terminal_renderer;
 mod terminal_sprites;
+mod text_input;
 
 use anyhow::{Context, Result};
 use eggie_daemon::{DaemonClient, is_daemon_invocation, run_daemon};
