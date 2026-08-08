@@ -3,6 +3,7 @@ use alacritty_terminal::{
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
     index::{Boundary, Column, Direction, Line, Point, Side},
+    selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{
         ClipboardType, Config, Osc52, Term, TermMode,
@@ -38,8 +39,9 @@ use eggie_protocol::{
     TerminalOscEventUpdate, TerminalProgress, TerminalProgressState, TerminalProgressTimeouts,
     TerminalProgressUpdate, TerminalReportedLocation, TerminalScrollEvent, TerminalScrollPhase,
     TerminalScrollUnit, TerminalSearchDirection, TerminalSearchMatch, TerminalSearchRequest,
-    TerminalSearchResult, TerminalSemanticPhase, TerminalShellIntegrationState, TerminalSize,
-    TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
+    TerminalSearchResult, TerminalSemanticPhase, TerminalSelectionKind, TerminalSelectionRange,
+    TerminalSelectionSide, TerminalShellIntegrationState, TerminalSize,
+    TerminalLinkRange, TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
 };
 use flate2::write::ZlibDecoder;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -79,6 +81,12 @@ const BUNDLED_BASH_INTEGRATION: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), 
 static INSTALLED_SHELL_INTEGRATION: OnceLock<std::result::Result<PathBuf, String>> =
     OnceLock::new();
 static RENDER_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
+/// Regex for auto-detecting bare URLs. regex-automata (the terminal core's engine) has no
+/// look-around, so the scheme is anchored on `://` (or the literal `mailto:`) and the body is a
+/// greedy run of non-whitespace, non-control, non-delimiter characters. Trailing punctuation and
+/// unbalanced brackets are stripped in `refine_url_range` afterwards.
+const URL_PATTERN: &str =
+    r#"(?i)((https?|ftps?|ssh|git)://|mailto:)[^ \t\x00-\x1f\x7f<>"{}|\\^`\[\]]+"#;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_METADATA_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
@@ -152,6 +160,12 @@ struct ListenerState {
     kitty_file_transfers: Mutex<HashMap<String, KittyIncomingTransfer>>,
     iterm2_multipart: Mutex<Option<Iterm2MultipartTransfer>>,
     allow_clipboard_read: AtomicBool,
+    /// Whether bare-URL auto-detection is enabled for this session (client-configurable, default on).
+    detect_urls: AtomicBool,
+    /// Lazily-compiled regex for auto-detecting bare URLs in terminal output. `None` = not yet
+    /// built; `Some(None)` = compilation failed (detection permanently disabled); `Some(Some(_))` =
+    /// the compiled DFA, reused across every publish so the DFA is never rebuilt per frame.
+    url_regex: Mutex<Option<Option<RegexSearch>>>,
 }
 
 enum ClipboardReadResponder {
@@ -680,6 +694,8 @@ impl ListenerState {
             kitty_file_transfers: Mutex::new(HashMap::new()),
             iterm2_multipart: Mutex::new(None),
             allow_clipboard_read: AtomicBool::new(false),
+            detect_urls: AtomicBool::new(true),
+            url_regex: Mutex::new(None),
         }
     }
 
@@ -688,14 +704,16 @@ impl ListenerState {
         // existing ownership and only take the snapshot lock for the final Arc swap.
         let started = Instant::now();
         let revision = self.revision.load(Ordering::Relaxed).wrapping_add(1);
-        let snapshot = Arc::new(snapshot_terminal(
+        let mut snapshot = snapshot_terminal(
             terminal,
             self.session_id,
             *self.size.read(),
             self.title.read().clone(),
             revision,
             self.last_input_sequence.load(Ordering::Acquire),
-        ));
+        );
+        self.detect_urls_into(&mut snapshot, terminal);
+        let snapshot = Arc::new(snapshot);
         let cell_count = snapshot.cells.len();
         // A snapshot and the image generations referenced by it must have the same lifetime.
         // Kitty animations can advance again before the UI has fetched the previous frame; asking
@@ -746,6 +764,39 @@ impl ListenerState {
                 started.elapsed().as_secs_f64() * 1_000.,
             );
         }
+    }
+
+    /// Detect bare URLs in the current viewport and fill `snapshot.detected_links`. Runs under the
+    /// terminal lock (the caller owns it). Cheap when no URL is present: a substring precheck over
+    /// the already-built snapshot cells short-circuits before touching the regex engine.
+    fn detect_urls_into(
+        &self,
+        snapshot: &mut TerminalSnapshot,
+        terminal: &Term<DaemonEventListener>,
+    ) {
+        if !self.detect_urls.load(Ordering::Acquire) {
+            return;
+        }
+        // Precheck: only scan when a scheme separator is visible. This keeps high-throughput output
+        // (which rarely contains URLs) from paying for a regex pass every frame.
+        let has_candidate = snapshot.plain_lines().iter().any(|line| {
+            line.contains("://") || line.contains("mailto:")
+        });
+        if !has_candidate {
+            return;
+        }
+
+        let mut guard = self.url_regex.lock();
+        let regex = guard.get_or_insert_with(|| RegexSearch::new(URL_PATTERN).ok());
+        let Some(regex) = regex.as_mut() else {
+            return;
+        };
+
+        let display_offset = terminal.grid().display_offset();
+        let screen_lines = terminal.grid().screen_lines();
+        let columns = terminal.grid().columns();
+        snapshot.detected_links =
+            detect_viewport_urls(terminal, regex, display_offset, screen_lines, columns);
     }
 
     fn snapshot(&self) -> Arc<TerminalSnapshot> {
@@ -2447,6 +2498,119 @@ fn render_metrics_enabled() -> bool {
     })
 }
 
+/// Scan the visible viewport for bare URLs and return them in viewport-relative coordinates. A URL
+/// that soft-wraps across rows is split into one range per row so each row can be drawn and
+/// hit-tested independently. The scan mirrors `collect_viewport_matches`: the viewport maps to grid
+/// lines `[-display_offset, screen_lines - display_offset)`.
+fn detect_viewport_urls<T>(
+    terminal: &Term<T>,
+    regex: &mut RegexSearch,
+    display_offset: usize,
+    screen_lines: usize,
+    columns: usize,
+) -> Vec<TerminalLinkRange> {
+    if screen_lines == 0 || columns == 0 {
+        return Vec::new();
+    }
+    let top_line = Line(-(display_offset as i32));
+    let bottom_line = Line(screen_lines as i32 - 1 - display_offset as i32);
+    let start = Point::new(top_line, Column(0));
+    let end = Point::new(bottom_line, terminal.grid().last_column());
+    let mut links = Vec::new();
+    for regex_match in RegexIter::new(start, end, Direction::Right, terminal, regex) {
+        let Some((url, refined)) = refine_url_range(terminal, regex_match) else {
+            continue;
+        };
+        // Split a multi-row (soft-wrapped) match into one range per visible row.
+        let start = *refined.start();
+        let end = *refined.end();
+        for line in start.line.0..=end.line.0 {
+            let row_start_col = if line == start.line.0 {
+                start.column.0
+            } else {
+                0
+            };
+            let row_end_col = if line == end.line.0 {
+                end.column.0
+            } else {
+                columns - 1
+            };
+            let range = Point::new(Line(line), Column(row_start_col))
+                ..=Point::new(Line(line), Column(row_end_col));
+            if let Some((vp_start, vp_end)) =
+                clamp_range_to_viewport(range, display_offset, screen_lines, columns)
+            {
+                links.push(TerminalLinkRange {
+                    start: vp_start,
+                    end: vp_end,
+                    url: url.clone(),
+                });
+            }
+        }
+    }
+    links
+}
+
+/// Trim trailing punctuation and unbalanced closing brackets from a raw URL match. Handles the
+/// common cases: a sentence-ending `.`/`,`, a wrapping `(url)`, while keeping balanced brackets like
+/// `wiki_(foo)`. Returns the cleaned prefix (possibly empty).
+fn trim_url_trailing(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = chars.len();
+    while keep > 0 {
+        let ch = chars[keep - 1];
+        let strip = match ch {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+            ')' | ']' | '}' => {
+                let (open, close) = match ch {
+                    ')' => ('(', ')'),
+                    ']' => ('[', ']'),
+                    _ => ('{', '}'),
+                };
+                let opens = chars[..keep].iter().filter(|&&c| c == open).count();
+                let closes = chars[..keep].iter().filter(|&&c| c == close).count();
+                closes > opens
+            }
+            _ => false,
+        };
+        if strip {
+            keep -= 1;
+        } else {
+            break;
+        }
+    }
+    chars[..keep].iter().collect()
+}
+
+/// Trim trailing punctuation from a raw regex match, returning the cleaned URL text and the grid
+/// range that still covers it. Returns `None` if nothing usable remains.
+fn refine_url_range<T>(
+    terminal: &Term<T>,
+    regex_match: RangeInclusive<Point>,
+) -> Option<(String, RangeInclusive<Point>)> {
+    let start = *regex_match.start();
+    let end = *regex_match.end();
+    let text = terminal.bounds_to_string(start, end);
+    let url = trim_url_trailing(&text);
+    if url.is_empty() {
+        return None;
+    }
+    // Shrink the grid end by the number of stripped chars. bounds_to_string emits one char per
+    // (non-wide-spacer) cell on a line, and the trimmed punctuation set is all single-column ASCII,
+    // so the column shift maps 1:1.
+    let trimmed_cols = text.chars().count() - url.chars().count();
+    let new_end = if trimmed_cols == 0 {
+        end
+    } else {
+        let mut point = end;
+        for _ in 0..trimmed_cols {
+            point = point.sub(terminal, Boundary::Grid, 1);
+        }
+        point
+    };
+    Some((url, start..=new_end))
+}
+
 #[derive(Clone)]
 struct DaemonEventListener(Arc<ListenerState>);
 
@@ -3056,6 +3220,72 @@ impl TerminalSession {
         })
     }
 
+    /// Begin an interactive selection at a viewport cell. Converts the viewport point to a
+    /// grid-absolute `Point` using the current scroll offset and stores it as the terminal core's
+    /// authoritative selection, then republishes so the client sees the projected highlight.
+    fn selection_start(
+        &self,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+        kind: TerminalSelectionKind,
+    ) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        let absolute = viewport_point_to_absolute(&*terminal, point);
+        let ty = match kind {
+            TerminalSelectionKind::Simple => SelectionType::Simple,
+            TerminalSelectionKind::Semantic => SelectionType::Semantic,
+            TerminalSelectionKind::Lines => SelectionType::Lines,
+            TerminalSelectionKind::Block => SelectionType::Block,
+        };
+        terminal.selection = Some(Selection::new(ty, absolute, selection_side(side)));
+        self.events.publish_terminal(&terminal);
+        Ok(())
+    }
+
+    /// Extend the active selection's head to a viewport cell (drag).
+    fn selection_update(
+        &self,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+    ) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        let absolute = viewport_point_to_absolute(&*terminal, point);
+        if let Some(selection) = terminal.selection.as_mut() {
+            selection.update(absolute, selection_side(side));
+        }
+        self.events.publish_terminal(&terminal);
+        Ok(())
+    }
+
+    /// Clear the active selection.
+    fn selection_clear(&self) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        if terminal.selection.take().is_some() {
+            self.events.publish_terminal(&terminal);
+        }
+        Ok(())
+    }
+
+    /// Select the entire buffer including scrollback.
+    fn select_all(&self) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        let start = Point::new(terminal.topmost_line(), Column(0));
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.include_all();
+        let end = Point::new(terminal.bottommost_line(), terminal.grid().last_column());
+        selection.update(end, Side::Right);
+        terminal.selection = Some(selection);
+        self.events.publish_terminal(&terminal);
+        Ok(())
+    }
+
+    /// Extract the current selection's text (whole scrollback span, soft-wrap unwrapped, trailing
+    /// whitespace trimmed). Returns `None` when there is no active or non-empty selection.
+    fn selection_text(&self) -> Result<Option<String>> {
+        let terminal = self.terminal.lock();
+        Ok(terminal.selection_to_string())
+    }
+
     fn focus(&self, focused: bool) -> Result<()> {
         let terminal = self.terminal.lock();
         let report_focus = terminal.mode().contains(TermMode::FOCUS_IN_OUT);
@@ -3214,6 +3444,15 @@ impl TerminalSession {
             .store(allow_clipboard_read, Ordering::Release);
     }
 
+    fn set_url_detection(&self, detect_urls: bool) {
+        let previous = self.events.detect_urls.swap(detect_urls, Ordering::AcqRel);
+        if previous != detect_urls {
+            // Republish so detected-link highlights appear (or clear) without waiting for the next
+            // terminal output.
+            self.events.publish_terminal(&self.terminal.lock());
+        }
+    }
+
     fn terminate(&self) {
         self.events.progress.report(None);
         let _ = self.sender.send(Msg::Shutdown);
@@ -3270,6 +3509,7 @@ fn snapshot_terminal(
     };
     let cursor_point = point_to_viewport(display_offset, content.cursor.point)
         .filter(|point| point.line < size.rows as usize);
+    let selection = project_selection(terminal, display_offset, size);
     TerminalSnapshot {
         session_id,
         size,
@@ -3321,6 +3561,9 @@ fn snapshot_terminal(
                 z: placement.z,
             })
             .collect(),
+        selection,
+        // Filled in by `ListenerState::detect_urls_into` after this snapshot is built.
+        detected_links: Vec::new(),
     }
 }
 
@@ -3398,6 +3641,8 @@ fn snapshot_delta(
         images: (base.images != current.images).then(|| current.images.clone()),
         image_placements: (base.image_placements != current.image_placements)
             .then(|| current.image_placements.clone()),
+        selection: current.selection,
+        detected_links: current.detected_links.clone(),
     })
 }
 
@@ -3715,31 +3960,69 @@ fn active_match_display_offset<T>(terminal: &Term<T>, active_start: Point) -> us
     target as usize
 }
 
-/// Convert a grid-absolute match into a viewport-relative highlight, clamping endpoints to the
-/// visible rows. Returns `None` if the match start is below the viewport or the whole match is
-/// above it. `columns` is the grid width, used to extend a clamped end to the row edge.
-fn viewport_match_inner(
-    regex_match: RangeInclusive<Point>,
+/// Convert a viewport cell position into a grid-absolute point using the current scroll offset.
+/// Viewport row `r` maps to absolute line `r - display_offset`.
+fn viewport_point_to_absolute<T>(terminal: &Term<T>, point: TerminalCellPosition) -> Point {
+    let display_offset = terminal.grid().display_offset() as i32;
+    Point::new(
+        Line(point.line as i32 - display_offset),
+        Column(point.column as usize),
+    )
+}
+
+/// Map a protocol selection side to the terminal core's `Side`.
+fn selection_side(side: TerminalSelectionSide) -> Side {
+    match side {
+        TerminalSelectionSide::Left => Side::Left,
+        TerminalSelectionSide::Right => Side::Right,
+    }
+}
+
+/// Project the terminal core's authoritative selection into the current viewport. Returns `None`
+/// when there is no selection or it is entirely scrolled out of view.
+fn project_selection<T>(
+    terminal: &Term<T>,
+    display_offset: usize,
+    size: TerminalSize,
+) -> Option<TerminalSelectionRange> {
+    let range = terminal.selection.as_ref()?.to_range(terminal)?;
+    let is_block = range.is_block;
+    let (start, end) = clamp_range_to_viewport(
+        range.start..=range.end,
+        display_offset,
+        size.rows as usize,
+        size.columns as usize,
+    )?;
+    Some(TerminalSelectionRange {
+        start,
+        end,
+        is_block,
+    })
+}
+
+/// Clamp a grid-absolute inclusive point range into the visible viewport rows, returning the
+/// viewport-relative endpoints. Returns `None` if the range is entirely off screen. A clamped start
+/// snaps to column 0 of the top row; a clamped end snaps to the last column of the bottom row, so a
+/// highlight rectangle covers the visible portion. Shared by search-match and selection projection.
+fn clamp_range_to_viewport(
+    range: RangeInclusive<Point>,
     display_offset: usize,
     screen_lines: usize,
     columns: usize,
-) -> Option<TerminalSearchMatch> {
+) -> Option<(TerminalCellPosition, TerminalCellPosition)> {
     if screen_lines == 0 || columns == 0 {
         return None;
     }
     let last_line = (screen_lines - 1) as i32;
     let last_column = (columns - 1) as u16;
-    let start = *regex_match.start();
-    let end = *regex_match.end();
+    let start = *range.start();
+    let end = *range.end();
     let start_line = start.line.0 + display_offset as i32;
     let end_line = end.line.0 + display_offset as i32;
-    // Reject a match whose start is below the viewport or whose end is above it (fully off screen).
+    // Reject a range whose start is below the viewport or whose end is above it (fully off screen).
     if start_line > last_line || end_line < 0 {
         return None;
     }
-    // Clamp each endpoint into the visible rows. When an endpoint is clamped to a different row than
-    // the match actually occupies, extend the highlight to that row's edge (column 0 for a clamped
-    // start, last column for a clamped end) so the rectangle covers the visible portion.
     let (start_line, start_column) = if start_line < 0 {
         (0u16, 0u16)
     } else {
@@ -3750,16 +4033,30 @@ fn viewport_match_inner(
     } else {
         (end_line as u16, end.column.0 as u16)
     };
-    Some(TerminalSearchMatch {
-        start: TerminalCellPosition {
+    Some((
+        TerminalCellPosition {
             line: start_line,
             column: start_column.min(last_column),
         },
-        end: TerminalCellPosition {
+        TerminalCellPosition {
             line: end_line,
             column: end_column.min(last_column),
         },
-    })
+    ))
+}
+
+/// Convert a grid-absolute match into a viewport-relative highlight, clamping endpoints to the
+/// visible rows. Returns `None` if the match start is below the viewport or the whole match is
+/// above it. `columns` is the grid width, used to extend a clamped end to the row edge.
+fn viewport_match_inner(
+    regex_match: RangeInclusive<Point>,
+    display_offset: usize,
+    screen_lines: usize,
+    columns: usize,
+) -> Option<TerminalSearchMatch> {
+    let (start, end) =
+        clamp_range_to_viewport(regex_match, display_offset, screen_lines, columns)?;
+    Some(TerminalSearchMatch { start, end })
 }
 
 /// Collect all matches whose start falls within the current viewport rows, in viewport coordinates.
@@ -4145,6 +4442,35 @@ impl DaemonState {
                 let result = self.session(session_id)?.search(request)?;
                 Ok(DaemonResponse::SearchResult { session_id, result })
             }
+            ClientRequest::TerminalSelectionStart {
+                session_id,
+                point,
+                side,
+                kind,
+            } => {
+                self.session(session_id)?.selection_start(point, side, kind)?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalSelectionUpdate {
+                session_id,
+                point,
+                side,
+            } => {
+                self.session(session_id)?.selection_update(point, side)?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalSelectionClear { session_id } => {
+                self.session(session_id)?.selection_clear()?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalSelectAll { session_id } => {
+                self.session(session_id)?.select_all()?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalCopySelection { session_id } => {
+                let text = self.session(session_id)?.selection_text()?;
+                Ok(DaemonResponse::SelectionText { session_id, text })
+            }
             ClientRequest::Focus {
                 session_id,
                 focused,
@@ -4176,6 +4502,13 @@ impl DaemonState {
             } => {
                 self.session(session_id)?
                     .set_osc_policy(allow_clipboard_read);
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::SetUrlDetection {
+                session_id,
+                detect_urls,
+            } => {
+                self.session(session_id)?.set_url_detection(detect_urls);
                 Ok(DaemonResponse::Ok)
             }
             ClientRequest::Terminate { session_id } => {
@@ -4421,6 +4754,9 @@ fn serve_connection(stream: UnixStream, state: &DaemonState) -> Result<()> {
                     | ClientRequest::Mouse { .. }
                     | ClientRequest::Scroll { .. }
                     | ClientRequest::Focus { .. }
+                    | ClientRequest::TerminalSelectionStart { .. }
+                    | ClientRequest::TerminalSelectionUpdate { .. }
+                    | ClientRequest::TerminalSelectionClear { .. }
             )
         {
             configure_latency_sensitive_thread();
@@ -4656,6 +4992,20 @@ enum QueuedTerminalInput {
         session_id: SessionId,
         focused: bool,
     },
+    SelectionStart {
+        session_id: SessionId,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+        kind: TerminalSelectionKind,
+    },
+    SelectionUpdate {
+        session_id: SessionId,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+    },
+    SelectionClear {
+        session_id: SessionId,
+    },
 }
 
 impl QueuedTerminalInput {
@@ -4723,6 +5073,23 @@ impl QueuedTerminalInput {
                     focused: next_focused,
                 },
             ) if *session_id == next_session_id && *focused == next_focused => Ok(()),
+            (
+                Self::SelectionUpdate {
+                    session_id,
+                    point,
+                    side,
+                },
+                Self::SelectionUpdate {
+                    session_id: next_session_id,
+                    point: next_point,
+                    side: next_side,
+                },
+            ) if *session_id == next_session_id => {
+                // A fast drag emits many head updates; only the latest matters.
+                *point = next_point;
+                *side = next_side;
+                Ok(())
+            }
             (_, next) => Err(next),
         }
     }
@@ -4767,6 +5134,29 @@ impl QueuedTerminalInput {
                 session_id,
                 focused,
             },
+            Self::SelectionStart {
+                session_id,
+                point,
+                side,
+                kind,
+            } => ClientRequest::TerminalSelectionStart {
+                session_id,
+                point,
+                side,
+                kind,
+            },
+            Self::SelectionUpdate {
+                session_id,
+                point,
+                side,
+            } => ClientRequest::TerminalSelectionUpdate {
+                session_id,
+                point,
+                side,
+            },
+            Self::SelectionClear { session_id } => {
+                ClientRequest::TerminalSelectionClear { session_id }
+            }
         }
     }
 }
@@ -4922,6 +5312,44 @@ impl DaemonInputSender {
                 session_id,
                 focused,
             })
+            .context("terminal input worker stopped")
+    }
+
+    pub fn send_selection_start(
+        &self,
+        session_id: SessionId,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+        kind: TerminalSelectionKind,
+    ) -> Result<()> {
+        self.sender
+            .send(QueuedTerminalInput::SelectionStart {
+                session_id,
+                point,
+                side,
+                kind,
+            })
+            .context("terminal input worker stopped")
+    }
+
+    pub fn send_selection_update(
+        &self,
+        session_id: SessionId,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+    ) -> Result<()> {
+        self.sender
+            .send(QueuedTerminalInput::SelectionUpdate {
+                session_id,
+                point,
+                side,
+            })
+            .context("terminal input worker stopped")
+    }
+
+    pub fn send_selection_clear(&self, session_id: SessionId) -> Result<()> {
+        self.sender
+            .send(QueuedTerminalInput::SelectionClear { session_id })
             .context("terminal input worker stopped")
     }
 }
@@ -5489,6 +5917,8 @@ mod tests {
             input_modes: TerminalInputModes::default(),
             images: Vec::new(),
             image_placements: Vec::new(),
+            selection: None,
+            detected_links: Vec::new(),
         });
         let response = DaemonResponse::Snapshot {
             snapshot: snapshot.clone(),
@@ -5540,6 +5970,8 @@ mod tests {
             input_modes: TerminalInputModes::default(),
             images: Vec::new(),
             image_placements: Vec::new(),
+            selection: None,
+            detected_links: Vec::new(),
         };
         let image = TerminalImageKey {
             id: 7,
@@ -6902,6 +7334,301 @@ mod tests {
             regex_result.total, total,
             "regex 'n..dle' should match the same cells as literal 'needle'"
         );
+
+        session.terminate();
+    }
+
+    #[test]
+    fn select_all_and_selection_text_span_the_whole_scrollback() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        // Print more lines than the viewport so the earliest ones scroll into history.
+        session
+            .input(
+                b"printf 'FIRSTLINE\\n'; for i in $(seq 1 60); do echo filler $i; done; printf 'LASTLINE\\n'\r".to_vec(),
+                1,
+            )
+            .unwrap();
+
+        // Wait until LASTLINE has been parsed into the snapshot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            let has_last = snapshot
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("LASTLINE"));
+            if has_last {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "LASTLINE did not arrive in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // FIRSTLINE is now in scrollback (not visible). Select-all must reach it and LASTLINE.
+        session.select_all().unwrap();
+        let text = session
+            .selection_text()
+            .unwrap()
+            .expect("select all should produce text");
+        assert!(
+            text.contains("FIRSTLINE"),
+            "select all should include the scrollback top; got:\n{text}"
+        );
+        assert!(
+            text.contains("LASTLINE"),
+            "select all should include the buffer bottom; got:\n{text}"
+        );
+
+        // Clearing drops the selection text entirely.
+        session.selection_clear().unwrap();
+        assert!(session.selection_text().unwrap().is_none());
+
+        session.terminate();
+    }
+
+    #[test]
+    fn interactive_selection_projects_into_the_visible_viewport() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        session
+            .input(b"printf 'ALPHA BRAVO CHARLIE\\n'\r".to_vec(), 1)
+            .unwrap();
+
+        // Wait until the printed line has arrived, then wait for the terminal to go quiescent (the
+        // trailing shell prompt can scroll the grid). Take the target row and its expected text from
+        // the SAME settled snapshot so the assertion tests the viewport→absolute mapping, not timing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            let present = snapshot.plain_lines().iter().any(|line| {
+                line.contains("ALPHA BRAVO CHARLIE") && !line.contains("printf")
+            });
+            if present {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "printed line did not arrive in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Settle: require the revision to hold steady across a short window.
+        let mut last_revision = session.snapshot().revision;
+        loop {
+            thread::sleep(Duration::from_millis(120));
+            let revision = session.snapshot().revision;
+            if revision == last_revision {
+                break;
+            }
+            last_revision = revision;
+            assert!(
+                Instant::now() < deadline,
+                "terminal did not go quiescent for the selection test"
+            );
+        }
+
+        let settled = session.snapshot();
+        let lines = settled.plain_lines();
+        let target_line = lines
+            .iter()
+            .position(|line| line.contains("ALPHA BRAVO CHARLIE") && !line.contains("printf"))
+            .expect("printed line should be present in the settled snapshot")
+            as u16;
+        let expected: String = lines[target_line as usize].chars().take(5).collect();
+
+        // Select the first five columns of that row.
+        session
+            .selection_start(
+                TerminalCellPosition {
+                    line: target_line,
+                    column: 0,
+                },
+                TerminalSelectionSide::Left,
+                TerminalSelectionKind::Simple,
+            )
+            .unwrap();
+        session
+            .selection_update(
+                TerminalCellPosition {
+                    line: target_line,
+                    column: 4,
+                },
+                TerminalSelectionSide::Right,
+            )
+            .unwrap();
+
+        let text = session
+            .selection_text()
+            .unwrap()
+            .expect("interactive selection should produce text");
+        assert_eq!(text, expected);
+        assert_eq!(expected, "ALPHA");
+
+        // The selection projects into the visible viewport on the same row.
+        let projected = session
+            .snapshot()
+            .selection
+            .expect("visible selection should project into the snapshot");
+        assert_eq!(projected.start.line, target_line);
+        assert_eq!(projected.start.column, 0);
+        assert_eq!(projected.end.line, target_line);
+
+        session.terminate();
+    }
+
+    #[test]
+    fn detects_bare_url_and_trims_trailing_punctuation() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        session
+            .input(b"printf 'see https://example.com. now\\n'\r".to_vec(), 1)
+            .unwrap();
+
+        // Wait until a detected link appears for the printed URL (ignoring the echoed command line).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let link = loop {
+            let snapshot = session.snapshot();
+            let link = snapshot
+                .detected_links
+                .iter()
+                .find(|link| link.url == "https://example.com")
+                .cloned();
+            if let Some(link) = link {
+                break link;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detected link did not arrive; links = {:?}",
+                session.snapshot().detected_links
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        // The trailing period must not be part of the URL, so the range ends before it.
+        let snapshot = session.snapshot();
+        let line = snapshot
+            .plain_lines()
+            .into_iter()
+            .find(|line| line.contains("see https://example.com. now"))
+            .expect("printed line should be present");
+        let dot_column = line.find("https://example.com.").unwrap() + "https://example.com".len();
+        assert!(
+            (link.end.column as usize) < dot_column,
+            "range should stop before the trailing period at column {dot_column}, got end {}",
+            link.end.column
+        );
+
+        session.terminate();
+    }
+
+    #[test]
+    fn refine_url_range_strips_trailing_and_unbalanced_punctuation() {
+        // A pure-logic check of the trimming rules independent of the grid: build a tiny term,
+        // print candidates, and assert the cleaned text. Uses the same trimming that runs on real
+        // matches, exercised through short strings.
+        for (raw, expected) in [
+            ("https://example.com.", "https://example.com"),
+            ("http://a.com,", "http://a.com"),
+            ("https://a.com/x)", "https://a.com/x"),
+            ("https://a.com/wiki_(foo)", "https://a.com/wiki_(foo)"),
+        ] {
+            let cleaned = trim_url_trailing(raw);
+            assert_eq!(cleaned, expected, "trimming {raw}");
+        }
+    }
+
+    #[test]
+    fn explicit_osc8_hyperlink_stays_out_of_detected_links() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        // OSC 8 hyperlink whose visible text is NOT itself a URL, so a match in detected_links could
+        // only come from the auto-detector (which must ignore explicit links).
+        session
+            .input(
+                b"printf '\\033]8;;https://osc8.example\\033\\\\clickme\\033]8;;\\033\\\\\\n'\r"
+                    .to_vec(),
+                1,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            // Find the cell that carries the explicit OSC 8 link (its visible text is "clickme").
+            let osc8_cell = snapshot
+                .cells
+                .iter()
+                .find(|cell| cell.hyperlink.as_deref() == Some("https://osc8.example"));
+            if let Some(cell) = osc8_cell {
+                // That cell must not be covered by any auto-detected link range: explicit OSC 8
+                // links are carried on `hyperlink`, never duplicated into `detected_links`. (The
+                // echoed command line may separately contain the literal URL text as a real bare
+                // URL; that is a different cell and legitimately detectable.)
+                let covered = snapshot.detected_links.iter().any(|link| {
+                    link.start.line == cell.line
+                        && cell.column >= link.start.column
+                        && cell.column <= link.end.column
+                });
+                assert!(
+                    !covered,
+                    "the OSC 8 link cell must not be covered by a detected bare URL"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "OSC 8 hyperlink cell did not arrive"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
 
         session.terminate();
     }

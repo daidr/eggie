@@ -82,6 +82,7 @@ pub(crate) struct AppSettings {
     pub(crate) progress_complete_timeout_secs: u32,
     pub(crate) progress_stale_timeout_secs: u32,
     pub(crate) allow_osc_clipboard_read: bool,
+    pub(crate) detect_urls: bool,
 }
 
 impl Default for AppSettings {
@@ -99,6 +100,7 @@ impl Default for AppSettings {
             progress_complete_timeout_secs: DEFAULT_PROGRESS_COMPLETE_TIMEOUT_SECS,
             progress_stale_timeout_secs: DEFAULT_PROGRESS_STALE_TIMEOUT_SECS,
             allow_osc_clipboard_read: false,
+            detect_urls: true,
         }
     }
 }
@@ -493,6 +495,7 @@ mod tests {
             progress_complete_timeout_secs: 0,
             progress_stale_timeout_secs: u32::MAX,
             allow_osc_clipboard_read: true,
+            detect_urls: false,
         };
         config.normalize();
         fs::create_dir_all(&directory).unwrap();

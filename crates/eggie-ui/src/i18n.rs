@@ -796,6 +796,45 @@ impl Language {
         }
     }
 
+    pub(crate) fn enabled(self) -> &'static str {
+        match self {
+            Self::English => "Enabled",
+            Self::SimplifiedChinese => "启用",
+        }
+    }
+
+    pub(crate) fn disabled(self) -> &'static str {
+        match self {
+            Self::English => "Disabled",
+            Self::SimplifiedChinese => "禁用",
+        }
+    }
+
+    pub(crate) fn terminal_behavior_section(self) -> &'static str {
+        match self {
+            Self::English => "Terminal behavior",
+            Self::SimplifiedChinese => "终端行为",
+        }
+    }
+
+    pub(crate) fn detect_urls_row(self) -> &'static str {
+        match self {
+            Self::English => "Detect URLs",
+            Self::SimplifiedChinese => "URL 检测",
+        }
+    }
+
+    pub(crate) fn detect_urls_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Highlight bare URLs in terminal output so they can be hovered and opened with Cmd/Ctrl+click."
+            }
+            Self::SimplifiedChinese => {
+                "高亮终端输出中的裸露 URL，可悬停并用 Cmd/Ctrl+点击打开。"
+            }
+        }
+    }
+
     pub(crate) fn terminal_preview_label(self) -> &'static str {
         match self {
             Self::English => "TERMINAL PREVIEW",

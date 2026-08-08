@@ -13,7 +13,6 @@ use crate::terminal_renderer::{
     TerminalTextureKey,
     terminal_background, terminal_cell_metrics,
 };
-use alacritty_terminal::term::cell::Flags;
 use eggie_daemon::{DaemonClient, DaemonInputSender};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
@@ -27,7 +26,8 @@ use eggie_protocol::{
     TerminalMousePosition, TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
     TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollDelta,
     TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection,
-    TerminalSearchRequest, TerminalSearchResult, TerminalSize, TerminalSnapshot,
+    TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind, TerminalSelectionSide,
+    TerminalSize, TerminalSnapshot,
 };
 use gpui::{
     AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
@@ -224,19 +224,10 @@ struct TerminalViewport {
     columns: u16,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalSelectionMode {
-    Character,
-    Word,
-    Line,
-}
-
 #[derive(Clone, Copy)]
 struct TerminalSelectionDrag {
     group_id: GroupId,
     session_id: SessionId,
-    initial: TerminalSelection,
-    mode: TerminalSelectionMode,
     dragged: bool,
 }
 
@@ -392,10 +383,11 @@ pub struct EggieApp {
     terminal_sizes: HashMap<SessionId, TerminalSize>,
     terminal_resize_in_flight: HashMap<SessionId, TerminalSize>,
     terminal_viewports: HashMap<GroupId, TerminalViewport>,
-    terminal_selections: HashMap<SessionId, TerminalSelection>,
     terminal_selection_drag: Option<TerminalSelectionDrag>,
     terminal_search: Option<TerminalSearchUi>,
     hyperlink_mouse_down: bool,
+    /// The auto-detected URL currently under the mouse, if any, for hover underline + pointer cursor.
+    terminal_hovered_link: Option<(SessionId, eggie_protocol::TerminalLinkRange)>,
     terminal_has_focus: bool,
     terminal_focused_session: Option<SessionId>,
     terminal_ime_states: HashMap<SessionId, TerminalImeState>,
@@ -421,6 +413,7 @@ pub struct EggieApp {
     focus_handle: FocusHandle,
     notification_routes: NotificationRoutes,
     allow_osc_clipboard_read: bool,
+    detect_urls: bool,
     language: Language,
     closing: bool,
     poll_error: Option<String>,
@@ -733,6 +726,12 @@ impl EggieApp {
             }) {
                 eprintln!("failed to set terminal OSC policy: {error:#}");
             }
+            if let Err(error) = client.request(ClientRequest::SetUrlDetection {
+                session_id: session.id,
+                detect_urls: config.detect_urls,
+            }) {
+                eprintln!("failed to set terminal URL detection: {error:#}");
+            }
         }
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
@@ -776,10 +775,10 @@ impl EggieApp {
             terminal_sizes: HashMap::new(),
             terminal_resize_in_flight: HashMap::new(),
             terminal_viewports: HashMap::new(),
-            terminal_selections: HashMap::new(),
             terminal_selection_drag: None,
             terminal_search: None,
             hyperlink_mouse_down: false,
+            terminal_hovered_link: None,
             terminal_has_focus: false,
             terminal_focused_session: None,
             terminal_ime_states: HashMap::new(),
@@ -801,6 +800,7 @@ impl EggieApp {
             focus_handle: cx.focus_handle(),
             notification_routes,
             allow_osc_clipboard_read: config.allow_osc_clipboard_read,
+            detect_urls: config.detect_urls,
             language: config.language,
             closing: false,
             poll_error: None,
@@ -1865,6 +1865,15 @@ impl EggieApp {
         }
     }
 
+    fn configure_session_url_detection(&self, session_id: SessionId) {
+        if let Err(error) = self.client.request(ClientRequest::SetUrlDetection {
+            session_id,
+            detect_urls: self.detect_urls,
+        }) {
+            eprintln!("failed to configure terminal URL detection for {session_id}: {error:#}");
+        }
+    }
+
     fn new_terminal(
         &mut self,
         group_id: GroupId,
@@ -2276,8 +2285,14 @@ impl EggieApp {
             self.snapshots.remove(&session_id);
             self.terminal_sizes.remove(&session_id);
             self.terminal_resize_in_flight.remove(&session_id);
-            self.terminal_selections.remove(&session_id);
             self.terminal_ime_states.remove(&session_id);
+            if self
+                .terminal_hovered_link
+                .as_ref()
+                .is_some_and(|(hovered_session, _)| *hovered_session == session_id)
+            {
+                self.terminal_hovered_link = None;
+            }
             self.session_inspections.remove(&session_id);
             self.session_inspection_errors.remove(&session_id);
         }
@@ -2385,10 +2400,12 @@ impl EggieApp {
         let Some(point) = terminal_point_from_position(viewport, event.position) else {
             return;
         };
-        let hyperlink = self
-            .snapshots
-            .get(&viewport.session_id)
-            .and_then(|snapshot| terminal_hyperlink_at(snapshot, point));
+        // Cmd/Ctrl+click opens a link. Explicit OSC 8 hyperlinks take priority; a bare
+        // auto-detected URL under the cursor is the fallback.
+        let hyperlink = self.snapshots.get(&viewport.session_id).and_then(|snapshot| {
+            terminal_hyperlink_at(snapshot, point)
+                .or_else(|| detected_link_at(snapshot, point).map(|link| link.url.clone()))
+        });
         if event.button == MouseButton::Left
             && event.modifiers.platform
             && let Some(url) = hyperlink
@@ -2440,7 +2457,7 @@ impl EggieApp {
         let captured = snapshot.input_modes.captures_mouse() && !event.modifiers.shift;
         if captured {
             self.terminal_selection_drag = None;
-            self.terminal_selections.remove(&viewport.session_id);
+            let _ = self.input_sender.send_selection_clear(viewport.session_id);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2450,52 +2467,50 @@ impl EggieApp {
             return;
         }
 
-        let (mode, initial, preserve_without_drag) = match event.click_count {
+        let side = terminal_selection_side(viewport, event.position);
+        // The daemon owns the authoritative selection (a terminal-core `Selection` spanning
+        // scrollback). We only forward the viewport point + intent; the daemon expands word/line
+        // selections and keeps the anchor valid across scroll. `preserve_without_drag` records
+        // whether a selection should survive a click that never becomes a drag.
+        let preserve_without_drag = match event.click_count {
             0 | 1 if event.modifiers.shift => {
-                let selection = self
-                    .terminal_selections
-                    .get(&viewport.session_id)
-                    .copied()
-                    .map(|selection| TerminalSelection {
-                        anchor: selection.anchor,
-                        head: point,
-                    })
-                    .unwrap_or(TerminalSelection {
-                        anchor: point,
-                        head: point,
-                    });
-                (TerminalSelectionMode::Character, selection, true)
+                // Extend the existing selection's head to the clicked cell.
+                let _ = self
+                    .input_sender
+                    .send_selection_update(viewport.session_id, cell_position(point), side);
+                true
             }
-            0 | 1 => (
-                TerminalSelectionMode::Character,
-                TerminalSelection {
-                    anchor: point,
-                    head: point,
-                },
-                false,
-            ),
-            2 => (
-                TerminalSelectionMode::Word,
-                word_selection(snapshot, point),
-                true,
-            ),
-            _ => (
-                TerminalSelectionMode::Line,
-                line_selection(snapshot, point.line),
-                true,
-            ),
+            0 | 1 => {
+                let _ = self.input_sender.send_selection_start(
+                    viewport.session_id,
+                    cell_position(point),
+                    side,
+                    TerminalSelectionKind::Simple,
+                );
+                false
+            }
+            2 => {
+                let _ = self.input_sender.send_selection_start(
+                    viewport.session_id,
+                    cell_position(point),
+                    side,
+                    TerminalSelectionKind::Semantic,
+                );
+                true
+            }
+            _ => {
+                let _ = self.input_sender.send_selection_start(
+                    viewport.session_id,
+                    cell_position(point),
+                    side,
+                    TerminalSelectionKind::Lines,
+                );
+                true
+            }
         };
-        if preserve_without_drag {
-            self.terminal_selections
-                .insert(viewport.session_id, initial);
-        } else {
-            self.terminal_selections.remove(&viewport.session_id);
-        }
         self.terminal_selection_drag = Some(TerminalSelectionDrag {
             group_id,
             session_id: viewport.session_id,
-            initial,
-            mode,
             dragged: preserve_without_drag,
         });
         cx.stop_propagation();
@@ -2543,17 +2558,28 @@ impl EggieApp {
         }
     }
 
-    fn terminal_mouse_move(&mut self, group_id: GroupId, event: &MouseMoveEvent) {
+    fn terminal_mouse_move(
+        &mut self,
+        group_id: GroupId,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(viewport) = self.terminal_viewports.get(&group_id).copied() else {
             return;
         };
         let Some(point) = terminal_point_from_position(viewport, event.position) else {
             return;
         };
-        let Some(snapshot) = self.snapshots.get(&viewport.session_id) else {
+        // Update the hovered-URL state first, before the mouse-tracking early-returns, so the hover
+        // underline and pointer cursor work even for apps that consume mouse motion.
+        self.update_terminal_hovered_link(viewport.session_id, point, cx);
+        let Some(tracking) = self
+            .snapshots
+            .get(&viewport.session_id)
+            .map(|snapshot| snapshot.input_modes.mouse_tracking)
+        else {
             return;
         };
-        let tracking = snapshot.input_modes.mouse_tracking;
         let button = event.pressed_button.and_then(protocol_mouse_button);
         let should_report = match tracking {
             TerminalMouseTracking::Disabled | TerminalMouseTracking::Click => false,
@@ -2579,6 +2605,25 @@ impl EggieApp {
             },
         ) {
             eprintln!("failed to enqueue terminal mouse motion: {error:#}");
+        }
+    }
+
+    /// Recompute which auto-detected URL (if any) is under `point` and update hover state. Only
+    /// notifies when the hovered link actually changes, to avoid a rerender on every mouse move.
+    fn update_terminal_hovered_link(
+        &mut self,
+        session_id: SessionId,
+        point: TerminalPoint,
+        cx: &mut Context<Self>,
+    ) {
+        let hovered = self
+            .snapshots
+            .get(&session_id)
+            .and_then(|snapshot| detected_link_at(snapshot, point))
+            .map(|link| (session_id, link.clone()));
+        if self.terminal_hovered_link != hovered {
+            self.terminal_hovered_link = hovered;
+            cx.notify();
         }
     }
 
@@ -2635,16 +2680,50 @@ impl EggieApp {
         let Some(viewport) = self.terminal_viewports.get(&drag.group_id).copied() else {
             return;
         };
+        // Auto-scroll when the pointer is dragged above or below the viewport, so a selection can be
+        // extended into scrollback. The daemon scrolls the grid and the terminal core keeps the
+        // anchor valid; the next snapshot reprojects the selection over the new viewport.
+        let top = f32::from(viewport.bounds.origin.y);
+        let bottom = top + f32::from(viewport.bounds.size.height);
+        let pointer_y = f32::from(event.position.y);
+        if viewport.line_height > 0. {
+            let lines = if pointer_y < top {
+                ((top - pointer_y) / viewport.line_height).ceil() as i32
+            } else if pointer_y > bottom {
+                -(((pointer_y - bottom) / viewport.line_height).ceil() as i32)
+            } else {
+                0
+            };
+            if lines != 0 {
+                let clamped_point =
+                    terminal_point_from_position(viewport, event.position).unwrap_or(TerminalPoint {
+                        line: 0,
+                        column: 0,
+                    });
+                let _ = self.input_sender.send_scroll(
+                    drag.session_id,
+                    TerminalScrollEvent {
+                        delta: TerminalScrollDelta {
+                            x: 0,
+                            y: lines.saturating_mul(TERMINAL_SCROLL_DELTA_SCALE),
+                            unit: TerminalScrollUnit::Lines,
+                        },
+                        phase: TerminalScrollPhase::Moved,
+                        position: protocol_mouse_position(clamped_point, viewport, event.position),
+                        modifiers: protocol_terminal_modifiers(event.modifiers),
+                    },
+                );
+            }
+        }
         let Some(point) = terminal_point_from_position(viewport, event.position) else {
             return;
         };
-        let Some(snapshot) = self.snapshots.get(&drag.session_id) else {
-            return;
-        };
-        let selection = selection_for_drag(snapshot, drag.initial, drag.mode, point);
+        let side = terminal_selection_side(viewport, event.position);
+        let _ = self
+            .input_sender
+            .send_selection_update(drag.session_id, cell_position(point), side);
         drag.dragged = true;
         self.terminal_selection_drag = Some(drag);
-        self.terminal_selections.insert(drag.session_id, selection);
         cx.notify();
     }
 
@@ -2653,7 +2732,7 @@ impl EggieApp {
             return;
         };
         if !drag.dragged {
-            self.terminal_selections.remove(&drag.session_id);
+            let _ = self.input_sender.send_selection_clear(drag.session_id);
         }
         cx.notify();
     }
@@ -2662,16 +2741,18 @@ impl EggieApp {
         let Some(session_id) = self.active_session_id() else {
             return false;
         };
-        let Some(selection) = self.terminal_selections.get(&session_id).copied() else {
+        // The daemon owns the selection and extracts its text from the terminal core (whole
+        // scrollback span, soft-wrap unwrapped, trailing whitespace trimmed).
+        let text = match self
+            .client
+            .request(ClientRequest::TerminalCopySelection { session_id })
+        {
+            Ok(DaemonResponse::SelectionText { text, .. }) => text,
+            _ => return false,
+        };
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
             return false;
         };
-        let Some(snapshot) = self.snapshots.get(&session_id) else {
-            return false;
-        };
-        let text = selected_terminal_text(snapshot, selection);
-        if text.is_empty() {
-            return false;
-        }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         true
     }
@@ -2703,9 +2784,9 @@ impl EggieApp {
         if !enqueued {
             return false;
         }
-        let selection_changed = self.terminal_selections.remove(&session_id).is_some();
+        let _ = self.input_sender.send_selection_clear(session_id);
         let ime_changed = self.terminal_ime_states.remove(&session_id).is_some();
-        if selection_changed || ime_changed {
+        if ime_changed {
             cx.notify();
         }
         true
@@ -2756,28 +2837,15 @@ impl EggieApp {
         true
     }
 
-    fn select_all_active_terminal(&mut self, cx: &mut Context<Self>) -> bool {
+    fn select_all_active_terminal(&mut self, _cx: &mut Context<Self>) -> bool {
         let Some(session_id) = self.active_session_id() else {
             return false;
         };
-        let Some(snapshot) = self.snapshots.get(&session_id) else {
-            return false;
-        };
-        if snapshot.size.rows == 0 || snapshot.size.columns == 0 {
-            return false;
-        }
-        self.terminal_selections.insert(
-            session_id,
-            TerminalSelection {
-                anchor: TerminalPoint { line: 0, column: 0 },
-                head: TerminalPoint {
-                    line: snapshot.size.rows - 1,
-                    column: snapshot.size.columns - 1,
-                },
-            },
-        );
-        cx.notify();
-        true
+        // The daemon selects the whole buffer (including scrollback) in the terminal core and
+        // republishes; the projected selection arrives with the next snapshot.
+        self.client
+            .request(ClientRequest::TerminalSelectAll { session_id })
+            .is_ok()
     }
 
     /// Open the in-terminal search bar for the active session (⌘F), or refocus it if already open.
@@ -3111,7 +3179,7 @@ impl EggieApp {
         cx: &mut Context<Self>,
     ) {
         self.terminal_ime_states.remove(&session_id);
-        self.terminal_selections.remove(&session_id);
+        let _ = self.input_sender.send_selection_clear(session_id);
         if !text.is_empty() {
             self.enqueue_terminal_input(session_id, terminal_text_bytes(text));
         }
@@ -3145,11 +3213,8 @@ impl EggieApp {
             return;
         };
         self.enqueue_terminal_input(session_id, bytes);
-        let selection_changed = self.terminal_selections.remove(&session_id).is_some();
+        let _ = self.input_sender.send_selection_clear(session_id);
         cx.stop_propagation();
-        if selection_changed {
-            cx.notify();
-        }
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4231,6 +4296,12 @@ impl EggieApp {
             .and_then(|item| item.session_id)
             .and_then(|session_id| self.snapshots.get(&session_id))
             .is_some_and(|snapshot| snapshot.input_modes.captures_mouse());
+        // Whether an auto-detected URL is hovered in this group's active session (pointer cursor).
+        let link_hovered = group
+            .active_item()
+            .and_then(|item| item.session_id)
+            .zip(self.terminal_hovered_link.as_ref())
+            .is_some_and(|(session_id, (hovered_session, _))| session_id == *hovered_session);
         let content = group
             .active_item()
             .and_then(|item| item.session_id)
@@ -4238,11 +4309,28 @@ impl EggieApp {
             .map(|snapshot| {
                 let session_id = snapshot.session_id;
                 let snapshot_size = snapshot.size;
-                let selection = self.terminal_selections.get(&session_id).copied();
+                // The daemon projects its authoritative selection into the viewport and ships the
+                // range inside the snapshot, so the highlight always matches this frame's cells.
+                let selection = snapshot.selection.map(|range| TerminalSelection {
+                    anchor: TerminalPoint {
+                        line: range.start.line,
+                        column: range.start.column,
+                    },
+                    head: TerminalPoint {
+                        line: range.end.line,
+                        column: range.end.column,
+                    },
+                });
                 let ime = self.terminal_ime_states.get(&session_id).cloned();
                 let search = self
                     .terminal_search_matches(session_id)
                     .map(TerminalSearchHighlights::from_result);
+                // Underline the hovered auto-detected URL, but only for the session it belongs to.
+                let url_hover = self
+                    .terminal_hovered_link
+                    .as_ref()
+                    .filter(|(hovered_session, _)| *hovered_session == session_id)
+                    .map(|(_, link)| link.clone());
                 let app = cx.entity().downgrade();
                 let input = (self.workspace().active_group_id == group_id)
                     .then(|| TerminalInputContext::new(app.clone(), self.focus_handle.clone()));
@@ -4293,7 +4381,8 @@ impl EggieApp {
                             input,
                             self.input_latency.clone(),
                         )
-                        .with_search(search),
+                        .with_search(search)
+                        .with_url_hover(url_hover),
                     ))
                     .into_any_element()
             })
@@ -4384,13 +4473,20 @@ impl EggieApp {
                 cx.listener(move |app, event, _, cx| app.terminal_mouse_up(group_id, event, cx)),
             )
             .on_mouse_move(
-                cx.listener(move |app, event, _, _| app.terminal_mouse_move(group_id, event)),
+                cx.listener(move |app, event, _, cx| app.terminal_mouse_move(group_id, event, cx)),
             )
             .on_scroll_wheel(
                 cx.listener(move |app, event, _, cx| app.terminal_scroll(group_id, event, cx)),
             )
-            .when(terminal_captures_mouse, |element| element.cursor_default())
-            .when(!terminal_captures_mouse, |element| element.cursor_text())
+            .when(link_hovered, |element| {
+                element.cursor(gpui::CursorStyle::PointingHand)
+            })
+            .when(terminal_captures_mouse && !link_hovered, |element| {
+                element.cursor_default()
+            })
+            .when(!terminal_captures_mouse && !link_hovered, |element| {
+                element.cursor_text()
+            })
             .child(content);
         if let Some(zone) = content_drop_zone {
             let overlay = div()
@@ -4680,6 +4776,12 @@ impl gpui::Render for EggieApp {
             self.allow_osc_clipboard_read = config.allow_osc_clipboard_read;
             for session_id in self.window_session_ids() {
                 self.configure_session_osc_policy(session_id);
+            }
+        }
+        if config.detect_urls != self.detect_urls {
+            self.detect_urls = config.detect_urls;
+            for session_id in self.window_session_ids() {
+                self.configure_session_url_detection(session_id);
             }
         }
         self.language = config.language;
@@ -5160,6 +5262,60 @@ fn terminal_point_from_position(
     })
 }
 
+/// Which half of its cell a pixel position falls in. The daemon uses this as the selection
+/// endpoint's `Side`, so a selection can include or exclude the cell under the cursor depending on
+/// whether the pointer is past the cell's midpoint.
+fn terminal_selection_side(
+    viewport: TerminalViewport,
+    position: gpui::Point<Pixels>,
+) -> TerminalSelectionSide {
+    if viewport.cell_width <= 0. {
+        return TerminalSelectionSide::Left;
+    }
+    let x = f32::from(position.x - viewport.bounds.origin.x);
+    let fraction = (x / viewport.cell_width).fract();
+    if fraction >= 0.5 {
+        TerminalSelectionSide::Right
+    } else {
+        TerminalSelectionSide::Left
+    }
+}
+
+/// Convert a viewport point (renderer coordinate) into the protocol cell position sent to the
+/// daemon. Both are 0-based viewport line/column; only the type differs across the crate boundary.
+fn cell_position(point: TerminalPoint) -> eggie_protocol::TerminalCellPosition {
+    eggie_protocol::TerminalCellPosition {
+        line: point.line,
+        column: point.column,
+    }
+}
+
+fn terminal_hyperlink_at(snapshot: &TerminalSnapshot, point: TerminalPoint) -> Option<String> {
+    snapshot
+        .cells
+        .iter()
+        .find(|cell| cell.line == point.line && cell.column == point.column)
+        .and_then(|cell| cell.hyperlink.clone())
+}
+
+/// The auto-detected URL range covering `point`, if any. Ranges are per-row, so a hit is a simple
+/// line match plus column containment.
+fn detected_link_at(
+    snapshot: &TerminalSnapshot,
+    point: TerminalPoint,
+) -> Option<&eggie_protocol::TerminalLinkRange> {
+    snapshot.detected_links.iter().find(|link| {
+        link.start.line == point.line
+            && point.column >= link.start.column
+            && point.column <= link.end.column
+    })
+}
+
+fn url_has_safe_external_scheme(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
+}
+
 fn protocol_mouse_position(
     point: TerminalPoint,
     viewport: TerminalViewport,
@@ -5285,182 +5441,6 @@ fn fixed_terminal_scroll_delta(delta: f32) -> i32 {
     (f64::from(delta) * f64::from(TERMINAL_SCROLL_DELTA_SCALE))
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalWordClass {
-    Whitespace,
-    Word,
-    Punctuation,
-}
-
-fn terminal_cell_character(snapshot: &TerminalSnapshot, point: TerminalPoint) -> char {
-    snapshot
-        .cells
-        .iter()
-        .find(|cell| cell.line == point.line && cell.column == point.column)
-        .map(|cell| cell.character)
-        .unwrap_or(' ')
-}
-
-fn terminal_hyperlink_at(snapshot: &TerminalSnapshot, point: TerminalPoint) -> Option<String> {
-    snapshot
-        .cells
-        .iter()
-        .find(|cell| cell.line == point.line && cell.column == point.column)
-        .and_then(|cell| cell.hyperlink.clone())
-}
-
-fn url_has_safe_external_scheme(url: &str) -> bool {
-    let lower = url.trim().to_ascii_lowercase();
-    lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
-}
-
-fn terminal_word_class(character: char) -> TerminalWordClass {
-    if character.is_whitespace() {
-        TerminalWordClass::Whitespace
-    } else if character.is_alphanumeric() || character == '_' {
-        TerminalWordClass::Word
-    } else {
-        TerminalWordClass::Punctuation
-    }
-}
-
-fn word_selection(snapshot: &TerminalSnapshot, point: TerminalPoint) -> TerminalSelection {
-    let columns = snapshot.size.columns.max(1);
-    let point = TerminalPoint {
-        line: point.line.min(snapshot.size.rows.saturating_sub(1)),
-        column: point.column.min(columns - 1),
-    };
-    let class = terminal_word_class(terminal_cell_character(snapshot, point));
-    let mut start = point.column;
-    while start > 0
-        && terminal_word_class(terminal_cell_character(
-            snapshot,
-            TerminalPoint {
-                line: point.line,
-                column: start - 1,
-            },
-        )) == class
-    {
-        start -= 1;
-    }
-    let mut end = point.column;
-    while end + 1 < columns
-        && terminal_word_class(terminal_cell_character(
-            snapshot,
-            TerminalPoint {
-                line: point.line,
-                column: end + 1,
-            },
-        )) == class
-    {
-        end += 1;
-    }
-    TerminalSelection {
-        anchor: TerminalPoint {
-            line: point.line,
-            column: start,
-        },
-        head: TerminalPoint {
-            line: point.line,
-            column: end,
-        },
-    }
-}
-
-fn line_selection(snapshot: &TerminalSnapshot, line: u16) -> TerminalSelection {
-    let line = line.min(snapshot.size.rows.saturating_sub(1));
-    TerminalSelection {
-        anchor: TerminalPoint { line, column: 0 },
-        head: TerminalPoint {
-            line,
-            column: snapshot.size.columns.saturating_sub(1),
-        },
-    }
-}
-
-fn selection_for_drag(
-    snapshot: &TerminalSnapshot,
-    initial: TerminalSelection,
-    mode: TerminalSelectionMode,
-    point: TerminalPoint,
-) -> TerminalSelection {
-    match mode {
-        TerminalSelectionMode::Character => TerminalSelection {
-            anchor: initial.anchor,
-            head: point,
-        },
-        TerminalSelectionMode::Word => {
-            let (initial_start, initial_end) = initial.ordered();
-            let (current_start, current_end) = word_selection(snapshot, point).ordered();
-            if current_start < initial_start {
-                TerminalSelection {
-                    anchor: initial_end,
-                    head: current_start,
-                }
-            } else {
-                TerminalSelection {
-                    anchor: initial_start,
-                    head: current_end,
-                }
-            }
-        }
-        TerminalSelectionMode::Line => {
-            let (initial_start, initial_end) = initial.ordered();
-            let (current_start, current_end) = line_selection(snapshot, point.line).ordered();
-            if current_start < initial_start {
-                TerminalSelection {
-                    anchor: initial_end,
-                    head: current_start,
-                }
-            } else {
-                TerminalSelection {
-                    anchor: initial_start,
-                    head: current_end,
-                }
-            }
-        }
-    }
-}
-
-fn selected_terminal_text(snapshot: &TerminalSnapshot, selection: TerminalSelection) -> String {
-    if snapshot.size.rows == 0 || snapshot.size.columns == 0 {
-        return String::new();
-    }
-    let (mut start, mut end) = selection.ordered();
-    start.line = start.line.min(snapshot.size.rows - 1);
-    end.line = end.line.min(snapshot.size.rows - 1);
-    start.column = start.column.min(snapshot.size.columns - 1);
-    end.column = end.column.min(snapshot.size.columns - 1);
-    let mut lines = Vec::with_capacity((end.line - start.line + 1) as usize);
-    for line in start.line..=end.line {
-        let first_column = if line == start.line { start.column } else { 0 };
-        let last_column = if line == end.line {
-            end.column
-        } else {
-            snapshot.size.columns - 1
-        };
-        let mut text = String::new();
-        for column in first_column..=last_column {
-            let cell = snapshot
-                .cells
-                .iter()
-                .find(|cell| cell.line == line && cell.column == column);
-            let Some(cell) = cell else {
-                text.push(' ');
-                continue;
-            };
-            let flags = Flags::from_bits_retain(cell.flags);
-            if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                continue;
-            }
-            text.push(cell.character);
-            text.extend(cell.zerowidth.iter().copied());
-        }
-        lines.push(text.trim_end().to_owned());
-    }
-    lines.join("\n")
 }
 
 fn terminal_size_for_viewport(
@@ -5995,7 +5975,6 @@ fn item_kind_icon(kind: ItemKind) -> IconName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eggie_protocol::{TerminalCell, TerminalColor, TerminalCursorShape};
     use gpui::{Keystroke, Modifiers};
     use uuid::Uuid;
 
@@ -6161,67 +6140,6 @@ mod tests {
             },
             is_held: false,
             prefer_character_input: false,
-        }
-    }
-
-    fn selection_snapshot() -> TerminalSnapshot {
-        let mut cells = Vec::new();
-        for (column, character) in "hello".chars().enumerate() {
-            cells.push(TerminalCell {
-                line: 0,
-                column: column as u16,
-                character,
-                zerowidth: Vec::new(),
-                foreground: TerminalColor::Named(256),
-                background: TerminalColor::Named(257),
-                underline_color: None,
-                hyperlink: None,
-                flags: 0,
-            });
-        }
-        for (column, character) in [(0, '界'), (2, '好')] {
-            cells.push(TerminalCell {
-                line: 1,
-                column,
-                character,
-                zerowidth: Vec::new(),
-                foreground: TerminalColor::Named(256),
-                background: TerminalColor::Named(257),
-                underline_color: None,
-                hyperlink: None,
-                flags: Flags::WIDE_CHAR.bits(),
-            });
-            cells.push(TerminalCell {
-                line: 1,
-                column: column + 1,
-                character: ' ',
-                zerowidth: Vec::new(),
-                foreground: TerminalColor::Named(256),
-                background: TerminalColor::Named(257),
-                underline_color: None,
-                hyperlink: None,
-                flags: Flags::WIDE_CHAR_SPACER.bits(),
-            });
-        }
-        TerminalSnapshot {
-            session_id: Uuid::nil(),
-            size: TerminalSize {
-                columns: 6,
-                rows: 2,
-                ..TerminalSize::default()
-            },
-            cells,
-            color_overrides: Vec::new(),
-            cursor_line: 0,
-            cursor_column: 0,
-            cursor_shape: TerminalCursorShape::Block,
-            cursor_width: 1,
-            title: String::new(),
-            revision: 0,
-            last_input_sequence: 0,
-            input_modes: Default::default(),
-            images: Vec::new(),
-            image_placements: Vec::new(),
         }
     }
 
@@ -6458,28 +6376,6 @@ mod tests {
                 ..Modifiers::default()
             },
         )));
-    }
-
-    #[test]
-    fn terminal_selection_extracts_multiline_and_wide_text() {
-        let snapshot = selection_snapshot();
-        assert_eq!(
-            selected_terminal_text(
-                &snapshot,
-                TerminalSelection {
-                    anchor: TerminalPoint { line: 0, column: 1 },
-                    head: TerminalPoint { line: 1, column: 3 },
-                },
-            ),
-            "ello\n界好"
-        );
-        assert_eq!(
-            word_selection(&snapshot, TerminalPoint { line: 0, column: 2 }),
-            TerminalSelection {
-                anchor: TerminalPoint { line: 0, column: 0 },
-                head: TerminalPoint { line: 0, column: 4 },
-            }
-        );
     }
 
     #[test]

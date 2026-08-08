@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -283,6 +283,35 @@ pub enum ClientRequest {
         session_id: SessionId,
         event: TerminalScrollEvent,
     },
+    /// Begin an interactive selection at a viewport cell. The daemon converts the viewport point to
+    /// an absolute grid point (accounting for the current scroll offset) and stores it as the
+    /// terminal core's authoritative `Selection`, which stays valid across scrollback growth.
+    TerminalSelectionStart {
+        session_id: SessionId,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+        kind: TerminalSelectionKind,
+    },
+    /// Extend the active selection's head to a viewport cell (drag). Consecutive updates are merged
+    /// on the daemon's input queue so a fast drag does not flood the terminal core.
+    TerminalSelectionUpdate {
+        session_id: SessionId,
+        point: TerminalCellPosition,
+        side: TerminalSelectionSide,
+    },
+    /// Clear the active selection (e.g. a click that did not turn into a drag).
+    TerminalSelectionClear {
+        session_id: SessionId,
+    },
+    /// Select the entire buffer including scrollback.
+    TerminalSelectAll {
+        session_id: SessionId,
+    },
+    /// Extract the current selection's text (whole scrollback span, soft-wrap unwrapped, trailing
+    /// whitespace trimmed) and return it in [`DaemonResponse::SelectionText`].
+    TerminalCopySelection {
+        session_id: SessionId,
+    },
     /// Search the terminal grid (including scrollback) for `query`. The daemon runs the search in
     /// its terminal core, scrolls the viewport so the active match is visible, publishes a fresh
     /// snapshot, and replies with [`DaemonResponse::SearchResult`]. Coordinates in the reply are
@@ -310,6 +339,11 @@ pub enum ClientRequest {
     SetOscPolicy {
         session_id: SessionId,
         allow_clipboard_read: bool,
+    },
+    /// Enable or disable bare-URL auto-detection for a session.
+    SetUrlDetection {
+        session_id: SessionId,
+        detect_urls: bool,
     },
     Terminate {
         session_id: SessionId,
@@ -691,6 +725,10 @@ pub struct TerminalSnapshot {
     pub images: Vec<TerminalImageDescriptor>,
     #[serde(rename = "gp", default, skip_serializing_if = "Vec::is_empty")]
     pub image_placements: Vec<TerminalImagePlacement>,
+    #[serde(rename = "sel", default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<TerminalSelectionRange>,
+    #[serde(rename = "dl", default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_links: Vec<TerminalLinkRange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -758,6 +796,61 @@ pub struct TerminalSearchResult {
     pub revision: u64,
 }
 
+/// Which edge of a cell a selection endpoint sits on. Mirrors the terminal core's `Side`; the client
+/// derives it from the sub-cell x position of the mouse (left half vs right half).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSelectionSide {
+    #[default]
+    Left,
+    Right,
+}
+
+/// The semantic kind of an interactive selection, chosen by click count. Mirrors the terminal core's
+/// `SelectionType` (minus `Block`, which is reserved for a future rectangular-selection modifier).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSelectionKind {
+    /// Character-granularity selection (single click + drag).
+    #[default]
+    Simple,
+    /// Word/semantic selection (double click).
+    Semantic,
+    /// Whole-line selection (triple click).
+    Lines,
+    /// Rectangular/block selection.
+    Block,
+}
+
+/// The active selection projected into the current viewport, in viewport-relative coordinates. Both
+/// endpoints are inclusive. The daemon owns the authoritative selection (a terminal-core `Selection`
+/// spanning scrollback); this is only its visible projection for the current snapshot. `None` in a
+/// snapshot means the selection is empty or entirely scrolled out of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSelectionRange {
+    #[serde(rename = "s")]
+    pub start: TerminalCellPosition,
+    #[serde(rename = "e")]
+    pub end: TerminalCellPosition,
+    #[serde(rename = "b", default, skip_serializing_if = "is_false")]
+    pub is_block: bool,
+}
+
+/// A URL auto-detected in the terminal output, in viewport-relative coordinates. Both endpoints are
+/// inclusive. A URL spanning multiple rows (soft-wrapped) is emitted as one range per row so the
+/// client can draw and hit-test each row independently. Distinct from [`TerminalCell::hyperlink`]
+/// (explicit OSC 8 links), which take priority when both cover the same cell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalLinkRange {
+    #[serde(rename = "s")]
+    pub start: TerminalCellPosition,
+    #[serde(rename = "e")]
+    pub end: TerminalCellPosition,
+    #[serde(rename = "u")]
+    pub url: String,
+}
+
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshotDelta {
     #[serde(rename = "id")]
@@ -792,6 +885,10 @@ pub struct TerminalSnapshotDelta {
     pub images: Option<Vec<TerminalImageDescriptor>>,
     #[serde(rename = "gp", default, skip_serializing_if = "Option::is_none")]
     pub image_placements: Option<Vec<TerminalImagePlacement>>,
+    #[serde(rename = "sel", default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<TerminalSelectionRange>,
+    #[serde(rename = "dl", default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_links: Vec<TerminalLinkRange>,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -877,6 +974,8 @@ impl TerminalSnapshot {
                 .image_placements
                 .clone()
                 .unwrap_or_else(|| self.image_placements.clone()),
+            selection: delta.selection,
+            detected_links: delta.detected_links.clone(),
         })
     }
 }
@@ -928,6 +1027,13 @@ pub enum DaemonResponse {
     SearchResult {
         session_id: SessionId,
         result: TerminalSearchResult,
+    },
+    /// Reply to [`ClientRequest::TerminalCopySelection`]. `text` is `None` when there is no active
+    /// selection or it is empty.
+    SelectionText {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     TerminalImage {
         key: TerminalImageKey,
@@ -1170,6 +1276,110 @@ mod tests {
     }
 
     #[test]
+    fn terminal_selection_requests_and_reply_round_trip() {
+        for request in [
+            ClientRequest::TerminalSelectionStart {
+                session_id: Uuid::nil(),
+                point: TerminalCellPosition { line: 3, column: 7 },
+                side: TerminalSelectionSide::Right,
+                kind: TerminalSelectionKind::Semantic,
+            },
+            ClientRequest::TerminalSelectionUpdate {
+                session_id: Uuid::nil(),
+                point: TerminalCellPosition {
+                    line: 12,
+                    column: 0,
+                },
+                side: TerminalSelectionSide::Left,
+            },
+            ClientRequest::TerminalSelectionClear {
+                session_id: Uuid::nil(),
+            },
+            ClientRequest::TerminalSelectAll {
+                session_id: Uuid::nil(),
+            },
+            ClientRequest::TerminalCopySelection {
+                session_id: Uuid::nil(),
+            },
+        ] {
+            let encoded = encode_line(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
+                request
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<ClientRequest>(
+                    &rmp_serde::to_vec_named(&request).unwrap()
+                )
+                .unwrap(),
+                request
+            );
+        }
+
+        let reply = DaemonResponse::SelectionText {
+            session_id: Uuid::nil(),
+            text: Some("hello\nworld".to_owned()),
+        };
+        let encoded = encode_line(&reply).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DaemonResponse>(&encoded).unwrap(),
+            reply
+        );
+    }
+
+    #[test]
+    fn selection_side_and_kind_default_and_omitted_block_flag() {
+        assert_eq!(TerminalSelectionSide::default(), TerminalSelectionSide::Left);
+        assert_eq!(
+            TerminalSelectionKind::default(),
+            TerminalSelectionKind::Simple
+        );
+        // A range without the block flag omits "b" on the wire and decodes back to false.
+        let range = TerminalSelectionRange {
+            start: TerminalCellPosition { line: 0, column: 0 },
+            end: TerminalCellPosition { line: 1, column: 4 },
+            is_block: false,
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        assert!(!json.contains("\"b\""));
+        assert_eq!(
+            serde_json::from_str::<TerminalSelectionRange>(&json).unwrap(),
+            range
+        );
+    }
+
+    #[test]
+    fn snapshot_without_selection_key_decodes_to_none() {
+        // An older daemon's snapshot has no "sel" key; it must decode with selection == None so a
+        // version-skewed client does not hard-fail.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","s":{"columns":80,"rows":24,"cell_width":8,"cell_height":16},"c":[],"cl":0,"cc":0,"cs":"block","cw":1,"t":"","r":1}"#;
+        let snapshot: TerminalSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.selection, None);
+        assert!(snapshot.detected_links.is_empty());
+    }
+
+    #[test]
+    fn detected_links_round_trip_and_default_empty() {
+        let link = TerminalLinkRange {
+            start: TerminalCellPosition { line: 2, column: 6 },
+            end: TerminalCellPosition {
+                line: 2,
+                column: 24,
+            },
+            url: "https://example.com/x".to_owned(),
+        };
+        let encoded = encode_line(&link).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TerminalLinkRange>(&encoded).unwrap(),
+            link
+        );
+        // A snapshot without "dl" decodes to an empty link list.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","s":{"columns":80,"rows":24,"cell_width":8,"cell_height":16},"c":[],"cl":0,"cc":0,"cs":"block","cw":1,"t":"","r":1}"#;
+        let snapshot: TerminalSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.detected_links.is_empty());
+    }
+
+    #[test]
     fn terminal_progress_update_round_trips() {
         let response = DaemonResponse::Progress {
             update: TerminalProgressUpdate {
@@ -1333,6 +1543,8 @@ mod tests {
                 destination_height: 4,
                 z: -1,
             }],
+            selection: None,
+            detected_links: Vec::new(),
         };
         let encoded = encode_line(&DaemonResponse::Snapshot {
             snapshot: Arc::new(snapshot.clone()),
@@ -1417,6 +1629,8 @@ mod tests {
                 destination_height: 36,
                 z: 1,
             }],
+            selection: None,
+            detected_links: Vec::new(),
         };
         let replacement = TerminalCell {
             line: 0,
@@ -1452,6 +1666,8 @@ mod tests {
             },
             images: Some(Vec::new()),
             image_placements: Some(Vec::new()),
+            selection: None,
+            detected_links: Vec::new(),
         };
 
         let updated = snapshot.apply_delta(&delta).unwrap();
