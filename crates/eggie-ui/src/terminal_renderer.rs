@@ -7,8 +7,8 @@ use crate::{
 };
 use alacritty_terminal::term::cell::Flags;
 use eggie_protocol::{
-    TerminalCell, TerminalColor, TerminalCursorShape, TerminalImageKey, TerminalSearchMatch,
-    TerminalSearchResult, TerminalSnapshot,
+    TerminalCell, TerminalColor, TerminalCursorShape, TerminalImageKey, TerminalLinkRange,
+    TerminalSearchMatch, TerminalSearchResult, TerminalSnapshot,
 };
 use gpui::{
     App, Bounds, Element, ElementId, FocusHandle, GlobalElementId, InputHandler,
@@ -72,6 +72,7 @@ pub(crate) struct TerminalRenderOptions {
     input: Option<TerminalInputContext>,
     input_latency: InputLatencyTracker,
     search: Option<TerminalSearchHighlights>,
+    url_hover: Option<TerminalLinkRange>,
 }
 
 /// Viewport-relative search highlights to overlay on the terminal grid. `active` is the currently
@@ -114,11 +115,17 @@ impl TerminalRenderOptions {
             input,
             input_latency,
             search: None,
+            url_hover: None,
         }
     }
 
     pub(crate) fn with_search(mut self, search: Option<TerminalSearchHighlights>) -> Self {
         self.search = search.filter(|search| !search.is_empty());
+        self
+    }
+
+    pub(crate) fn with_url_hover(mut self, url_hover: Option<TerminalLinkRange>) -> Self {
+        self.url_hover = url_hover;
         self
     }
 }
@@ -169,6 +176,7 @@ struct PreparationKey {
     selection: Option<TerminalSelection>,
     ime: Option<TerminalImeState>,
     search: Option<TerminalSearchHighlights>,
+    url_hover: Option<TerminalLinkRange>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -212,6 +220,7 @@ impl MetalTerminalRenderer {
             input: options.input,
             input_latency: options.input_latency,
             search: options.search,
+            url_hover: options.url_hover,
         }
     }
 
@@ -260,6 +269,7 @@ pub(crate) struct MetalTerminalElement {
     input: Option<TerminalInputContext>,
     input_latency: InputLatencyTracker,
     search: Option<TerminalSearchHighlights>,
+    url_hover: Option<TerminalLinkRange>,
 }
 
 #[derive(Clone, Debug)]
@@ -694,6 +704,7 @@ impl Element for MetalTerminalElement {
             selection: self.selection,
             ime: self.ime.clone(),
             search: self.search.clone(),
+            url_hover: self.url_hover.clone(),
         };
         let cached = self
             .renderer
@@ -723,6 +734,7 @@ impl Element for MetalTerminalElement {
                 self.selection,
                 self.ime.as_ref(),
                 self.search.as_ref(),
+                self.url_hover.as_ref(),
                 &image_cache,
             ));
             drop(image_cache);
@@ -857,6 +869,7 @@ fn prepare_terminal(
     selection: Option<TerminalSelection>,
     ime: Option<&TerminalImeState>,
     search: Option<&TerminalSearchHighlights>,
+    url_hover: Option<&TerminalLinkRange>,
     image_cache: &FxHashMap<TerminalTextureKey, Arc<TerminalImageData>>,
 ) -> PreparedMetalTerminal {
     let palette = TerminalPalette::new(snapshot, theme);
@@ -901,6 +914,9 @@ fn prepare_terminal(
     );
     let mut decorations =
         prepare_decorations(&grid, &palette, cell_width, line_height, minimum_contrast);
+    // Hovered auto-detected URL: underline it in the accent color so it reads as clickable.
+    let mut url_hover_commands =
+        prepare_url_hover(url_hover, snapshot, cell_width, line_height, (accent << 8) | 0xff);
     let (mut images_below_background, mut images_below_text, mut images_above_text) =
         prepare_images(snapshot, cell_width, line_height, scale_factor, image_cache);
     let mut commands = Vec::with_capacity(
@@ -912,6 +928,7 @@ fn prepare_terminal(
             + cursor_background.len()
             + glyphs.len()
             + decorations.len()
+            + url_hover_commands.len()
             + cursor_foreground.len()
             + images_above_text.len(),
     );
@@ -924,6 +941,7 @@ fn prepare_terminal(
     commands.append(&mut cursor_background);
     commands.append(&mut glyphs);
     commands.append(&mut decorations);
+    commands.append(&mut url_hover_commands);
     commands.append(&mut cursor_foreground);
     commands.append(&mut images_above_text);
     if let Some(ime) = ime.filter(|ime| !ime.text.is_empty()) {
@@ -1163,6 +1181,41 @@ fn push_search_match(
             color,
         );
     }
+}
+
+/// Underline a hovered auto-detected URL. `detected_links` are already emitted one range per row, so
+/// this draws a single thin rect along the bottom of the hovered range's cells.
+fn prepare_url_hover(
+    url_hover: Option<&TerminalLinkRange>,
+    snapshot: &TerminalSnapshot,
+    cell_width: f32,
+    line_height: f32,
+    color: u32,
+) -> Vec<MetalCommand> {
+    let Some(link) = url_hover else {
+        return Vec::new();
+    };
+    let rows = snapshot.size.rows;
+    let columns = snapshot.size.columns;
+    if rows == 0 || columns == 0 {
+        return Vec::new();
+    }
+    let line = link.start.line.min(rows - 1);
+    let first_column = link.start.column.min(columns - 1);
+    let last_column = link.end.column.min(columns - 1);
+    let (lo, hi) = (first_column.min(last_column), first_column.max(last_column));
+    // A 1px underline sitting just above the cell's bottom edge.
+    let thickness = (line_height * 0.08).clamp(1., 2.);
+    let mut commands = Vec::with_capacity(1);
+    push_rect(
+        &mut commands,
+        lo as f32 * cell_width,
+        (line as f32 + 1.) * line_height - thickness,
+        (hi - lo + 1) as f32 * cell_width,
+        thickness,
+        color,
+    );
+    commands
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1609,7 +1662,7 @@ fn dim_rgba(color: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::settings::{AppSettings, ThemeMode, theme_catalog};
-    use eggie_protocol::{TerminalColorOverride, TerminalSize};
+    use eggie_protocol::{TerminalCellPosition, TerminalColorOverride, TerminalSize};
     use uuid::Uuid;
 
     fn theme() -> &'static TerminalTheme {
@@ -1646,6 +1699,8 @@ mod tests {
             input_modes: Default::default(),
             images: Vec::new(),
             image_placements: Vec::new(),
+            selection: None,
+            detected_links: Vec::new(),
         }
     }
 
@@ -1958,6 +2013,31 @@ mod tests {
     }
 
     #[test]
+    fn url_hover_underlines_the_hovered_range() {
+        let mut snapshot = snapshot(Vec::new());
+        snapshot.size.rows = 3;
+        let link = TerminalLinkRange {
+            start: TerminalCellPosition { line: 1, column: 2 },
+            end: TerminalCellPosition { line: 1, column: 5 },
+            url: "https://example.com".to_owned(),
+        };
+        let commands = prepare_url_hover(Some(&link), &snapshot, 8., 18., 0xabcdef99);
+        assert_eq!(commands.len(), 1);
+        let MetalCommand::Rect { rect, color } = commands[0] else {
+            panic!("hover underline must be a rect");
+        };
+        assert_eq!(color, 0xabcdef99);
+        // Spans columns 2..=5 (x = 16, width = 4 cells = 32) and sits at the bottom of row 1.
+        assert_eq!(rect[0], 16.);
+        assert_eq!(rect[2], 32.);
+        let thickness = rect[3];
+        assert!((1.0..=2.0).contains(&thickness), "thickness {thickness}");
+        assert!((rect[1] - (2. * 18. - thickness)).abs() < 0.001, "y = {}", rect[1]);
+        // No hover → no commands.
+        assert!(prepare_url_hover(None, &snapshot, 8., 18., 0xabcdef99).is_empty());
+    }
+
+    #[test]
     fn ime_candidate_offsets_follow_utf16_and_display_width() {
         assert_eq!(display_width_for_utf16_prefix("a界😀", 0), 0);
         assert_eq!(display_width_for_utf16_prefix("a界😀", 1), 1);
@@ -2078,6 +2158,7 @@ mod tests {
             14.,
             0x3399ffff,
             1.,
+            None,
             None,
             None,
             None,
@@ -2264,6 +2345,7 @@ mod tests {
                 14.,
                 0x3399ffff,
                 1.,
+                None,
                 None,
                 None,
                 None,

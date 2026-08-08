@@ -385,6 +385,12 @@ impl SettingsWindow {
         });
     }
 
+    fn set_detect_urls(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.detect_urls = enabled, cx)
+        });
+    }
+
     fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.language = language, cx)
@@ -529,6 +535,44 @@ impl SettingsWindow {
                             })
                             .on_click(cx.listener(move |settings, _, _, cx| {
                                 settings.set_osc_clipboard_read(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_detect_urls_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("detect-urls-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_detect_urls(value, cx)
                             }))
                             .child(label),
                     )
@@ -1250,6 +1294,7 @@ impl gpui::Render for SettingsWindow {
         );
         let osc_clipboard_read_control =
             self.render_osc_clipboard_read_control(config.allow_osc_clipboard_read, cx);
+        let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
         let terminal_preview = self.render_terminal_preview(&config, theme);
 
         div()
@@ -1496,6 +1541,16 @@ impl gpui::Render for SettingsWindow {
                                                                         self.colors,
                                                                     ),
                                                                 ],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
+                                                                language.terminal_behavior_section(),
+                                                                vec![settings_row(
+                                                                    language.detect_urls_row(),
+                                                                    language.detect_urls_description(),
+                                                                    detect_urls_control,
+                                                                    self.colors,
+                                                                )],
                                                                 self.colors,
                                                             ),
                                                             settings_section(
