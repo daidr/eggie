@@ -83,6 +83,8 @@ pub(crate) struct AppSettings {
     pub(crate) progress_stale_timeout_secs: u32,
     pub(crate) allow_osc_clipboard_read: bool,
     pub(crate) detect_urls: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) keybindings: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -101,6 +103,7 @@ impl Default for AppSettings {
             progress_stale_timeout_secs: DEFAULT_PROGRESS_STALE_TIMEOUT_SECS,
             allow_osc_clipboard_read: false,
             detect_urls: true,
+            keybindings: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -145,6 +148,11 @@ impl AppSettings {
         self.progress_stale_timeout_secs = self
             .progress_stale_timeout_secs
             .clamp(MIN_PROGRESS_TIMEOUT_SECS, MAX_PROGRESS_TIMEOUT_SECS);
+        self.keybindings.retain(|id, keystroke| {
+            crate::keybindings::spec_by_id(id).is_some()
+                && gpui::Keystroke::parse(keystroke).is_ok()
+                && crate::keybindings::default_keystroke(id) != Some(keystroke.as_str())
+        });
     }
 
     pub(crate) fn effective_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
@@ -496,6 +504,7 @@ mod tests {
             progress_stale_timeout_secs: u32::MAX,
             allow_osc_clipboard_read: true,
             detect_urls: false,
+            keybindings: std::collections::BTreeMap::new(),
         };
         config.normalize();
         fs::create_dir_all(&directory).unwrap();
@@ -542,6 +551,82 @@ mod tests {
             config.progress_stale_timeout_secs,
             DEFAULT_PROGRESS_STALE_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn legacy_settings_without_keybindings_field_load_empty() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "theme_mode": "system",
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert!(config.keybindings.is_empty());
+    }
+
+    #[test]
+    fn normalize_drops_unknown_action_ids() {
+        let mut config = AppSettings::default();
+        config
+            .keybindings
+            .insert("not_a_real_action".to_owned(), "cmd-shift-z".to_owned());
+        config.normalize();
+        assert!(config.keybindings.is_empty());
+    }
+
+    #[test]
+    fn normalize_drops_invalid_keystrokes() {
+        let mut config = AppSettings::default();
+        // Two non-modifier keys is not a valid single keystroke.
+        config
+            .keybindings
+            .insert("terminal_copy".to_owned(), "cmd-a-b".to_owned());
+        config.normalize();
+        assert!(config.keybindings.is_empty());
+    }
+
+    #[test]
+    fn normalize_drops_overrides_equal_to_default() {
+        let mut config = AppSettings::default();
+        // terminal_copy's default is cmd-c; storing it as an override is redundant.
+        config
+            .keybindings
+            .insert("terminal_copy".to_owned(), "cmd-c".to_owned());
+        config.normalize();
+        assert!(config.keybindings.is_empty());
+    }
+
+    #[test]
+    fn normalize_keeps_valid_overrides() {
+        let mut config = AppSettings::default();
+        config
+            .keybindings
+            .insert("terminal_copy".to_owned(), "cmd-shift-c".to_owned());
+        config.normalize();
+        assert_eq!(
+            config.keybindings.get("terminal_copy").map(String::as_str),
+            Some("cmd-shift-c")
+        );
+    }
+
+    #[test]
+    fn keybindings_only_serialize_when_present() {
+        let config = AppSettings::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("keybindings"),
+            "empty keybindings should be skipped: {json}"
+        );
+
+        let mut with_override = AppSettings::default();
+        with_override
+            .keybindings
+            .insert("terminal_copy".to_owned(), "cmd-shift-c".to_owned());
+        let json = serde_json::to_string(&with_override).unwrap();
+        assert!(json.contains("keybindings"));
+        assert!(json.contains("terminal_copy"));
     }
 
     #[test]

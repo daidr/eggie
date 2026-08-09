@@ -11,7 +11,7 @@ use crate::{
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, Context, Entity, KeyBinding, Menu,
+    Anchor, AnyElement, App, Bounds, Context, Entity, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
     actions, anchored, deferred, div, point, prelude::*, px, rgb, size,
@@ -31,7 +31,21 @@ actions!(
         TerminalCopy,
         TerminalPaste,
         TerminalSelectAll,
-        TerminalFind
+        TerminalFind,
+        NewTab,
+        CloseTab,
+        NextTab,
+        PrevTab,
+        SplitRight,
+        SplitDown,
+        ClearScreen,
+        ScrollTop,
+        ScrollBottom,
+        PageUp,
+        PageDown,
+        FontIncrease,
+        FontDecrease,
+        FontReset
     ]
 );
 
@@ -84,11 +98,17 @@ enum SettingsSection {
     #[default]
     General,
     Appearance,
+    Keybindings,
     Advanced,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 3] = [Self::General, Self::Appearance, Self::Advanced];
+    const ALL: [Self; 4] = [
+        Self::General,
+        Self::Appearance,
+        Self::Keybindings,
+        Self::Advanced,
+    ];
 }
 
 pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
@@ -98,24 +118,23 @@ pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.bind_keys([
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-c", TerminalCopy, None),
-        KeyBinding::new("cmd-v", TerminalPaste, None),
-        KeyBinding::new("cmd-a", TerminalSelectAll, None),
-        KeyBinding::new("cmd-f", TerminalFind, None),
-    ]);
-    // Register the text-input keybindings AFTER the terminal's context-less bindings above, so the
-    // `EggieTextInput`-context bindings win the binding-index tiebreak when a text field is focused.
-    crate::text_input::install_keybindings(cx);
-    let language = settings.read(cx).config().language;
+    // Build the keymap from settings (defaults + user overrides). This also
+    // registers the text-input bindings in the correct order to preserve the
+    // binding-index tiebreak. Action handlers above are registered exactly once
+    // and are intentionally *not* rebuilt when the keymap changes.
+    let config = settings.read(cx).config().clone();
+    crate::keybindings::rebuild_keymap(&config, cx);
+    let language = config.language;
     cx.set_menus(build_menus(language));
 
     let settings_for_observer = settings.clone();
     cx.observe(&settings, move |_, cx| {
-        let language = settings_for_observer.read(cx).config().language;
-        cx.set_menus(build_menus(language));
+        let config = settings_for_observer.read(cx).config().clone();
+        // Rebuild the keymap first: `set_menus` snapshots the current keymap to resolve each
+        // menu item's shortcut, so it must run *after* the keymap reflects this change or the
+        // menu bar lags one edit behind.
+        crate::keybindings::rebuild_keymap(&config, cx);
+        cx.set_menus(build_menus(config.language));
     })
     .detach();
 }
@@ -271,6 +290,12 @@ struct SettingsWindow {
     selector_bounds: [Option<Bounds<Pixels>>; 3],
     moving_window: bool,
     selected_section: SettingsSection,
+    /// The action id currently being recorded (its shortcut cell is capturing keys), if any.
+    recording: Option<String>,
+    /// Keystroke interceptor active while recording; dropping it uninstalls the capture.
+    recording_subscription: Option<gpui::Subscription>,
+    /// When a recorded keystroke collides with another action, its label (for the conflict hint).
+    recording_conflict: Option<String>,
 }
 
 impl SettingsWindow {
@@ -313,6 +338,9 @@ impl SettingsWindow {
             selector_bounds: [None; 3],
             moving_window: false,
             selected_section: SettingsSection::default(),
+            recording: None,
+            recording_subscription: None,
+            recording_conflict: None,
         }
     }
 
@@ -898,6 +926,275 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    // --- Keyboard shortcut recording ---------------------------------------------------------
+
+    /// Enter recording mode for `id`: install a keystroke interceptor that swallows every key
+    /// (so bound shortcuts like ⌘C are captured, not triggered) and forwards it to the state
+    /// machine. Dropping the returned subscription (in `cancel_recording`) uninstalls it.
+    fn start_recording(&mut self, id: String, cx: &mut Context<Self>) {
+        self.recording = Some(id);
+        self.recording_conflict = None;
+        let weak = cx.weak_entity();
+        self.recording_subscription = Some(cx.intercept_keystrokes(move |event, _window, cx| {
+            cx.stop_propagation();
+            let keystroke = event.keystroke.clone();
+            weak.update(cx, |this, cx| this.on_recorded_keystroke(keystroke, cx))
+                .ok();
+        }));
+        cx.notify();
+    }
+
+    fn on_recorded_keystroke(&mut self, keystroke: gpui::Keystroke, cx: &mut Context<Self>) {
+        // Escape cancels recording.
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            self.cancel_recording(cx);
+            return;
+        }
+        // Ignore the intermediate state where only modifiers are held.
+        if crate::keybindings::is_bare_modifier(&keystroke.key) {
+            return;
+        }
+        // Require at least one modifier so a bare letter cannot swallow terminal input.
+        if !keystroke.modifiers.modified() {
+            return;
+        }
+        let Some(id) = self.recording.clone() else {
+            return;
+        };
+        let canonical = crate::keybindings::canonical_keystroke(&keystroke);
+        // Reject a combination already bound to a different action.
+        if let Some(other_id) = self.find_binding_conflict(&canonical, &id, cx) {
+            let language = self.settings.read(cx).config().language;
+            let other_label = crate::keybindings::spec_by_id(other_id)
+                .map(|spec| (spec.label)(language))
+                .unwrap_or(other_id);
+            self.recording_conflict = Some(other_label.to_owned());
+            cx.notify();
+            return;
+        }
+        self.set_binding(id, canonical, cx);
+        self.cancel_recording(cx);
+    }
+
+    fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        self.recording = None;
+        self.recording_subscription = None;
+        self.recording_conflict = None;
+        cx.notify();
+    }
+
+    fn find_binding_conflict(
+        &self,
+        candidate: &str,
+        exclude_id: &str,
+        cx: &Context<Self>,
+    ) -> Option<&'static str> {
+        let config = self.settings.read(cx).config();
+        crate::keybindings::find_conflict(config, candidate, exclude_id)
+    }
+
+    /// Persist an override for `id`. If the recorded keystroke equals the default, drop the
+    /// override instead of storing a redundant entry.
+    fn set_binding(&mut self, id: String, canonical: String, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |config| {
+                    if crate::keybindings::default_keystroke(&id) == Some(canonical.as_str()) {
+                        config.keybindings.remove(&id);
+                    } else {
+                        config.keybindings.insert(id.clone(), canonical.clone());
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
+    fn reset_binding(&mut self, id: String, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|config| {
+                config.keybindings.remove(&id);
+            }, cx)
+        });
+    }
+
+    fn reset_all_bindings(&mut self, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|config| config.keybindings.clear(), cx)
+        });
+    }
+
+    fn render_keybindings_section(
+        &self,
+        language: Language,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let config = self.settings.read(cx).config().clone();
+        let has_overrides = !config.keybindings.is_empty();
+        let colors = self.colors;
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.muted))
+                    .child(language.keybindings_hint()),
+            )
+            .when(has_overrides, |element| {
+                element.child(
+                    div()
+                        .id("reset-all-keybindings")
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .h(px(28.))
+                        .px_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(colors.border))
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .hover(|element| element.bg(rgb(colors.panel_alt)))
+                        .child(language.reset_all())
+                        .on_click(cx.listener(|settings, _, _, cx| {
+                            settings.reset_all_bindings(cx);
+                        })),
+                )
+            })
+            .into_any_element();
+
+        let rows: Vec<AnyElement> = crate::keybindings::ACTION_SPECS
+            .iter()
+            .map(|spec| self.render_keybinding_row(spec, &config, language, cx))
+            .collect();
+
+        vec![
+            header,
+            settings_section(language.keybindings_section(), rows, colors),
+        ]
+    }
+
+    fn render_keybinding_row(
+        &self,
+        spec: &'static crate::keybindings::ActionSpec,
+        config: &AppSettings,
+        language: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors;
+        let id = spec.id;
+        let label = (spec.label)(language);
+        let effective = crate::keybindings::effective_keystroke(config, id)
+            .unwrap_or(spec.default_keystroke);
+        let is_overridden = config.keybindings.contains_key(id);
+        let is_recording = self.recording.as_deref() == Some(id);
+        let conflict = if is_recording {
+            self.recording_conflict.clone()
+        } else {
+            None
+        };
+
+        let cell_text = if is_recording {
+            if let Some(other) = conflict.as_deref() {
+                language.keybind_conflict(other)
+            } else {
+                language.recording_prompt().to_owned()
+            }
+        } else {
+            crate::keybindings::display_keystroke(effective)
+        };
+        let cell_text_color = if conflict.is_some() {
+            0xff6b6b
+        } else if is_recording {
+            colors.accent
+        } else {
+            colors.text
+        };
+        let cell_border = if is_recording {
+            colors.accent
+        } else {
+            colors.border
+        };
+
+        let recorded_id = id.to_string();
+        let shortcut_cell = div()
+            .id(SharedString::from(format!("keybind-{id}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.))
+            .min_w(px(84.))
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(cell_border))
+            .text_size(px(13.))
+            .text_color(rgb(cell_text_color))
+            .cursor_pointer()
+            .when(!is_recording, |element| {
+                element.hover(|element| element.bg(rgb(colors.panel_alt)))
+            })
+            .when(is_recording, |element| element.bg(rgb(colors.panel_alt)))
+            .child(cell_text)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |settings, _, _, cx| {
+                if settings.recording.as_deref() == Some(recorded_id.as_str()) {
+                    settings.cancel_recording(cx);
+                } else {
+                    settings.start_recording(recorded_id.clone(), cx);
+                }
+            }));
+
+        let reset_id = id.to_string();
+        let reset_button = div().flex_none().when(is_overridden, |element| {
+            element.child(
+                div()
+                    .id(SharedString::from(format!("reset-keybind-{id}")))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.))
+                    .px_2()
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.muted))
+                    .cursor_pointer()
+                    .hover(|element| element.bg(rgb(colors.panel_alt)))
+                    .child(language.reset_to_default())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |settings, _, _, cx| {
+                        settings.reset_binding(reset_id.clone(), cx);
+                    })),
+            )
+        });
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .min_h(px(48.))
+            .px_4()
+            .py_2()
+            .child(div().flex_1().min_w_0().child(label))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(reset_button)
+                    .child(shortcut_cell),
+            )
+            .into_any_element()
+    }
+
     fn render_font_size_control(&self, font_size: f32, cx: &mut Context<Self>) -> AnyElement {
         let button = |id: &'static str,
                       label: &'static str,
@@ -1368,6 +1665,11 @@ impl gpui::Render for SettingsWindow {
                                         language.appearance_sidebar(),
                                         IconName::Appearance,
                                     ),
+                                    SettingsSection::Keybindings => (
+                                        "settings-sidebar-keybindings",
+                                        language.keybindings_sidebar(),
+                                        IconName::Keyboard,
+                                    ),
                                     SettingsSection::Advanced => (
                                         "settings-sidebar-advanced",
                                         language.advanced_sidebar(),
@@ -1395,6 +1697,9 @@ impl gpui::Render for SettingsWindow {
                                         })
                                     })
                                     .on_click(cx.listener(move |settings, _, _, cx| {
+                                        if settings.recording.is_some() {
+                                            settings.cancel_recording(cx);
+                                        }
                                         settings.selected_section = section;
                                         cx.notify();
                                     }))
@@ -1440,6 +1745,7 @@ impl gpui::Render for SettingsWindow {
                                                             .child(match self.selected_section {
                                                                 SettingsSection::General => language.general_section(),
                                                                 SettingsSection::Appearance => language.appearance_section(),
+                                                                SettingsSection::Keybindings => language.keybindings_section(),
                                                                 SettingsSection::Advanced => language.advanced_section(),
                                                             }),
                                                     )
@@ -1564,6 +1870,9 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                         ],
+                                                        SettingsSection::Keybindings => {
+                                                            self.render_keybindings_section(language, cx)
+                                                        }
                                                     }),
                                             ),
                                     ),

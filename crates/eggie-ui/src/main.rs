@@ -2,6 +2,7 @@ mod app;
 mod i18n;
 mod icons;
 mod input_latency;
+mod keybindings;
 #[cfg(target_os = "macos")]
 mod metal_terminal;
 mod native_menu;

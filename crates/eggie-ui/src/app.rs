@@ -4,8 +4,15 @@ use crate::native_menu::{
     NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand,
     prepare_process_menu, prepare_project_menu, prepare_tab_menu,
 };
-use crate::settings::{Language, SettingsStore, TerminalTheme, UiColors, system_uses_dark_appearance};
-use crate::settings_window::{TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, is_dark_appearance};
+use crate::settings::{
+    DEFAULT_FONT_SIZE, Language, SettingsStore, TerminalTheme, UiColors,
+    system_uses_dark_appearance,
+};
+use crate::settings_window::{
+    ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, NewTab, NextTab, PageDown,
+    PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitRight, TerminalCopy, TerminalFind,
+    TerminalPaste, TerminalSelectAll, is_dark_appearance,
+};
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
     MetalTerminalRenderer, TerminalImageData, TerminalImeState, TerminalInputContext,
@@ -24,8 +31,9 @@ use eggie_protocol::{
     TerminalClipboardContent, TerminalClipboardSelection, TerminalImageDescriptor,
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
     TerminalMousePosition, TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
-    TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollDelta,
-    TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection,
+    TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollCommand,
+    TerminalScrollDelta, TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit,
+    TerminalSearchDirection,
     TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind, TerminalSelectionSide,
     TerminalSize, TerminalSnapshot,
 };
@@ -2848,6 +2856,95 @@ impl EggieApp {
             .is_ok()
     }
 
+    // --- Keybinding action handlers ----------------------------------------------------------
+    //
+    // These are thin wrappers over existing capabilities, invoked by the configurable keymap.
+    // Each returns whether it acted so the caller can stop action propagation.
+
+    fn new_tab_in_active_group(&mut self, cx: &mut Context<Self>) -> bool {
+        let group_id = self.workspace().active_group_id;
+        self.new_terminal(group_id, None, cx);
+        true
+    }
+
+    fn split_active_group(&mut self, direction: Direction, cx: &mut Context<Self>) -> bool {
+        let group_id = self.workspace().active_group_id;
+        self.new_terminal(group_id, Some(direction), cx);
+        true
+    }
+
+    fn close_active_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let group_id = self.workspace().active_group_id;
+        let Some(item_id) = self
+            .workspace()
+            .layout
+            .find_group(group_id)
+            .and_then(|group| group.active_item_id)
+        else {
+            return false;
+        };
+        self.close_item(group_id, item_id, cx);
+        true
+    }
+
+    fn activate_relative_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let group_id = self.workspace().active_group_id;
+        let Some(group) = self.workspace().layout.find_group(group_id) else {
+            return false;
+        };
+        let count = group.items.len();
+        if count < 2 {
+            return false;
+        }
+        let Some(current) = group
+            .active_item_id
+            .and_then(|active| group.items.iter().position(|item| item.id == active))
+        else {
+            return false;
+        };
+        let next_index = (current as isize + delta).rem_euclid(count as isize) as usize;
+        let item_id = group.items[next_index].id;
+        self.activate_item(group_id, item_id, window, cx);
+        true
+    }
+
+    fn clear_active_terminal(&mut self, _cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.active_session_id() else {
+            return false;
+        };
+        // Send Ctrl-L (form feed); the shell redraws its prompt on a cleared screen.
+        self.enqueue_terminal_input(session_id, vec![0x0c])
+    }
+
+    fn scroll_active_terminal(&mut self, command: TerminalScrollCommand, _cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.active_session_id() else {
+            return false;
+        };
+        self.client
+            .request(ClientRequest::TerminalScrollTo {
+                session_id,
+                command,
+            })
+            .is_ok()
+    }
+
+    fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) -> bool {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |settings| settings.font_size = (settings.font_size + delta).round(),
+                cx,
+            )
+        });
+        true
+    }
+
+    fn reset_font_size(&mut self, cx: &mut Context<Self>) -> bool {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.font_size = DEFAULT_FONT_SIZE, cx)
+        });
+        true
+    }
+
     /// Open the in-terminal search bar for the active session (⌘F), or refocus it if already open.
     fn open_terminal_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(session_id) = self.active_session_id() else {
@@ -4808,6 +4905,76 @@ impl gpui::Render for EggieApp {
             }))
             .on_action(cx.listener(|app, _: &TerminalFind, window, cx| {
                 if app.open_terminal_search(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &NewTab, _, cx| {
+                if app.new_tab_in_active_group(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &CloseTab, _, cx| {
+                if app.close_active_tab(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &NextTab, window, cx| {
+                if app.activate_relative_tab(1, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &PrevTab, window, cx| {
+                if app.activate_relative_tab(-1, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &SplitRight, _, cx| {
+                if app.split_active_group(Direction::Right, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &SplitDown, _, cx| {
+                if app.split_active_group(Direction::Down, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &ClearScreen, _, cx| {
+                if app.clear_active_terminal(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &ScrollTop, _, cx| {
+                if app.scroll_active_terminal(TerminalScrollCommand::Top, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &ScrollBottom, _, cx| {
+                if app.scroll_active_terminal(TerminalScrollCommand::Bottom, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &PageUp, _, cx| {
+                if app.scroll_active_terminal(TerminalScrollCommand::PageUp, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &PageDown, _, cx| {
+                if app.scroll_active_terminal(TerminalScrollCommand::PageDown, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &FontIncrease, _, cx| {
+                if app.adjust_font_size(1., cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &FontDecrease, _, cx| {
+                if app.adjust_font_size(-1., cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &FontReset, _, cx| {
+                if app.reset_font_size(cx) {
                     cx.stop_propagation();
                 }
             }))

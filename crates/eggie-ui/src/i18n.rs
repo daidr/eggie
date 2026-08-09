@@ -897,4 +897,197 @@ impl Language {
             Self::SimplifiedChinese => "跟随系统",
         }
     }
+
+    // --- Keyboard shortcuts ------------------------------------------------------------------
+
+    pub(crate) fn keybindings_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "Keyboard",
+            Self::SimplifiedChinese => "键盘",
+        }
+    }
+
+    pub(crate) fn keybindings_section(self) -> &'static str {
+        match self {
+            Self::English => "Keyboard Shortcuts",
+            Self::SimplifiedChinese => "键盘快捷键",
+        }
+    }
+
+    pub(crate) fn recording_prompt(self) -> &'static str {
+        match self {
+            Self::English => "Press shortcut…",
+            Self::SimplifiedChinese => "按下快捷键…",
+        }
+    }
+
+    pub(crate) fn keybind_conflict(self, other: &str) -> String {
+        match self {
+            Self::English => format!("Conflicts with {other}"),
+            Self::SimplifiedChinese => format!("与「{other}」冲突"),
+        }
+    }
+
+    pub(crate) fn reset_to_default(self) -> &'static str {
+        match self {
+            Self::English => "Reset",
+            Self::SimplifiedChinese => "恢复默认",
+        }
+    }
+
+    pub(crate) fn reset_all(self) -> &'static str {
+        match self {
+            Self::English => "Reset All",
+            Self::SimplifiedChinese => "全部恢复默认",
+        }
+    }
+
+    pub(crate) fn keybindings_hint(self) -> &'static str {
+        match self {
+            Self::English => "Click a shortcut to record a new key combination.",
+            Self::SimplifiedChinese => "点击快捷键即可录制新的组合键。",
+        }
+    }
+
+    // --- Action labels -----------------------------------------------------------------------
+
+    pub(crate) fn action_open_settings(self) -> &'static str {
+        match self {
+            Self::English => "Open Settings",
+            Self::SimplifiedChinese => "打开设置",
+        }
+    }
+
+    pub(crate) fn action_quit(self) -> &'static str {
+        match self {
+            Self::English => "Quit Eggie",
+            Self::SimplifiedChinese => "退出 Eggie",
+        }
+    }
+
+    pub(crate) fn action_terminal_copy(self) -> &'static str {
+        match self {
+            Self::English => "Copy",
+            Self::SimplifiedChinese => "复制",
+        }
+    }
+
+    pub(crate) fn action_terminal_paste(self) -> &'static str {
+        match self {
+            Self::English => "Paste",
+            Self::SimplifiedChinese => "粘贴",
+        }
+    }
+
+    pub(crate) fn action_terminal_select_all(self) -> &'static str {
+        match self {
+            Self::English => "Select All",
+            Self::SimplifiedChinese => "全选",
+        }
+    }
+
+    pub(crate) fn action_terminal_find(self) -> &'static str {
+        match self {
+            Self::English => "Find",
+            Self::SimplifiedChinese => "查找",
+        }
+    }
+
+    pub(crate) fn action_new_tab(self) -> &'static str {
+        match self {
+            Self::English => "New Tab",
+            Self::SimplifiedChinese => "新建标签页",
+        }
+    }
+
+    pub(crate) fn action_close_tab(self) -> &'static str {
+        match self {
+            Self::English => "Close Tab",
+            Self::SimplifiedChinese => "关闭标签页",
+        }
+    }
+
+    pub(crate) fn action_next_tab(self) -> &'static str {
+        match self {
+            Self::English => "Next Tab",
+            Self::SimplifiedChinese => "下一个标签页",
+        }
+    }
+
+    pub(crate) fn action_prev_tab(self) -> &'static str {
+        match self {
+            Self::English => "Previous Tab",
+            Self::SimplifiedChinese => "上一个标签页",
+        }
+    }
+
+    pub(crate) fn action_split_right(self) -> &'static str {
+        match self {
+            Self::English => "Split Right",
+            Self::SimplifiedChinese => "向右分屏",
+        }
+    }
+
+    pub(crate) fn action_split_down(self) -> &'static str {
+        match self {
+            Self::English => "Split Down",
+            Self::SimplifiedChinese => "向下分屏",
+        }
+    }
+
+    pub(crate) fn action_clear_screen(self) -> &'static str {
+        match self {
+            Self::English => "Clear Screen",
+            Self::SimplifiedChinese => "清屏",
+        }
+    }
+
+    pub(crate) fn action_scroll_top(self) -> &'static str {
+        match self {
+            Self::English => "Scroll to Top",
+            Self::SimplifiedChinese => "滚动到顶部",
+        }
+    }
+
+    pub(crate) fn action_scroll_bottom(self) -> &'static str {
+        match self {
+            Self::English => "Scroll to Bottom",
+            Self::SimplifiedChinese => "滚动到底部",
+        }
+    }
+
+    pub(crate) fn action_page_up(self) -> &'static str {
+        match self {
+            Self::English => "Page Up",
+            Self::SimplifiedChinese => "向上翻页",
+        }
+    }
+
+    pub(crate) fn action_page_down(self) -> &'static str {
+        match self {
+            Self::English => "Page Down",
+            Self::SimplifiedChinese => "向下翻页",
+        }
+    }
+
+    pub(crate) fn action_font_increase(self) -> &'static str {
+        match self {
+            Self::English => "Increase Font Size",
+            Self::SimplifiedChinese => "增大字号",
+        }
+    }
+
+    pub(crate) fn action_font_decrease(self) -> &'static str {
+        match self {
+            Self::English => "Decrease Font Size",
+            Self::SimplifiedChinese => "减小字号",
+        }
+    }
+
+    pub(crate) fn action_font_reset(self) -> &'static str {
+        match self {
+            Self::English => "Reset Font Size",
+            Self::SimplifiedChinese => "重置字号",
+        }
+    }
 }
