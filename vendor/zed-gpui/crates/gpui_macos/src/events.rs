@@ -473,6 +473,17 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
                         .all(|c| c.is_ascii_lowercase())
                 {
                     chars_ignoring_modifiers
+                } else if shift
+                    && chars_ignoring_modifiers.chars().count() == 1
+                    && chars_ignoring_modifiers.is_ascii()
+                {
+                    // Keep the unshifted base key and preserve the Shift modifier for ASCII
+                    // symbol/digit keys, so e.g. cmd-shift-, stays {shift:true, key:","} instead
+                    // of folding to {shift:false, key:"<"}. This mirrors how letters are already
+                    // handled above and keeps keybinding storage/matching/menu labels consistent.
+                    // Non-ASCII (international) layouts fall through to the shifted-char branch
+                    // below so their existing behavior is unchanged.
+                    chars_ignoring_modifiers
                 } else if shift {
                     shift = false;
                     chars_with_shift

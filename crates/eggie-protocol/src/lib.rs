@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -283,6 +283,13 @@ pub enum ClientRequest {
         session_id: SessionId,
         event: TerminalScrollEvent,
     },
+    /// Scroll the viewport by a discrete command (page up/down, jump to top/bottom). Unlike
+    /// [`ClientRequest::Scroll`] this maps directly onto the terminal core's `Scroll` primitives,
+    /// giving exact page and boundary semantics without the wheel accumulator.
+    TerminalScrollTo {
+        session_id: SessionId,
+        command: TerminalScrollCommand,
+    },
     /// Begin an interactive selection at a viewport cell. The daemon converts the viewport point to
     /// an absolute grid point (accounting for the current scroll offset) and stores it as the
     /// terminal core's authoritative `Selection`, which stays valid across scrollback growth.
@@ -409,6 +416,20 @@ pub enum TerminalScrollPhase {
     Started,
     Moved,
     Ended,
+}
+
+/// Discrete viewport scroll commands mapping directly onto the terminal core's scroll primitives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalScrollCommand {
+    /// Jump to the oldest scrollback line.
+    Top,
+    /// Jump to the live bottom of the buffer.
+    Bottom,
+    /// Scroll up one viewport page.
+    PageUp,
+    /// Scroll down one viewport page.
+    PageDown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1325,6 +1346,31 @@ mod tests {
             serde_json::from_slice::<DaemonResponse>(&encoded).unwrap(),
             reply
         );
+    }
+
+    #[test]
+    fn terminal_scroll_to_commands_round_trip() {
+        for command in [
+            TerminalScrollCommand::Top,
+            TerminalScrollCommand::Bottom,
+            TerminalScrollCommand::PageUp,
+            TerminalScrollCommand::PageDown,
+        ] {
+            let request = ClientRequest::TerminalScrollTo {
+                session_id: Uuid::nil(),
+                command,
+            };
+            let encoded = encode_line(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
+                request
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<ClientRequest>(&rmp_serde::to_vec_named(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
     }
 
     #[test]

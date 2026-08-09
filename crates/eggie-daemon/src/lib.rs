@@ -37,8 +37,9 @@ use eggie_protocol::{
     TerminalMouseButton, TerminalMouseEncoding, TerminalMouseEvent, TerminalMousePosition,
     TerminalMouseTracking, TerminalNotification, TerminalOscEvent, TerminalOscEventPayload,
     TerminalOscEventUpdate, TerminalProgress, TerminalProgressState, TerminalProgressTimeouts,
-    TerminalProgressUpdate, TerminalReportedLocation, TerminalScrollEvent, TerminalScrollPhase,
-    TerminalScrollUnit, TerminalSearchDirection, TerminalSearchMatch, TerminalSearchRequest,
+    TerminalProgressUpdate, TerminalReportedLocation, TerminalScrollCommand, TerminalScrollEvent,
+    TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection, TerminalSearchMatch,
+    TerminalSearchRequest,
     TerminalSearchResult, TerminalSemanticPhase, TerminalSelectionKind, TerminalSelectionRange,
     TerminalSelectionSide, TerminalShellIntegrationState, TerminalSize,
     TerminalLinkRange, TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
@@ -3080,6 +3081,24 @@ impl TerminalSession {
         Ok(())
     }
 
+    fn scroll_to(&self, command: TerminalScrollCommand) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        let initial_display_offset = terminal.grid().display_offset();
+        let scroll = match command {
+            TerminalScrollCommand::Top => Scroll::Top,
+            TerminalScrollCommand::Bottom => Scroll::Bottom,
+            TerminalScrollCommand::PageUp => Scroll::PageUp,
+            TerminalScrollCommand::PageDown => Scroll::PageDown,
+        };
+        terminal.scroll_display(scroll);
+        let viewport_changed = terminal.grid().display_offset() != initial_display_offset;
+        if viewport_changed {
+            self.events.publish_terminal(&terminal);
+        }
+        drop(terminal);
+        Ok(())
+    }
+
     fn search(&self, request: TerminalSearchRequest) -> Result<TerminalSearchResult> {
         let mut terminal = self.terminal.lock();
 
@@ -4433,6 +4452,13 @@ impl DaemonState {
             }
             ClientRequest::Scroll { session_id, event } => {
                 self.session(session_id)?.scroll(event)?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalScrollTo {
+                session_id,
+                command,
+            } => {
+                self.session(session_id)?.scroll_to(command)?;
                 Ok(DaemonResponse::Ok)
             }
             ClientRequest::TerminalSearch {
@@ -7397,6 +7423,85 @@ mod tests {
         // Clearing drops the selection text entirely.
         session.selection_clear().unwrap();
         assert!(session.selection_text().unwrap().is_none());
+
+        session.terminate();
+    }
+
+    #[test]
+    fn scroll_to_commands_move_the_viewport_across_scrollback() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        session
+            .input(
+                b"printf 'FIRSTLINE\\n'; for i in $(seq 1 60); do echo filler $i; done; printf 'LASTLINE\\n'\r".to_vec(),
+                1,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            if snapshot
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("LASTLINE"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "LASTLINE did not arrive");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // FIRSTLINE is in scrollback and not visible at the live bottom.
+        assert!(
+            !session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("FIRSTLINE")),
+            "FIRSTLINE should start off-screen in scrollback"
+        );
+
+        // Jump to the top: the earliest scrollback line becomes visible.
+        session.scroll_to(TerminalScrollCommand::Top).unwrap();
+        assert!(
+            session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("FIRSTLINE")),
+            "scroll-to-top should reveal the oldest scrollback line"
+        );
+
+        // Jump back to the bottom: the live tail is visible again.
+        session.scroll_to(TerminalScrollCommand::Bottom).unwrap();
+        assert!(
+            session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("LASTLINE")),
+            "scroll-to-bottom should return to the live viewport"
+        );
+        assert!(
+            !session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("FIRSTLINE")),
+            "scroll-to-bottom should leave scrollback again"
+        );
 
         session.terminate();
     }
