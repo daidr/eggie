@@ -2948,8 +2948,11 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn semantic_prompt(&mut self, prompt: SemanticPrompt) {
         let cursor_line = self.grid.cursor.point.line.0;
+        // Capture the scrollback depth synchronously: the parser holds the terminal lock here, so
+        // this is the only place a listener can read a coherent history size for this marker.
+        let history_size = self.grid.history_size();
         self.event_proxy
-            .send_event(Event::SemanticPrompt(prompt, cursor_line));
+            .send_event(Event::SemanticPrompt(prompt, cursor_line, history_size));
     }
 
     #[inline]

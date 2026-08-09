@@ -101,9 +101,15 @@ const OSC_EVENT_HISTORY: usize = 256;
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
 const MAX_ITERM2_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 const COMMAND_HISTORY: usize = 1_000;
+/// Scrollback capacity (lines) configured on every terminal. Also the eviction window for the
+/// jump-to-prompt index.
+const TERMINAL_SCROLLBACK_LIMIT: usize = 10_000;
 const MAX_RICH_CLIPBOARD_BYTES: usize = 64 * 1024 * 1024;
 const KITTY_CLIPBOARD_CHUNK_BYTES: usize = 4_096;
 const PASTE_CLIPBOARD_GRANT_TTL: Duration = Duration::from_secs(30);
+/// Minimum spacing between forwarded bell events; a burst of `\a` within this window collapses to
+/// one, protecting the bounded OSC queue and preventing UI flash thrash.
+const BELL_THROTTLE: Duration = Duration::from_millis(100);
 const RAW_TERMINAL_IMAGE_WIRE_FLAG: u32 = 1 << 31;
 const RAW_TERMINAL_IMAGE_METADATA_SIZE: usize = 28;
 
@@ -167,6 +173,9 @@ struct ListenerState {
     /// built; `Some(None)` = compilation failed (detection permanently disabled); `Some(Some(_))` =
     /// the compiled DFA, reused across every publish so the DFA is never rebuilt per frame.
     url_regex: Mutex<Option<Option<RegexSearch>>>,
+    /// Timestamp of the last bell we forwarded, used to throttle a burst of `\a` so a runaway
+    /// program cannot flood the bounded OSC event queue or thrash the UI flash animation.
+    last_bell: Mutex<Option<Instant>>,
 }
 
 enum ClipboardReadResponder {
@@ -344,6 +353,15 @@ impl OscEventTracker {
     }
 }
 
+/// Direction for jump-to-prompt navigation (daemon-internal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalJumpDirection {
+    /// Toward older prompts (further up in scrollback).
+    Up,
+    /// Toward newer prompts (further down toward the live bottom).
+    Down,
+}
+
 struct ShellIntegrationTracker {
     phase: TerminalSemanticPhase,
     /// Grid line where the active prompt started (relative to the top of the visible screen, as
@@ -354,6 +372,18 @@ struct ShellIntegrationTracker {
     history: VecDeque<TerminalCommandRecord>,
     next_command_id: u64,
     user_variables: HashMap<String, String>,
+    /// Monotonic count of lines that have scrolled off the top of the active screen since the
+    /// session started. Kept fresh each frame by [`ShellIntegrationTracker::observe_scroll`]. Used
+    /// as a stable coordinate base: a prompt captured at active-screen line `cursor_line` is stored
+    /// as `total_scrolled_lines + cursor_line`, which never shifts as scrollback grows.
+    total_scrolled_lines: u64,
+    /// The `history_size` seen at the previous `observe_scroll`, to derive scroll increments after
+    /// the scrollback saturates (once at the limit, `history_size` stops growing).
+    last_history_size: usize,
+    /// Global line coordinates (see `total_scrolled_lines`) of each recorded prompt start, oldest
+    /// first. This is the jump-to-prompt index. Bounded by `COMMAND_HISTORY` and pruned as
+    /// scrollback evicts old lines.
+    prompt_jump_points: VecDeque<u64>,
 }
 
 impl Default for ShellIntegrationTracker {
@@ -365,6 +395,9 @@ impl Default for ShellIntegrationTracker {
             history: VecDeque::with_capacity(COMMAND_HISTORY),
             next_command_id: 1,
             user_variables: HashMap::new(),
+            total_scrolled_lines: 0,
+            last_history_size: 0,
+            prompt_jump_points: VecDeque::new(),
         }
     }
 }
@@ -372,9 +405,15 @@ impl Default for ShellIntegrationTracker {
 impl ShellIntegrationTracker {
     /// Update the tracker from an OSC 133 marker. `cursor_line` is the grid line the cursor was on
     /// when the marker was emitted (relative to the top of the visible screen), used to record
-    /// where the active prompt starts.
-    fn update(&mut self, prompt: SemanticPrompt, cursor_line: i32) {
+    /// where the active prompt starts. `history_size` is the scrollback depth captured at the same
+    /// instant (synchronously, under the terminal lock) — folding it in here keeps the jump-point
+    /// coordinate accurate even when the throttled `observe_scroll` has not caught up with a burst
+    /// of output.
+    fn update(&mut self, prompt: SemanticPrompt, cursor_line: i32, history_size: usize) {
         let now = unix_time_ms();
+        // Fold the freshly-captured scrollback depth into the coordinate base before recording any
+        // jump point, so `record_prompt_jump_point` uses an up-to-date `total_scrolled_lines`.
+        self.advance_scroll_base(history_size);
         match prompt.action {
             SemanticPromptAction::FreshLine => {}
             SemanticPromptAction::FreshLineAndPrompt | SemanticPromptAction::PromptStart => {
@@ -387,12 +426,14 @@ impl ShellIntegrationTracker {
                     TerminalSemanticPhase::Prompt | TerminalSemanticPhase::Input
                 ) {
                     self.prompt_start_line = Some(cursor_line);
+                    self.record_prompt_jump_point(cursor_line);
                 }
                 self.phase = TerminalSemanticPhase::Prompt;
             }
             SemanticPromptAction::NewCommand => {
                 self.begin_command(now, option_value(&prompt.options, "cmdline"));
                 self.prompt_start_line = Some(cursor_line);
+                self.record_prompt_jump_point(cursor_line);
                 self.phase = TerminalSemanticPhase::Prompt;
             }
             SemanticPromptAction::InputStart
@@ -465,6 +506,83 @@ impl ShellIntegrationTracker {
         self.next_command_id = self.next_command_id.wrapping_add(1).max(1);
         while self.history.len() > COMMAND_HISTORY {
             self.history.pop_front();
+        }
+    }
+
+    /// Record the global line coordinate of a prompt start for jump-to-prompt. De-dupes a repeat of
+    /// the current prompt (same global line) rather than appending a second jump point.
+    fn record_prompt_jump_point(&mut self, cursor_line: i32) {
+        let global = self.total_scrolled_lines as i64 + cursor_line as i64;
+        if global < 0 {
+            return;
+        }
+        let global = global as u64;
+        if self.prompt_jump_points.back() == Some(&global) {
+            return;
+        }
+        self.prompt_jump_points.push_back(global);
+        while self.prompt_jump_points.len() > COMMAND_HISTORY {
+            self.prompt_jump_points.pop_front();
+        }
+    }
+
+    /// Advance the scroll-base (`total_scrolled_lines`) toward the given live `history_size`.
+    /// Shared by the OSC-133 capture path (accurate at marker time) and the per-frame
+    /// `observe_scroll`. While unsaturated, `history_size` equals the lines scrolled off the top, so
+    /// the base tracks it exactly; after saturation `history_size` pins to the limit and this
+    /// advances by the observed increase (best effort). A shrink (clear/reset) rebases downward.
+    fn advance_scroll_base(&mut self, history_size: usize) {
+        if history_size >= self.last_history_size {
+            self.total_scrolled_lines += (history_size - self.last_history_size) as u64;
+        } else {
+            self.total_scrolled_lines = self
+                .total_scrolled_lines
+                .saturating_sub((self.last_history_size - history_size) as u64);
+        }
+        self.last_history_size = history_size;
+    }
+
+    /// Keep `total_scrolled_lines` current and prune jump points that have scrolled out of the
+    /// buffer. Called once per published frame with the terminal's live `history_size`.
+    fn observe_scroll(&mut self, history_size: usize, scrollback_limit: usize) {
+        self.advance_scroll_base(history_size);
+        let _ = scrollback_limit;
+        // The oldest visible-or-scrollback line has global coordinate `total_scrolled - history`.
+        // Anything older has been evicted from the buffer and can never be jumped to again.
+        let oldest_live = self.total_scrolled_lines.saturating_sub(history_size as u64);
+        while self
+            .prompt_jump_points
+            .front()
+            .is_some_and(|&global| global < oldest_live)
+        {
+            self.prompt_jump_points.pop_front();
+        }
+    }
+
+    /// Reset the jump-point index and its coordinate base. Used when a column resize reflows the
+    /// buffer, invalidating every stored line coordinate.
+    fn clear_jump_points(&mut self) {
+        self.prompt_jump_points.clear();
+        self.total_scrolled_lines = 0;
+        self.last_history_size = 0;
+    }
+
+    /// Pick the jump target relative to the line currently at the top of the viewport.
+    /// `viewport_top_global` is that line's global coordinate. Returns the target's global
+    /// coordinate, or `None` when there is no strictly-earlier / strictly-later prompt.
+    fn jump_target(&self, viewport_top_global: i64, direction: TerminalJumpDirection) -> Option<u64> {
+        match direction {
+            TerminalJumpDirection::Up => self
+                .prompt_jump_points
+                .iter()
+                .rev()
+                .find(|&&global| (global as i64) < viewport_top_global)
+                .copied(),
+            TerminalJumpDirection::Down => self
+                .prompt_jump_points
+                .iter()
+                .find(|&&global| (global as i64) > viewport_top_global)
+                .copied(),
         }
     }
 
@@ -697,6 +815,7 @@ impl ListenerState {
             allow_clipboard_read: AtomicBool::new(false),
             detect_urls: AtomicBool::new(true),
             url_regex: Mutex::new(None),
+            last_bell: Mutex::new(None),
         }
     }
 
@@ -704,6 +823,10 @@ impl ListenerState {
         // Every caller already owns the terminal mutex. Build the immutable frame under that
         // existing ownership and only take the snapshot lock for the final Arc swap.
         let started = Instant::now();
+        // Keep the jump-to-prompt coordinate base current with the live scrollback depth.
+        self.shell_integration
+            .lock()
+            .observe_scroll(terminal.grid().history_size(), TERMINAL_SCROLLBACK_LIMIT);
         let revision = self.revision.load(Ordering::Relaxed).wrapping_add(1);
         let mut snapshot = snapshot_terminal(
             terminal,
@@ -879,6 +1002,22 @@ impl ListenerState {
             location.local = previous.local;
         }
         *reported = Some(location);
+    }
+
+    /// Forward a terminal bell to the UI as an OSC event, throttled so a burst of `\a` collapses to
+    /// one event per [`BELL_THROTTLE`] window. Returns whether the bell was actually forwarded.
+    fn ring_bell(&self) -> bool {
+        let now = Instant::now();
+        let mut last = self.last_bell.lock();
+        if let Some(previous) = *last
+            && now.duration_since(previous) < BELL_THROTTLE
+        {
+            return false;
+        }
+        *last = Some(now);
+        drop(last);
+        self.osc_events.push(TerminalOscEventPayload::Bell);
+        true
     }
 
     fn update_remote_host(&self, value: &str) {
@@ -2628,8 +2767,11 @@ impl EventListener for DaemonEventListener {
             Event::WorkingDirectory(directory) => {
                 self.0.report_working_directory(&directory);
             }
-            Event::SemanticPrompt(prompt, cursor_line) => {
-                self.0.shell_integration.lock().update(prompt, cursor_line);
+            Event::SemanticPrompt(prompt, cursor_line, history_size) => {
+                self.0
+                    .shell_integration
+                    .lock()
+                    .update(prompt, cursor_line, history_size);
             }
             Event::DesktopNotification(notification) => {
                 self.0.handle_notification(notification);
@@ -2669,8 +2811,10 @@ impl EventListener for DaemonEventListener {
             Event::ClipboardLoad(clipboard, formatter) => {
                 self.0.clipboard_load(clipboard, formatter);
             }
-            Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange | Event::Bell => {
+            Event::Bell => {
+                self.0.ring_bell();
             }
+            Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {}
         }
     }
 }
@@ -2741,7 +2885,7 @@ impl TerminalSession {
         ));
         let listener = DaemonEventListener(state.clone());
         let config = Config {
-            scrolling_history: 10_000,
+            scrolling_history: TERMINAL_SCROLLBACK_LIMIT,
             kitty_keyboard: true,
             // Permission is enforced by ListenerState so it can be changed at runtime without
             // rebuilding the terminal. Reads remain denied by default.
@@ -3082,6 +3226,14 @@ impl TerminalSession {
     }
 
     fn scroll_to(&self, command: TerminalScrollCommand) -> Result<()> {
+        let direction = match command {
+            TerminalScrollCommand::PrevPrompt => Some(TerminalJumpDirection::Up),
+            TerminalScrollCommand::NextPrompt => Some(TerminalJumpDirection::Down),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            return self.jump_to_prompt(direction);
+        }
         let mut terminal = self.terminal.lock();
         let initial_display_offset = terminal.grid().display_offset();
         let scroll = match command {
@@ -3089,10 +3241,44 @@ impl TerminalSession {
             TerminalScrollCommand::Bottom => Scroll::Bottom,
             TerminalScrollCommand::PageUp => Scroll::PageUp,
             TerminalScrollCommand::PageDown => Scroll::PageDown,
+            TerminalScrollCommand::PrevPrompt | TerminalScrollCommand::NextPrompt => unreachable!(),
         };
         terminal.scroll_display(scroll);
         let viewport_changed = terminal.grid().display_offset() != initial_display_offset;
         if viewport_changed {
+            self.events.publish_terminal(&terminal);
+        }
+        drop(terminal);
+        Ok(())
+    }
+
+    /// Scroll to the previous/next OSC 133 shell prompt. No-op (returns `Ok`) when shell integration
+    /// recorded no reachable prompt in that direction, so the keybinding is silent without data.
+    fn jump_to_prompt(&self, direction: TerminalJumpDirection) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        let display_offset = terminal.grid().display_offset();
+        let history_size = terminal.grid().history_size();
+        let mut shell = self.events.shell_integration.lock();
+        // Refresh the coordinate base from the live buffer before comparing, so output that landed
+        // since the last published frame does not skew the viewport-top coordinate.
+        shell.advance_scroll_base(history_size);
+        let total_scrolled = shell.total_scrolled_lines;
+        // Global coordinate of the line currently at the top of the viewport.
+        let viewport_top_global = total_scrolled as i64 - display_offset as i64;
+        let Some(target_global) = shell.jump_target(viewport_top_global, direction) else {
+            return Ok(());
+        };
+        drop(shell);
+        // Convert the target's stable global coordinate back to a current absolute grid Line
+        // (relative to the active-screen top, negative in scrollback).
+        let target_line = target_global as i64 - total_scrolled as i64;
+        let target_point = Point::new(Line(target_line as i32), Column(0));
+        let initial_display_offset = display_offset;
+        let target_offset = active_match_display_offset(&terminal, target_point);
+        if target_offset != initial_display_offset {
+            terminal.scroll_display(Scroll::Delta(
+                target_offset as i32 - initial_display_offset as i32,
+            ));
             self.events.publish_terminal(&terminal);
         }
         drop(terminal);
@@ -3326,8 +3512,14 @@ impl TerminalSession {
         // Read the semantic phase and prompt-start line under the same terminal ->
         // shell_integration lock order used by `send_event`, so this can never deadlock. Together
         // they decide whether — and where — the active prompt region is cleared before reflow.
+        // A column change reflows the whole buffer, invalidating every stored jump-point line
+        // coordinate, so the index is dropped and rebuilt from subsequent prompts.
+        let columns_changed = terminal.columns() != size.columns as usize;
         let (phase, prompt_start_line) = {
-            let shell = self.events.shell_integration.lock();
+            let mut shell = self.events.shell_integration.lock();
+            if columns_changed || terminal.mode().contains(TermMode::ALT_SCREEN) {
+                shell.clear_jump_points();
+            }
             (shell.phase, shell.prompt_start_line)
         };
         resize_terminal_with_history_reflow(&mut terminal, size, phase, prompt_start_line);
@@ -6823,6 +7015,7 @@ mod tests {
                 options: String::new(),
             },
             0,
+            0,
         );
         tracker.update(
             SemanticPrompt {
@@ -6830,6 +7023,7 @@ mod tests {
                 options: String::new(),
             },
             1,
+            0,
         );
         assert_eq!(tracker.phase, TerminalSemanticPhase::Input);
         // The prompt start was recorded from the first (PromptStart) marker, not moved down to the
@@ -6855,6 +7049,156 @@ mod tests {
             !grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
             "the tracker's Input phase must route the resize into the prompt-clearing branch"
         );
+    }
+
+    fn prompt_start(tracker: &mut ShellIntegrationTracker, cursor_line: i32, history_size: usize) {
+        tracker.update(
+            SemanticPrompt {
+                action: SemanticPromptAction::PromptStart,
+                options: String::new(),
+            },
+            cursor_line,
+            history_size,
+        );
+    }
+
+    fn output_start(tracker: &mut ShellIntegrationTracker, history_size: usize) {
+        tracker.update(
+            SemanticPrompt {
+                action: SemanticPromptAction::OutputStart,
+                options: String::new(),
+            },
+            0,
+            history_size,
+        );
+    }
+
+    #[test]
+    fn prompt_jump_points_dedupe_repeated_marks() {
+        let mut tracker = ShellIntegrationTracker::default();
+        // A prompt re-emitting PromptStart while already on the prompt (zle redraw) must not add a
+        // second jump point.
+        prompt_start(&mut tracker, 0, 0);
+        prompt_start(&mut tracker, 0, 0);
+        prompt_start(&mut tracker, 0, 0);
+        assert_eq!(tracker.prompt_jump_points.len(), 1);
+        assert_eq!(tracker.prompt_jump_points.front(), Some(&0));
+    }
+
+    #[test]
+    fn prompt_jump_points_use_global_line_from_total_scrolled() {
+        let mut tracker = ShellIntegrationTracker::default();
+        // First prompt at screen line 0, nothing scrolled yet -> global 0.
+        prompt_start(&mut tracker, 0, 0);
+        output_start(&mut tracker, 0);
+        // 5 lines of output scrolled off (history_size captured with the next marker); next prompt
+        // at screen line 3 -> global 5 + 3 = 8. This proves the capture uses the marker's own
+        // history_size, without relying on a separate observe_scroll call.
+        prompt_start(&mut tracker, 3, 5);
+        assert_eq!(
+            tracker.prompt_jump_points.iter().copied().collect::<Vec<_>>(),
+            vec![0, 8]
+        );
+    }
+
+    #[test]
+    fn prompt_capture_uses_marker_history_not_stale_observe_scroll() {
+        // Regression: a burst like `cat ~/.zshrc` scrolls many lines in one parser batch, while the
+        // throttled observe_scroll lags behind. The new prompt marker must still record an accurate
+        // global coordinate from its own (fresh) history_size, so a later Up jump lands on the
+        // previous prompt rather than in the middle of the output.
+        let mut tracker = ShellIntegrationTracker::default();
+        prompt_start(&mut tracker, 0, 0); // prompt #0 at global 0
+        output_start(&mut tracker, 0);
+        // 50 lines of output scrolled off. observe_scroll has NOT run yet (still stale at 0), but
+        // the next prompt marker carries the true history_size = 50.
+        prompt_start(&mut tracker, 2, 50); // prompt #1 at global 50 + 2 = 52
+        assert_eq!(
+            tracker.prompt_jump_points.iter().copied().collect::<Vec<_>>(),
+            vec![0, 52],
+            "the second prompt must be recorded at its true post-scroll coordinate"
+        );
+        // Viewport sitting at the live bottom: top line global == total_scrolled (50).
+        assert_eq!(tracker.total_scrolled_lines, 50);
+        // Jumping Up from the bottom selects prompt #0 (global 0), never a mid-output line.
+        assert_eq!(tracker.jump_target(50, TerminalJumpDirection::Up), Some(0));
+    }
+
+    #[test]
+    fn observe_scroll_tracks_history_below_saturation() {
+        let mut tracker = ShellIntegrationTracker::default();
+        prompt_start(&mut tracker, 0, 0); // global 0
+        output_start(&mut tracker, 0);
+        // Below saturation, total_scrolled == history_size and nothing is evicted yet (the whole
+        // buffer still fits in scrollback), so the point survives.
+        tracker.observe_scroll(500, TERMINAL_SCROLLBACK_LIMIT);
+        assert_eq!(tracker.total_scrolled_lines, 500);
+        assert_eq!(tracker.prompt_jump_points.front(), Some(&0));
+    }
+
+    #[test]
+    fn observe_scroll_prunes_points_that_fall_out_of_a_shrunk_buffer() {
+        let mut tracker = ShellIntegrationTracker::default();
+        // Simulate a saturated buffer: many lines scrolled, points spread across the window.
+        tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
+        tracker.prompt_jump_points.extend([5, 9_000]);
+        // The active-screen top is at global == total_scrolled; a point at global 5 sits
+        // `10000 - 5` lines up, still inside the scrollback window (oldest live == 0), so it stays.
+        tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
+        assert_eq!(
+            tracker.prompt_jump_points.iter().copied().collect::<Vec<_>>(),
+            vec![5, 9_000]
+        );
+    }
+
+    #[test]
+    fn command_history_cap_bounds_the_jump_index() {
+        let mut tracker = ShellIntegrationTracker::default();
+        // Push more distinct prompts than the cap; the oldest are dropped, newest kept.
+        for i in 0..(COMMAND_HISTORY + 5) {
+            prompt_start(&mut tracker, 0, i);
+            output_start(&mut tracker, i);
+        }
+        assert!(tracker.prompt_jump_points.len() <= COMMAND_HISTORY);
+    }
+
+    #[test]
+    fn observe_scroll_advances_after_saturation() {
+        let mut tracker = ShellIntegrationTracker::default();
+        tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
+        assert_eq!(tracker.total_scrolled_lines, TERMINAL_SCROLLBACK_LIMIT as u64);
+        // history_size stays pinned at the limit, but observe_scroll must not stall: the delta is 0
+        // here, so total stays; a later call with the same size keeps it monotonic.
+        tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
+        assert_eq!(tracker.total_scrolled_lines, TERMINAL_SCROLLBACK_LIMIT as u64);
+    }
+
+    #[test]
+    fn clear_jump_points_resets_index_and_base() {
+        let mut tracker = ShellIntegrationTracker::default();
+        prompt_start(&mut tracker, 2, 0);
+        tracker.observe_scroll(10, TERMINAL_SCROLLBACK_LIMIT);
+        tracker.clear_jump_points();
+        assert!(tracker.prompt_jump_points.is_empty());
+        assert_eq!(tracker.total_scrolled_lines, 0);
+        assert_eq!(tracker.last_history_size, 0);
+    }
+
+    #[test]
+    fn jump_target_selects_strictly_nearer_prompt_in_each_direction() {
+        let mut tracker = ShellIntegrationTracker::default();
+        // Prompts at global lines 0, 10, 20.
+        tracker.prompt_jump_points.extend([0, 10, 20]);
+        // Viewport top at global 15: Up -> nearest below 15 is 10; Down -> nearest above 15 is 20.
+        assert_eq!(tracker.jump_target(15, TerminalJumpDirection::Up), Some(10));
+        assert_eq!(tracker.jump_target(15, TerminalJumpDirection::Down), Some(20));
+        // At the oldest prompt (0): Up has nothing strictly earlier.
+        assert_eq!(tracker.jump_target(0, TerminalJumpDirection::Up), None);
+        // At the newest prompt (20): Down has nothing strictly later.
+        assert_eq!(tracker.jump_target(20, TerminalJumpDirection::Down), None);
+        // Exactly on a prompt line (10): Up -> 0, Down -> 20 (strict inequality).
+        assert_eq!(tracker.jump_target(10, TerminalJumpDirection::Up), Some(0));
+        assert_eq!(tracker.jump_target(10, TerminalJumpDirection::Down), Some(20));
     }
 
     #[test]
@@ -8477,6 +8821,24 @@ mod tests {
     }
 
     #[test]
+    fn bell_is_forwarded_once_and_throttles_a_burst() {
+        let state = osc_listener_state();
+        // First bell is forwarded and publishes an OSC event.
+        assert!(state.ring_bell());
+        let update = state
+            .osc_events
+            .wait_after(0, Duration::ZERO)
+            .expect("first bell publishes an OSC event");
+        assert_eq!(update.events.len(), 1);
+        assert_eq!(update.events[0].payload, TerminalOscEventPayload::Bell);
+
+        // A second bell inside the throttle window is dropped, so the revision does not advance.
+        let revision_after_first = state.osc_events.revision();
+        assert!(!state.ring_bell());
+        assert_eq!(state.osc_events.revision(), revision_after_first);
+    }
+
+    #[test]
     fn osc_reported_locations_distinguish_local_and_remote_hosts() {
         let local = parse_reported_location("file:///Users/test/My%20Project").unwrap();
         assert_eq!(local.path, "/Users/test/My Project");
@@ -8511,30 +8873,30 @@ mod tests {
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::PromptStart,
             options: String::new(),
-        }, 0);
+        }, 0, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::InputStart,
             options: "cmdline=echo hello".to_owned(),
-        }, 0);
+        }, 0, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::CommandFinished,
             options: "130".to_owned(),
-        }, 0);
+        }, 0, 0);
         assert_eq!(tracker.snapshot().phase, TerminalSemanticPhase::None);
         assert!(tracker.snapshot().history.is_empty());
 
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::InputStart,
             options: "cmdline=printf ok".to_owned(),
-        }, 0);
+        }, 0, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::OutputStart,
             options: String::new(),
-        }, 0);
+        }, 0, 0);
         tracker.update(SemanticPrompt {
             action: SemanticPromptAction::CommandFinished,
             options: "7".to_owned(),
-        }, 0);
+        }, 0, 0);
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.phase, TerminalSemanticPhase::None);
         assert_eq!(snapshot.history.len(), 1);

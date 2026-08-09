@@ -9,9 +9,9 @@ use crate::settings::{
     system_uses_dark_appearance,
 };
 use crate::settings_window::{
-    ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, NewTab, NextTab, PageDown,
-    PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitRight, TerminalCopy, TerminalFind,
-    TerminalPaste, TerminalSelectAll, is_dark_appearance,
+    ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
+    NewTab, NextTab, PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitRight,
+    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, is_dark_appearance,
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
@@ -104,6 +104,12 @@ const PROGRESS_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const OSC_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_ROW_HEIGHT: f32 = 20.;
 const TERMINAL_IMAGE_CHUNK_SIZE: u32 = 16 * 1024 * 1024;
+/// A bell triggers a single smooth pulse: the tab tint fades in, then back out, over this span.
+const BELL_FLASH_DURATION: Duration = Duration::from_millis(420);
+/// Repaint cadence during the pulse — small enough for a continuous fade.
+const BELL_FLASH_STEP: Duration = Duration::from_millis(16);
+/// Peak alpha of the accent tint at the middle of the pulse (0x00..=0xff).
+const BELL_FLASH_PEAK_ALPHA: f32 = 0x66 as f32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TerminalImageStreamKey {
@@ -377,6 +383,10 @@ pub struct EggieApp {
     progress_frame_scheduled: bool,
     progress_animation_scheduled: bool,
     progress_animation_epoch: Instant,
+    /// Sessions currently flashing from a terminal bell, keyed by the flash's start time.
+    bell_flash: HashMap<SessionId, Instant>,
+    /// Whether the bell-flash animation loop is already running (prevents duplicate timers).
+    bell_flash_scheduled: bool,
     progress_timeouts: TerminalProgressTimeouts,
     snapshot_watchers: HashSet<SessionId>,
     progress_watchers: HashSet<SessionId>,
@@ -765,6 +775,8 @@ impl EggieApp {
             progress_frame_scheduled: false,
             progress_animation_scheduled: false,
             progress_animation_epoch: Instant::now(),
+            bell_flash: HashMap::new(),
+            bell_flash_scheduled: false,
             progress_timeouts,
             snapshot_watchers: HashSet::new(),
             progress_watchers: HashSet::new(),
@@ -1076,6 +1088,21 @@ impl EggieApp {
                 window.activate_window();
                 self.activate_session_by_id(session_id, window, cx);
             }
+            TerminalOscEventPayload::Bell => {
+                let bell_mode = self.settings.read(cx).config().bell_mode;
+                if bell_mode.plays_sound() {
+                    window.play_system_bell();
+                }
+                if bell_mode.flashes() {
+                    self.bell_flash.insert(session_id, Instant::now());
+                    self.ensure_bell_flash(cx);
+                    // Draw attention to a background window so a bell is not missed.
+                    if !window.is_window_active() {
+                        window.request_attention();
+                    }
+                    cx.notify();
+                }
+            }
             TerminalOscEventPayload::AttentionRequest { request } => {
                 if request != TerminalAttentionRequest::Cancel && !window.is_window_active() {
                     window.request_attention();
@@ -1262,6 +1289,55 @@ impl EggieApp {
         // GPUI's macOS display link stops while the window is minimized or fully occluded, so this
         // animation naturally suspends without a background timer waking hidden windows.
         window.refresh();
+    }
+
+    /// Run the bell-flash animation: a background timer that repaints while any session is within
+    /// its pulse window, expiring each entry after [`BELL_FLASH_DURATION`]. Uses a background timer
+    /// (not the display link) so the pulse still completes when the window is not frontmost.
+    fn ensure_bell_flash(&mut self, cx: &mut Context<Self>) {
+        if self.bell_flash_scheduled || self.bell_flash.is_empty() {
+            return;
+        }
+        self.bell_flash_scheduled = true;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(BELL_FLASH_STEP).await;
+                let keep_going = this
+                    .update(cx, |app, cx| {
+                        app.bell_flash
+                            .retain(|_, started| started.elapsed() < BELL_FLASH_DURATION);
+                        if app.bell_flash.is_empty() {
+                            app.bell_flash_scheduled = false;
+                            false
+                        } else {
+                            cx.notify();
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The accent-tint color for a session's pulsing tab this frame, or `None` if the pulse is over.
+    /// A single pulse: alpha eases from 0 up to [`BELL_FLASH_PEAK_ALPHA`] at the midpoint, then back
+    /// to 0, using a raised-cosine so the fill and restore are continuous and smooth.
+    fn bell_flash_tint(&self, session_id: SessionId) -> Option<u32> {
+        let started = self.bell_flash.get(&session_id)?;
+        let elapsed = started.elapsed();
+        if elapsed >= BELL_FLASH_DURATION {
+            return None;
+        }
+        let progress = elapsed.as_secs_f32() / BELL_FLASH_DURATION.as_secs_f32();
+        // Raised cosine: 0 -> 1 -> 0 across the pulse, with zero slope at both ends.
+        let intensity = 0.5 - 0.5 * (progress * std::f32::consts::TAU).cos();
+        let alpha = (intensity * BELL_FLASH_PEAK_ALPHA).round() as u32;
+        Some((self.colors.accent << 8) | alpha.min(0xff))
     }
 
     fn render_item_icon(
@@ -3965,6 +4041,9 @@ impl EggieApp {
                         .when(active, |element| {
                             element.bg(rgb(self.colors.panel_alt))
                         })
+                        .when_some(self.bell_flash_tint(session_id), |element, tint| {
+                            element.bg(rgba(tint))
+                        })
                         .hover({
                             let colors = self.colors;
                             move |element| element.bg(rgb(colors.hover))
@@ -4180,6 +4259,10 @@ impl EggieApp {
                         element.mr(px(TAB_GAP))
                     })
                     .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
+                    .when_some(
+                        item.session_id.and_then(|sid| self.bell_flash_tint(sid)),
+                        |element, tint| element.bg(rgba(tint)),
+                    )
                     .cursor_pointer()
                     .on_click(cx.listener(move |app, _, window, cx| {
                         app.activate_item(group_id, item_id, window, cx)
@@ -4975,6 +5058,16 @@ impl gpui::Render for EggieApp {
             }))
             .on_action(cx.listener(|app, _: &FontReset, _, cx| {
                 if app.reset_font_size(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &JumpPrevPrompt, _, cx| {
+                if app.scroll_active_terminal(TerminalScrollCommand::PrevPrompt, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &JumpNextPrompt, _, cx| {
+                if app.scroll_active_terminal(TerminalScrollCommand::NextPrompt, cx) {
                     cx.stop_propagation();
                 }
             }))

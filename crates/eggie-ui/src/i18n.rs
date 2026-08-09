@@ -1090,4 +1090,62 @@ impl Language {
             Self::SimplifiedChinese => "重置字号",
         }
     }
+
+    // --- Bell -------------------------------------------------------------------------------
+
+    pub(crate) fn bell_row(self) -> &'static str {
+        match self {
+            Self::English => "Bell",
+            Self::SimplifiedChinese => "响铃",
+        }
+    }
+
+    pub(crate) fn bell_description(self) -> &'static str {
+        match self {
+            Self::English => "How to react when a program rings the terminal bell.",
+            Self::SimplifiedChinese => "程序触发终端响铃时如何提示。",
+        }
+    }
+
+    pub(crate) fn bell_mode_silent(self) -> &'static str {
+        match self {
+            Self::English => "Silent",
+            Self::SimplifiedChinese => "静默",
+        }
+    }
+
+    pub(crate) fn bell_mode_flash(self) -> &'static str {
+        match self {
+            Self::English => "Flash",
+            Self::SimplifiedChinese => "闪动",
+        }
+    }
+
+    pub(crate) fn bell_mode_sound(self) -> &'static str {
+        match self {
+            Self::English => "Sound",
+            Self::SimplifiedChinese => "声音",
+        }
+    }
+
+    pub(crate) fn bell_mode_flash_and_sound(self) -> &'static str {
+        match self {
+            Self::English => "Both",
+            Self::SimplifiedChinese => "闪动+声音",
+        }
+    }
+
+    pub(crate) fn action_jump_prev_prompt(self) -> &'static str {
+        match self {
+            Self::English => "Jump to Previous Command",
+            Self::SimplifiedChinese => "跳到上一条命令",
+        }
+    }
+
+    pub(crate) fn action_jump_next_prompt(self) -> &'static str {
+        match self {
+            Self::English => "Jump to Next Command",
+            Self::SimplifiedChinese => "跳到下一条命令",
+        }
+    }
 }
