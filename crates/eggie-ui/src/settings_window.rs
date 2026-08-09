@@ -3,10 +3,10 @@ use std::sync::OnceLock;
 use crate::{
     icons::{IconName, icon, icon_sized},
     settings::{
-        AppSettings, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS,
-        MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS,
-        MIN_TERMINAL_PADDING, SettingsStore, TerminalTheme, ThemeMode, UiColors,
-        minimum_contrast_rgb, theme_catalog,
+        AppSettings, BellMode, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST,
+        MAX_PROGRESS_TIMEOUT_SECS, MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST,
+        MIN_PROGRESS_TIMEOUT_SECS, MIN_TERMINAL_PADDING, SettingsStore, TerminalTheme, ThemeMode,
+        UiColors, minimum_contrast_rgb, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
@@ -45,7 +45,9 @@ actions!(
         PageDown,
         FontIncrease,
         FontDecrease,
-        FontReset
+        FontReset,
+        JumpPrevPrompt,
+        JumpNextPrompt
     ]
 );
 
@@ -63,6 +65,9 @@ const SELECTOR_WIDTH: f32 = 270.;
 const SELECTOR_DROPDOWN_HEIGHT: f32 = 208.;
 const SELECTOR_DROPDOWN_GAP: f32 = 4.;
 const SELECTOR_WINDOW_MARGIN: f32 = 8.;
+/// Width of the compact bell-mode dropdown (trigger and popover).
+const BELL_DROPDOWN_WIDTH: f32 = 180.;
+const BELL_DROPDOWN_ROW_HEIGHT: f32 = 30.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectorKind {
@@ -296,6 +301,10 @@ struct SettingsWindow {
     recording_subscription: Option<gpui::Subscription>,
     /// When a recorded keystroke collides with another action, its label (for the conflict hint).
     recording_conflict: Option<String>,
+    /// Whether the bell-mode dropdown popover is open.
+    bell_dropdown_open: bool,
+    /// Bounds of the bell-mode dropdown trigger, for positioning the popover.
+    bell_dropdown_bounds: Option<Bounds<Pixels>>,
 }
 
 impl SettingsWindow {
@@ -341,6 +350,8 @@ impl SettingsWindow {
             recording: None,
             recording_subscription: None,
             recording_conflict: None,
+            bell_dropdown_open: false,
+            bell_dropdown_bounds: None,
         }
     }
 
@@ -404,6 +415,12 @@ impl SettingsWindow {
     fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.theme_mode = mode, cx)
+        });
+    }
+
+    fn set_bell_mode(&mut self, mode: BellMode, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.bell_mode = mode, cx)
         });
     }
 
@@ -526,6 +543,171 @@ impl SettingsWindow {
                     )
                 },
             )
+            .into_any_element()
+    }
+
+    fn bell_mode_label(language: Language, mode: BellMode) -> &'static str {
+        match mode {
+            BellMode::Silent => language.bell_mode_silent(),
+            BellMode::Flash => language.bell_mode_flash(),
+            BellMode::Sound => language.bell_mode_sound(),
+            BellMode::FlashAndSound => language.bell_mode_flash_and_sound(),
+        }
+    }
+
+    fn render_bell_control(
+        &self,
+        selected: BellMode,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        let dropdown_position = self.bell_dropdown_bounds.map(|bounds| {
+            let popover_height = px(BELL_DROPDOWN_ROW_HEIGHT * BellMode::ALL.len() as f32 + 8.);
+            let gap = px(SELECTOR_DROPDOWN_GAP);
+            let margin = px(SELECTOR_WINDOW_MARGIN);
+            let y = if window.viewport_size().height - bounds.bottom()
+                >= popover_height + gap + margin
+            {
+                bounds.bottom() + gap
+            } else {
+                bounds.top() - popover_height - gap
+            };
+            point(bounds.left(), y)
+        });
+        let control = cx.entity().downgrade();
+        div()
+            .on_children_prepainted(move |children, _, cx| {
+                let Some(bounds) = children.first().copied() else {
+                    return;
+                };
+                let control = control.clone();
+                cx.defer(move |cx| {
+                    control
+                        .update(cx, |settings, cx| {
+                            if settings.bell_dropdown_bounds != Some(bounds) {
+                                settings.bell_dropdown_bounds = Some(bounds);
+                                if settings.bell_dropdown_open {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                });
+            })
+            .id("bell-mode-container")
+            .relative()
+            .w(px(BELL_DROPDOWN_WIDTH))
+            .h(px(32.))
+            .child(
+                div()
+                    .id("bell-mode-trigger")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .size_full()
+                    .px_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(self.colors.border))
+                    .bg(rgb(self.colors.panel_alt))
+                    .cursor_pointer()
+                    .hover(|element| element.border_color(rgb(self.colors.accent)))
+                    .on_click(cx.listener(|settings, _, _, cx| {
+                        settings.bell_dropdown_open = !settings.bell_dropdown_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(Self::bell_mode_label(language, selected)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(self.colors.muted))
+                            .child(icon(IconName::ArrowDown)),
+                    ),
+            )
+            .when(self.bell_dropdown_open, |control| {
+                let mut dropdown = anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(SELECTOR_WINDOW_MARGIN));
+                if let Some(position) = dropdown_position {
+                    dropdown = dropdown.position(position);
+                }
+                control.child(
+                    deferred(dropdown.child(self.render_bell_dropdown(selected, language, cx)))
+                        .priority(2),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_bell_dropdown(
+        &self,
+        selected: BellMode,
+        language: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let options = BellMode::ALL.into_iter().fold(
+            div().flex().flex_col().py_1(),
+            |list, mode| {
+                let is_selected = mode == selected;
+                list.child(
+                    div()
+                        .id(SharedString::from(format!("bell-mode-{}", mode.slug())))
+                        .flex()
+                        .items_center()
+                        .flex_none()
+                        .h(px(BELL_DROPDOWN_ROW_HEIGHT))
+                        .mx_1()
+                        .px_3()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(is_selected, |element| {
+                            element
+                                .bg(rgb(self.colors.panel_alt))
+                                .text_color(rgb(self.colors.accent))
+                        })
+                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                        .on_click(cx.listener(move |settings, _, window, cx| {
+                            settings.set_bell_mode(mode, cx);
+                            settings.bell_dropdown_open = false;
+                            let _ = window;
+                            cx.notify();
+                        }))
+                        .child(Self::bell_mode_label(language, mode)),
+                )
+            },
+        );
+        div()
+            .id("bell-mode-dropdown")
+            .flex()
+            .flex_col()
+            .w(px(BELL_DROPDOWN_WIDTH))
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .bg(rgb(self.colors.panel))
+            .shadow_lg()
+            // Block mouse/hover for the settings rows painted behind the popover so clicks on its
+            // blank areas can't bubble through to a control underneath (canonical GPUI overlay
+            // isolation). Children still receive their own events.
+            .occlude()
+            .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
+                cx.defer_in(window, move |settings, _, cx| {
+                    if settings.bell_dropdown_open {
+                        settings.bell_dropdown_open = false;
+                        cx.notify();
+                    }
+                });
+            }))
+            .child(options)
             .into_any_element()
     }
 
@@ -1539,6 +1721,7 @@ impl gpui::Render for SettingsWindow {
 
         let language = config.language;
         let language_control = self.render_language_control(language, cx);
+        let bell_control = self.render_bell_control(config.bell_mode, window, cx);
         let mode_control = self.render_mode_control(config.theme_mode, cx);
         let dark_selector = self.render_selector(
             "dark-theme-selector",
@@ -1700,6 +1883,7 @@ impl gpui::Render for SettingsWindow {
                                         if settings.recording.is_some() {
                                             settings.cancel_recording(cx);
                                         }
+                                        settings.bell_dropdown_open = false;
                                         settings.selected_section = section;
                                         cx.notify();
                                     }))
@@ -1851,12 +2035,20 @@ impl gpui::Render for SettingsWindow {
                                                             ),
                                                             settings_section(
                                                                 language.terminal_behavior_section(),
-                                                                vec![settings_row(
-                                                                    language.detect_urls_row(),
-                                                                    language.detect_urls_description(),
-                                                                    detect_urls_control,
-                                                                    self.colors,
-                                                                )],
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.detect_urls_row(),
+                                                                        language.detect_urls_description(),
+                                                                        detect_urls_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.bell_row(),
+                                                                        language.bell_description(),
+                                                                        bell_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
                                                                 self.colors,
                                                             ),
                                                             settings_section(

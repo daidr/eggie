@@ -67,6 +67,48 @@ impl Language {
     }
 }
 
+/// How the terminal bell (BEL / `\a`) is surfaced to the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BellMode {
+    /// Ignore the bell entirely.
+    Silent,
+    /// Flash the tab (and sidebar row) of the ringing session.
+    #[default]
+    Flash,
+    /// Play the system bell sound.
+    Sound,
+    /// Flash and play the sound.
+    FlashAndSound,
+}
+
+impl BellMode {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Silent,
+        Self::Flash,
+        Self::Sound,
+        Self::FlashAndSound,
+    ];
+
+    /// A stable ascii slug for element ids (not user-facing; display text comes from i18n).
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Flash => "flash",
+            Self::Sound => "sound",
+            Self::FlashAndSound => "flash-and-sound",
+        }
+    }
+
+    pub(crate) fn plays_sound(self) -> bool {
+        matches!(self, Self::Sound | Self::FlashAndSound)
+    }
+
+    pub(crate) fn flashes(self) -> bool {
+        matches!(self, Self::Flash | Self::FlashAndSound)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
@@ -83,6 +125,7 @@ pub(crate) struct AppSettings {
     pub(crate) progress_stale_timeout_secs: u32,
     pub(crate) allow_osc_clipboard_read: bool,
     pub(crate) detect_urls: bool,
+    pub(crate) bell_mode: BellMode,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) keybindings: std::collections::BTreeMap<String, String>,
 }
@@ -103,6 +146,7 @@ impl Default for AppSettings {
             progress_stale_timeout_secs: DEFAULT_PROGRESS_STALE_TIMEOUT_SECS,
             allow_osc_clipboard_read: false,
             detect_urls: true,
+            bell_mode: BellMode::default(),
             keybindings: std::collections::BTreeMap::new(),
         }
     }
@@ -504,6 +548,7 @@ mod tests {
             progress_stale_timeout_secs: u32::MAX,
             allow_osc_clipboard_read: true,
             detect_urls: false,
+            bell_mode: BellMode::Sound,
             keybindings: std::collections::BTreeMap::new(),
         };
         config.normalize();
@@ -564,6 +609,33 @@ mod tests {
         )
         .unwrap();
         assert!(config.keybindings.is_empty());
+    }
+
+    #[test]
+    fn bell_mode_defaults_to_flash() {
+        assert_eq!(BellMode::default(), BellMode::Flash);
+        assert_eq!(AppSettings::default().bell_mode, BellMode::Flash);
+    }
+
+    #[test]
+    fn legacy_settings_without_bell_mode_default_to_flash() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "theme_mode": "system",
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.bell_mode, BellMode::Flash);
+    }
+
+    #[test]
+    fn bell_mode_sound_and_flash_predicates() {
+        assert!(!BellMode::Silent.plays_sound() && !BellMode::Silent.flashes());
+        assert!(BellMode::Flash.flashes() && !BellMode::Flash.plays_sound());
+        assert!(BellMode::Sound.plays_sound() && !BellMode::Sound.flashes());
+        assert!(BellMode::FlashAndSound.plays_sound() && BellMode::FlashAndSound.flashes());
     }
 
     #[test]

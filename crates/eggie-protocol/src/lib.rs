@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -171,6 +171,9 @@ pub enum TerminalOscEventPayload {
         url: String,
     },
     FocusRequest,
+    /// The terminal rang the bell (BEL / `\a`). Carries no payload; the UI decides how to react
+    /// (visual flash, sound, or nothing) based on the user's bell-mode setting.
+    Bell,
     AttentionRequest {
         request: TerminalAttentionRequest,
     },
@@ -430,6 +433,11 @@ pub enum TerminalScrollCommand {
     PageUp,
     /// Scroll down one viewport page.
     PageDown,
+    /// Scroll to the previous (older) shell prompt marked via OSC 133. No-op without shell
+    /// integration or when already at the oldest recorded prompt.
+    PrevPrompt,
+    /// Scroll to the next (newer) shell prompt marked via OSC 133.
+    NextPrompt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1355,6 +1363,8 @@ mod tests {
             TerminalScrollCommand::Bottom,
             TerminalScrollCommand::PageUp,
             TerminalScrollCommand::PageDown,
+            TerminalScrollCommand::PrevPrompt,
+            TerminalScrollCommand::NextPrompt,
         ] {
             let request = ClientRequest::TerminalScrollTo {
                 session_id: Uuid::nil(),
@@ -1371,6 +1381,24 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn bell_osc_event_round_trips() {
+        let payload = TerminalOscEventPayload::Bell;
+        let json = serde_json::to_string(&payload).unwrap();
+        assert_eq!(json, r#"{"type":"bell"}"#);
+        assert_eq!(
+            serde_json::from_str::<TerminalOscEventPayload>(&json).unwrap(),
+            payload
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<TerminalOscEventPayload>(
+                &rmp_serde::to_vec_named(&payload).unwrap()
+            )
+            .unwrap(),
+            payload
+        );
     }
 
     #[test]

@@ -32,7 +32,12 @@ pub enum Event {
     /// The second field is the grid line the cursor was on when the marker was emitted (relative to
     /// the top of the visible screen; may be negative if in scrollback). Eggie records this so a
     /// resize can clear exactly the active prompt region instead of guessing its extent.
-    SemanticPrompt(SemanticPrompt, i32),
+    ///
+    /// The third field is the scrollback `history_size` at emit time, captured synchronously here
+    /// because the parser holds the terminal lock. Eggie combines it with the cursor line to record
+    /// a scroll-stable coordinate for jump-to-prompt, which cannot be recovered later from the
+    /// throttled snapshot path.
+    SemanticPrompt(SemanticPrompt, i32, usize),
 
     /// Desktop notification command reported by OSC 9, OSC 99, or OSC 777.
     DesktopNotification(DesktopNotification),
@@ -106,8 +111,8 @@ impl Debug for Event {
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::ProgressReport(progress) => write!(f, "ProgressReport({progress:?})"),
             Event::WorkingDirectory(directory) => write!(f, "WorkingDirectory({directory:?})"),
-            Event::SemanticPrompt(prompt, line) => {
-                write!(f, "SemanticPrompt({prompt:?}, {line})")
+            Event::SemanticPrompt(prompt, line, history_size) => {
+                write!(f, "SemanticPrompt({prompt:?}, {line}, {history_size})")
             }
             Event::DesktopNotification(notification) => {
                 write!(f, "DesktopNotification({notification:?})")
