@@ -3052,6 +3052,16 @@ impl TerminalSession {
 
     fn input(&self, bytes: Vec<u8>, sequence: u64) -> Result<()> {
         self.last_input_sequence.store(sequence, Ordering::Release);
+        // Scroll-on-keystroke: typing while scrolled back into history snaps the viewport to the
+        // live bottom, so the user sees what they type. The kernel pins the viewport during output
+        // when display_offset != 0, so without this a keystroke's echo would land off-screen.
+        {
+            let mut terminal = self.terminal.lock();
+            if terminal.grid().display_offset() != 0 {
+                terminal.scroll_display(Scroll::Bottom);
+                self.events.publish_terminal(&terminal);
+            }
+        }
         self.sender
             .send(Msg::Input(bytes.into()))
             .context("failed to write terminal input")
@@ -7845,6 +7855,67 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("FIRSTLINE")),
             "scroll-to-bottom should leave scrollback again"
+        );
+
+        session.terminate();
+    }
+
+    #[test]
+    fn keystroke_snaps_the_viewport_back_to_the_live_bottom() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        session
+            .input(
+                b"printf 'FIRSTLINE\\n'; for i in $(seq 1 60); do echo filler $i; done; printf 'LASTLINE\\n'\r".to_vec(),
+                1,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("LASTLINE"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "LASTLINE did not arrive");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Scroll up into history so the live bottom is off-screen.
+        session.scroll_to(TerminalScrollCommand::Top).unwrap();
+        assert!(
+            session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("FIRSTLINE")),
+            "precondition: scrolled into scrollback"
+        );
+
+        // Typing must snap the viewport back to the bottom, even before the echo arrives.
+        session.input(b"x".to_vec(), 2).unwrap();
+        assert!(
+            session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("LASTLINE")),
+            "a keystroke should scroll the viewport back to the live bottom"
         );
 
         session.terminate();
