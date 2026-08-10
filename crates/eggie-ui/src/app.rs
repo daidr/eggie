@@ -450,6 +450,9 @@ pub struct EggieApp {
     detect_urls: bool,
     copy_on_select: bool,
     cursor_shape: CursorShapeSetting,
+    /// Mirror of `config.scrollback_lines`, so `render` can diff it and push runtime changes to all
+    /// live sessions (the shell fields are spawn-only and need no mirror).
+    scrollback_limit: usize,
     cursor_blink: CursorBlink,
     language: Language,
     closing: bool,
@@ -574,6 +577,9 @@ impl EggieApp {
             .config()
             .effective_theme(system_uses_dark_appearance())
             .appearance();
+        let initial_scrollback = settings_store.config().scrollback_lines;
+        let initial_shell_program = settings_store.config().shell_program.clone();
+        let initial_shell_args = settings_store.config().shell_args.clone();
         let all_sessions = match client.request(ClientRequest::ListSessions) {
             Ok(DaemonResponse::Sessions { sessions }) => sessions,
             _ => Vec::new(),
@@ -588,6 +594,9 @@ impl EggieApp {
                     cwd: project.effective_root(),
                     size: TerminalSize::default(),
                     appearance: initial_appearance,
+                    scrollback_limit: initial_scrollback,
+                    shell_program: initial_shell_program.clone(),
+                    shell_args: initial_shell_args.clone(),
                 })
                 .expect("failed to create initial terminal session");
             let session = match response {
@@ -610,6 +619,9 @@ impl EggieApp {
                         cwd: project_root,
                         size: TerminalSize::default(),
                         appearance: initial_appearance,
+                        scrollback_limit: initial_scrollback,
+                        shell_program: initial_shell_program.clone(),
+                        shell_args: initial_shell_args.clone(),
                     })
                     .expect("failed to create initial terminal session");
                 let session = match response {
@@ -775,6 +787,14 @@ impl EggieApp {
             }) {
                 eprintln!("failed to set terminal cursor style: {error:#}");
             }
+            // Pre-existing sessions adopted from the daemon were spawned with the built-in default;
+            // align them to the configured scrollback (new sessions bake it in at CreateSession).
+            if let Err(error) = client.request(ClientRequest::SetScrollbackLimit {
+                session_id: session.id,
+                limit: config.scrollback_lines,
+            }) {
+                eprintln!("failed to set terminal scrollback limit: {error:#}");
+            }
         }
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
@@ -865,6 +885,7 @@ impl EggieApp {
             detect_urls: config.detect_urls,
             copy_on_select: config.copy_on_select,
             cursor_shape: config.cursor_shape,
+            scrollback_limit: config.scrollback_lines,
             cursor_blink: config.cursor_blink,
             language: config.language,
             closing: false,
@@ -2068,6 +2089,15 @@ impl EggieApp {
         }
     }
 
+    fn configure_session_scrollback(&self, session_id: SessionId) {
+        if let Err(error) = self.client.request(ClientRequest::SetScrollbackLimit {
+            session_id,
+            limit: self.scrollback_limit,
+        }) {
+            eprintln!("failed to configure terminal scrollback for {session_id}: {error:#}");
+        }
+    }
+
     fn new_terminal(
         &mut self,
         group_id: GroupId,
@@ -2075,12 +2105,19 @@ impl EggieApp {
         cx: &mut Context<Self>,
     ) {
         let project = self.workspace().project.clone();
+        let config = self.settings.read(cx).config();
+        let scrollback_limit = config.scrollback_lines;
+        let shell_program = config.shell_program.clone();
+        let shell_args = config.shell_args.clone();
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
                 cwd: project.effective_root(),
                 size: TerminalSize::default(),
                 appearance: self.terminal_appearance,
+                scrollback_limit,
+                shell_program,
+                shell_args,
             })
         else {
             return;
@@ -2135,12 +2172,19 @@ impl EggieApp {
 
     fn add_project(&mut self, name: String, cx: &mut Context<Self>) {
         let project = Project::new(name);
+        let config = self.settings.read(cx).config();
+        let scrollback_limit = config.scrollback_lines;
+        let shell_program = config.shell_program.clone();
+        let shell_args = config.shell_args.clone();
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
                 cwd: project.effective_root(),
                 size: TerminalSize::default(),
                 appearance: self.terminal_appearance,
+                scrollback_limit,
+                shell_program,
+                shell_args,
             })
         else {
             return;
@@ -5113,6 +5157,12 @@ impl gpui::Render for EggieApp {
             self.cursor_shape = config.cursor_shape;
             for session_id in self.window_session_ids() {
                 self.configure_session_cursor_shape(session_id);
+            }
+        }
+        if config.scrollback_lines != self.scrollback_limit {
+            self.scrollback_limit = config.scrollback_lines;
+            for session_id in self.window_session_ids() {
+                self.configure_session_scrollback(session_id);
             }
         }
         self.cursor_blink = config.cursor_blink;

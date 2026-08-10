@@ -1182,6 +1182,81 @@ impl Language {
         }
     }
 
+    pub(crate) fn scrollback_lines_row(self) -> &'static str {
+        match self {
+            Self::English => "Scrollback lines",
+            Self::SimplifiedChinese => "回滚行数",
+        }
+    }
+
+    pub(crate) fn scrollback_lines_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "How many lines of terminal history to keep (0 disables scrollback). Applies to all terminals immediately."
+            }
+            Self::SimplifiedChinese => {
+                "保留的终端历史行数（0 表示禁用回滚）。立即应用到所有终端。"
+            }
+        }
+    }
+
+    pub(crate) fn shell_section(self) -> &'static str {
+        match self {
+            Self::English => "Shell",
+            Self::SimplifiedChinese => "Shell",
+        }
+    }
+
+    pub(crate) fn shell_program_row(self) -> &'static str {
+        match self {
+            Self::English => "Shell program",
+            Self::SimplifiedChinese => "Shell 程序",
+        }
+    }
+
+    pub(crate) fn shell_program_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Path to the shell to launch. Leave empty to use $SHELL. Applies to newly created terminals only."
+            }
+            Self::SimplifiedChinese => {
+                "要启动的 shell 路径。留空则使用 $SHELL。仅对新建终端生效。"
+            }
+        }
+    }
+
+    pub(crate) fn shell_args_row(self) -> &'static str {
+        match self {
+            Self::English => "Shell arguments",
+            Self::SimplifiedChinese => "Shell 参数",
+        }
+    }
+
+    pub(crate) fn shell_args_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Space-separated arguments passed to the shell. Leave empty for the default. Applies to newly created terminals only."
+            }
+            Self::SimplifiedChinese => {
+                "传给 shell 的参数，以空格分隔。留空则使用默认值。仅对新建终端生效。"
+            }
+        }
+    }
+
+    pub(crate) fn shell_program_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "e.g. /opt/homebrew/bin/fish",
+            Self::SimplifiedChinese => "例如 /opt/homebrew/bin/fish",
+        }
+    }
+
+    pub(crate) fn shell_args_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "e.g. -l",
+            Self::SimplifiedChinese => "例如 -l",
+        }
+    }
+
     pub(crate) fn cursor_shape_block(self) -> &'static str {
         match self {
             Self::English => "Block",

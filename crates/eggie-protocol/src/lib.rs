@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -215,6 +215,18 @@ pub enum ClientRequest {
         cwd: PathBuf,
         size: TerminalSize,
         appearance: TerminalAppearance,
+        /// Scrollback history depth in lines (`0` disables scrollback). The client always sends its
+        /// resolved value; `#[serde(default)]` only guards deserializing a request that predates the
+        /// field, which the version handshake already rules out in practice.
+        #[serde(default)]
+        scrollback_limit: usize,
+        /// Shell executable to launch. Empty = the daemon falls back to `$SHELL` (then `/bin/zsh`).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        shell_program: String,
+        /// Custom arguments for the shell. Empty = Eggie's default launch args (`-l`, plus the
+        /// mandatory `--posix` for bash integration).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shell_args: Vec<String>,
     },
     ListSessions,
     InspectSession {
@@ -360,6 +372,12 @@ pub enum ClientRequest {
     SetCursorStyle {
         session_id: SessionId,
         shape: TerminalCursorShape,
+    },
+    /// Set the session's scrollback history depth at runtime (`0` disables scrollback). Shrinking
+    /// below the current history evicts the oldest lines; the change applies to the live terminal.
+    SetScrollbackLimit {
+        session_id: SessionId,
+        limit: usize,
     },
     Terminate {
         session_id: SessionId,
@@ -1417,6 +1435,72 @@ mod tests {
                     .unwrap(),
                 request
             );
+        }
+    }
+
+    #[test]
+    fn set_scrollback_limit_request_round_trips() {
+        for limit in [0usize, 500, 10_000, 1_000_000] {
+            let request = ClientRequest::SetScrollbackLimit {
+                session_id: Uuid::nil(),
+                limit,
+            };
+            let encoded = encode_line(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
+                request
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<ClientRequest>(&rmp_serde::to_vec_named(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn create_session_carries_scrollback_and_shell_overrides() {
+        let request = ClientRequest::CreateSession {
+            project_id: Uuid::nil(),
+            cwd: PathBuf::from("/tmp"),
+            size: TerminalSize::default(),
+            appearance: TerminalAppearance::default(),
+            scrollback_limit: 500,
+            shell_program: "/opt/homebrew/bin/fish".to_owned(),
+            shell_args: vec!["-l".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+        };
+        let encoded = encode_line(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
+            request
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<ClientRequest>(&rmp_serde::to_vec_named(&request).unwrap())
+                .unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn create_session_shell_overrides_default_to_empty_when_absent() {
+        // A request omitting the new fields (older client shape) decodes with empty/zero defaults.
+        let appearance = serde_json::to_string(&TerminalAppearance::default()).unwrap();
+        let json = format!(
+            r#"{{"type":"create_session","project_id":"00000000-0000-0000-0000-000000000000","cwd":"/tmp","size":{{"columns":80,"rows":24,"cell_width":8,"cell_height":16}},"appearance":{appearance}}}"#
+        );
+        let decoded: ClientRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ClientRequest::CreateSession {
+                scrollback_limit,
+                shell_program,
+                shell_args,
+                ..
+            } => {
+                assert_eq!(scrollback_limit, 0);
+                assert!(shell_program.is_empty());
+                assert!(shell_args.is_empty());
+            }
+            other => panic!("unexpected decode: {other:?}"),
         }
     }
 

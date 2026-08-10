@@ -2833,6 +2833,18 @@ struct TerminalSession {
     last_input_sequence: Arc<AtomicU64>,
     mouse_state: Mutex<TerminalMouseState>,
     search_state: Mutex<TerminalSearchState>,
+    /// Live terminal-core config knobs that are rebuilt together on every `set_options`. Kept as the
+    /// single source of truth so a runtime change to one field (cursor shape, scrollback depth) does
+    /// not clobber the other when `terminal_config` reconstructs the whole `Config`.
+    config_state: Mutex<TerminalConfigState>,
+}
+
+/// The subset of the terminal-core `Config` that Eggie mutates at runtime. `set_default_cursor_shape`
+/// and `set_scrollback_limit` each update one field and rebuild via [`terminal_config`] from both, so
+/// neither reset the other to the built-in default.
+struct TerminalConfigState {
+    cursor_shape: CursorShape,
+    scrollback_limit: usize,
 }
 
 /// Per-session terminal search cursor. Tracks the last active match (in grid-absolute coordinates)
@@ -2868,13 +2880,34 @@ struct SessionRuntimeMetadata {
     last_refresh: Option<Instant>,
 }
 
+/// Everything the client picks per-session at creation time. Grouped into a struct so the growing
+/// set of spawn-time knobs (scrollback depth, shell override, …) does not force every call site to
+/// thread positional arguments.
+struct SessionSpawnConfig {
+    project_id: ProjectId,
+    cwd: PathBuf,
+    size: TerminalSize,
+    appearance: TerminalAppearance,
+    /// Scrollback history depth in lines (`0` disables scrollback).
+    scrollback_limit: usize,
+    /// Shell executable override. `None`/empty falls back to `$SHELL` (then `/bin/zsh`).
+    shell_program: Option<String>,
+    /// Custom shell arguments. `None` uses Eggie's default launch args (`-l`, plus `--posix` for bash
+    /// integration).
+    shell_args: Option<Vec<String>>,
+}
+
 impl TerminalSession {
-    fn spawn(
-        project_id: ProjectId,
-        cwd: PathBuf,
-        size: TerminalSize,
-        appearance: TerminalAppearance,
-    ) -> Result<Self> {
+    fn spawn(config: SessionSpawnConfig) -> Result<Self> {
+        let SessionSpawnConfig {
+            project_id,
+            cwd,
+            size,
+            appearance,
+            scrollback_limit,
+            shell_program,
+            shell_args,
+        } = config;
         let id = SessionId::new_v4();
         let last_input_sequence = Arc::new(AtomicU64::new(0));
         let state = Arc::new(ListenerState::new(
@@ -2884,11 +2917,15 @@ impl TerminalSession {
             last_input_sequence.clone(),
         ));
         let listener = DaemonEventListener(state.clone());
-        let config = terminal_config(CursorShape::default());
+        let config = terminal_config(CursorShape::default(), scrollback_limit);
         let mut terminal = Term::new(config, &GridSize(size), listener.clone());
         terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
         let terminal = Arc::new(FairMutex::new(terminal));
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned());
+        // Resolve the shell: an explicit non-empty override wins, otherwise fall back to `$SHELL`
+        // (then `/bin/zsh`). The basename still drives shell-integration matching either way.
+        let shell = shell_program
+            .filter(|program| !program.trim().is_empty())
+            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned()));
         let shell_name = Path::new(&shell)
             .file_name()
             .and_then(|name| name.to_str())
@@ -2912,6 +2949,7 @@ impl TerminalSession {
             integration_root.as_deref(),
             std::env::var("ZDOTDIR").ok(),
             std::env::var("ENV").ok(),
+            shell_args,
         );
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell, launch.args)),
@@ -2957,6 +2995,30 @@ impl TerminalSession {
             last_input_sequence,
             mouse_state: Mutex::new(TerminalMouseState::default()),
             search_state: Mutex::new(TerminalSearchState::default()),
+            config_state: Mutex::new(TerminalConfigState {
+                cursor_shape: CursorShape::default(),
+                scrollback_limit,
+            }),
+        })
+    }
+
+    /// Convenience constructor for tests: spawn with the built-in scrollback default and the
+    /// environment's shell, so the many test call sites don't thread spawn-time config knobs.
+    #[cfg(test)]
+    fn spawn_default(
+        project_id: ProjectId,
+        cwd: PathBuf,
+        size: TerminalSize,
+        appearance: TerminalAppearance,
+    ) -> Result<Self> {
+        Self::spawn(SessionSpawnConfig {
+            project_id,
+            cwd,
+            size,
+            appearance,
+            scrollback_limit: TERMINAL_SCROLLBACK_LIMIT,
+            shell_program: None,
+            shell_args: None,
         })
     }
 
@@ -3668,11 +3730,31 @@ impl TerminalSession {
     }
 
     /// Set the session's default cursor shape. This changes only the *default* (`set_options`
-    /// replaces the whole config, reconstructed from the same constants used at creation), so a
+    /// replaces the whole config, reconstructed from the session's live [`TerminalConfigState`]), so a
     /// program that has issued DECSCUSR keeps its runtime override — matching Ghostty's semantics.
+    /// Rebuilding from `config_state` also preserves any custom scrollback depth.
     fn set_default_cursor_shape(&self, shape: TerminalCursorShape) {
         let mut terminal = self.terminal.lock();
-        let config = terminal_config(kernel_cursor_shape(shape));
+        let mut state = self.config_state.lock();
+        state.cursor_shape = kernel_cursor_shape(shape);
+        let config = terminal_config(state.cursor_shape, state.scrollback_limit);
+        drop(state);
+        terminal.set_options(config);
+        self.events.publish_terminal(&terminal);
+    }
+
+    /// Set the session's scrollback history depth at runtime. Rebuilds the whole config from the
+    /// live [`TerminalConfigState`] (preserving the current default cursor shape); the terminal core
+    /// shrinks the buffer if the new depth is smaller than the current history.
+    fn set_scrollback_limit(&self, limit: usize) {
+        let mut terminal = self.terminal.lock();
+        let mut state = self.config_state.lock();
+        if state.scrollback_limit == limit {
+            return;
+        }
+        state.scrollback_limit = limit;
+        let config = terminal_config(state.cursor_shape, state.scrollback_limit);
+        drop(state);
         terminal.set_options(config);
         self.events.publish_terminal(&terminal);
     }
@@ -4133,11 +4215,12 @@ fn kernel_cursor_shape(shape: TerminalCursorShape) -> CursorShape {
     }
 }
 
-/// Build the terminal core `Config` for a session with the given default cursor shape. Kept in one
-/// place so session creation and runtime `set_options` stay in sync on every other field.
-fn terminal_config(default_cursor_shape: CursorShape) -> Config {
+/// Build the terminal core `Config` for a session with the given default cursor shape and scrollback
+/// depth. Kept in one place so session creation and runtime `set_options` stay in sync on every other
+/// field. Both runtime knobs are passed explicitly so a change to one never resets the other.
+fn terminal_config(default_cursor_shape: CursorShape, scrollback_limit: usize) -> Config {
     Config {
-        scrolling_history: TERMINAL_SCROLLBACK_LIMIT,
+        scrolling_history: scrollback_limit,
         kitty_keyboard: true,
         // Permission is enforced by ListenerState so it can be changed at runtime without
         // rebuilding the terminal. Reads remain denied by default.
@@ -4533,8 +4616,19 @@ impl DaemonState {
                 cwd,
                 size,
                 appearance,
+                scrollback_limit,
+                shell_program,
+                shell_args,
             } => {
-                let session = Arc::new(TerminalSession::spawn(project_id, cwd, size, appearance)?);
+                let session = Arc::new(TerminalSession::spawn(SessionSpawnConfig {
+                    project_id,
+                    cwd,
+                    size,
+                    appearance,
+                    scrollback_limit,
+                    shell_program: (!shell_program.is_empty()).then_some(shell_program),
+                    shell_args: (!shell_args.is_empty()).then_some(shell_args),
+                })?);
                 let summary = session.summary();
                 self.sessions.write().insert(session.id, session);
                 Ok(DaemonResponse::SessionCreated { session: summary })
@@ -4780,6 +4874,10 @@ impl DaemonState {
                 self.session(session_id)?.set_default_cursor_shape(shape);
                 Ok(DaemonResponse::Ok)
             }
+            ClientRequest::SetScrollbackLimit { session_id, limit } => {
+                self.session(session_id)?.set_scrollback_limit(limit);
+                Ok(DaemonResponse::Ok)
+            }
             ClientRequest::Terminate { session_id } => {
                 let Some(session) = self.sessions.write().remove(&session_id) else {
                     bail!("unknown terminal session {session_id}");
@@ -4817,6 +4915,11 @@ struct ShellLaunch {
 ///   the `ENV`-based POSIX startup path.
 /// - anything else / no integration installed: base environment only; resize falls back to native
 ///   reflow.
+///
+/// `custom_args`, when `Some`, replaces Eggie's default `-l` login argument with the user's argv.
+/// bash's `--posix` is mandatory for the ENV-based integration hook, so it is force-prepended even
+/// over custom args (integration wins; the user's args are still honored after it). When
+/// `custom_args` is `None` the behavior is byte-identical to before this knob existed.
 fn build_shell_env(
     shell_name: &str,
     shell_path: &str,
@@ -4824,6 +4927,7 @@ fn build_shell_env(
     integration_root: Option<&Path>,
     user_zdotdir: Option<String>,
     user_env_var: Option<String>,
+    custom_args: Option<Vec<String>>,
 ) -> ShellLaunch {
     let mut env = HashMap::new();
     env.insert("TERM".to_owned(), "alacritty".to_owned());
@@ -4838,7 +4942,8 @@ fn build_shell_env(
         env!("CARGO_PKG_VERSION").to_owned(),
     );
 
-    let mut args = vec!["-l".to_owned()];
+    let custom = custom_args.is_some();
+    let mut args = custom_args.unwrap_or_else(|| vec!["-l".to_owned()]);
 
     match (shell_name, integration_root) {
         ("zsh", Some(root)) => {
@@ -4853,7 +4958,14 @@ fn build_shell_env(
         // Apple's /bin/bash is 3.2 and does not honor the ENV-based POSIX startup path, so
         // integration is impossible there; fall through to no injection.
         ("bash", Some(root)) if shell_path != "/bin/bash" || !cfg!(target_os = "macos") => {
-            args = vec!["--posix".to_owned()];
+            // `--posix` is required for the ENV-based POSIX startup hook. Without custom args this is
+            // the sole argument (preserving the original default); with custom args we force it to
+            // the front so integration still works while keeping the user's args.
+            if !custom {
+                args = vec!["--posix".to_owned()];
+            } else if !args.iter().any(|arg| arg == "--posix") {
+                args.insert(0, "--posix".to_owned());
+            }
             if let Some(original) = user_env_var {
                 env.insert("EGGIE_BASH_ENV".to_owned(), original);
             }
@@ -5884,7 +5996,7 @@ mod tests {
     #[test]
     fn child_sessions_report_the_alacritty_terminal_contract() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -5937,7 +6049,7 @@ mod tests {
             cell_width: 8,
             cell_height: 18,
         };
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             size,
@@ -6022,7 +6134,7 @@ mod tests {
         }
 
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -6352,7 +6464,7 @@ mod tests {
     #[test]
     fn pty_osc_progress_reaches_daemon_and_ris_clears_it() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize::default(),
@@ -6385,7 +6497,7 @@ mod tests {
     #[test]
     fn terminal_input_to_snapshot_is_event_driven() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -6455,7 +6567,7 @@ mod tests {
         }
         let _pty_guard = PTY_TEST_LOCK.lock();
         let session = Arc::new(
-            TerminalSession::spawn(
+            TerminalSession::spawn_default(
                 ProjectId::new_v4(),
                 std::env::current_dir().unwrap(),
                 TerminalSize {
@@ -6638,7 +6750,10 @@ mod tests {
         };
         // Build a terminal with a Beam default shape (as set_default_cursor_shape would).
         let mut term = Term::new(
-            terminal_config(kernel_cursor_shape(TerminalCursorShape::Beam)),
+            terminal_config(
+                kernel_cursor_shape(TerminalCursorShape::Beam),
+                TERMINAL_SCROLLBACK_LIMIT,
+            ),
             &GridSize(size),
             VoidListener,
         );
@@ -6650,9 +6765,10 @@ mod tests {
         assert_eq!(term.cursor_style().shape, CursorShape::Block);
 
         // Reapplying the default via set_options must not clobber the program's runtime override.
-        term.set_options(terminal_config(kernel_cursor_shape(
-            TerminalCursorShape::Underline,
-        )));
+        term.set_options(terminal_config(
+            kernel_cursor_shape(TerminalCursorShape::Underline),
+            TERMINAL_SCROLLBACK_LIMIT,
+        ));
         assert_eq!(
             term.cursor_style().shape,
             CursorShape::Block,
@@ -6672,6 +6788,143 @@ mod tests {
             kernel_cursor_shape(TerminalCursorShape::Hidden),
             CursorShape::Block
         );
+    }
+
+    #[test]
+    fn scrollback_limit_config_caps_history_and_survives_a_cursor_change() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TerminalSize {
+            columns: 20,
+            rows: 5,
+            ..TerminalSize::default()
+        };
+        // A 50-line scrollback caps history no matter how much scrolls past.
+        let mut term = Term::new(
+            terminal_config(CursorShape::Block, 50),
+            &GridSize(size),
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, "\r\n".repeat(200).as_bytes());
+        assert_eq!(
+            term.grid().history_size(),
+            50,
+            "scrollback history should cap at the configured limit"
+        );
+
+        // Reapplying the config with a *different cursor shape* but the same scrollback must not
+        // reset the history cap — the clobber risk `config_state` guards against.
+        term.set_options(terminal_config(CursorShape::Beam, 50));
+        processor.advance(&mut term, "\r\n".repeat(50).as_bytes());
+        assert_eq!(term.grid().history_size(), 50);
+        assert_eq!(term.cursor_style().shape, CursorShape::Beam);
+
+        // Shrinking the scrollback (cursor shape unchanged) evicts down to the new limit at once.
+        term.set_options(terminal_config(CursorShape::Beam, 20));
+        assert_eq!(term.grid().history_size(), 20);
+        assert_eq!(term.cursor_style().shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn runtime_scrollback_and_cursor_changes_do_not_clobber_each_other() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(SessionSpawnConfig {
+            project_id: ProjectId::new_v4(),
+            cwd: std::env::current_dir().unwrap(),
+            size: TerminalSize::default(),
+            appearance: TerminalAppearance::default(),
+            scrollback_limit: 500,
+            shell_program: None,
+            shell_args: None,
+        })
+        .unwrap();
+
+        // The spawn-time scrollback threads into the session's live config state.
+        {
+            let state = session.config_state.lock();
+            assert_eq!(state.scrollback_limit, 500);
+            assert_eq!(state.cursor_shape, CursorShape::Block);
+        }
+
+        // Changing the cursor default preserves the custom scrollback.
+        session.set_default_cursor_shape(TerminalCursorShape::Beam);
+        {
+            let state = session.config_state.lock();
+            assert_eq!(state.cursor_shape, CursorShape::Beam);
+            assert_eq!(
+                state.scrollback_limit, 500,
+                "a cursor change must not reset the scrollback depth"
+            );
+        }
+
+        // Changing the scrollback preserves the cursor default.
+        session.set_scrollback_limit(50);
+        {
+            let state = session.config_state.lock();
+            assert_eq!(state.scrollback_limit, 50);
+            assert_eq!(
+                state.cursor_shape,
+                CursorShape::Beam,
+                "a scrollback change must not reset the default cursor shape"
+            );
+        }
+
+        session.terminate();
+    }
+
+    #[test]
+    fn set_scrollback_limit_shrinks_live_history() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn_default(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 20,
+                rows: 5,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        // Drive the shared grid directly so the test is deterministic (no PTY output timing).
+        {
+            let mut term = session.terminal.lock();
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut *term, "\r\n".repeat(200).as_bytes());
+            assert!(term.grid().history_size() >= 50);
+        }
+
+        session.set_scrollback_limit(50);
+        assert_eq!(
+            session.terminal.lock().grid().history_size(),
+            50,
+            "shrinking the scrollback limit should evict the oldest lines immediately"
+        );
+
+        session.terminate();
+    }
+
+    #[test]
+    fn custom_shell_program_drives_the_session_shell() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn(SessionSpawnConfig {
+            project_id: ProjectId::new_v4(),
+            cwd: std::env::current_dir().unwrap(),
+            size: TerminalSize::default(),
+            appearance: TerminalAppearance::default(),
+            scrollback_limit: TERMINAL_SCROLLBACK_LIMIT,
+            shell_program: Some("/bin/sh".to_owned()),
+            shell_args: None,
+        })
+        .unwrap();
+        // The configured shell's basename becomes the session's initial process name.
+        assert_eq!(session.runtime_metadata.lock().current_process.name, "sh");
+        session.terminate();
     }
 
     #[test]
@@ -7313,6 +7566,7 @@ mod tests {
             Some(&root),
             Some("/home/user/.zsh".to_owned()),
             None,
+            None,
         );
         assert_eq!(
             launch.env.get("ZDOTDIR").map(String::as_str),
@@ -7332,7 +7586,7 @@ mod tests {
     fn zsh_env_without_user_zdotdir_sets_no_marker() {
         let terminfo = PathBuf::from("/tmp/eggie-terminfo");
         let root = PathBuf::from("/tmp/eggie-integration");
-        let launch = build_shell_env("zsh", "/bin/zsh", &terminfo, Some(&root), None, None);
+        let launch = build_shell_env("zsh", "/bin/zsh", &terminfo, Some(&root), None, None, None);
         assert!(launch.env.contains_key("ZDOTDIR"));
         assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
     }
@@ -7349,6 +7603,7 @@ mod tests {
             Some(&root),
             None,
             Some("/home/user/env.sh".to_owned()),
+            None,
         );
         assert_eq!(
             launch.env.get("ENV").map(String::as_str),
@@ -7370,7 +7625,7 @@ mod tests {
     fn apple_bin_bash_skips_integration() {
         let terminfo = PathBuf::from("/tmp/eggie-terminfo");
         let root = PathBuf::from("/tmp/eggie-integration");
-        let launch = build_shell_env("bash", "/bin/bash", &terminfo, Some(&root), None, None);
+        let launch = build_shell_env("bash", "/bin/bash", &terminfo, Some(&root), None, None, None);
         // Apple's /bin/bash cannot use the ENV-based POSIX startup path, so no injection.
         assert!(!launch.env.contains_key("ENV"));
         assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
@@ -7381,7 +7636,8 @@ mod tests {
     fn non_integrated_shell_has_no_injection() {
         let terminfo = PathBuf::from("/tmp/eggie-terminfo");
         let root = PathBuf::from("/tmp/eggie-integration");
-        let launch = build_shell_env("fish", "/usr/bin/fish", &terminfo, Some(&root), None, None);
+        let launch =
+            build_shell_env("fish", "/usr/bin/fish", &terminfo, Some(&root), None, None, None);
         assert!(!launch.env.contains_key("ZDOTDIR"));
         assert!(!launch.env.contains_key("ENV"));
         assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
@@ -7400,10 +7656,92 @@ mod tests {
             None,
             Some("/home/user/.zsh".to_owned()),
             None,
+            None,
         );
         assert!(!launch.env.contains_key("ZDOTDIR"));
         assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
         assert_eq!(launch.args, vec!["-l".to_owned()]);
+    }
+
+    #[test]
+    fn custom_args_replace_the_default_login_arg_for_zsh() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env(
+            "zsh",
+            "/bin/zsh",
+            &terminfo,
+            Some(&root),
+            None,
+            None,
+            Some(vec!["-i".to_owned(), "-c".to_owned(), "echo hi".to_owned()]),
+        );
+        // Custom args used verbatim (no implicit `-l`), integration env still applied.
+        assert_eq!(
+            launch.args,
+            vec!["-i".to_owned(), "-c".to_owned(), "echo hi".to_owned()]
+        );
+        assert!(launch.env.contains_key("ZDOTDIR"));
+    }
+
+    #[test]
+    fn bash_forces_posix_ahead_of_custom_args() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env(
+            "bash",
+            "/opt/homebrew/bin/bash",
+            &terminfo,
+            Some(&root),
+            None,
+            None,
+            Some(vec!["-i".to_owned()]),
+        );
+        // `--posix` is mandatory for the ENV-based hook, so it is prepended before the user's args.
+        assert_eq!(launch.args, vec!["--posix".to_owned(), "-i".to_owned()]);
+        assert!(launch.env.contains_key("ENV"));
+        assert_eq!(
+            launch.env.get("EGGIE_BASH_INJECT").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn bash_does_not_duplicate_a_user_supplied_posix_flag() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env(
+            "bash",
+            "/opt/homebrew/bin/bash",
+            &terminfo,
+            Some(&root),
+            None,
+            None,
+            Some(vec!["--posix".to_owned(), "-c".to_owned(), "true".to_owned()]),
+        );
+        assert_eq!(
+            launch.args,
+            vec!["--posix".to_owned(), "-c".to_owned(), "true".to_owned()]
+        );
+    }
+
+    #[test]
+    fn custom_args_pass_through_for_non_integrated_shell() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let launch = build_shell_env(
+            "fish",
+            "/usr/bin/fish",
+            &terminfo,
+            Some(&root),
+            None,
+            None,
+            Some(vec!["-C".to_owned(), "echo hi".to_owned()]),
+        );
+        // fish gets no injection; custom args used verbatim.
+        assert_eq!(launch.args, vec!["-C".to_owned(), "echo hi".to_owned()]);
+        assert!(!launch.env.contains_key("ENV"));
+        assert!(!launch.env.contains_key("ZDOTDIR"));
     }
 
     #[test]
@@ -7607,7 +7945,7 @@ mod tests {
     #[test]
     fn resizing_a_session_updates_its_snapshot_grid_and_revision() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize::default(),
@@ -7634,7 +7972,7 @@ mod tests {
     fn pty_output_is_parsed_into_an_alacritty_snapshot() {
         let _pty_guard = PTY_TEST_LOCK.lock();
         let cwd = std::env::current_dir().unwrap();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             cwd,
             TerminalSize {
@@ -7705,7 +8043,7 @@ mod tests {
     #[test]
     fn terminal_search_finds_counts_and_navigates_matches() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -7812,7 +8150,7 @@ mod tests {
     #[test]
     fn select_all_and_selection_text_span_the_whole_scrollback() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -7875,7 +8213,7 @@ mod tests {
     #[test]
     fn scroll_to_commands_move_the_viewport_across_scrollback() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -7954,7 +8292,7 @@ mod tests {
     #[test]
     fn keystroke_snaps_the_viewport_back_to_the_live_bottom() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -8015,7 +8353,7 @@ mod tests {
     #[test]
     fn interactive_selection_projects_into_the_visible_viewport() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -8116,7 +8454,7 @@ mod tests {
     #[test]
     fn detects_bare_url_and_trims_trailing_punctuation() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -8188,7 +8526,7 @@ mod tests {
     #[test]
     fn explicit_osc8_hyperlink_stays_out_of_detected_links() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -8250,7 +8588,7 @@ mod tests {
         // pattern like "aa" over "aaaa" does not re-find the same overlapping match, and the
         // reported index moves forward instead of sticking.
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -8320,7 +8658,7 @@ mod tests {
     #[test]
     fn non_bmp_utf8_input_round_trips_through_the_pty_and_alacritty() {
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {
@@ -8361,7 +8699,7 @@ mod tests {
     fn session_summary_tracks_foreground_process_and_working_directory() {
         let _pty_guard = PTY_TEST_LOCK.lock();
         let cwd = std::env::current_dir().unwrap();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             cwd,
             TerminalSize {
@@ -8791,7 +9129,7 @@ mod tests {
         }
 
         let _pty_guard = PTY_TEST_LOCK.lock();
-        let session = TerminalSession::spawn(
+        let session = TerminalSession::spawn_default(
             ProjectId::new_v4(),
             std::env::current_dir().unwrap(),
             TerminalSize {

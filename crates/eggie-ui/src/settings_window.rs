@@ -4,9 +4,10 @@ use crate::{
     icons::{IconName, icon, icon_sized},
     settings::{
         AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, MAX_FONT_SIZE,
-        MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_TERMINAL_PADDING, MIN_FONT_SIZE,
-        MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_TERMINAL_PADDING, SettingsStore,
-        TerminalTheme, ThemeMode, UiColors, minimum_contrast_rgb, theme_catalog,
+        MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING,
+        MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
+        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme, ThemeMode,
+        UiColors, minimum_contrast_rgb, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
@@ -394,6 +395,10 @@ struct SettingsWindow {
     colors: UiColors,
     open_selector: Option<SelectorKind>,
     selector_search_input: Entity<TextInput>,
+    /// Persistent inputs for the shell override (Advanced → Shell). Seeded once from config; edits
+    /// write straight back to settings. Spawn-only, so no live push to running terminals.
+    shell_program_input: Entity<TextInput>,
+    shell_args_input: Entity<TextInput>,
     selector_scroll_handle: ScrollHandle,
     settings_scroll_handle: ScrollHandle,
     selector_bounds: [Option<Bounds<Pixels>>; 6],
@@ -438,6 +443,34 @@ impl SettingsWindow {
         });
         cx.subscribe_in(&selector_search_input, window, Self::on_selector_search_event)
             .detach();
+        let input_style = TextInputStyle {
+            text_color: (colors.text << 8) | 0xff,
+            placeholder_color: (colors.muted << 8) | 0xff,
+            cursor_color: (colors.accent << 8) | 0xff,
+            selection_color: (colors.accent << 8) | 0x55,
+        };
+        let shell_program_input = cx.new(|cx| TextInput::new(window, cx, input_style));
+        let shell_args_input = cx.new(|cx| TextInput::new(window, cx, input_style));
+        // Seed the shell inputs from the persisted config exactly once. `set_content` emits Changed,
+        // but that fires before the subscriptions below are installed, so it won't loop back.
+        {
+            let config = settings.read(cx).config();
+            let language = config.language;
+            let program = config.shell_program.clone();
+            let args = config.shell_args.join(" ");
+            shell_program_input.update(cx, |input, cx| {
+                input.set_placeholder(language.shell_program_placeholder());
+                input.set_content(program, cx);
+            });
+            shell_args_input.update(cx, |input, cx| {
+                input.set_placeholder(language.shell_args_placeholder());
+                input.set_content(args, cx);
+            });
+        }
+        cx.subscribe_in(&shell_program_input, window, Self::on_shell_program_event)
+            .detach();
+        cx.subscribe_in(&shell_args_input, window, Self::on_shell_args_event)
+            .detach();
         Self {
             settings,
             dark_theme_names: theme_catalog().dark_names(),
@@ -446,6 +479,8 @@ impl SettingsWindow {
             colors,
             open_selector: None,
             selector_search_input,
+            shell_program_input,
+            shell_args_input,
             selector_scroll_handle: ScrollHandle::new(),
             settings_scroll_handle: ScrollHandle::new(),
             selector_bounds: [None; 6],
@@ -481,6 +516,51 @@ impl SettingsWindow {
                 self.open_selector = None;
                 cx.notify();
             }
+        }
+    }
+
+    fn on_shell_program_event(
+        &mut self,
+        input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Persist on any content change (and on Enter). The input is the edit surface; normalize()
+        // trims whitespace when the settings are saved.
+        if matches!(
+            event,
+            TextInputEvent::Changed | TextInputEvent::Confirm | TextInputEvent::ConfirmReverse
+        ) {
+            let program = input.read(cx).content().to_owned();
+            self.settings.update(cx, |settings, cx| {
+                settings.update(|settings| settings.shell_program = program, cx);
+            });
+        }
+    }
+
+    fn on_shell_args_event(
+        &mut self,
+        input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            event,
+            TextInputEvent::Changed | TextInputEvent::Confirm | TextInputEvent::ConfirmReverse
+        ) {
+            // Tokenize the single edit line into an argv on whitespace. Quoting is not handled (v1):
+            // arguments containing spaces must be split into separate whitespace-free tokens.
+            let args = input
+                .read(cx)
+                .content()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            self.settings.update(cx, |settings, cx| {
+                settings.update(|settings| settings.shell_args = args, cx);
+            });
         }
     }
 
@@ -710,6 +790,21 @@ impl SettingsWindow {
                         i64::from(MIN_PROGRESS_TIMEOUT_SECS),
                         i64::from(MAX_PROGRESS_TIMEOUT_SECS),
                     ) as u32;
+                },
+                cx,
+            )
+        });
+    }
+
+    fn change_scrollback_lines(&mut self, delta: i64, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |settings| {
+                    let next = (settings.scrollback_lines as i64 + delta).clamp(
+                        MIN_SCROLLBACK_LINES as i64,
+                        MAX_SCROLLBACK_LINES as i64,
+                    );
+                    settings.scrollback_lines = next as usize;
                 },
                 cx,
             )
@@ -2396,6 +2491,102 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn render_scrollback_control(&self, value: usize, cx: &mut Context<Self>) -> AnyElement {
+        let button = |id: &'static str,
+                      label: &'static str,
+                      enabled: bool,
+                      delta: i64,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(30.))
+                .text_size(px(16.))
+                .cursor_pointer()
+                .text_color(rgb(if enabled {
+                    self.colors.text
+                } else {
+                    self.colors.muted
+                }))
+                .when(enabled, |element| {
+                    element
+                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            settings.change_scrollback_lines(delta, cx)
+                        }))
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .overflow_hidden()
+            .child(button(
+                "decrease-scrollback-lines",
+                "−",
+                value > MIN_SCROLLBACK_LINES,
+                -SCROLLBACK_LINES_STEP,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(72.))
+                    .h(px(30.))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(self.colors.border))
+                    .child(value.to_string()),
+            )
+            .child(button(
+                "increase-scrollback-lines",
+                "+",
+                value < MAX_SCROLLBACK_LINES,
+                SCROLLBACK_LINES_STEP,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// Wrap a persistent shell `TextInput` entity in a bordered, fixed-width control box for a
+    /// settings row. `id` disambiguates the two boxes (program vs args).
+    fn render_shell_input_control(
+        &self,
+        id: &'static str,
+        input: &Entity<TextInput>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .w(px(220.))
+            .h(px(30.))
+            .px_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .bg(rgb(self.colors.panel_alt))
+            .text_size(px(12.))
+            .text_color(rgb(self.colors.text))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(input.clone()),
+            )
+            .into_any_element()
+    }
+
     fn render_terminal_preview(&self, config: &AppSettings, theme: &TerminalTheme) -> AnyElement {
         let language = config.language;
         let foreground =
@@ -2586,6 +2777,11 @@ impl gpui::Render for SettingsWindow {
         let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
         let copy_on_select_control =
             self.render_copy_on_select_control(config.copy_on_select, cx);
+        let scrollback_control = self.render_scrollback_control(config.scrollback_lines, cx);
+        let shell_program_control =
+            self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
+        let shell_args_control =
+            self.render_shell_input_control("settings-shell-args", &self.shell_args_input);
         let terminal_preview = self.render_terminal_preview(&config, theme);
 
         div()
@@ -2752,6 +2948,16 @@ impl gpui::Render for SettingsWindow {
                                                                     language.language_row(),
                                                                     language.language_description(),
                                                                     language_control,
+                                                                    self.colors,
+                                                                )],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
+                                                                language.terminal_behavior_section(),
+                                                                vec![settings_row(
+                                                                    language.scrollback_lines_row(),
+                                                                    language.scrollback_lines_description(),
+                                                                    scrollback_control,
                                                                     self.colors,
                                                                 )],
                                                                 self.colors,
@@ -2959,6 +3165,24 @@ impl gpui::Render for SettingsWindow {
                                                                     osc_clipboard_read_control,
                                                                     self.colors,
                                                                 )],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
+                                                                language.shell_section(),
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.shell_program_row(),
+                                                                        language.shell_program_description(),
+                                                                        shell_program_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.shell_args_row(),
+                                                                        language.shell_args_description(),
+                                                                        shell_args_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
                                                                 self.colors,
                                                             ),
                                                         ],

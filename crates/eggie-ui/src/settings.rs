@@ -21,6 +21,10 @@ pub(crate) const DEFAULT_PROGRESS_COMPLETE_TIMEOUT_SECS: u32 = 5;
 pub(crate) const DEFAULT_PROGRESS_STALE_TIMEOUT_SECS: u32 = 60;
 pub(crate) const MIN_PROGRESS_TIMEOUT_SECS: u32 = 1;
 pub(crate) const MAX_PROGRESS_TIMEOUT_SECS: u32 = 3_600;
+pub(crate) const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+pub(crate) const MIN_SCROLLBACK_LINES: usize = 0;
+pub(crate) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
+pub(crate) const SCROLLBACK_LINES_STEP: i64 = 1_000;
 
 fn default_true() -> bool {
     true
@@ -34,6 +38,15 @@ fn is_true(value: &bool) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_scrollback_lines() -> usize {
+    DEFAULT_SCROLLBACK_LINES
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_scrollback(value: &usize) -> bool {
+    *value == DEFAULT_SCROLLBACK_LINES
 }
 
 fn default_thicken_strength() -> u8 {
@@ -580,6 +593,18 @@ pub(crate) struct AppSettings {
     pub(crate) font_metrics: FontMetricAdjustments,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) keybindings: std::collections::BTreeMap<String, String>,
+    /// Scrollback history depth in lines (`0` disables scrollback). Applies to all live sessions at
+    /// runtime, matching Ghostty's `scrollback-limit`.
+    #[serde(default = "default_scrollback_lines", skip_serializing_if = "is_default_scrollback")]
+    pub(crate) scrollback_lines: usize,
+    /// Shell executable to launch (matching Ghostty's `command`). Empty = fall back to `$SHELL`.
+    /// Only takes effect for newly created terminals — the running shell can't be swapped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) shell_program: String,
+    /// Custom arguments for the shell. Empty = Eggie's default launch args. Stored as a real argv
+    /// (the settings UI edits it as a single space-separated line). New terminals only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) shell_args: Vec<String>,
 }
 
 /// Per-metric adjustments matching Ghostty's `adjust-*` config keys. Each is an optional
@@ -675,6 +700,9 @@ impl Default for AppSettings {
             bell_mode: BellMode::default(),
             font_metrics: FontMetricAdjustments::default(),
             keybindings: std::collections::BTreeMap::new(),
+            scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+            shell_program: String::new(),
+            shell_args: Vec::new(),
         }
     }
 }
@@ -736,6 +764,17 @@ impl AppSettings {
                 && crate::keybindings::default_keystroke(id) != Some(keystroke.as_str())
         });
         self.font_metrics.normalize();
+        self.scrollback_lines = self
+            .scrollback_lines
+            .clamp(MIN_SCROLLBACK_LINES, MAX_SCROLLBACK_LINES);
+        // Whitespace-only shell path means "use $SHELL"; normalize it to empty so the daemon's
+        // fallback kicks in. Drop blank argument entries so an empty UI line never becomes an arg.
+        if self.shell_program.trim().is_empty() {
+            self.shell_program.clear();
+        } else {
+            self.shell_program = self.shell_program.trim().to_owned();
+        }
+        self.shell_args.retain(|arg| !arg.trim().is_empty());
     }
 
     /// Build the resolved font families, each per-style slot falling back to the regular family
@@ -1163,6 +1202,9 @@ mod tests {
             bell_mode: BellMode::Sound,
             font_metrics: FontMetricAdjustments::default(),
             keybindings: std::collections::BTreeMap::new(),
+            scrollback_lines: MAX_SCROLLBACK_LINES + 1,
+            shell_program: "  /bin/fish  ".to_owned(),
+            shell_args: vec!["-l".to_owned(), "  ".to_owned()],
         };
         config.normalize();
         fs::create_dir_all(&directory).unwrap();
@@ -1173,6 +1215,9 @@ mod tests {
         assert_eq!(loaded.config.terminal_padding_x, MIN_TERMINAL_PADDING);
         assert_eq!(loaded.config.terminal_padding_y, DEFAULT_TERMINAL_PADDING_Y);
         assert_eq!(loaded.config.minimum_contrast, MAX_MINIMUM_CONTRAST);
+        assert_eq!(loaded.config.scrollback_lines, MAX_SCROLLBACK_LINES);
+        assert_eq!(loaded.config.shell_program, "/bin/fish");
+        assert_eq!(loaded.config.shell_args, vec!["-l".to_owned()]);
         assert_eq!(
             loaded.config.progress_complete_timeout_secs,
             MIN_PROGRESS_TIMEOUT_SECS
@@ -1487,6 +1532,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.font_metrics, FontMetricAdjustments::default());
+    }
+
+    #[test]
+    fn scrollback_and_shell_default_and_serialize_only_when_non_default() {
+        let config = AppSettings::default();
+        assert_eq!(config.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
+        assert!(config.shell_program.is_empty());
+        assert!(config.shell_args.is_empty());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("scrollback_lines"), "default skipped: {json}");
+        assert!(!json.contains("shell_program"));
+        assert!(!json.contains("shell_args"));
+
+        let mut custom = AppSettings::default();
+        custom.scrollback_lines = 500;
+        custom.shell_program = "/opt/homebrew/bin/fish".to_owned();
+        custom.shell_args = vec!["-l".to_owned()];
+        let json = serde_json::to_string(&custom).unwrap();
+        let round_trip: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip.scrollback_lines, 500);
+        assert_eq!(round_trip.shell_program, "/opt/homebrew/bin/fish");
+        assert_eq!(round_trip.shell_args, vec!["-l".to_owned()]);
+    }
+
+    #[test]
+    fn legacy_settings_without_scrollback_or_shell_use_defaults() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
+        assert!(config.shell_program.is_empty());
+        assert!(config.shell_args.is_empty());
+    }
+
+    #[test]
+    fn normalize_clamps_scrollback_and_cleans_shell_fields() {
+        let mut config = AppSettings::default();
+        config.scrollback_lines = MAX_SCROLLBACK_LINES + 5_000;
+        config.shell_program = "  /bin/fish  ".to_owned();
+        config.shell_args = vec![" -l ".to_owned(), "  ".to_owned(), String::new()];
+        config.normalize();
+        assert_eq!(config.scrollback_lines, MAX_SCROLLBACK_LINES);
+        assert_eq!(config.shell_program, "/bin/fish");
+        // Blank/whitespace-only args dropped; the meaningful one is kept (untrimmed value preserved
+        // beyond the emptiness check — argv semantics are the daemon's concern).
+        assert_eq!(config.shell_args, vec![" -l ".to_owned()]);
+
+        // Whitespace-only shell path normalizes to empty (=> $SHELL fallback).
+        let mut blank = AppSettings::default();
+        blank.shell_program = "   ".to_owned();
+        blank.normalize();
+        assert!(blank.shell_program.is_empty());
     }
 
     #[test]
