@@ -1713,6 +1713,17 @@ impl SettingsWindow {
             .collect::<Vec<_>>();
         let has_items = !items.is_empty();
 
+        // Per-style families (bold/italic/bold-italic) can be cleared back to "follow the regular
+        // family". Offer that as a pinned first entry when not actively searching, so a set value is
+        // always reversible (an empty stored value means "inherit regular"). Regular Font and themes
+        // always resolve to a concrete value, so they get no clear entry.
+        let style_font = matches!(
+            kind,
+            SelectorKind::FontBold | SelectorKind::FontItalic | SelectorKind::FontBoldItalic
+        );
+        let show_clear = style_font && query_owned.is_empty();
+        let clear_selected = show_clear && current.trim().is_empty();
+
         let mut list = div()
             .id("settings-selector-list")
             .flex()
@@ -1722,6 +1733,53 @@ impl SettingsWindow {
             .overflow_y_scroll()
             .track_scroll(&self.selector_scroll_handle)
             .py_1();
+        if show_clear {
+            list = list.child(
+                div()
+                    .id("settings-selector-clear")
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .flex_none()
+                    .h(px(32.))
+                    .mx_1()
+                    .px_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(clear_selected, |element| {
+                        element
+                            .bg(rgb(self.colors.panel_alt))
+                            .text_color(rgb(self.colors.accent))
+                    })
+                    .when(!clear_selected, |element| {
+                        element.text_color(rgb(self.colors.muted))
+                    })
+                    .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                    .on_click(cx.listener(move |settings, _, _, cx| {
+                        settings.settings.update(cx, |store, cx| {
+                            store.update(
+                                |config| match kind {
+                                    SelectorKind::FontBold => config.font_family_bold.clear(),
+                                    SelectorKind::FontItalic => config.font_family_italic.clear(),
+                                    SelectorKind::FontBoldItalic => {
+                                        config.font_family_bold_italic.clear()
+                                    }
+                                    _ => {}
+                                },
+                                cx,
+                            )
+                        });
+                        settings.open_selector = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(language.font_family_use_regular()),
+                    ),
+            );
+        }
         for (index, item) in items.into_iter().enumerate() {
             let selected = item == current;
             let selected_item = item.clone();
@@ -1785,7 +1843,7 @@ impl SettingsWindow {
                     .child(div().min_w_0().truncate().child(item)),
             );
         }
-        if !has_items {
+        if !has_items && !show_clear {
             list = list.child(
                 div()
                     .flex()

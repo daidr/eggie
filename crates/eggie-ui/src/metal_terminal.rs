@@ -1516,22 +1516,29 @@ fn icon_constraint_metrics(
 /// constraint (the ~85% common case). Because that constraint scales width and height by the same
 /// factor, the whole thing reduces to one scalar we can apply by re-sizing the face.
 ///
-/// `glyph_w`/`glyph_h` are the icon's measured ink size, `cell_w` the target cell advance, and
-/// `target_height` the icon constraint height (`icon_height_single` for single-cell). The factor
-/// fits the glyph within the cell (`min` of the width- and height-limited factors); `fit_cover1`'s
-/// "scale up to at least cover one cell" behavior falls out because a small icon yields a factor
-/// > 1. Degenerate ink returns `1.0` (leave the glyph untouched).
-fn icon_fit_cover1_scale(glyph_w: f64, glyph_h: f64, cell_w: f64, target_height: f64) -> f64 {
+/// The scale is **height-driven**: `target_height / glyph_h` makes the icon's ink match the
+/// configured constraint height (shrinking a tall icon, growing a small one — `fit_cover1`'s
+/// "cover at least one cell" upscaling). `max_width` is only a safety cap so a wide icon can't grow
+/// past the space Eggie is willing to give it (the cell advance plus its bounded overhang); it is
+/// deliberately *not* the plain cell advance, since Nerd Font icon ink is roughly an em square
+/// (~2× the cell advance) and clamping on the advance would pin every icon to ~0.5 regardless of
+/// the height target — defeating `adjust-icon-height`. Degenerate ink returns `1.0`.
+fn icon_fit_cover1_scale(glyph_w: f64, glyph_h: f64, max_width: f64, target_height: f64) -> f64 {
     let positive_finite = |v: f64| v.is_finite() && v > 0.;
     if !positive_finite(glyph_w) || !positive_finite(glyph_h) {
         return 1.0;
     }
-    if !cell_w.is_finite() || !target_height.is_finite() {
+    if !max_width.is_finite() || !target_height.is_finite() {
         return 1.0;
     }
-    let width_factor = cell_w / glyph_w;
     let height_factor = target_height / glyph_h;
-    let factor = width_factor.min(height_factor);
+    // Cap on width only when a positive bound is given, so the icon never overruns its overhang
+    // budget; otherwise the height target alone decides the scale.
+    let factor = if max_width > 0. {
+        height_factor.min(max_width / glyph_w)
+    } else {
+        height_factor
+    };
     if factor.is_finite() && factor > 0. {
         factor
     } else {
@@ -1576,14 +1583,22 @@ fn scale_icon_font(
     } else {
         metrics.icon_height_single
     };
-    let target_width = (single_cell_width.max(1) * constraint_cells.max(1)) as f64;
+    let single = single_cell_width.max(1);
+    let cells = constraint_cells.max(1);
+    // The icon may overhang one cell to each side (see `raster_placement`), so the width it is
+    // allowed to grow into is the constraint span plus that bounded overhang — not the bare advance.
+    // The height target drives the scale within this budget.
+    let target_width = (single * cells) as f64;
+    let max_width = target_width + 2.0 * single as f64;
+    // Measure the icon's ink in a context wide enough to include the overhang so a large icon isn't
+    // clipped during measurement (which would under-report its width and mis-cap the scale).
     let line = attributed_line(text, icon_face);
-    let context = mask_context(target_width.max(1.) as usize, cell_height.max(1), None);
+    let context = mask_context(max_width.max(1.) as usize, cell_height.max(1), None);
     let ink = line.get_image_bounds(&context);
     if ink.is_empty() || !ink.size.width.is_finite() || !ink.size.height.is_finite() {
         return icon_face.clone();
     }
-    let scale = icon_fit_cover1_scale(ink.size.width, ink.size.height, target_width, target_height);
+    let scale = icon_fit_cover1_scale(ink.size.width, ink.size.height, max_width, target_height);
     let pt = icon_face.pt_size();
     if pt.is_finite() && (scale - 1.0).abs() > 1e-3 {
         icon_face.clone_with_font_size((pt * scale).max(1.))
@@ -2371,19 +2386,36 @@ mod tests {
 
     #[test]
     fn icon_fit_cover1_scale_fits_shrinks_and_grows() {
-        // Icon taller than the target height shrinks (height-limited).
-        let shrink = icon_fit_cover1_scale(10., 40., 20., 20.);
+        // Height drives the scale: a tall icon shrinks to the target height. max_width is generous
+        // (overhang-inclusive) so it doesn't bind.
+        let shrink = icon_fit_cover1_scale(10., 40., 60., 20.);
         assert!(shrink < 1.0, "tall icon should shrink, got {shrink}");
         assert!((shrink - 0.5).abs() < 1e-9, "height-limited factor 20/40");
 
-        // Small icon with width headroom grows to cover (fit_cover1 upscaling).
-        let grow = icon_fit_cover1_scale(8., 8., 20., 16.);
+        // A small icon grows to the target height (fit_cover1 upscaling), width headroom permitting.
+        let grow = icon_fit_cover1_scale(8., 8., 60., 16.);
         assert!(grow > 1.0, "small icon should grow, got {grow}");
         assert!((grow - 2.0).abs() < 1e-9, "height-limited factor 16/8");
 
-        // A wide-but-short icon is clamped by the cell width, not the height target.
-        let width_limited = icon_fit_cover1_scale(40., 8., 20., 100.);
-        assert!((width_limited - 0.5).abs() < 1e-9, "width-limited factor 20/40");
+        // Height genuinely drives the result: a square icon whose width ≈ cell advance is NOT pinned
+        // to the advance — a larger target height yields a larger scale (the bug we fixed).
+        let small_target = icon_fit_cover1_scale(20., 20., 200., 20.);
+        let large_target = icon_fit_cover1_scale(20., 20., 200., 40.);
+        assert!(
+            large_target > small_target,
+            "raising the height target must raise the scale ({large_target} !> {small_target})"
+        );
+
+        // max_width caps runaway growth so the icon can't overrun its overhang budget.
+        let width_capped = icon_fit_cover1_scale(40., 8., 20., 100.);
+        assert!(
+            (width_capped - 0.5).abs() < 1e-9,
+            "width cap 20/40 binds when the height target would grow past the budget"
+        );
+
+        // A non-positive width budget means "height only" (no cap).
+        let uncapped = icon_fit_cover1_scale(40., 8., 0., 80.);
+        assert!((uncapped - 10.0).abs() < 1e-9, "height-only factor 80/8");
 
         // Degenerate ink leaves the glyph untouched.
         assert_eq!(icon_fit_cover1_scale(0., 10., 20., 20.), 1.0);
@@ -3079,6 +3111,18 @@ mod tests {
         assert!(
             grown_rows > shrunk_rows,
             "a larger target must grow the icon ink ({grown_rows} !> {shrunk_rows})"
+        );
+
+        // Regression guard for the "changing the value does nothing" bug: two distinct non-zero
+        // adjustments must produce distinct ink heights (the scale is height-driven, not pinned to
+        // the cell advance).
+        let small = rasterize_text(&key_with(crate::settings::MetricModifier::parse("-30%")));
+        let large = rasterize_text(&key_with(crate::settings::MetricModifier::parse("-10%")));
+        assert!(
+            ink_rows(&large) > ink_rows(&small),
+            "distinct icon-height values must yield distinct ink ({} !> {})",
+            ink_rows(&large),
+            ink_rows(&small)
         );
     }
 
