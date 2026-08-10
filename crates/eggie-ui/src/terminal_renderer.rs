@@ -2,7 +2,7 @@ use crate::{
     app::EggieApp,
     input_latency::InputLatencyTracker,
     metal_terminal::{GlyphRasterCache, MetalBackend},
-    settings::{TerminalTheme, minimum_contrast_rgb},
+    settings::{ResolvedMetricAdjustments, TerminalTheme, minimum_contrast_rgb},
     terminal_sprites::{self, SpriteKind},
 };
 use alacritty_terminal::term::cell::Flags;
@@ -75,6 +75,22 @@ pub(crate) struct TerminalRenderOptions {
     url_hover: Option<TerminalLinkRange>,
     /// Whether the cursor should be painted this frame. `false` during the "off" half of a blink.
     cursor_visible: bool,
+    /// Font-metric adjustments (`adjust-*`) applied to decoration/cursor/box positions.
+    adjustments: ResolvedMetricAdjustments,
+    /// Resolved per-style font families + synthetic-style policy.
+    font_families: Option<crate::settings::ResolvedFontFamilies>,
+    /// OpenType feature overrides (ligature toggle + user features) applied during shaping.
+    font_features: Arc<[crate::settings::FontFeature]>,
+    /// Master ligature toggle; false takes the cheap per-grapheme path.
+    ligatures: bool,
+    /// Break shaping runs at the cursor cell so the character under the cursor renders un-ligated.
+    shaping_break_cursor: bool,
+    /// Variable-font axis settings applied to the face.
+    font_variations: Arc<[crate::settings::FontVariation]>,
+    /// macOS font-smoothing thickening: `None` = off, `Some(strength)` = on at 0–255.
+    font_thicken: Option<u8>,
+    /// Per-codepoint-range family overrides (`font-codepoint-map`).
+    font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
 }
 
 /// Viewport-relative search highlights to overlay on the terminal grid. `active` is the currently
@@ -119,6 +135,14 @@ impl TerminalRenderOptions {
             search: None,
             url_hover: None,
             cursor_visible: true,
+            adjustments: ResolvedMetricAdjustments::default(),
+            font_families: None,
+            font_features: Arc::from(&[][..]),
+            ligatures: false,
+            shaping_break_cursor: true,
+            font_variations: Arc::from(&[][..]),
+            font_thicken: None,
+            font_codepoint_map: Arc::from(&[][..]),
         }
     }
 
@@ -134,6 +158,52 @@ impl TerminalRenderOptions {
 
     pub(crate) fn with_cursor_visible(mut self, cursor_visible: bool) -> Self {
         self.cursor_visible = cursor_visible;
+        self
+    }
+
+    pub(crate) fn with_metric_adjustments(
+        mut self,
+        adjustments: ResolvedMetricAdjustments,
+    ) -> Self {
+        self.adjustments = adjustments;
+        self
+    }
+
+    pub(crate) fn with_font_families(
+        mut self,
+        font_families: crate::settings::ResolvedFontFamilies,
+    ) -> Self {
+        self.font_families = Some(font_families);
+        self
+    }
+
+    pub(crate) fn with_font_features(
+        mut self,
+        font_features: Arc<[crate::settings::FontFeature]>,
+        ligatures: bool,
+        shaping_break_cursor: bool,
+    ) -> Self {
+        self.font_features = font_features;
+        self.ligatures = ligatures;
+        self.shaping_break_cursor = shaping_break_cursor;
+        self
+    }
+
+    pub(crate) fn with_font_variations(
+        mut self,
+        font_variations: Arc<[crate::settings::FontVariation]>,
+        font_thicken: Option<u8>,
+    ) -> Self {
+        self.font_variations = font_variations;
+        self.font_thicken = font_thicken;
+        self
+    }
+
+    pub(crate) fn with_codepoint_map(
+        mut self,
+        font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
+    ) -> Self {
+        self.font_codepoint_map = font_codepoint_map;
         self
     }
 }
@@ -186,6 +256,14 @@ struct PreparationKey {
     search: Option<TerminalSearchHighlights>,
     url_hover: Option<TerminalLinkRange>,
     cursor_visible: bool,
+    adjustments: ResolvedMetricAdjustments,
+    font_families: Option<crate::settings::ResolvedFontFamilies>,
+    font_features: Arc<[crate::settings::FontFeature]>,
+    ligatures: bool,
+    shaping_break_cursor: bool,
+    font_variations: Arc<[crate::settings::FontVariation]>,
+    font_thicken: Option<u8>,
+    font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -231,6 +309,14 @@ impl MetalTerminalRenderer {
             search: options.search,
             url_hover: options.url_hover,
             cursor_visible: options.cursor_visible,
+            adjustments: options.adjustments,
+            font_families: options.font_families,
+            font_features: options.font_features,
+            ligatures: options.ligatures,
+            shaping_break_cursor: options.shaping_break_cursor,
+            font_variations: options.font_variations,
+            font_thicken: options.font_thicken,
+            font_codepoint_map: options.font_codepoint_map,
         }
     }
 
@@ -281,6 +367,14 @@ pub(crate) struct MetalTerminalElement {
     search: Option<TerminalSearchHighlights>,
     url_hover: Option<TerminalLinkRange>,
     cursor_visible: bool,
+    adjustments: ResolvedMetricAdjustments,
+    font_families: Option<crate::settings::ResolvedFontFamilies>,
+    font_features: Arc<[crate::settings::FontFeature]>,
+    ligatures: bool,
+    shaping_break_cursor: bool,
+    font_variations: Arc<[crate::settings::FontVariation]>,
+    font_thicken: Option<u8>,
+    font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +393,10 @@ pub(crate) enum MetalCommand {
         background: u32,
         minimum_contrast: f32,
         minimum_contrast_disabled: bool,
+        /// A pre-shaped glyph id to draw instead of re-shaping `text`. Set for cells inside a
+        /// ligature run so the contextually-substituted glyph (e.g. the joined half of `=>`)
+        /// renders; `None` means shape `text` normally.
+        glyph_id: Option<u16>,
     },
     Image {
         image: Arc<TerminalImageData>,
@@ -313,6 +411,21 @@ pub(crate) struct PreparedMetalTerminal {
     pub(crate) font_size: f32,
     pub(crate) cell_width: f32,
     pub(crate) last_input_sequence: u64,
+    /// `adjust-font-baseline` modifier (logical px), applied to text glyph vertical placement.
+    pub(crate) baseline_adjustment: Option<crate::settings::MetricModifier>,
+    /// `adjust-box-thickness` modifier (logical px), applied to box-drawing sprite stroke width.
+    pub(crate) box_thickness_adjustment: Option<crate::settings::MetricModifier>,
+    /// Resolved per-style families + synthetic-style policy. `None` keeps the legacy behavior of
+    /// deriving bold/italic from the single `family` via CoreText trait synthesis.
+    pub(crate) font_families: Option<crate::settings::ResolvedFontFamilies>,
+    /// OpenType feature overrides applied when shaping text glyphs. Empty = font defaults.
+    pub(crate) font_features: Arc<[crate::settings::FontFeature]>,
+    /// Variable-font axis settings applied to the face. Empty = font defaults.
+    pub(crate) font_variations: Arc<[crate::settings::FontVariation]>,
+    /// macOS font-smoothing thickening: `None` = off, `Some(strength)` = on at 0–255.
+    pub(crate) font_thicken: Option<u8>,
+    /// Per-codepoint-range family overrides (`font-codepoint-map`). Empty = none.
+    pub(crate) font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -495,7 +608,10 @@ impl TerminalPalette {
     }
 }
 
-pub(crate) fn terminal_cell_metrics(window: &mut Window) -> (Pixels, Pixels) {
+pub(crate) fn terminal_cell_metrics(
+    window: &mut Window,
+    adjustments: ResolvedMetricAdjustments,
+) -> (Pixels, Pixels) {
     let text_style = window.text_style();
     let font_size = text_style.font_size.to_pixels(window.rem_size());
     let (cell_width, line_height) = crate::metal_terminal::font_metrics(
@@ -503,6 +619,10 @@ pub(crate) fn terminal_cell_metrics(window: &mut Window) -> (Pixels, Pixels) {
         f32::from(font_size),
         window.scale_factor(),
     );
+    // `adjust-cell-width` / `adjust-cell-height` scale the font-derived cell box (Ghostty
+    // semantics). Clamp to ≥1px so a hostile percent never collapses the grid.
+    let cell_width = ResolvedMetricAdjustments::adjust(adjustments.cell_width, cell_width, 1.);
+    let line_height = ResolvedMetricAdjustments::adjust(adjustments.cell_height, line_height, 1.);
     (px(cell_width), px(line_height))
 }
 
@@ -696,7 +816,7 @@ impl Element for MetalTerminalElement {
     ) -> Self::PrepaintState {
         let text_style = window.text_style();
         let font_size = f32::from(text_style.font_size.to_pixels(window.rem_size()));
-        let (cell_width, line_height) = terminal_cell_metrics(window);
+        let (cell_width, line_height) = terminal_cell_metrics(window, self.adjustments);
         let scale_factor = window.scale_factor();
         let started = Instant::now();
         let family = Arc::from(text_style.font_family.as_ref());
@@ -717,6 +837,14 @@ impl Element for MetalTerminalElement {
             search: self.search.clone(),
             url_hover: self.url_hover.clone(),
             cursor_visible: self.cursor_visible,
+            adjustments: self.adjustments,
+            font_families: self.font_families.clone(),
+            font_features: Arc::clone(&self.font_features),
+            ligatures: self.ligatures,
+            shaping_break_cursor: self.shaping_break_cursor,
+            font_variations: Arc::clone(&self.font_variations),
+            font_thicken: self.font_thicken,
+            font_codepoint_map: Arc::clone(&self.font_codepoint_map),
         };
         let cached = self
             .renderer
@@ -748,6 +876,14 @@ impl Element for MetalTerminalElement {
                 self.search.as_ref(),
                 self.url_hover.as_ref(),
                 self.cursor_visible,
+                self.adjustments,
+                self.font_families.clone(),
+                Arc::clone(&self.font_features),
+                self.ligatures,
+                self.shaping_break_cursor,
+                Arc::clone(&self.font_variations),
+                self.font_thicken,
+                Arc::clone(&self.font_codepoint_map),
                 &image_cache,
             ));
             drop(image_cache);
@@ -831,7 +967,7 @@ impl Element for MetalTerminalElement {
         _cx: &mut App,
     ) {
         if let Some(input) = &self.input {
-            let (cell_width, line_height) = terminal_cell_metrics(window);
+            let (cell_width, line_height) = terminal_cell_metrics(window, self.adjustments);
             let cursor_bounds = Bounds::new(
                 point(
                     bounds.origin.x + cell_width * self.snapshot.cursor_column as f32,
@@ -884,6 +1020,14 @@ fn prepare_terminal(
     search: Option<&TerminalSearchHighlights>,
     url_hover: Option<&TerminalLinkRange>,
     cursor_visible: bool,
+    adjustments: ResolvedMetricAdjustments,
+    font_families: Option<crate::settings::ResolvedFontFamilies>,
+    font_features: Arc<[crate::settings::FontFeature]>,
+    ligatures: bool,
+    shaping_break_cursor: bool,
+    font_variations: Arc<[crate::settings::FontVariation]>,
+    font_thicken: Option<u8>,
+    font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
     image_cache: &FxHashMap<TerminalTextureKey, Arc<TerminalImageData>>,
 ) -> PreparedMetalTerminal {
     let palette = TerminalPalette::new(snapshot, theme);
@@ -916,7 +1060,7 @@ fn prepare_terminal(
         if !cursor_visible || ime.is_some_and(|ime| !ime.text.is_empty()) {
             (Vec::new(), Vec::new())
         } else {
-            prepare_cursor(snapshot, &palette, cell_width, line_height)
+            prepare_cursor(snapshot, &palette, cell_width, line_height, adjustments)
         };
     let mut glyphs = prepare_glyphs(
         &grid,
@@ -925,9 +1069,23 @@ fn prepare_terminal(
         cell_width,
         line_height,
         minimum_contrast,
+        &ShapingContext {
+            family: &family,
+            font_families: font_families.as_ref(),
+            font_size,
+            features: &font_features,
+            shaping_break_cursor,
+            ligatures_enabled: ligatures,
+        },
     );
-    let mut decorations =
-        prepare_decorations(&grid, &palette, cell_width, line_height, minimum_contrast);
+    let mut decorations = prepare_decorations(
+        &grid,
+        &palette,
+        cell_width,
+        line_height,
+        minimum_contrast,
+        adjustments,
+    );
     // Hovered auto-detected URL: underline it in the accent color so it reads as clickable.
     let mut url_hover_commands =
         prepare_url_hover(url_hover, snapshot, cell_width, line_height, (accent << 8) | 0xff);
@@ -975,6 +1133,13 @@ fn prepare_terminal(
         font_size,
         cell_width,
         last_input_sequence: snapshot.last_input_sequence,
+        baseline_adjustment: adjustments.font_baseline,
+        box_thickness_adjustment: adjustments.box_thickness,
+        font_families,
+        font_features,
+        font_variations,
+        font_thicken,
+        font_codepoint_map,
     }
 }
 
@@ -1263,6 +1428,7 @@ fn prepare_ime(
         background,
         minimum_contrast,
         minimum_contrast_disabled: false,
+        glyph_id: None,
     });
     push_rect(
         commands,
@@ -1324,6 +1490,36 @@ fn prepare_backgrounds(
     }
 }
 
+/// Inputs the glyph-preparation pass needs to shape ligature runs. Borrowed for the duration of one
+/// `prepare_terminal` call.
+struct ShapingContext<'a> {
+    family: &'a Arc<str>,
+    font_families: Option<&'a crate::settings::ResolvedFontFamilies>,
+    font_size: f32,
+    features: &'a [crate::settings::FontFeature],
+    shaping_break_cursor: bool,
+    /// Whether run shaping should run at all. False takes the cheap per-grapheme path for every
+    /// cell (ligatures disabled), avoiding wasted CoreText shaping.
+    ligatures_enabled: bool,
+}
+
+impl ShapingContext<'_> {
+    /// The family used for a `(bold, italic)` style — the per-style resolved family when set, else
+    /// the single base family.
+    fn family_for(&self, bold: bool, italic: bool) -> &str {
+        match self.font_families {
+            Some(families) => families.family(bold, italic).as_ref(),
+            None => self.family.as_ref(),
+        }
+    }
+}
+
+/// Maximum number of cells a single shaping run may cover. Bounds per-frame shaping cost for
+/// pathologically long same-style runs. Each cell still renders at cell width (no wide tiles), so
+/// this only splits shaping context — set high enough that a real code line's ligatures never
+/// straddle the boundary.
+const MAX_SHAPING_RUN_CELLS: usize = 256;
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_glyphs(
     grid: &TerminalGrid<'_>,
@@ -1332,11 +1528,15 @@ fn prepare_glyphs(
     cell_width: f32,
     line_height: f32,
     minimum_contrast: f32,
+    shaping: &ShapingContext<'_>,
 ) -> Vec<MetalCommand> {
     let mut commands = Vec::new();
     let cursor_is_block = snapshot.cursor_shape == TerminalCursorShape::Block;
+    let ligatures_possible = shaping.ligatures_enabled;
     for row_index in 0..grid.rows {
         let row = grid.row(row_index);
+        let cursor_column = (snapshot.cursor_line as usize == row_index)
+            .then_some(snapshot.cursor_column as usize);
         let mut column = 0;
         while column < row.len() {
             let Some(cell) = row[column].as_ref() else {
@@ -1357,43 +1557,212 @@ fn prepare_glyphs(
             let visible = !hidden
                 && ((cell.character != ' ' && cell.character != '\t')
                     || !cell.zerowidth.is_empty());
-            if visible {
-                let use_cursor_text = cursor_is_block
-                    && snapshot.cursor_line as usize == row_index
-                    && snapshot.cursor_column as usize == column;
-                let resolved = palette.resolve_cell(cell, use_cursor_text);
-                let (text, source_span) = collect_grapheme(row, column);
-                let render_span = UnicodeWidthStr::width(text.as_str())
-                    .clamp(1, 2)
-                    .min(source_span);
-                let sprite = source_span == span
-                    && cell.zerowidth.is_empty()
-                    && SpriteKind::for_char(cell.character).is_some();
-                commands.push(MetalCommand::Glyph {
-                    rect: [
-                        column as f32 * cell_width,
-                        row_index as f32 * line_height,
-                        render_span as f32 * cell_width,
-                        line_height,
-                    ],
-                    text: Arc::from(text),
-                    color: resolved.foreground,
-                    bold: flags.contains(Flags::BOLD),
-                    italic: flags.contains(Flags::ITALIC),
-                    sprite,
-                    background: resolved.background,
-                    minimum_contrast,
-                    minimum_contrast_disabled: terminal_sprites::skips_minimum_contrast(
-                        cell.character,
-                    ) || use_cursor_text,
-                });
-                column += source_span;
+            if !visible {
+                column += span;
                 continue;
             }
-            column += span;
+
+            // Try to assemble and shape a ligature run starting here. On success it emits the run's
+            // commands and returns how many cells it consumed; otherwise fall through to per-cell.
+            if ligatures_possible
+                && let Some(consumed) = try_emit_shaped_run(
+                    &mut commands,
+                    row,
+                    row_index,
+                    column,
+                    cursor_column,
+                    cursor_is_block,
+                    palette,
+                    cell_width,
+                    line_height,
+                    minimum_contrast,
+                    shaping,
+                )
+            {
+                column += consumed;
+                continue;
+            }
+
+            let use_cursor_text = cursor_is_block && cursor_column == Some(column);
+            let (text, source_span) = collect_grapheme(row, column);
+            emit_glyph_command(
+                &mut commands,
+                row_index,
+                column,
+                &text,
+                source_span,
+                cell,
+                palette.resolve_cell(cell, use_cursor_text),
+                use_cursor_text,
+                cell_width,
+                line_height,
+                minimum_contrast,
+                None,
+            );
+            column += source_span;
         }
     }
     commands
+}
+
+/// Emit a single glyph command for a grapheme cluster at `column`. Shared by the per-cell path and
+/// the ligature run so their geometry/attributes stay identical. `glyph_id` carries a pre-shaped
+/// glyph (from a ligature run) to draw instead of re-shaping `text`; `None` for normal cells.
+#[allow(clippy::too_many_arguments)]
+fn emit_glyph_command(
+    commands: &mut Vec<MetalCommand>,
+    row_index: usize,
+    column: usize,
+    text: &str,
+    source_span: usize,
+    cell: &TerminalCell,
+    resolved: ResolvedCell,
+    use_cursor_text: bool,
+    cell_width: f32,
+    line_height: f32,
+    minimum_contrast: f32,
+    glyph_id: Option<u16>,
+) {
+    let flags = Flags::from_bits_retain(cell.flags);
+    let span = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+    let render_span = UnicodeWidthStr::width(text)
+        .clamp(1, 2)
+        .min(source_span);
+    let sprite = source_span == span
+        && cell.zerowidth.is_empty()
+        && SpriteKind::for_char(cell.character).is_some();
+    commands.push(MetalCommand::Glyph {
+        rect: [
+            column as f32 * cell_width,
+            row_index as f32 * line_height,
+            render_span as f32 * cell_width,
+            line_height,
+        ],
+        text: Arc::from(text),
+        color: resolved.foreground,
+        bold: flags.contains(Flags::BOLD),
+        italic: flags.contains(Flags::ITALIC),
+        sprite,
+        background: resolved.background,
+        minimum_contrast,
+        minimum_contrast_disabled: terminal_sprites::skips_minimum_contrast(cell.character)
+            || use_cursor_text,
+        // A shaped glyph never applies to a sprite (those bypass the font); guard so a stray gid
+        // can't hijack a box-drawing cell.
+        glyph_id: if sprite { None } else { glyph_id },
+    });
+}
+
+/// Whether a cell may participate in a shaping run: a visible, single-cell, non-sprite, non-wide
+/// character with no combining marks. CJK / emoji / box-drawing / combining sequences never ligate
+/// in a terminal, so they always break the run (and use the per-grapheme path).
+fn shapeable_cell(cell: &TerminalCell) -> bool {
+    let flags = Flags::from_bits_retain(cell.flags);
+    if flags.intersects(
+        Flags::WIDE_CHAR
+            | Flags::WIDE_CHAR_SPACER
+            | Flags::LEADING_WIDE_CHAR_SPACER
+            | Flags::HIDDEN,
+    ) {
+        return false;
+    }
+    if !cell.zerowidth.is_empty() {
+        return false;
+    }
+    if cell.character == ' ' || cell.character == '\t' {
+        return false;
+    }
+    if SpriteKind::for_char(cell.character).is_some() {
+        return false;
+    }
+    // A char that isn't a single UTF-16 unit (astral plane) can't map cleanly to one cell index.
+    cell.character.len_utf16() == 1
+}
+
+/// Attempt to shape a ligature run starting at `start`. Assembles a maximal contiguous same-style
+/// run of shapeable cells (bounded by [`MAX_SHAPING_RUN_CELLS`] and split at the cursor when
+/// requested), shapes it, and emits one command per resulting glyph cluster. Returns the number of
+/// cells consumed, or `None` if no ligature merged (so the caller uses the cheaper per-cell path).
+#[allow(clippy::too_many_arguments)]
+fn try_emit_shaped_run(
+    commands: &mut Vec<MetalCommand>,
+    row: &[Option<&TerminalCell>],
+    row_index: usize,
+    start: usize,
+    cursor_column: Option<usize>,
+    cursor_is_block: bool,
+    palette: &TerminalPalette,
+    cell_width: f32,
+    line_height: f32,
+    minimum_contrast: f32,
+    shaping: &ShapingContext<'_>,
+) -> Option<usize> {
+    let first = row.get(start).and_then(Option::as_ref).copied()?;
+    if !shapeable_cell(first) {
+        return None;
+    }
+    // Grow a run of contiguous cells that share the first cell's style and are all shapeable. Stop
+    // before the cursor cell when breaking there so it renders un-ligated (Ghostty semantics).
+    let mut end = start;
+    while end < row.len() && end - start < MAX_SHAPING_RUN_CELLS {
+        let Some(cell) = row.get(end).and_then(Option::as_ref).copied() else {
+            break;
+        };
+        if !shapeable_cell(cell) || !same_grapheme_style(first, cell) {
+            break;
+        }
+        if shaping.shaping_break_cursor
+            && cursor_is_block
+            && cursor_column == Some(end)
+            && end != start
+        {
+            break;
+        }
+        end += 1;
+    }
+    let cell_count = end - start;
+    if cell_count < 2 {
+        return None;
+    }
+    let bold = Flags::from_bits_retain(first.flags).contains(Flags::BOLD);
+    let italic = Flags::from_bits_retain(first.flags).contains(Flags::ITALIC);
+    let run_text: String = (start..end)
+        .filter_map(|column| row.get(column).and_then(Option::as_ref))
+        .map(|cell| cell.character)
+        .collect();
+    let glyph_ids = crate::metal_terminal::shape_terminal_run(
+        &run_text,
+        shaping.family_for(bold, italic),
+        shaping.font_size,
+        bold,
+        italic,
+        shaping.features,
+        cell_count,
+    )?;
+    // Per-cell contextual substitution: each cell keeps its own slot/advance, but renders the
+    // shaped glyph id (a variant that joins its neighbors) instead of re-shaping the character.
+    for (offset, glyph_id) in glyph_ids.into_iter().enumerate() {
+        let column = start + offset;
+        let cell = row.get(column).and_then(Option::as_ref).copied()?;
+        let use_cursor_text = cursor_is_block && cursor_column == Some(column);
+        let resolved = palette.resolve_cell(cell, use_cursor_text);
+        let (text, source_span) = collect_grapheme(row, column);
+        emit_glyph_command(
+            commands,
+            row_index,
+            column,
+            &text,
+            source_span,
+            cell,
+            resolved,
+            use_cursor_text,
+            cell_width,
+            line_height,
+            minimum_contrast,
+            Some(glyph_id),
+        );
+    }
+    Some(cell_count)
 }
 
 fn collect_grapheme(row: &[Option<&TerminalCell>], start: usize) -> (String, usize) {
@@ -1481,7 +1850,25 @@ fn prepare_decorations(
     cell_width: f32,
     line_height: f32,
     minimum_contrast: f32,
+    adjustments: ResolvedMetricAdjustments,
 ) -> Vec<MetalCommand> {
+    // Base decoration metrics (device-independent px). These mirror the previous hardcoded values;
+    // `adjust-underline-*` / `adjust-strikethrough-*` shift/scale them (Ghostty semantics).
+    // `*_position` is the distance from the cell top (larger = lower); thickness clamps to ≥1px.
+    let underline_thickness =
+        ResolvedMetricAdjustments::adjust(adjustments.underline_thickness, 1., 1.);
+    let underline_position = ResolvedMetricAdjustments::adjust(
+        adjustments.underline_position,
+        line_height - 2.,
+        0.,
+    );
+    let strikethrough_thickness =
+        ResolvedMetricAdjustments::adjust(adjustments.strikethrough_thickness, 1., 1.);
+    let strikethrough_position = ResolvedMetricAdjustments::adjust(
+        adjustments.strikethrough_position,
+        line_height * 0.55,
+        0.,
+    );
     let mut commands = Vec::new();
     for row_index in 0..grid.rows {
         let row = grid.row(row_index);
@@ -1509,30 +1896,51 @@ fn prepare_decorations(
                 minimum_contrast_rgba(resolved.underline, resolved.background, minimum_contrast);
             let foreground =
                 minimum_contrast_rgba(resolved.foreground, resolved.background, minimum_contrast);
+            // Underline baseline (bottom of the drawn line). Kept within the cell.
+            let underline_y = (y + underline_position).min(y + line_height - underline_thickness);
             match flags & Flags::ALL_UNDERLINES {
-                Flags::UNDERLINE => {
-                    push_rect(&mut commands, x, y + line_height - 2., width, 1., underline)
-                }
+                Flags::UNDERLINE => push_rect(
+                    &mut commands,
+                    x,
+                    underline_y,
+                    width,
+                    underline_thickness,
+                    underline,
+                ),
                 Flags::DOUBLE_UNDERLINE => {
-                    push_rect(&mut commands, x, y + line_height - 2., width, 1., underline);
-                    push_rect(&mut commands, x, y + line_height - 5., width, 1., underline);
+                    push_rect(
+                        &mut commands,
+                        x,
+                        underline_y,
+                        width,
+                        underline_thickness,
+                        underline,
+                    );
+                    push_rect(
+                        &mut commands,
+                        x,
+                        underline_y - (underline_thickness + 2.),
+                        width,
+                        underline_thickness,
+                        underline,
+                    );
                 }
                 Flags::UNDERCURL => {
-                    push_undercurl(&mut commands, x, y + line_height - 4., width, underline)
+                    push_undercurl(&mut commands, x, underline_y - 2., width, underline)
                 }
                 Flags::DOTTED_UNDERLINE => push_patterned_line(
                     &mut commands,
                     x,
-                    y + line_height - 2.,
+                    underline_y,
                     width,
-                    1.,
+                    underline_thickness,
                     2.,
                     underline,
                 ),
                 Flags::DASHED_UNDERLINE => push_patterned_line(
                     &mut commands,
                     x,
-                    y + line_height - 2.,
+                    underline_y,
                     width,
                     4.,
                     2.,
@@ -1544,9 +1952,9 @@ fn prepare_decorations(
                 push_rect(
                     &mut commands,
                     x,
-                    y + line_height * 0.55,
+                    y + strikethrough_position,
                     width,
-                    1.,
+                    strikethrough_thickness,
                     foreground,
                 );
             }
@@ -1560,6 +1968,7 @@ fn prepare_cursor(
     palette: &TerminalPalette,
     cell_width: f32,
     line_height: f32,
+    adjustments: ResolvedMetricAdjustments,
 ) -> (Vec<MetalCommand>, Vec<MetalCommand>) {
     if snapshot.cursor_shape == TerminalCursorShape::Hidden
         || snapshot.cursor_line >= snapshot.size.rows
@@ -1571,19 +1980,45 @@ fn prepare_cursor(
     let y = line_height * snapshot.cursor_line as f32;
     let width = cell_width * snapshot.cursor_width.clamp(1, 2) as f32;
     let color = palette.color(258);
+    // `adjust-cursor-thickness` scales the stroke of the bar/underline/hollow cursors (Ghostty
+    // applies it to the bar and outlined-rect cursors). Base is 2px for bar/underline, 1px for the
+    // hollow outline; clamp to ≥1px.
+    let bar_thickness = ResolvedMetricAdjustments::adjust(adjustments.cursor_thickness, 2., 1.);
+    let hollow_thickness = ResolvedMetricAdjustments::adjust(adjustments.cursor_thickness, 1., 1.);
     let mut background = Vec::new();
     let mut foreground = Vec::new();
     match snapshot.cursor_shape {
         TerminalCursorShape::Block => push_rect(&mut background, x, y, width, line_height, color),
-        TerminalCursorShape::Underline => {
-            push_rect(&mut foreground, x, y + line_height - 2., width, 2., color)
+        TerminalCursorShape::Underline => push_rect(
+            &mut foreground,
+            x,
+            y + line_height - bar_thickness,
+            width,
+            bar_thickness,
+            color,
+        ),
+        TerminalCursorShape::Beam => {
+            push_rect(&mut foreground, x, y, bar_thickness, line_height, color)
         }
-        TerminalCursorShape::Beam => push_rect(&mut foreground, x, y, 2., line_height, color),
         TerminalCursorShape::HollowBlock => {
-            push_rect(&mut foreground, x, y, width, 1., color);
-            push_rect(&mut foreground, x, y + line_height - 1., width, 1., color);
-            push_rect(&mut foreground, x, y, 1., line_height, color);
-            push_rect(&mut foreground, x + width - 1., y, 1., line_height, color);
+            push_rect(&mut foreground, x, y, width, hollow_thickness, color);
+            push_rect(
+                &mut foreground,
+                x,
+                y + line_height - hollow_thickness,
+                width,
+                hollow_thickness,
+                color,
+            );
+            push_rect(&mut foreground, x, y, hollow_thickness, line_height, color);
+            push_rect(
+                &mut foreground,
+                x + width - hollow_thickness,
+                y,
+                hollow_thickness,
+                line_height,
+                color,
+            );
         }
         TerminalCursorShape::Hidden => {}
     }
@@ -1678,6 +2113,23 @@ mod tests {
     use crate::settings::{AppSettings, ThemeMode, theme_catalog};
     use eggie_protocol::{TerminalCellPosition, TerminalColorOverride, TerminalSize};
     use uuid::Uuid;
+
+    fn menlo_family() -> Arc<str> {
+        Arc::from("Menlo")
+    }
+
+    /// A shaping context with ligatures disabled — the glyph tests exercise the per-cell path and
+    /// don't want CoreText run shaping to merge cells.
+    fn test_shaping_context(family: &Arc<str>) -> ShapingContext<'_> {
+        ShapingContext {
+            family,
+            font_families: None,
+            font_size: 14.,
+            features: &[],
+            shaping_break_cursor: true,
+            ligatures_enabled: false,
+        }
+    }
 
     fn theme() -> &'static TerminalTheme {
         let name = theme_catalog()
@@ -1781,7 +2233,7 @@ mod tests {
         let block = cell(3, '▒', TerminalColor::Named(256), Flags::empty());
         let snapshot = snapshot(vec![wide, spacer, block]);
         let palette = TerminalPalette::new(&snapshot, theme());
-        let glyphs = prepare_glyphs(&terminal_grid(&snapshot), &snapshot, &palette, 8., 18., 1.);
+        let glyphs = prepare_glyphs(&terminal_grid(&snapshot), &snapshot, &palette, 8., 18., 1., &test_shaping_context(&menlo_family()));
         assert_eq!(glyphs.len(), 2);
         let MetalCommand::Glyph {
             rect, text, sprite, ..
@@ -1854,7 +2306,7 @@ mod tests {
         ]);
         snapshot.size.columns = 24;
         let palette = TerminalPalette::new(&snapshot, theme());
-        let glyphs = prepare_glyphs(&terminal_grid(&snapshot), &snapshot, &palette, 8., 18., 1.);
+        let glyphs = prepare_glyphs(&terminal_grid(&snapshot), &snapshot, &palette, 8., 18., 1., &test_shaping_context(&menlo_family()));
         let glyph_data = glyphs
             .iter()
             .map(|command| match command {
@@ -1882,7 +2334,7 @@ mod tests {
         let second = cell(1, '🇶', TerminalColor::Named(2), Flags::empty());
         let snapshot = snapshot(vec![first, second]);
         let palette = TerminalPalette::new(&snapshot, theme());
-        let glyphs = prepare_glyphs(&terminal_grid(&snapshot), &snapshot, &palette, 8., 18., 1.);
+        let glyphs = prepare_glyphs(&terminal_grid(&snapshot), &snapshot, &palette, 8., 18., 1., &test_shaping_context(&menlo_family()));
         assert_eq!(glyphs.len(), 2);
     }
 
@@ -1901,7 +2353,15 @@ mod tests {
         let snapshot = snapshot(vec![text, graphic, font_powerline]);
         let palette = TerminalPalette::new(&snapshot, theme);
         let grid = terminal_grid(&snapshot);
-        let glyphs = prepare_glyphs(&grid, &snapshot, &palette, 8., 18., 3.);
+        let glyphs = prepare_glyphs(
+            &grid,
+            &snapshot,
+            &palette,
+            8.,
+            18.,
+            3.,
+            &test_shaping_context(&menlo_family()),
+        );
 
         let MetalCommand::Glyph {
             background,
@@ -1934,7 +2394,14 @@ mod tests {
         assert!(!*sprite);
         assert!(*minimum_contrast_disabled);
 
-        let decorations = prepare_decorations(&grid, &palette, 8., 18., 3.);
+        let decorations = prepare_decorations(
+            &grid,
+            &palette,
+            8.,
+            18.,
+            3.,
+            ResolvedMetricAdjustments::default(),
+        );
         let MetalCommand::Rect { color, .. } = &decorations[0] else {
             panic!()
         };
@@ -1956,7 +2423,14 @@ mod tests {
         ] {
             let snapshot = snapshot(vec![cell(0, 'x', TerminalColor::Named(256), flag)]);
             let palette = TerminalPalette::new(&snapshot, theme());
-            let commands = prepare_decorations(&terminal_grid(&snapshot), &palette, 8., 18., 1.);
+            let commands = prepare_decorations(
+                &terminal_grid(&snapshot),
+                &palette,
+                8.,
+                18.,
+                1.,
+                ResolvedMetricAdjustments::default(),
+            );
             assert!(!commands.is_empty(), "missing geometry for {flag:?}");
         }
     }
@@ -1973,10 +2447,65 @@ mod tests {
             let mut snapshot = snapshot(Vec::new());
             snapshot.cursor_shape = shape;
             let palette = TerminalPalette::new(&snapshot, theme());
-            let (background, foreground) = prepare_cursor(&snapshot, &palette, 8., 18.);
+            let (background, foreground) =
+                prepare_cursor(&snapshot, &palette, 8., 18., ResolvedMetricAdjustments::default());
             assert_eq!(background.len(), backgrounds);
             assert_eq!(foreground.len(), foregrounds);
         }
+    }
+
+    #[test]
+    fn adjust_underline_thickness_and_position_shift_the_decoration_rect() {
+        let snapshot = snapshot(vec![cell(0, 'x', TerminalColor::Named(256), Flags::UNDERLINE)]);
+        let palette = TerminalPalette::new(&snapshot, theme());
+        let grid = terminal_grid(&snapshot);
+        // Baseline: default underline is 1px tall, near the bottom of an 18px cell.
+        let base = prepare_decorations(&grid, &palette, 8., 18., 1., ResolvedMetricAdjustments::default());
+        let MetalCommand::Rect { rect: base_rect, .. } = base[0] else {
+            panic!("underline must be a rect");
+        };
+        assert_eq!(base_rect[3], 1., "default underline thickness is 1px");
+
+        // Thicken to 3px and lift the position higher up the cell.
+        let adjustments = ResolvedMetricAdjustments {
+            underline_thickness: Some(crate::settings::MetricModifier::Absolute(2)),
+            underline_position: Some(crate::settings::MetricModifier::Absolute(-4)),
+            ..ResolvedMetricAdjustments::default()
+        };
+        let adjusted = prepare_decorations(&grid, &palette, 8., 18., 1., adjustments);
+        let MetalCommand::Rect { rect: adjusted_rect, .. } = adjusted[0] else {
+            panic!("underline must be a rect");
+        };
+        assert_eq!(adjusted_rect[3], 3., "thickness +2 → 3px");
+        assert!(
+            adjusted_rect[1] < base_rect[1],
+            "position -4 lifts the underline ({} !< {})",
+            adjusted_rect[1],
+            base_rect[1]
+        );
+    }
+
+    #[test]
+    fn adjust_cursor_thickness_widens_the_bar_cursor() {
+        let mut snapshot = snapshot(Vec::new());
+        snapshot.cursor_shape = TerminalCursorShape::Beam;
+        let palette = TerminalPalette::new(&snapshot, theme());
+        let (_, base) =
+            prepare_cursor(&snapshot, &palette, 8., 18., ResolvedMetricAdjustments::default());
+        let MetalCommand::Rect { rect: base_rect, .. } = base[0] else {
+            panic!("beam cursor must be a rect");
+        };
+        assert_eq!(base_rect[2], 2., "default beam is 2px wide");
+
+        let adjustments = ResolvedMetricAdjustments {
+            cursor_thickness: Some(crate::settings::MetricModifier::Absolute(2)),
+            ..ResolvedMetricAdjustments::default()
+        };
+        let (_, adjusted) = prepare_cursor(&snapshot, &palette, 8., 18., adjustments);
+        let MetalCommand::Rect { rect: adjusted_rect, .. } = adjusted[0] else {
+            panic!("beam cursor must be a rect");
+        };
+        assert_eq!(adjusted_rect[2], 4., "thickness +2 → 4px wide beam");
     }
 
     #[test]
@@ -2178,6 +2707,14 @@ mod tests {
             None,
             None,
             true,
+            ResolvedMetricAdjustments::default(),
+            None,
+            Arc::from(&[][..]),
+            false,
+            true,
+            Arc::from(&[][..]),
+            None,
+            Arc::from(&[][..]),
             &image_cache,
         );
         let image_index = |id| {
@@ -2366,6 +2903,14 @@ mod tests {
                 None,
                 None,
                 true,
+                ResolvedMetricAdjustments::default(),
+                None,
+                Arc::from(&[][..]),
+                false,
+                true,
+                Arc::from(&[][..]),
+                None,
+                Arc::from(&[][..]),
                 &image_cache,
             ))
             .commands

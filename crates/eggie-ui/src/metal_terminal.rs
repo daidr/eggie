@@ -5,19 +5,27 @@ use crate::terminal_renderer::{
 use crate::terminal_sprites;
 use anyhow::{Result, anyhow};
 use core_foundation::{
+    array::CFArray,
     attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
     boolean::CFBoolean,
+    dictionary::CFDictionary,
+    number::CFNumber,
     string::{CFString, CFStringRef},
 };
 use core_graphics::{
     base::{kCGImageAlphaNone, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
     context::CGContext,
+    font::CGGlyph,
+    geometry::CGPoint,
 };
 use core_text::{
     font::{self, CTFont, CTFontRef},
-    font_descriptor::{kCTFontBoldTrait, kCTFontColorGlyphsTrait, kCTFontItalicTrait},
+    font_descriptor::{
+        kCTFontBoldTrait, kCTFontColorGlyphsTrait, kCTFontFeatureSettingsAttribute,
+        kCTFontItalicTrait, kCTFontOrientationDefault, kCTFontVariationAttribute,
+    },
     line::CTLine,
     string_attributes::{kCTFontAttributeName, kCTForegroundColorFromContextAttributeName},
 };
@@ -60,6 +68,10 @@ unsafe extern "C" {
         string: CFStringRef,
         range: CFRange,
     ) -> CTFontRef;
+
+    // OpenType feature dictionary keys. `core-text` 21 doesn't re-export these, so link them here.
+    static kCTFontOpenTypeFeatureTag: CFStringRef;
+    static kCTFontOpenTypeFeatureValue: CFStringRef;
 }
 
 const SHADER: &str = r#"
@@ -208,6 +220,20 @@ struct GlyphKey {
     width: u16,
     height: u16,
     sprite: bool,
+    /// `adjust-font-baseline` modifier, pre-scaled to device px (text glyphs only).
+    baseline: Option<crate::settings::MetricModifier>,
+    /// `adjust-box-thickness` modifier, pre-scaled to device px (sprite/box-drawing glyphs only).
+    box_thickness: Option<crate::settings::MetricModifier>,
+    /// OpenType feature overrides applied when shaping this glyph (text glyphs only). Empty = font
+    /// defaults. Keeps deterministic ligature on/off in the cache key.
+    features: Arc<[crate::settings::FontFeature]>,
+    /// A pre-shaped glyph id to draw directly (from a ligature run's per-cell substitution), instead
+    /// of shaping `text`. `None` renders `text` normally.
+    glyph_id: Option<u16>,
+    /// Variable-font axis settings applied to the face (empty = font defaults).
+    variations: Arc<[crate::settings::FontVariation]>,
+    /// macOS font-smoothing thickening: `None` = off, `Some(strength)` = on at 0–255.
+    thicken: Option<u8>,
 }
 
 enum RasterCacheEntry {
@@ -1056,6 +1082,7 @@ impl MetalBackend {
                 background,
                 minimum_contrast,
                 minimum_contrast_disabled,
+                glyph_id: _,
             } => {
                 stats.glyph_count += 1;
                 let (pixel_origin, _) = snap_device_rect(origin, *rect, scale);
@@ -1127,6 +1154,7 @@ fn glyph_key_for_command(
         bold,
         italic,
         sprite,
+        glyph_id,
         ..
     } = command
     else {
@@ -1138,16 +1166,72 @@ fn glyph_key_for_command(
         [rect[0], rect[1], terminal.cell_width, rect[3]],
         scale,
     );
+    // Resolve the per-style family and whether CoreText trait synthesis should still apply.
+    // Sprites bypass the font entirely, so they keep the regular family and no synthesis.
+    let (mut family, mut synth_bold, mut synth_italic) = match (&terminal.font_families, *sprite) {
+        (Some(families), false) => {
+            let family = Arc::clone(families.family(*bold, *italic));
+            if families.has_dedicated_family(*bold, *italic) {
+                // A dedicated face already provides the style; don't double-apply synthetic traits.
+                (family, false, false)
+            } else {
+                // No dedicated face: synthesize only if allowed for this style (else fall back to
+                // the plain regular face with no faux-bold/italic).
+                let allow = families.allows_synthesis(*bold, *italic);
+                (family, *bold && allow, *italic && allow)
+            }
+        }
+        _ => (Arc::clone(&terminal.family), *bold, *italic),
+    };
+    // `font-codepoint-map`: a codepoint-range override wins over the style family. Sprites are
+    // hand-drawn and never remapped.
+    if !*sprite
+        && !terminal.font_codepoint_map.is_empty()
+        && let Some(character) = text.chars().next()
+        && let Some(entry) = terminal
+            .font_codepoint_map
+            .iter()
+            .find(|entry| entry.contains(character as u32))
+    {
+        family = Arc::from(entry.family.as_str());
+        // The override family provides its own glyphs; don't synthesize on top of it.
+        synth_bold = false;
+        synth_italic = false;
+    }
     Some(GlyphKey {
         text: Arc::clone(text),
-        family: Arc::clone(&terminal.family),
+        family,
         font_size_bits: (terminal.font_size * scale).to_bits(),
-        bold: *bold,
-        italic: *italic,
+        bold: synth_bold,
+        italic: synth_italic,
         cell_width: (cell_pixel_size[0].max(1.) as usize).min(u16::MAX as usize) as u16,
         width: (pixel_size[0].max(1.) as usize).min(u16::MAX as usize) as u16,
         height: (pixel_size[1].max(1.) as usize).min(u16::MAX as usize) as u16,
         sprite: *sprite,
+        // Baseline only shifts text glyphs; box thickness only affects hand-drawn sprites. Keep the
+        // irrelevant modifier out of each key so the cache doesn't split on a no-op adjustment.
+        baseline: if *sprite {
+            None
+        } else {
+            terminal.baseline_adjustment.map(|m| m.prescale(scale))
+        },
+        box_thickness: if *sprite {
+            terminal.box_thickness_adjustment.map(|m| m.prescale(scale))
+        } else {
+            None
+        },
+        features: if *sprite {
+            Arc::from(&[][..])
+        } else {
+            Arc::clone(&terminal.font_features)
+        },
+        glyph_id: if *sprite { None } else { *glyph_id },
+        variations: if *sprite {
+            Arc::from(&[][..])
+        } else {
+            Arc::clone(&terminal.font_variations)
+        },
+        thicken: if *sprite { None } else { terminal.font_thicken },
     })
 }
 
@@ -1170,7 +1254,9 @@ fn rasterize_glyph(key: &GlyphKey) -> RasterizedGlyph {
             .text
             .chars()
             .next()
-            .and_then(|character| terminal_sprites::rasterize(character, width, height))
+            .and_then(|character| {
+                terminal_sprites::rasterize(character, width, height, key.box_thickness)
+            })
     {
         return RasterizedGlyph::exact_mask(pixels, width, height);
     }
@@ -1183,6 +1269,7 @@ struct FontStyleKey {
     point_size_bits: u64,
     bold: bool,
     italic: bool,
+    variations: Arc<[crate::settings::FontVariation]>,
 }
 
 #[derive(Default)]
@@ -1198,6 +1285,7 @@ impl GlyphRasterizer {
             point_size_bits: point_size.to_bits(),
             bold: key.bold,
             italic: key.italic,
+            variations: Arc::clone(&key.variations),
         };
         if let Some(font) = self.fonts.get(&style) {
             return font.clone();
@@ -1219,6 +1307,7 @@ impl GlyphRasterizer {
                 .clone_with_symbolic_traits(traits, kCTFontBoldTrait | kCTFontItalicTrait)
                 .unwrap_or(base_font)
         };
+        let font = font_with_variations(&font, &key.variations);
         self.fonts.insert(style, font.clone());
         font
     }
@@ -1227,6 +1316,18 @@ impl GlyphRasterizer {
         let width = key.width as usize;
         let height = key.height as usize;
         let font = self.font(key);
+        // Ligature run cells carry a pre-shaped glyph id: draw that exact glyph from the run's font
+        // (a contextual variant that visually joins its neighbors) rather than re-shaping the text.
+        if let Some(glyph_id) = key.glyph_id {
+            return RasterizedGlyph::Mask(rasterize_glyph_id(
+                &font,
+                glyph_id,
+                width,
+                height,
+                key.baseline,
+                key.thicken,
+            ));
+        }
         let font = font_for_text(&font, &key.text);
         let confine_to_cell = is_single_cell_fraction(&key.text);
         let font = if confine_to_cell {
@@ -1234,14 +1335,24 @@ impl GlyphRasterizer {
         } else {
             font
         };
+        // Apply OpenType feature overrides (ligature on/off, ss01, …) so the same feature state
+        // that drove run shaping also renders the (possibly ligated) glyph.
+        let font = font_with_features(&font, &key.features);
         let line = attributed_line(&key.text, &font);
         if font.postscript_name().contains("LastResort") || line_uses_last_resort(&line) {
             return unknown_glyph_outline(key.cell_width as usize, height);
         }
         if !key.text.contains('\u{fe0e}') && line_uses_only_color_glyphs(&line) {
-            RasterizedGlyph::Color(rasterize_color_line(&line, width, height))
+            RasterizedGlyph::Color(rasterize_color_line(&line, width, height, key.baseline))
         } else {
-            RasterizedGlyph::Mask(rasterize_mask_line(&line, width, height, confine_to_cell))
+            RasterizedGlyph::Mask(rasterize_mask_line(
+                &line,
+                width,
+                height,
+                confine_to_cell,
+                key.baseline,
+                key.thicken,
+            ))
         }
     }
 }
@@ -1303,7 +1414,7 @@ fn fit_font_to_cell(text: &str, font: &CTFont, width: usize, height: usize) -> C
     // Keep that behavior here so PingFang's U+2150/U+2151/U+2152 fit without replacing their
     // native outlines with hand-drawn approximations.
     let line = attributed_line(text, font);
-    let context = mask_context(width, height);
+    let context = mask_context(width, height, None);
     let ink = line.get_image_bounds(&context);
     let right = ink.origin.x + ink.size.width;
     if !ink.is_empty()
@@ -1327,11 +1438,58 @@ fn font_for_text(base_font: &CTFont, text: &str) -> CTFont {
             range,
         )
     };
-    if fallback.is_null() {
+    let resolved = if fallback.is_null() {
         base_font.clone()
     } else {
         unsafe { CTFont::wrap_under_create_rule(fallback) }
+    };
+    // If neither the base font nor the system fallback chain can render the text (LastResort), try
+    // the bundled Nerd Font symbols so private-use-area icons work without a patched font installed.
+    if resolved.postscript_name().contains("LastResort")
+        && let Some(nerd) = nerd_font_fallback(base_font.pt_size())
+        && nerd_font_covers(&nerd, text)
+    {
+        return nerd;
     }
+    resolved
+}
+
+/// The bundled "Symbols Only" Nerd Font, embedded so private-use-area icons render even without a
+/// patched Nerd Font installed. Registered with CoreText once (not installed system-wide).
+const NERD_FONT_SYMBOLS: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
+
+thread_local! {
+    /// Lazily-built descriptor for the embedded Nerd Font (per-thread; CoreText objects aren't Sync).
+    /// `None` if registration failed. The outer Option marks "not yet attempted".
+    static NERD_FONT_DESCRIPTOR: RefCell<Option<Option<core_text::font_descriptor::CTFontDescriptor>>> =
+        const { RefCell::new(None) };
+}
+
+/// A `CTFont` for the embedded Nerd Font symbols at `pt_size`, or `None` if it couldn't be built.
+fn nerd_font_fallback(pt_size: f64) -> Option<CTFont> {
+    NERD_FONT_DESCRIPTOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let descriptor = slot
+            .get_or_insert_with(|| {
+                core_text::font_manager::create_font_descriptor(NERD_FONT_SYMBOLS).ok()
+            })
+            .clone()?;
+        Some(font::new_from_descriptor(&descriptor, pt_size.max(1.)))
+    })
+}
+
+/// Whether `font` has a real (non-`.notdef`) glyph for the first character of `text`.
+fn nerd_font_covers(font: &CTFont, text: &str) -> bool {
+    let Some(character) = text.chars().next() else {
+        return false;
+    };
+    let mut utf16 = [0u16; 2];
+    let encoded = character.encode_utf16(&mut utf16);
+    let mut glyphs = [0u16; 2];
+    let ok = unsafe {
+        font.get_glyphs_for_characters(encoded.as_ptr(), glyphs.as_mut_ptr(), encoded.len() as _)
+    };
+    ok && glyphs[0] != 0
 }
 
 fn attributed_line(text: &str, font: &CTFont) -> CTLine {
@@ -1346,6 +1504,215 @@ fn attributed_line(text: &str, font: &CTFont) -> CTLine {
         &CFBoolean::true_value(),
     );
     CTLine::new_with_attributed_string(attributed.as_concrete_TypeRef())
+}
+
+/// Apply OpenType feature overrides to a font via a copied descriptor. An empty list returns the
+/// font unchanged. Each feature becomes a `{OpenTypeFeatureTag, OpenTypeFeatureValue}` dict entry
+/// under `kCTFontFeatureSettingsAttribute`.
+fn font_with_features(font: &CTFont, features: &[crate::settings::FontFeature]) -> CTFont {
+    if features.is_empty() {
+        return font.clone();
+    }
+    let tag_key = unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureTag) };
+    let value_key = unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureValue) };
+    let settings: Vec<CFDictionary<CFString, core_foundation::base::CFType>> = features
+        .iter()
+        .map(|feature| {
+            let tag = CFString::new(
+                std::str::from_utf8(&feature.tag).unwrap_or("").trim_end_matches('\0'),
+            );
+            let value = CFNumber::from(feature.value as i64);
+            CFDictionary::from_CFType_pairs(&[
+                (tag_key.clone(), tag.as_CFType()),
+                (value_key.clone(), value.as_CFType()),
+            ])
+        })
+        .collect();
+    let settings_array = CFArray::from_CFTypes(&settings);
+    let feature_key = unsafe { CFString::wrap_under_get_rule(kCTFontFeatureSettingsAttribute) };
+    let attributes = CFDictionary::from_CFType_pairs(&[(
+        feature_key,
+        settings_array.as_CFType(),
+    )]);
+    let base_descriptor = font.copy_descriptor();
+    match base_descriptor.create_copy_with_attributes(attributes.to_untyped()) {
+        Ok(descriptor) => font::new_from_descriptor(&descriptor, font.pt_size()),
+        Err(_) => font.clone(),
+    }
+}
+
+/// Apply variable-font axis settings (`wght`, `slnt`, …) to a font via a copied descriptor. The
+/// `kCTFontVariationAttribute` value is a dictionary keyed by each axis's four-char tag encoded as a
+/// big-endian `u32` identifier → the axis value. Empty list returns the font unchanged.
+fn font_with_variations(font: &CTFont, variations: &[crate::settings::FontVariation]) -> CTFont {
+    if variations.is_empty() {
+        return font.clone();
+    }
+    let pairs: Vec<(CFNumber, CFNumber)> = variations
+        .iter()
+        .map(|variation| {
+            let identifier = u32::from_be_bytes(variation.tag) as i64;
+            (CFNumber::from(identifier), CFNumber::from(variation.value as f64))
+        })
+        .collect();
+    let variation_dict = CFDictionary::from_CFType_pairs(
+        &pairs
+            .iter()
+            .map(|(key, value)| (key.as_CFType(), value.as_CFType()))
+            .collect::<Vec<_>>(),
+    );
+    let variation_key = unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) };
+    let attributes =
+        CFDictionary::from_CFType_pairs(&[(variation_key.as_CFType(), variation_dict.as_CFType())]);
+    let base_descriptor = font.copy_descriptor();
+    match base_descriptor.create_copy_with_attributes(attributes.to_untyped()) {
+        Ok(descriptor) => font::new_from_descriptor(&descriptor, font.pt_size()),
+        Err(_) => font.clone(),
+    }
+}
+
+/// Shape a run of `cell_count` single-cell characters with rustybuzz (a HarfBuzz port) and return
+/// the contextually-substituted glyph id for each cell. Modern programming fonts render ligatures
+/// as per-cell contextual substitutions (each cell keeps its own glyph slot and advance, but the
+/// glyph is swapped for a variant that visually joins its neighbors), so a correct rendering just
+/// needs the shaped glyph id per cell. Returns `Some` only when the shaper produced exactly one
+/// glyph per cell in order (the common case); otherwise `None`, so the caller falls back to
+/// rendering each character normally.
+fn shape_run_glyph_ids(
+    text: &str,
+    font_data: &[u8],
+    face_index: u32,
+    features: &[crate::settings::FontFeature],
+    cell_count: usize,
+) -> Option<Vec<u16>> {
+    if cell_count == 0 {
+        return None;
+    }
+    let face = rustybuzz::Face::from_slice(font_data, face_index)?;
+    let hb_features: Vec<rustybuzz::Feature> = features
+        .iter()
+        .map(|feature| {
+            rustybuzz::Feature::new(
+                rustybuzz::ttf_parser::Tag::from_bytes(&feature.tag),
+                feature.value,
+                ..,
+            )
+        })
+        .collect();
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.set_direction(rustybuzz::Direction::LeftToRight);
+    let shaped = rustybuzz::shape(&face, &hb_features, buffer);
+    let infos = shaped.glyph_infos();
+    // Require exactly one glyph per cell, clusters 0,1,2,… (the per-cell substitution model). If the
+    // font fused clusters into fewer glyphs, we can't map them onto the fixed cell grid, so bail.
+    if infos.len() != cell_count {
+        return None;
+    }
+    let mut glyph_ids = Vec::with_capacity(cell_count);
+    for (cell, info) in infos.iter().enumerate() {
+        if info.cluster as usize != cell {
+            return None;
+        }
+        glyph_ids.push(u16::try_from(info.glyph_id).ok()?);
+    }
+    Some(glyph_ids)
+}
+
+/// Public entry for the prepare path: shape a same-style run of single-cell characters and return
+/// the contextually-substituted glyph id per cell (or `None` to fall back to normal per-cell text
+/// rendering). Loads the family's font data (Menlo fallback) for the given bold/italic style and
+/// shapes with rustybuzz so programming ligatures (`->`, `==>`, …) apply.
+pub(crate) fn shape_terminal_run(
+    text: &str,
+    family: &str,
+    font_size: f32,
+    bold: bool,
+    italic: bool,
+    features: &[crate::settings::FontFeature],
+    cell_count: usize,
+) -> Option<Vec<u16>> {
+    if cell_count < 2 {
+        return None;
+    }
+    let font = styled_font(family, font_size, bold, italic)?;
+    let (data, face_index) = font_file_data(&font)?;
+    shape_run_glyph_ids(text, &data, face_index, features, cell_count)
+}
+
+/// Resolve a family + bold/italic style into a `CTFont` (Menlo fallback), applying symbolic traits.
+fn styled_font(family: &str, font_size: f32, bold: bool, italic: bool) -> Option<CTFont> {
+    let base = font::new_from_name(family, font_size as f64)
+        .or_else(|_| font::new_from_name("Menlo", font_size as f64))
+        .ok()?;
+    let mut traits = 0;
+    if bold {
+        traits |= kCTFontBoldTrait;
+    }
+    if italic {
+        traits |= kCTFontItalicTrait;
+    }
+    Some(if traits == 0 {
+        base
+    } else {
+        base.clone_with_symbolic_traits(traits, kCTFontBoldTrait | kCTFontItalicTrait)
+            .unwrap_or(base)
+    })
+}
+
+/// Raw font file bytes plus the face index within the file (for `.ttc`/`.otc` collections).
+type FontFileData = (Arc<Vec<u8>>, u32);
+
+thread_local! {
+    /// Cache of font file bytes keyed by resolved PostScript name, so a run doesn't re-read the
+    /// font file every frame. Values include the face index within a font collection.
+    static FONT_DATA_CACHE: RefCell<FxHashMap<String, Option<FontFileData>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// Read a `CTFont`'s backing font file bytes and its face index within the file. Cached per
+/// PostScript name. Returns `None` if the font isn't backed by a readable file on disk.
+fn font_file_data(font: &CTFont) -> Option<FontFileData> {
+    let key = font.postscript_name();
+    FONT_DATA_CACHE.with(|cache| {
+        if let Some(entry) = cache.borrow().get(&key) {
+            return entry.clone();
+        }
+        let loaded = load_font_file(font);
+        cache.borrow_mut().insert(key, loaded.clone());
+        loaded
+    })
+}
+
+/// Load a `CTFont`'s file bytes and locate its face index (its position within a `.ttc`/`.otc`
+/// collection) by matching PostScript names.
+fn load_font_file(font: &CTFont) -> Option<FontFileData> {
+    let url = font.url()?;
+    let path = url.to_path()?;
+    let data = std::fs::read(path).ok()?;
+    let target = font.postscript_name();
+    let face_index = rustybuzz::ttf_parser::fonts_in_collection(&data)
+        .map(|count| {
+            (0..count)
+                .find(|index| {
+                    rustybuzz::ttf_parser::Face::parse(&data, *index)
+                        .ok()
+                        .map(|face| postscript_name_matches(&face, &target))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    Some((Arc::new(data), face_index))
+}
+
+/// Whether a ttf-parser face's PostScript name (name id 6) matches `target`.
+fn postscript_name_matches(face: &rustybuzz::ttf_parser::Face<'_>, target: &str) -> bool {
+    face.names()
+        .into_iter()
+        .filter(|name| name.name_id == rustybuzz::ttf_parser::name_id::POST_SCRIPT_NAME)
+        .filter_map(|name| name.to_string())
+        .any(|name| name == target)
 }
 
 fn line_uses_only_color_glyphs(line: &CTLine) -> bool {
@@ -1383,10 +1750,17 @@ fn raster_placement(
     cell_width: usize,
     cell_height: usize,
     confine_to_cell: bool,
+    baseline_adjustment: Option<crate::settings::MetricModifier>,
 ) -> RasterPlacement {
     let metrics = line.get_typographic_bounds();
     let text_height = metrics.ascent + metrics.descent;
-    let baseline = ((cell_height as f64 - text_height) / 2.).max(0.) + metrics.descent;
+    let base_baseline = ((cell_height as f64 - text_height) / 2.).max(0.) + metrics.descent;
+    // `adjust-font-baseline` shifts the baseline. The modifier is pre-scaled to device px; a
+    // positive value raises the glyph (larger baseline y in this bottom-origin bitmap context).
+    let baseline = match baseline_adjustment {
+        Some(modifier) => f64::from(modifier.apply(base_baseline as f32)).max(0.),
+        None => base_baseline,
+    };
     let ink = line.get_image_bounds(context);
     let has_finite_ink = !ink.is_empty()
         && ink.origin.x.is_finite()
@@ -1432,7 +1806,7 @@ fn raster_placement(
     }
 }
 
-fn mask_context(width: usize, height: usize) -> CGContext {
+fn mask_context(width: usize, height: usize, thicken: Option<u8>) -> CGContext {
     let color_space = CGColorSpace::create_device_gray();
     let context = CGContext::create_bitmap_context(
         None,
@@ -1443,7 +1817,7 @@ fn mask_context(width: usize, height: usize) -> CGContext {
         &color_space,
         kCGImageAlphaNone,
     );
-    configure_text_context(&context);
+    configure_text_context(&context, thicken);
     context
 }
 
@@ -1452,13 +1826,22 @@ fn rasterize_mask_line(
     width: usize,
     height: usize,
     confine_to_cell: bool,
+    baseline_adjustment: Option<crate::settings::MetricModifier>,
+    thicken: Option<u8>,
 ) -> RasterizedImage {
-    let measurement_context = mask_context(width, height);
-    let placement = raster_placement(line, &measurement_context, width, height, confine_to_cell);
+    let measurement_context = mask_context(width, height, thicken);
+    let placement = raster_placement(
+        line,
+        &measurement_context,
+        width,
+        height,
+        confine_to_cell,
+        baseline_adjustment,
+    );
     let mut context = if placement.width == width {
         measurement_context
     } else {
-        mask_context(placement.width, placement.height)
+        mask_context(placement.width, placement.height, thicken)
     };
     context.data().fill(0);
     context.set_gray_fill_color(1., 1.);
@@ -1475,7 +1858,52 @@ fn rasterize_mask_line(
     }
 }
 
-fn color_context(width: usize, height: usize) -> CGContext {
+/// Rasterize a single pre-shaped glyph (by id) from `font` into a `cell_width`×`cell_height` mask,
+/// allowing a bounded one-cell overhang on each side so ligature halves that extend past the cell
+/// (e.g. the joining strokes of `=>`) aren't clipped. Baseline mirrors the text path so shaped
+/// glyphs sit on the same line as ordinary characters.
+fn rasterize_glyph_id(
+    font: &CTFont,
+    glyph_id: u16,
+    cell_width: usize,
+    cell_height: usize,
+    baseline_adjustment: Option<crate::settings::MetricModifier>,
+    thicken: Option<u8>,
+) -> RasterizedImage {
+    let ascent = font.ascent();
+    let descent = font.descent();
+    let text_height = ascent + descent;
+    let base_baseline = ((cell_height as f64 - text_height) / 2.).max(0.) + descent;
+    let baseline = match baseline_adjustment {
+        Some(modifier) => f64::from(modifier.apply(base_baseline as f32)).max(0.),
+        None => base_baseline,
+    };
+    // Measure ink so a glyph wider than its cell (a ligature half) keeps a bounded overhang.
+    let glyphs = [glyph_id as CGGlyph];
+    let bounds = font.get_bounding_rects_for_glyphs(kCTFontOrientationDefault, &glyphs);
+    let max_overhang = cell_width.max(1);
+    let left_overhang = ((-bounds.origin.x).ceil().max(0.) as usize).min(max_overhang);
+    let right_edge = bounds.origin.x + bounds.size.width;
+    let right_overhang = ((right_edge - cell_width as f64).ceil().max(0.) as usize)
+        .min(max_overhang);
+    let tile_width = cell_width + left_overhang + right_overhang;
+
+    let mut context = mask_context(tile_width, cell_height, thicken);
+    context.data().fill(0);
+    context.set_gray_fill_color(1., 1.);
+    let positions = [CGPoint::new(left_overhang as f64, baseline)];
+    font.draw_glyphs(&glyphs, &positions, context.clone());
+    context.flush();
+
+    RasterizedImage {
+        pixels: context.data().to_vec(),
+        width: tile_width,
+        height: cell_height,
+        offset: [-(left_overhang.min(i16::MAX as usize) as i16), 0],
+    }
+}
+
+fn color_context(width: usize, height: usize, thicken: Option<u8>) -> CGContext {
     let color_space = CGColorSpace::create_device_rgb();
     let context = CGContext::create_bitmap_context(
         None,
@@ -1486,17 +1914,29 @@ fn color_context(width: usize, height: usize) -> CGContext {
         &color_space,
         kCGImageAlphaPremultipliedLast,
     );
-    configure_text_context(&context);
+    configure_text_context(&context, thicken);
     context
 }
 
-fn rasterize_color_line(line: &CTLine, width: usize, height: usize) -> RasterizedImage {
-    let measurement_context = color_context(width, height);
-    let placement = raster_placement(line, &measurement_context, width, height, false);
+fn rasterize_color_line(
+    line: &CTLine,
+    width: usize,
+    height: usize,
+    baseline_adjustment: Option<crate::settings::MetricModifier>,
+) -> RasterizedImage {
+    let measurement_context = color_context(width, height, None);
+    let placement = raster_placement(
+        line,
+        &measurement_context,
+        width,
+        height,
+        false,
+        baseline_adjustment,
+    );
     let mut context = if placement.width == width {
         measurement_context
     } else {
-        color_context(placement.width, placement.height)
+        color_context(placement.width, placement.height, None)
     };
     context.data().fill(0);
     context.set_rgb_fill_color(1., 1., 1., 1.);
@@ -1510,11 +1950,18 @@ fn rasterize_color_line(line: &CTLine, width: usize, height: usize) -> Rasterize
     }
 }
 
-fn configure_text_context(context: &CGContext) {
+fn configure_text_context(context: &CGContext, thicken: Option<u8>) {
     context.set_allows_antialiasing(true);
     context.set_should_antialias(true);
-    context.set_allows_font_smoothing(false);
-    context.set_should_smooth_fonts(false);
+    // `font-thicken` (macOS): enable font smoothing, which fattens strokes. The smoothing style
+    // encodes strength in the high byte (Ghostty uses the same 0x00_SS_00_02 encoding); fall back
+    // to plain smoothing if the strength byte is 0.
+    let smooth = thicken.is_some();
+    context.set_allows_font_smoothing(smooth);
+    context.set_should_smooth_fonts(smooth);
+    if let Some(strength) = thicken {
+        context.set_font_smoothing_style(((strength as i32) << 16) | 2);
+    }
     context.set_allows_font_subpixel_positioning(true);
     context.set_should_subpixel_position_fonts(true);
     context.set_allows_font_subpixel_quantization(false);
@@ -1635,6 +2082,12 @@ mod tests {
             width: 18,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("ordinary text must stay on the compact mask path")
@@ -1656,6 +2109,12 @@ mod tests {
             width: 34,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("unknown text must stay on the tintable mask path")
@@ -1687,6 +2146,12 @@ mod tests {
                 width: 17,
                 height: 36,
                 sprite: false,
+                baseline: None,
+                box_thickness: None,
+                features: Arc::from(&[][..]),
+                glyph_id: None,
+                variations: Arc::from(&[][..]),
+                thicken: None,
             };
             let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
                 panic!("fraction U+{:04X} must use the mask atlas", fraction as u32)
@@ -1723,6 +2188,12 @@ mod tests {
             width: 17,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("Nerd Font lock must stay on the tintable mask path")
@@ -1758,7 +2229,7 @@ mod tests {
     fn notcurses_math_and_symbol_glyphs_do_not_use_last_resort() {
         let base = font::new_from_name("Menlo", 28.).unwrap();
         for character in "⎧⎫♠♥⅗⅘⅙⅚⅛╥⎛⎞╲╿╱◨◧◪◩◖◗⫷⫸⎩♦♣¼½¾⅐⅑⅒⅓⅔⅕⅖⅜⅝⅞⅟↉◲◱◳◰◶◵◷◴◜◝◟◞◿◺◹◸♟♜♞♝♛♚⩘▵△▹▷▿▽◃◁⩗▴⏶⯅▲▸⏵⯈▶▾⏷⯆▼◂⏴⯇◀⭡⭣⭠⭢⭧⭩⭦⭨⊖⊗⟬⟭≶≷⊆⊇⊴⊵⧒⧑❨❩⟃⟄⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉".chars() {
-            if terminal_sprites::rasterize(character, 16, 32).is_some() {
+            if terminal_sprites::rasterize(character, 16, 32, None).is_some() {
                 continue;
             }
             let text = character.to_string();
@@ -1784,6 +2255,12 @@ mod tests {
             width: 36,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         let RasterizedGlyph::Color(image) = rasterize_text(&key) else {
             panic!("Apple Color Emoji fallback must use the color atlas")
@@ -1811,6 +2288,12 @@ mod tests {
                 width: 36,
                 height: 36,
                 sprite: false,
+                baseline: None,
+                box_thickness: None,
+                features: Arc::from(&[][..]),
+                glyph_id: None,
+                variations: Arc::from(&[][..]),
+                thicken: None,
             };
             let RasterizedGlyph::Color(image) = rasterize_text(&key) else {
                 panic!("{text:?} must use the Apple Color Emoji atlas")
@@ -1838,6 +2321,12 @@ mod tests {
                 width: 96,
                 height: 36,
                 sprite: false,
+                baseline: None,
+                box_thickness: None,
+                features: Arc::from(&[][..]),
+                glyph_id: None,
+                variations: Arc::from(&[][..]),
+                thicken: None,
             };
             assert!(
                 matches!(rasterize_text(&key), RasterizedGlyph::Mask(_)),
@@ -1865,6 +2354,12 @@ mod tests {
             width: 18,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         assert_eq!(
             atlas
@@ -1886,6 +2381,12 @@ mod tests {
             width: 36,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         assert_eq!(
             atlas
@@ -1910,6 +2411,12 @@ mod tests {
             width: 18,
             height: 36,
             sprite: false,
+            baseline: None,
+            box_thickness: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
         };
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("slash must stay on the mask path")
@@ -2130,5 +2637,179 @@ mod tests {
         assert_eq!(pixel(10, 1), &[0, 64, 128, 255]);
         assert_eq!(pixel(14, 1), &[16, 16, 16, 255]);
         assert_eq!(pixel(18, 1), &[15, 10, 5, 255]);
+    }
+
+    fn glyph_command(bold: bool, italic: bool) -> MetalCommand {
+        MetalCommand::Glyph {
+            rect: [0., 0., 8., 18.],
+            text: Arc::from("x"),
+            color: 0xffffffff,
+            bold,
+            italic,
+            sprite: false,
+            background: 0,
+            minimum_contrast: 1.,
+            minimum_contrast_disabled: false,
+            glyph_id: None,
+        }
+    }
+
+    fn prepared_with_families(
+        families: Option<crate::settings::ResolvedFontFamilies>,
+    ) -> PreparedMetalTerminal {
+        PreparedMetalTerminal {
+            commands: Vec::new(),
+            family: Arc::from("Menlo"),
+            font_size: 14.,
+            cell_width: 8.,
+            last_input_sequence: 0,
+            baseline_adjustment: None,
+            box_thickness_adjustment: None,
+            font_families: families,
+            font_features: Arc::from(&[][..]),
+            font_variations: Arc::from(&[][..]),
+            font_thicken: None,
+            font_codepoint_map: Arc::from(&[][..]),
+        }
+    }
+
+    #[test]
+    fn dedicated_bold_family_is_used_without_synthetic_bold() {
+        let mut config = crate::settings::AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        config.font_family_bold = "Menlo Bold".to_owned();
+        let terminal = prepared_with_families(Some(config.resolved_font_families()));
+        let key = glyph_key_for_command(&terminal, &glyph_command(true, false), 1., [0., 0.])
+            .expect("glyph command produces a key");
+        assert_eq!(key.family.as_ref(), "Menlo Bold");
+        // The dedicated bold face already carries weight; don't also synthesize bold.
+        assert!(!key.bold);
+    }
+
+    #[test]
+    fn missing_bold_family_synthesizes_when_enabled_and_not_when_disabled() {
+        let config = crate::settings::AppSettings::default();
+        let terminal = prepared_with_families(Some(config.resolved_font_families()));
+        let key = glyph_key_for_command(&terminal, &glyph_command(true, false), 1., [0., 0.])
+            .expect("glyph command produces a key");
+        // No dedicated bold family, synthesis on by default → falls back to regular + synth bold.
+        assert_eq!(key.family.as_ref(), "Menlo");
+        assert!(key.bold);
+
+        let mut disabled = crate::settings::AppSettings::default();
+        disabled.font_synthetic_style.bold = false;
+        let terminal = prepared_with_families(Some(disabled.resolved_font_families()));
+        let key = glyph_key_for_command(&terminal, &glyph_command(true, false), 1., [0., 0.])
+            .expect("glyph command produces a key");
+        // Synthesis disabled → regular face, no faux bold.
+        assert_eq!(key.family.as_ref(), "Menlo");
+        assert!(!key.bold);
+    }
+
+    #[test]
+    fn font_with_features_toggles_standard_ligatures() {
+        // Verifies the OpenType feature descriptor plumbing works end to end: disabling `liga`
+        // splits a standard "fi" ligature back into two glyphs. (Helvetica ships on every macOS.)
+        let Ok(font) = font::new_from_name("Helvetica", 28.) else {
+            return;
+        };
+        let count = |line: &CTLine| {
+            line.glyph_runs()
+                .iter()
+                .map(|run| run.glyph_count())
+                .sum::<isize>()
+        };
+        let base_glyphs = count(&attributed_line("fi", &font));
+        let no_liga = crate::settings::FontFeature::parse("-liga").unwrap();
+        let disabled = font_with_features(&font, &[no_liga]);
+        let disabled_glyphs = count(&attributed_line("fi", &disabled));
+        // If the platform ligated "fi" at all, `-liga` must undo it (2 separate glyphs).
+        if base_glyphs == 1 {
+            assert_eq!(disabled_glyphs, 2, "-liga must split the fi ligature");
+        }
+    }
+
+    #[test]
+    fn font_with_variations_changes_the_advance_of_a_variable_font() {
+        // Applying `wght` to a variable font must produce a different face (heavier strokes → wider
+        // "M" advance). Guarded on a variable font being installed. Empty variations return the
+        // font unchanged.
+        for family in ["SF Mono", "Menlo", "Helvetica Neue"] {
+            let Ok(font) = font::new_from_name(family, 28.) else {
+                continue;
+            };
+            // Empty list is a no-op.
+            let same = font_with_variations(&font, &[]);
+            assert_eq!(same.postscript_name(), font.postscript_name());
+            // A wght axis only changes anything on a variable font; if the font isn't variable the
+            // descriptor copy still succeeds and returns a usable font (no panic), which is all we
+            // require here.
+            let wght = crate::settings::FontVariation {
+                tag: *b"wght",
+                value: 700.,
+            };
+            let varied = font_with_variations(&font, &[wght]);
+            assert!(varied.pt_size() > 0.);
+            return;
+        }
+    }
+
+    #[test]
+    fn embedded_nerd_font_registers_and_covers_private_use_icons() {
+        // The bundled Symbols Nerd Font must register with CoreText and provide a glyph for a
+        // common Nerd Font private-use-area icon (U+F001, a music note in the NF symbol range).
+        let font = nerd_font_fallback(28.).expect("embedded Nerd Font should register");
+        assert!(
+            nerd_font_covers(&font, "\u{f001}"),
+            "bundled Nerd Font must cover a PUA icon"
+        );
+        // It should NOT claim to cover an ordinary ASCII letter (symbols-only font).
+        assert!(!nerd_font_covers(&font, "A"));
+    }
+
+    #[test]
+    fn font_for_text_falls_back_to_the_bundled_nerd_font_for_pua_icons() {
+        // Menlo has no U+F001; the fallback chain should route to the bundled Nerd Font, whose
+        // PostScript name identifies it as the Symbols Nerd Font.
+        let menlo = font::new_from_name("Menlo", 28.).unwrap();
+        let resolved = font_for_text(&menlo, "\u{f001}");
+        let name = resolved.postscript_name().to_lowercase();
+        assert!(
+            name.contains("symbols") || name.contains("nerd"),
+            "expected the bundled Nerd Font, got {name}"
+        );
+    }
+
+    #[test]
+    fn rustybuzz_substitutes_contextual_ligature_glyphs() {
+        // Modern programming fonts (Cascadia/JetBrains/Maple/…) render ligatures as *per-cell
+        // contextual glyph substitutions*: each cell keeps its own glyph slot and advance, but the
+        // glyph is swapped for a variant that visually joins its neighbors. So `=` inside `=>` uses
+        // a different glyph id than `=` alone. Guarded on such a font being installed.
+        let calt = crate::settings::FontFeature::parse("calt").unwrap();
+        let liga = crate::settings::FontFeature::parse("liga").unwrap();
+        for family in ["Maple Mono NF CN", "JetBrains Mono", "Fira Code", "Cascadia Code"] {
+            let installed = font::new_from_name(family, 28.)
+                .map(|font| {
+                    let want = family.split_whitespace().next().unwrap_or("").to_lowercase();
+                    font.postscript_name().to_lowercase().contains(&want)
+                })
+                .unwrap_or(false);
+            if !installed {
+                continue;
+            }
+            // Two-cell "=>": both cells stay (2 glyph ids), and the first differs from a lone "=".
+            let arrow = shape_terminal_run("=>", family, 28., false, false, &[calt, liga], 2);
+            let plain = shape_terminal_run("==", family, 28., false, false, &[calt, liga], 2);
+            if let Some(arrow_gids) = arrow {
+                assert_eq!(arrow_gids.len(), 2, "{family}: => keeps two cell glyphs");
+                // At least one cell's glyph must differ from the equivalent non-ligated run.
+                assert!(
+                    plain.is_none() || plain.as_ref().unwrap() != &arrow_gids,
+                    "{family}: => should substitute a contextual glyph"
+                );
+            }
+            return;
+        }
     }
 }

@@ -692,6 +692,163 @@ impl Language {
         }
     }
 
+    pub(crate) fn font_family_use_regular(self) -> &'static str {
+        match self {
+            Self::English => "Use regular font",
+            Self::SimplifiedChinese => "跟随常规字体",
+        }
+    }
+
+    pub(crate) fn font_bold_row(self) -> &'static str {
+        match self {
+            Self::English => "Bold font",
+            Self::SimplifiedChinese => "粗体字体",
+        }
+    }
+
+    pub(crate) fn font_bold_description(self) -> &'static str {
+        match self {
+            Self::English => "Font for bold text. Falls back to the regular font when unset.",
+            Self::SimplifiedChinese => "粗体文本使用的字体。未设置时跟随常规字体。",
+        }
+    }
+
+    pub(crate) fn font_italic_row(self) -> &'static str {
+        match self {
+            Self::English => "Italic font",
+            Self::SimplifiedChinese => "斜体字体",
+        }
+    }
+
+    pub(crate) fn font_italic_description(self) -> &'static str {
+        match self {
+            Self::English => "Font for italic text. Falls back to the regular font when unset.",
+            Self::SimplifiedChinese => "斜体文本使用的字体。未设置时跟随常规字体。",
+        }
+    }
+
+    pub(crate) fn font_bold_italic_row(self) -> &'static str {
+        match self {
+            Self::English => "Bold italic font",
+            Self::SimplifiedChinese => "粗斜体字体",
+        }
+    }
+
+    pub(crate) fn font_bold_italic_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Font for bold italic text. Falls back to the regular font when unset."
+            }
+            Self::SimplifiedChinese => "粗斜体文本使用的字体。未设置时跟随常规字体。",
+        }
+    }
+
+    pub(crate) fn synthetic_bold_row(self) -> &'static str {
+        match self {
+            Self::English => "Synthesize bold",
+            Self::SimplifiedChinese => "合成粗体",
+        }
+    }
+
+    pub(crate) fn synthetic_bold_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Fake bold by thickening strokes when the font lacks a bold face and no bold family is set."
+            }
+            Self::SimplifiedChinese => "当字体没有粗体且未指定粗体字体时，通过加粗笔画模拟粗体。",
+        }
+    }
+
+    pub(crate) fn synthetic_italic_row(self) -> &'static str {
+        match self {
+            Self::English => "Synthesize italic",
+            Self::SimplifiedChinese => "合成斜体",
+        }
+    }
+
+    pub(crate) fn synthetic_italic_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Fake italic by skewing glyphs when the font lacks an italic face and no italic family is set."
+            }
+            Self::SimplifiedChinese => "当字体没有斜体且未指定斜体字体时，通过倾斜字形模拟斜体。",
+        }
+    }
+
+    pub(crate) fn synthetic_bold_italic_row(self) -> &'static str {
+        match self {
+            Self::English => "Synthesize bold italic",
+            Self::SimplifiedChinese => "合成粗斜体",
+        }
+    }
+
+    pub(crate) fn synthetic_bold_italic_description(self) -> &'static str {
+        match self {
+            Self::English => "Synthesize the bold italic style when the font and families lack it.",
+            Self::SimplifiedChinese => "当字体与所选字体族都缺少粗斜体时，合成粗斜体样式。",
+        }
+    }
+
+    pub(crate) fn ligatures_row(self) -> &'static str {
+        match self {
+            Self::English => "Ligatures",
+            Self::SimplifiedChinese => "连字",
+        }
+    }
+
+    pub(crate) fn ligatures_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Combine sequences like -> and ==> into single glyphs (requires a font with programming ligatures)."
+            }
+            Self::SimplifiedChinese => "将 -> 、==> 等序列合并为连字（需字体本身包含编程连字）。",
+        }
+    }
+
+    pub(crate) fn shaping_break_row(self) -> &'static str {
+        match self {
+            Self::English => "Break ligature at cursor",
+            Self::SimplifiedChinese => "光标处拆分连字",
+        }
+    }
+
+    pub(crate) fn shaping_break_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Render the character under the cursor un-ligated so editing sees individual characters."
+            }
+            Self::SimplifiedChinese => "光标所在字符不参与连字，便于编辑时看清单个字符。",
+        }
+    }
+
+    pub(crate) fn font_thicken_row(self) -> &'static str {
+        match self {
+            Self::English => "Thicken",
+            Self::SimplifiedChinese => "字体加粗",
+        }
+    }
+
+    pub(crate) fn font_thicken_description(self) -> &'static str {
+        match self {
+            Self::English => "Thicken glyph strokes via macOS font smoothing.",
+            Self::SimplifiedChinese => "通过 macOS 字体平滑加粗字形笔画。",
+        }
+    }
+
+    pub(crate) fn font_thicken_strength_row(self) -> &'static str {
+        match self {
+            Self::English => "Thicken strength",
+            Self::SimplifiedChinese => "加粗强度",
+        }
+    }
+
+    pub(crate) fn font_thicken_strength_description(self) -> &'static str {
+        match self {
+            Self::English => "How much to thicken (0–255) when thickening is enabled.",
+            Self::SimplifiedChinese => "开启加粗时的强度（0–255）。",
+        }
+    }
+
     pub(crate) fn font_size_row(self) -> &'static str {
         match self {
             Self::English => "Font size",
@@ -731,6 +888,139 @@ impl Language {
         match self {
             Self::English => "Top and bottom padding around the terminal grid.",
             Self::SimplifiedChinese => "终端网格上下两侧的内边距。",
+        }
+    }
+
+    pub(crate) fn font_metrics_section(self) -> &'static str {
+        match self {
+            Self::English => "Font metrics",
+            Self::SimplifiedChinese => "字体度量",
+        }
+    }
+
+    pub(crate) fn adjust_cell_width_row(self) -> &'static str {
+        match self {
+            Self::English => "Cell width",
+            Self::SimplifiedChinese => "单元格宽度",
+        }
+    }
+
+    pub(crate) fn adjust_cell_width_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to each cell's width. Changes the grid columns.",
+            Self::SimplifiedChinese => "对每个单元格宽度的像素微调，会改变网格列数。",
+        }
+    }
+
+    pub(crate) fn adjust_cell_height_row(self) -> &'static str {
+        match self {
+            Self::English => "Cell height",
+            Self::SimplifiedChinese => "单元格高度",
+        }
+    }
+
+    pub(crate) fn adjust_cell_height_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to each cell's height. Changes the grid rows.",
+            Self::SimplifiedChinese => "对每个单元格高度的像素微调，会改变网格行数。",
+        }
+    }
+
+    pub(crate) fn adjust_font_baseline_row(self) -> &'static str {
+        match self {
+            Self::English => "Font baseline",
+            Self::SimplifiedChinese => "字体基线",
+        }
+    }
+
+    pub(crate) fn adjust_font_baseline_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to the text baseline within each cell.",
+            Self::SimplifiedChinese => "对单元格内文本基线位置的像素微调。",
+        }
+    }
+
+    pub(crate) fn adjust_underline_position_row(self) -> &'static str {
+        match self {
+            Self::English => "Underline position",
+            Self::SimplifiedChinese => "下划线位置",
+        }
+    }
+
+    pub(crate) fn adjust_underline_position_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to how far down the underline sits.",
+            Self::SimplifiedChinese => "对下划线下沉距离的像素微调。",
+        }
+    }
+
+    pub(crate) fn adjust_underline_thickness_row(self) -> &'static str {
+        match self {
+            Self::English => "Underline thickness",
+            Self::SimplifiedChinese => "下划线粗细",
+        }
+    }
+
+    pub(crate) fn adjust_underline_thickness_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to the underline stroke thickness.",
+            Self::SimplifiedChinese => "对下划线笔画粗细的像素微调。",
+        }
+    }
+
+    pub(crate) fn adjust_strikethrough_position_row(self) -> &'static str {
+        match self {
+            Self::English => "Strikethrough position",
+            Self::SimplifiedChinese => "删除线位置",
+        }
+    }
+
+    pub(crate) fn adjust_strikethrough_position_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to how far down the strikethrough sits.",
+            Self::SimplifiedChinese => "对删除线下沉距离的像素微调。",
+        }
+    }
+
+    pub(crate) fn adjust_strikethrough_thickness_row(self) -> &'static str {
+        match self {
+            Self::English => "Strikethrough thickness",
+            Self::SimplifiedChinese => "删除线粗细",
+        }
+    }
+
+    pub(crate) fn adjust_strikethrough_thickness_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to the strikethrough stroke thickness.",
+            Self::SimplifiedChinese => "对删除线笔画粗细的像素微调。",
+        }
+    }
+
+    pub(crate) fn adjust_cursor_thickness_row(self) -> &'static str {
+        match self {
+            Self::English => "Cursor thickness",
+            Self::SimplifiedChinese => "光标粗细",
+        }
+    }
+
+    pub(crate) fn adjust_cursor_thickness_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to the bar/underline/hollow cursor stroke.",
+            Self::SimplifiedChinese => "对竖线/下划线/空心光标笔画粗细的像素微调。",
+        }
+    }
+
+    pub(crate) fn adjust_box_thickness_row(self) -> &'static str {
+        match self {
+            Self::English => "Box-drawing thickness",
+            Self::SimplifiedChinese => "制表符线条粗细",
+        }
+    }
+
+    pub(crate) fn adjust_box_thickness_description(self) -> &'static str {
+        match self {
+            Self::English => "Pixel adjustment to box-drawing line thickness.",
+            Self::SimplifiedChinese => "对制表符（框线）线条粗细的像素微调。",
         }
     }
 
