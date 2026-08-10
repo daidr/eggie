@@ -264,6 +264,7 @@ pub(crate) struct ResolvedMetricAdjustments {
     pub(crate) strikethrough_thickness: Option<MetricModifier>,
     pub(crate) cursor_thickness: Option<MetricModifier>,
     pub(crate) box_thickness: Option<MetricModifier>,
+    pub(crate) icon_height: Option<MetricModifier>,
 }
 
 impl ResolvedMetricAdjustments {
@@ -290,6 +291,7 @@ impl FontMetricAdjustments {
             strikethrough_thickness: parse(&self.strikethrough_thickness),
             cursor_thickness: parse(&self.cursor_thickness),
             box_thickness: parse(&self.box_thickness),
+            icon_height: parse(&self.icon_height),
         }
     }
 }
@@ -584,7 +586,7 @@ pub(crate) struct AppSettings {
 /// human-editable string (`"2"`, `"-1"`, `"20%"`); `None`/absent means "use the font-derived
 /// value unchanged". Only metrics Eggie actually renders are exposed — `adjust-overline-*` is
 /// omitted because the vte kernel never emits an overline attribute (no SGR 53), so it would be
-/// dead config. `adjust-icon-height` lands with the Nerd Font work.
+/// dead config.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct FontMetricAdjustments {
@@ -606,6 +608,11 @@ pub(crate) struct FontMetricAdjustments {
     pub(crate) cursor_thickness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) box_thickness: Option<String>,
+    /// Percentage or pixel adjustment to the constraint height of Nerd Font icons. Unlike the
+    /// other metrics this scales fallback icon glyphs at raster time rather than moving a
+    /// decoration line; `None` leaves icons at their font-native size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) icon_height: Option<String>,
 }
 
 impl FontMetricAdjustments {
@@ -626,6 +633,7 @@ impl FontMetricAdjustments {
             &mut self.strikethrough_thickness,
             &mut self.cursor_thickness,
             &mut self.box_thickness,
+            &mut self.icon_height,
         ] {
             if slot.as_deref().and_then(MetricModifier::parse).is_none() {
                 *slot = None;
@@ -1441,10 +1449,16 @@ mod tests {
         config.font_metrics.cell_height = Some("20%".to_owned());
         config.font_metrics.underline_thickness = Some("bogus".to_owned());
         config.font_metrics.cursor_thickness = Some("".to_owned());
+        config.font_metrics.icon_height = Some("-15%".to_owned());
         config.normalize();
         assert_eq!(config.font_metrics.cell_height.as_deref(), Some("20%"));
         assert_eq!(config.font_metrics.underline_thickness, None);
         assert_eq!(config.font_metrics.cursor_thickness, None);
+        assert_eq!(config.font_metrics.icon_height.as_deref(), Some("-15%"));
+        assert!(matches!(
+            config.font_metrics.resolve().icon_height,
+            Some(MetricModifier::Percent(m)) if (m - 0.85).abs() < 1e-9
+        ));
     }
 
     #[test]

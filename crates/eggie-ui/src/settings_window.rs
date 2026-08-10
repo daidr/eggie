@@ -122,10 +122,10 @@ impl SyntheticStyleKind {
     }
 }
 
-/// The nine renderable font-metric adjustments (`adjust-*`). The settings window edits each as an
+/// The ten renderable font-metric adjustments (`adjust-*`). The settings window edits each as an
 /// integer pixel delta (0 = unset / use the font-derived value); percent forms remain editable by
 /// hand in settings.json. `adjust-overline-*` is intentionally absent — the vte kernel never emits
-/// an overline attribute, so it would be dead config. `adjust-icon-height` arrives with Nerd Font.
+/// an overline attribute, so it would be dead config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetricAdjustmentKind {
     CellWidth,
@@ -137,10 +137,11 @@ enum MetricAdjustmentKind {
     StrikethroughThickness,
     CursorThickness,
     BoxThickness,
+    IconHeight,
 }
 
 impl MetricAdjustmentKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::CellWidth,
         Self::CellHeight,
         Self::FontBaseline,
@@ -150,6 +151,7 @@ impl MetricAdjustmentKind {
         Self::StrikethroughThickness,
         Self::CursorThickness,
         Self::BoxThickness,
+        Self::IconHeight,
     ];
 
     /// A stable ascii slug for element ids (not user-facing).
@@ -164,6 +166,7 @@ impl MetricAdjustmentKind {
             Self::StrikethroughThickness => "strikethrough-thickness",
             Self::CursorThickness => "cursor-thickness",
             Self::BoxThickness => "box-thickness",
+            Self::IconHeight => "icon-height",
         }
     }
 
@@ -179,6 +182,7 @@ impl MetricAdjustmentKind {
             Self::StrikethroughThickness => &mut metrics.strikethrough_thickness,
             Self::CursorThickness => &mut metrics.cursor_thickness,
             Self::BoxThickness => &mut metrics.box_thickness,
+            Self::IconHeight => &mut metrics.icon_height,
         }
     }
 
@@ -193,6 +197,7 @@ impl MetricAdjustmentKind {
             Self::StrikethroughThickness => &metrics.strikethrough_thickness,
             Self::CursorThickness => &metrics.cursor_thickness,
             Self::BoxThickness => &metrics.box_thickness,
+            Self::IconHeight => &metrics.icon_height,
         }
     }
 }
@@ -1303,6 +1308,10 @@ impl SettingsWindow {
             MetricAdjustmentKind::BoxThickness => (
                 language.adjust_box_thickness_row(),
                 language.adjust_box_thickness_description(),
+            ),
+            MetricAdjustmentKind::IconHeight => (
+                language.adjust_icon_height_row(),
+                language.adjust_icon_height_description(),
             ),
         }
     }

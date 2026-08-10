@@ -224,6 +224,9 @@ struct GlyphKey {
     baseline: Option<crate::settings::MetricModifier>,
     /// `adjust-box-thickness` modifier, pre-scaled to device px (sprite/box-drawing glyphs only).
     box_thickness: Option<crate::settings::MetricModifier>,
+    /// `adjust-icon-height` modifier, pre-scaled to device px. Only set on Nerd Font icon cells
+    /// (`is_nerd_icon_codepoint`); `None` everywhere else keeps ordinary text out of a cache split.
+    icon_height: Option<crate::settings::MetricModifier>,
     /// OpenType feature overrides applied when shaping this glyph (text glyphs only). Empty = font
     /// defaults. Keeps deterministic ligature on/off in the cache key.
     features: Arc<[crate::settings::FontFeature]>,
@@ -1220,6 +1223,20 @@ fn glyph_key_for_command(
         } else {
             None
         },
+        // Icon-height only scales Nerd Font icon glyphs. Gate on the codepoint (not just `!sprite`)
+        // so setting `adjust-icon-height` never splits the glyph cache for ordinary text — only
+        // real icon cells carry the modifier.
+        icon_height: if *sprite {
+            None
+        } else if text
+            .chars()
+            .next()
+            .is_some_and(is_nerd_icon_codepoint)
+        {
+            terminal.icon_height_adjustment.map(|m| m.prescale(scale))
+        } else {
+            None
+        },
         features: if *sprite {
             Arc::from(&[][..])
         } else {
@@ -1315,12 +1332,12 @@ impl GlyphRasterizer {
     fn rasterize_text(&mut self, key: &GlyphKey) -> RasterizedGlyph {
         let width = key.width as usize;
         let height = key.height as usize;
-        let font = self.font(key);
+        let primary = self.font(key);
         // Ligature run cells carry a pre-shaped glyph id: draw that exact glyph from the run's font
         // (a contextual variant that visually joins its neighbors) rather than re-shaping the text.
         if let Some(glyph_id) = key.glyph_id {
             return RasterizedGlyph::Mask(rasterize_glyph_id(
-                &font,
+                &primary,
                 glyph_id,
                 width,
                 height,
@@ -1328,7 +1345,27 @@ impl GlyphRasterizer {
                 key.thicken,
             ));
         }
-        let font = font_for_text(&font, &key.text);
+        let font = font_for_text(&primary, &key.text);
+        // `adjust-icon-height`: re-size the fallback face so Nerd Font icons hit the configured
+        // constraint height. Gated by the key builder to icon codepoints, so this never touches
+        // ordinary text; `None` skips it entirely and preserves the font-native size byte-for-byte.
+        let font = match key.icon_height {
+            Some(modifier) => {
+                // A double-width icon cell spans two cells; use the multi-cell constraint height.
+                let single = (key.cell_width as usize).max(1);
+                let constraint_cells = ((width + single / 2) / single).max(1);
+                scale_icon_font(
+                    &primary,
+                    &font,
+                    modifier,
+                    single,
+                    constraint_cells,
+                    height,
+                    &key.text,
+                )
+            }
+            None => font,
+        };
         let confine_to_cell = is_single_cell_fraction(&key.text);
         let font = if confine_to_cell {
             fit_font_to_cell(&key.text, &font, width, height)
@@ -1425,6 +1462,133 @@ fn fit_font_to_cell(text: &str, font: &CTFont, width: usize, height: usize) -> C
         font.clone_with_font_size((font.pt_size() * width as f64 / right).max(1.))
     } else {
         font.clone()
+    }
+}
+
+/// Constraint heights (device px) for Nerd Font icons, mirroring Ghostty's `Metrics.zig`:
+/// `icon_height` is the full face height (used for multi-cell icons) and `icon_height_single`
+/// blends cap height with face height for single-cell icons. `adjust-icon-height` scales both.
+#[derive(Clone, Copy, Debug)]
+struct IconMetrics {
+    icon_height: f64,
+    icon_height_single: f64,
+}
+
+/// Derive the Nerd Font icon constraint heights from the *primary* styled face (not the symbol
+/// fallback face, which often lacks a cap-height metric), then apply the `adjust-icon-height`
+/// modifier to both. Values are in device px because `primary` is built at `font_size * scale`.
+///
+/// Mirrors `ghostty/src/font/Metrics.zig`: `icon_height = face_height`,
+/// `icon_height_single = (2 * cap_height + face_height) / 3`, with the cap-height estimate
+/// (`0.75 * ascent`) used when the face reports no usable cap height.
+fn icon_constraint_metrics(
+    primary: &CTFont,
+    modifier: Option<crate::settings::MetricModifier>,
+) -> IconMetrics {
+    let ascent = primary.ascent();
+    let descent = primary.descent();
+    let leading = primary.leading().max(0.);
+    let face_height = ascent + descent + leading;
+    let cap_height = {
+        let reported = primary.cap_height();
+        if reported > 0. {
+            reported
+        } else {
+            0.75 * ascent
+        }
+    };
+    let icon_height = face_height;
+    let icon_height_single = (2.0 * cap_height + face_height) / 3.0;
+    let adjust = |base: f64| {
+        f64::from(crate::settings::ResolvedMetricAdjustments::adjust(
+            modifier,
+            base as f32,
+            1.0,
+        ))
+    };
+    IconMetrics {
+        icon_height: adjust(icon_height),
+        icon_height_single: adjust(icon_height_single),
+    }
+}
+
+/// The uniform scale factor for a Nerd Font icon under Ghostty's `fit_cover1 + height=icon`
+/// constraint (the ~85% common case). Because that constraint scales width and height by the same
+/// factor, the whole thing reduces to one scalar we can apply by re-sizing the face.
+///
+/// `glyph_w`/`glyph_h` are the icon's measured ink size, `cell_w` the target cell advance, and
+/// `target_height` the icon constraint height (`icon_height_single` for single-cell). The factor
+/// fits the glyph within the cell (`min` of the width- and height-limited factors); `fit_cover1`'s
+/// "scale up to at least cover one cell" behavior falls out because a small icon yields a factor
+/// > 1. Degenerate ink returns `1.0` (leave the glyph untouched).
+fn icon_fit_cover1_scale(glyph_w: f64, glyph_h: f64, cell_w: f64, target_height: f64) -> f64 {
+    let positive_finite = |v: f64| v.is_finite() && v > 0.;
+    if !positive_finite(glyph_w) || !positive_finite(glyph_h) {
+        return 1.0;
+    }
+    if !cell_w.is_finite() || !target_height.is_finite() {
+        return 1.0;
+    }
+    let width_factor = cell_w / glyph_w;
+    let height_factor = target_height / glyph_h;
+    let factor = width_factor.min(height_factor);
+    if factor.is_finite() && factor > 0. {
+        factor
+    } else {
+        1.0
+    }
+}
+
+/// Whether `character` is a Nerd Font icon codepoint that should receive the icon-height
+/// constraint. Covers the private-use areas Nerd Font packs icons into (BMP PUA plus the two
+/// supplementary planes) but excludes anything Eggie draws as a hand-drawn sprite (box/block/
+/// braille/powerline/…), since those never reach the font raster path and are already grid-fitted.
+fn is_nerd_icon_codepoint(character: char) -> bool {
+    let cp = character as u32;
+    let in_pua = (0xE000..=0xF8FF).contains(&cp)
+        || (0xF0000..=0xFFFFD).contains(&cp)
+        || (0x100000..=0x10FFFD).contains(&cp);
+    in_pua && terminal_sprites::SpriteKind::for_char(character).is_none()
+}
+
+/// Scale the Nerd Font fallback face so an icon's ink matches the (adjusted) icon-constraint
+/// height, Eggie's take on Ghostty's `fit_cover1 + height=icon` rule. `primary` supplies the
+/// constraint heights (its cap/face metrics), `icon_face` is the face that actually carries the
+/// glyph, and `modifier` is the pre-scaled `adjust-icon-height`. Single-cell icons target
+/// `icon_height_single`; a two-cell-wide icon (`constraint_cells == 2`) targets the full
+/// `icon_height` and may span both cells, matching Ghostty's single/multi-cell split. Measures the
+/// icon's ink at the current size, derives the uniform scale, and re-sizes the face (crisper than a
+/// raster transform, and it reuses the existing placement path). Returns the face unchanged when
+/// the icon can't be measured or the scale is ~1.
+fn scale_icon_font(
+    primary: &CTFont,
+    icon_face: &CTFont,
+    modifier: crate::settings::MetricModifier,
+    single_cell_width: usize,
+    constraint_cells: usize,
+    cell_height: usize,
+    text: &str,
+) -> CTFont {
+    let metrics = icon_constraint_metrics(primary, Some(modifier));
+    let multi_cell = constraint_cells >= 2;
+    let target_height = if multi_cell {
+        metrics.icon_height
+    } else {
+        metrics.icon_height_single
+    };
+    let target_width = (single_cell_width.max(1) * constraint_cells.max(1)) as f64;
+    let line = attributed_line(text, icon_face);
+    let context = mask_context(target_width.max(1.) as usize, cell_height.max(1), None);
+    let ink = line.get_image_bounds(&context);
+    if ink.is_empty() || !ink.size.width.is_finite() || !ink.size.height.is_finite() {
+        return icon_face.clone();
+    }
+    let scale = icon_fit_cover1_scale(ink.size.width, ink.size.height, target_width, target_height);
+    let pt = icon_face.pt_size();
+    if pt.is_finite() && (scale - 1.0).abs() > 1e-3 {
+        icon_face.clone_with_font_size((pt * scale).max(1.))
+    } else {
+        icon_face.clone()
     }
 }
 
@@ -2084,6 +2248,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2111,6 +2276,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2148,6 +2314,7 @@ mod tests {
                 sprite: false,
                 baseline: None,
                 box_thickness: None,
+                icon_height: None,
                 features: Arc::from(&[][..]),
                 glyph_id: None,
                 variations: Arc::from(&[][..]),
@@ -2166,6 +2333,78 @@ mod tests {
                 image.pixels.iter().any(|coverage| *coverage != 0),
                 "fraction U+{:04X} rasterized empty",
                 fraction as u32
+            );
+        }
+    }
+
+    #[test]
+    fn icon_constraint_metrics_derive_and_adjust_both_heights() {
+        let font = font::new_from_name("Menlo", 32.).expect("macOS must provide Menlo");
+        let ascent = font.ascent();
+        let descent = font.descent();
+        let leading = font.leading().max(0.);
+        let face_height = ascent + descent + leading;
+        let cap = {
+            let reported = font.cap_height();
+            if reported > 0. { reported } else { 0.75 * ascent }
+        };
+        let expected_single = (2.0 * cap + face_height) / 3.0;
+
+        // No modifier: heights are the raw derivations.
+        let base = icon_constraint_metrics(&font, None);
+        assert!((base.icon_height - face_height).abs() < 1e-6);
+        assert!((base.icon_height_single - expected_single).abs() < 1e-6);
+        // The blended single-cell height sits below the full face height.
+        assert!(base.icon_height_single < base.icon_height);
+
+        // A percentage scales both heights by the same factor.
+        let scaled = icon_constraint_metrics(&font, crate::settings::MetricModifier::parse("-50%"));
+        assert!((scaled.icon_height - face_height * 0.5).abs() < 1e-4);
+        assert!((scaled.icon_height_single - expected_single * 0.5).abs() < 1e-4);
+
+        // A huge negative absolute delta is floored at 1px, never zero/negative.
+        let floored =
+            icon_constraint_metrics(&font, crate::settings::MetricModifier::parse("-10000"));
+        assert_eq!(floored.icon_height, 1.0);
+        assert_eq!(floored.icon_height_single, 1.0);
+    }
+
+    #[test]
+    fn icon_fit_cover1_scale_fits_shrinks_and_grows() {
+        // Icon taller than the target height shrinks (height-limited).
+        let shrink = icon_fit_cover1_scale(10., 40., 20., 20.);
+        assert!(shrink < 1.0, "tall icon should shrink, got {shrink}");
+        assert!((shrink - 0.5).abs() < 1e-9, "height-limited factor 20/40");
+
+        // Small icon with width headroom grows to cover (fit_cover1 upscaling).
+        let grow = icon_fit_cover1_scale(8., 8., 20., 16.);
+        assert!(grow > 1.0, "small icon should grow, got {grow}");
+        assert!((grow - 2.0).abs() < 1e-9, "height-limited factor 16/8");
+
+        // A wide-but-short icon is clamped by the cell width, not the height target.
+        let width_limited = icon_fit_cover1_scale(40., 8., 20., 100.);
+        assert!((width_limited - 0.5).abs() < 1e-9, "width-limited factor 20/40");
+
+        // Degenerate ink leaves the glyph untouched.
+        assert_eq!(icon_fit_cover1_scale(0., 10., 20., 20.), 1.0);
+        assert_eq!(icon_fit_cover1_scale(10., 0., 20., 20.), 1.0);
+    }
+
+    #[test]
+    fn is_nerd_icon_codepoint_targets_icons_and_spares_text_and_sprites() {
+        // Nerd Font PUA icons across the BMP and a supplementary plane.
+        assert!(is_nerd_icon_codepoint('\u{f001}'));
+        assert!(is_nerd_icon_codepoint('\u{e5fb}'));
+        assert!(is_nerd_icon_codepoint('\u{f0001}'));
+        // Ordinary text and CJK are never constrained.
+        assert!(!is_nerd_icon_codepoint('A'));
+        assert!(!is_nerd_icon_codepoint('水'));
+        // Every sprite-drawn codepoint is excluded (box/block/braille/powerline).
+        for cp in [0x2500u32, 0x2588, 0x2800, 0xe0b0, 0xe0b2, 0xe0d4] {
+            let character = char::from_u32(cp).unwrap();
+            assert!(
+                !is_nerd_icon_codepoint(character),
+                "sprite U+{cp:04X} must not receive the icon constraint"
             );
         }
     }
@@ -2190,6 +2429,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2257,6 +2497,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2290,6 +2531,7 @@ mod tests {
                 sprite: false,
                 baseline: None,
                 box_thickness: None,
+                icon_height: None,
                 features: Arc::from(&[][..]),
                 glyph_id: None,
                 variations: Arc::from(&[][..]),
@@ -2323,6 +2565,7 @@ mod tests {
                 sprite: false,
                 baseline: None,
                 box_thickness: None,
+                icon_height: None,
                 features: Arc::from(&[][..]),
                 glyph_id: None,
                 variations: Arc::from(&[][..]),
@@ -2356,6 +2599,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2383,6 +2627,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2413,6 +2658,7 @@ mod tests {
             sprite: false,
             baseline: None,
             box_thickness: None,
+            icon_height: None,
             features: Arc::from(&[][..]),
             glyph_id: None,
             variations: Arc::from(&[][..]),
@@ -2665,6 +2911,7 @@ mod tests {
             last_input_sequence: 0,
             baseline_adjustment: None,
             box_thickness_adjustment: None,
+            icon_height_adjustment: None,
             font_families: families,
             font_features: Arc::from(&[][..]),
             font_variations: Arc::from(&[][..]),
@@ -2777,6 +3024,61 @@ mod tests {
         assert!(
             name.contains("symbols") || name.contains("nerd"),
             "expected the bundled Nerd Font, got {name}"
+        );
+    }
+
+    #[test]
+    fn adjust_icon_height_scales_bundled_nerd_font_icons() {
+        // The bundled Symbols Nerd Font must be registerable for this to exercise the icon path.
+        if nerd_font_fallback(28.).is_none() {
+            return;
+        }
+        // Count the vertical ink extent (rows containing any coverage) of a rasterized icon mask.
+        let ink_rows = |glyph: &RasterizedGlyph| -> usize {
+            let RasterizedGlyph::Mask(image) = glyph else {
+                panic!("Nerd Font icon must rasterize to a tintable mask");
+            };
+            (0..image.height)
+                .filter(|row| {
+                    image.pixels[row * image.width..(row + 1) * image.width]
+                        .iter()
+                        .any(|coverage| *coverage != 0)
+                })
+                .count()
+        };
+        let key_with = |icon_height: Option<crate::settings::MetricModifier>| GlyphKey {
+            text: Arc::from("\u{f001}"),
+            family: Arc::from("Menlo"),
+            font_size_bits: 28f32.to_bits(),
+            bold: false,
+            italic: false,
+            cell_width: 18,
+            width: 18,
+            height: 36,
+            sprite: false,
+            baseline: None,
+            box_thickness: None,
+            icon_height,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
+        };
+
+        let baseline = rasterize_text(&key_with(None));
+        let shrunk = rasterize_text(&key_with(crate::settings::MetricModifier::parse("-50%")));
+        let grown = rasterize_text(&key_with(crate::settings::MetricModifier::parse("40%")));
+
+        let (base_rows, shrunk_rows, grown_rows) =
+            (ink_rows(&baseline), ink_rows(&shrunk), ink_rows(&grown));
+        assert!(base_rows > 0, "the icon must render some ink");
+        assert!(
+            shrunk_rows < base_rows,
+            "-50% must shrink the icon ink ({shrunk_rows} !< {base_rows})"
+        );
+        assert!(
+            grown_rows > shrunk_rows,
+            "a larger target must grow the icon ink ({grown_rows} !> {shrunk_rows})"
         );
     }
 

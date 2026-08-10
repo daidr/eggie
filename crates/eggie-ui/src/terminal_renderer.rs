@@ -415,6 +415,8 @@ pub(crate) struct PreparedMetalTerminal {
     pub(crate) baseline_adjustment: Option<crate::settings::MetricModifier>,
     /// `adjust-box-thickness` modifier (logical px), applied to box-drawing sprite stroke width.
     pub(crate) box_thickness_adjustment: Option<crate::settings::MetricModifier>,
+    /// `adjust-icon-height` modifier (logical px), applied to Nerd Font icon glyph scaling.
+    pub(crate) icon_height_adjustment: Option<crate::settings::MetricModifier>,
     /// Resolved per-style families + synthetic-style policy. `None` keeps the legacy behavior of
     /// deriving bold/italic from the single `family` via CoreText trait synthesis.
     pub(crate) font_families: Option<crate::settings::ResolvedFontFamilies>,
@@ -1135,6 +1137,7 @@ fn prepare_terminal(
         last_input_sequence: snapshot.last_input_sequence,
         baseline_adjustment: adjustments.font_baseline,
         box_thickness_adjustment: adjustments.box_thickness,
+        icon_height_adjustment: adjustments.icon_height,
         font_families,
         font_features,
         font_variations,

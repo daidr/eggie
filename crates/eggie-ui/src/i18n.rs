@@ -1024,6 +1024,20 @@ impl Language {
         }
     }
 
+    pub(crate) fn adjust_icon_height_row(self) -> &'static str {
+        match self {
+            Self::English => "Nerd Font icon height",
+            Self::SimplifiedChinese => "Nerd Font 图标高度",
+        }
+    }
+
+    pub(crate) fn adjust_icon_height_description(self) -> &'static str {
+        match self {
+            Self::English => "Percentage or pixel adjustment to Nerd Font icon height.",
+            Self::SimplifiedChinese => "对 Nerd Font 图标高度的百分比或像素微调。",
+        }
+    }
+
     pub(crate) fn completed_timeout_row(self) -> &'static str {
         match self {
             Self::English => "Completed timeout",
