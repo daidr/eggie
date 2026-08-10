@@ -3,10 +3,10 @@ use std::sync::OnceLock;
 use crate::{
     icons::{IconName, icon, icon_sized},
     settings::{
-        AppSettings, BellMode, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST,
-        MAX_PROGRESS_TIMEOUT_SECS, MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST,
-        MIN_PROGRESS_TIMEOUT_SECS, MIN_TERMINAL_PADDING, SettingsStore, TerminalTheme, ThemeMode,
-        UiColors, minimum_contrast_rgb, theme_catalog,
+        AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, MAX_FONT_SIZE,
+        MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_TERMINAL_PADDING, MIN_FONT_SIZE,
+        MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_TERMINAL_PADDING, SettingsStore,
+        TerminalTheme, ThemeMode, UiColors, minimum_contrast_rgb, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
@@ -436,6 +436,24 @@ impl SettingsWindow {
         });
     }
 
+    fn set_copy_on_select(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.copy_on_select = enabled, cx)
+        });
+    }
+
+    fn set_cursor_shape(&mut self, shape: CursorShapeSetting, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.cursor_shape = shape, cx)
+        });
+    }
+
+    fn set_cursor_blink(&mut self, blink: CursorBlink, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.cursor_blink = blink, cx)
+        });
+    }
+
     fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.language = language, cx)
@@ -785,6 +803,145 @@ impl SettingsWindow {
                                 settings.set_detect_urls(value, cx)
                             }))
                             .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_copy_on_select_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("copy-on-select-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_copy_on_select(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn cursor_shape_label(language: Language, shape: CursorShapeSetting) -> &'static str {
+        match shape {
+            CursorShapeSetting::Block => language.cursor_shape_block(),
+            CursorShapeSetting::Bar => language.cursor_shape_bar(),
+            CursorShapeSetting::Underline => language.cursor_shape_underline(),
+            CursorShapeSetting::BlockHollow => language.cursor_shape_block_hollow(),
+        }
+    }
+
+    fn render_cursor_shape_control(
+        &self,
+        selected: CursorShapeSetting,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        CursorShapeSetting::ALL
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, shape| {
+                    control.child(
+                        div()
+                            .id(format!("cursor-shape-{}", shape.slug()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(selected == shape, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_cursor_shape(shape, cx)
+                            }))
+                            .child(Self::cursor_shape_label(language, shape)),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn cursor_blink_label(language: Language, blink: CursorBlink) -> &'static str {
+        match blink {
+            CursorBlink::Program => language.cursor_blink_program(),
+            CursorBlink::On => language.cursor_blink_on(),
+            CursorBlink::Off => language.cursor_blink_off(),
+        }
+    }
+
+    fn render_cursor_blink_control(
+        &self,
+        selected: CursorBlink,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        CursorBlink::ALL
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, blink| {
+                    control.child(
+                        div()
+                            .id(format!("cursor-blink-{}", blink.slug()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(selected == blink, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_cursor_blink(blink, cx)
+                            }))
+                            .child(Self::cursor_blink_label(language, blink)),
                     )
                 },
             )
@@ -1748,6 +1905,8 @@ impl gpui::Render for SettingsWindow {
             cx,
         );
         let font_size_control = self.render_font_size_control(config.font_size, cx);
+        let cursor_shape_control = self.render_cursor_shape_control(config.cursor_shape, cx);
+        let cursor_blink_control = self.render_cursor_blink_control(config.cursor_blink, cx);
         let minimum_contrast_control =
             self.render_minimum_contrast_control(config.minimum_contrast, cx);
         let horizontal_padding_control = self.render_terminal_padding_control(
@@ -1775,6 +1934,8 @@ impl gpui::Render for SettingsWindow {
         let osc_clipboard_read_control =
             self.render_osc_clipboard_read_control(config.allow_osc_clipboard_read, cx);
         let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
+        let copy_on_select_control =
+            self.render_copy_on_select_control(config.copy_on_select, cx);
         let terminal_preview = self.render_terminal_preview(&config, theme);
 
         div()
@@ -1996,6 +2157,24 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
+                                                                language.cursor_section(),
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.cursor_shape_row(),
+                                                                        language.cursor_shape_description(),
+                                                                        cursor_shape_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.cursor_blink_row(),
+                                                                        language.cursor_blink_description(),
+                                                                        cursor_blink_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
                                                                 language.terminal_layout_section(),
                                                                 vec![
                                                                     settings_row(
@@ -2040,6 +2219,12 @@ impl gpui::Render for SettingsWindow {
                                                                         language.detect_urls_row(),
                                                                         language.detect_urls_description(),
                                                                         detect_urls_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.copy_on_select_row(),
+                                                                        language.copy_on_select_description(),
+                                                                        copy_on_select_control,
                                                                         self.colors,
                                                                     ),
                                                                     settings_row(

@@ -835,6 +835,116 @@ impl Language {
         }
     }
 
+    pub(crate) fn copy_on_select_row(self) -> &'static str {
+        match self {
+            Self::English => "Copy on select",
+            Self::SimplifiedChinese => "选中即复制",
+        }
+    }
+
+    pub(crate) fn copy_on_select_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Automatically copy text to the clipboard as soon as it is selected with the mouse."
+            }
+            Self::SimplifiedChinese => {
+                "鼠标选中文本后自动复制到剪贴板。"
+            }
+        }
+    }
+
+    pub(crate) fn cursor_section(self) -> &'static str {
+        match self {
+            Self::English => "Cursor",
+            Self::SimplifiedChinese => "光标",
+        }
+    }
+
+    pub(crate) fn cursor_shape_row(self) -> &'static str {
+        match self {
+            Self::English => "Cursor shape",
+            Self::SimplifiedChinese => "光标形状",
+        }
+    }
+
+    pub(crate) fn cursor_shape_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "The default cursor shape. Programs can still override it at runtime (DECSCUSR)."
+            }
+            Self::SimplifiedChinese => {
+                "默认光标形状。程序仍可在运行时覆盖（DECSCUSR）。"
+            }
+        }
+    }
+
+    pub(crate) fn cursor_shape_block(self) -> &'static str {
+        match self {
+            Self::English => "Block",
+            Self::SimplifiedChinese => "方块",
+        }
+    }
+
+    pub(crate) fn cursor_shape_bar(self) -> &'static str {
+        match self {
+            Self::English => "Bar",
+            Self::SimplifiedChinese => "竖线",
+        }
+    }
+
+    pub(crate) fn cursor_shape_underline(self) -> &'static str {
+        match self {
+            Self::English => "Underline",
+            Self::SimplifiedChinese => "下划线",
+        }
+    }
+
+    pub(crate) fn cursor_shape_block_hollow(self) -> &'static str {
+        match self {
+            Self::English => "Hollow",
+            Self::SimplifiedChinese => "空心",
+        }
+    }
+
+    pub(crate) fn cursor_blink_row(self) -> &'static str {
+        match self {
+            Self::English => "Cursor blink",
+            Self::SimplifiedChinese => "光标闪烁",
+        }
+    }
+
+    pub(crate) fn cursor_blink_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Whether the cursor blinks. Follow lets programs decide (DECSCUSR / DEC Mode 12)."
+            }
+            Self::SimplifiedChinese => {
+                "光标是否闪烁。「跟随程序」由程序决定（DECSCUSR / DEC Mode 12）。"
+            }
+        }
+    }
+
+    pub(crate) fn cursor_blink_program(self) -> &'static str {
+        match self {
+            Self::English => "Follow",
+            Self::SimplifiedChinese => "跟随程序",
+        }
+    }
+
+    pub(crate) fn cursor_blink_on(self) -> &'static str {
+        match self {
+            Self::English => "On",
+            Self::SimplifiedChinese => "开",
+        }
+    }
+
+    pub(crate) fn cursor_blink_off(self) -> &'static str {
+        match self {
+            Self::English => "Off",
+            Self::SimplifiedChinese => "关",
+        }
+    }
+
     pub(crate) fn terminal_preview_label(self) -> &'static str {
         match self {
             Self::English => "TERMINAL PREVIEW",

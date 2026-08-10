@@ -15,8 +15,8 @@ use alacritty_terminal::{
     },
     tty,
     vte::ansi::{
-        Color, CursorShape, NamedColor, ProgressState as VteProgressState, Rgb, SemanticPrompt,
-        SemanticPromptAction,
+        Color, CursorShape, CursorStyle, NamedColor, ProgressState as VteProgressState, Rgb,
+        SemanticPrompt, SemanticPromptAction,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -2884,14 +2884,7 @@ impl TerminalSession {
             last_input_sequence.clone(),
         ));
         let listener = DaemonEventListener(state.clone());
-        let config = Config {
-            scrolling_history: TERMINAL_SCROLLBACK_LIMIT,
-            kitty_keyboard: true,
-            // Permission is enforced by ListenerState so it can be changed at runtime without
-            // rebuilding the terminal. Reads remain denied by default.
-            osc52: Osc52::CopyPaste,
-            ..Config::default()
-        };
+        let config = terminal_config(CursorShape::default());
         let mut terminal = Term::new(config, &GridSize(size), listener.clone());
         terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
         let terminal = Arc::new(FairMutex::new(terminal));
@@ -3674,6 +3667,16 @@ impl TerminalSession {
         }
     }
 
+    /// Set the session's default cursor shape. This changes only the *default* (`set_options`
+    /// replaces the whole config, reconstructed from the same constants used at creation), so a
+    /// program that has issued DECSCUSR keeps its runtime override — matching Ghostty's semantics.
+    fn set_default_cursor_shape(&self, shape: TerminalCursorShape) {
+        let mut terminal = self.terminal.lock();
+        let config = terminal_config(kernel_cursor_shape(shape));
+        terminal.set_options(config);
+        self.events.publish_terminal(&terminal);
+    }
+
     fn terminate(&self) {
         self.events.progress.report(None);
         let _ = self.sender.send(Msg::Shutdown);
@@ -3742,6 +3745,10 @@ fn snapshot_terminal(
             snapshot_cursor_shape(content.cursor.shape)
         }),
         cursor_width,
+        // The kernel tracks the blinking bit alongside the shape (set by DECSCUSR or DEC Mode 12);
+        // it is only meaningful while the cursor is on-screen. The UI's blink setting decides
+        // whether to actually honor this.
+        cursor_blinking: cursor_point.is_some() && terminal.cursor_style().blinking,
         title,
         revision,
         last_input_sequence,
@@ -3855,6 +3862,7 @@ fn snapshot_delta(
         cursor_column: current.cursor_column,
         cursor_shape: current.cursor_shape,
         cursor_width: current.cursor_width,
+        cursor_blinking: current.cursor_blinking,
         title: current.title.clone(),
         revision: current.revision,
         last_input_sequence: current.last_input_sequence,
@@ -4110,6 +4118,35 @@ fn snapshot_cursor_shape(shape: CursorShape) -> TerminalCursorShape {
         CursorShape::Beam => TerminalCursorShape::Beam,
         CursorShape::HollowBlock => TerminalCursorShape::HollowBlock,
         CursorShape::Hidden => TerminalCursorShape::Hidden,
+    }
+}
+
+/// Map a protocol cursor shape back to the terminal core's `CursorShape`. `Hidden` has no meaning as
+/// a *default* shape (it would make the cursor permanently invisible), so it falls back to `Block`.
+fn kernel_cursor_shape(shape: TerminalCursorShape) -> CursorShape {
+    match shape {
+        TerminalCursorShape::Block => CursorShape::Block,
+        TerminalCursorShape::Underline => CursorShape::Underline,
+        TerminalCursorShape::Beam => CursorShape::Beam,
+        TerminalCursorShape::HollowBlock => CursorShape::HollowBlock,
+        TerminalCursorShape::Hidden => CursorShape::Block,
+    }
+}
+
+/// Build the terminal core `Config` for a session with the given default cursor shape. Kept in one
+/// place so session creation and runtime `set_options` stay in sync on every other field.
+fn terminal_config(default_cursor_shape: CursorShape) -> Config {
+    Config {
+        scrolling_history: TERMINAL_SCROLLBACK_LIMIT,
+        kitty_keyboard: true,
+        // Permission is enforced by ListenerState so it can be changed at runtime without
+        // rebuilding the terminal. Reads remain denied by default.
+        osc52: Osc52::CopyPaste,
+        default_cursor_style: CursorStyle {
+            shape: default_cursor_shape,
+            blinking: false,
+        },
+        ..Config::default()
     }
 }
 
@@ -4737,6 +4774,10 @@ impl DaemonState {
                 detect_urls,
             } => {
                 self.session(session_id)?.set_url_detection(detect_urls);
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::SetCursorStyle { session_id, shape } => {
+                self.session(session_id)?.set_default_cursor_shape(shape);
                 Ok(DaemonResponse::Ok)
             }
             ClientRequest::Terminate { session_id } => {
@@ -6139,6 +6180,7 @@ mod tests {
             cursor_column: 0,
             cursor_shape: TerminalCursorShape::Hidden,
             cursor_width: 1,
+            cursor_blinking: false,
             title: "truecolor".to_owned(),
             revision: 7,
             last_input_sequence: 3,
@@ -6192,6 +6234,7 @@ mod tests {
             cursor_column: 0,
             cursor_shape: TerminalCursorShape::Hidden,
             cursor_width: 1,
+            cursor_blinking: false,
             title: String::new(),
             revision: 10,
             last_input_sequence: 0,
@@ -6580,6 +6623,54 @@ mod tests {
         assert_eq!(
             snapshot_cursor_shape(CursorShape::Hidden),
             TerminalCursorShape::Hidden
+        );
+    }
+
+    #[test]
+    fn default_cursor_shape_config_is_applied_and_overridable_by_the_program() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TerminalSize {
+            columns: 20,
+            rows: 5,
+            ..TerminalSize::default()
+        };
+        // Build a terminal with a Beam default shape (as set_default_cursor_shape would).
+        let mut term = Term::new(
+            terminal_config(kernel_cursor_shape(TerminalCursorShape::Beam)),
+            &GridSize(size),
+            VoidListener,
+        );
+        assert_eq!(term.cursor_style().shape, CursorShape::Beam);
+
+        // A program issuing DECSCUSR (CSI 2 SP q = steady block) overrides the configured default.
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, b"\x1b[2 q");
+        assert_eq!(term.cursor_style().shape, CursorShape::Block);
+
+        // Reapplying the default via set_options must not clobber the program's runtime override.
+        term.set_options(terminal_config(kernel_cursor_shape(
+            TerminalCursorShape::Underline,
+        )));
+        assert_eq!(
+            term.cursor_style().shape,
+            CursorShape::Block,
+            "program's DECSCUSR override should survive a default-shape config change"
+        );
+
+        // DECSCUSR 0 resets to the (new) configured default.
+        processor.advance(&mut term, b"\x1b[0 q");
+        assert_eq!(term.cursor_style().shape, CursorShape::Underline);
+    }
+
+    #[test]
+    fn hidden_is_not_usable_as_a_default_cursor_shape() {
+        // Hidden has no meaning as a *default* (it would make the cursor permanently invisible), so
+        // the protocol->kernel mapping falls back to Block.
+        assert_eq!(
+            kernel_cursor_shape(TerminalCursorShape::Hidden),
+            CursorShape::Block
         );
     }
 
