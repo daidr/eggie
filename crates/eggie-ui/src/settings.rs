@@ -22,6 +22,278 @@ pub(crate) const DEFAULT_PROGRESS_STALE_TIMEOUT_SECS: u32 = 60;
 pub(crate) const MIN_PROGRESS_TIMEOUT_SECS: u32 = 1;
 pub(crate) const MAX_PROGRESS_TIMEOUT_SECS: u32 = 3_600;
 
+fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_thicken_strength() -> u8 {
+    255
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_full_strength(value: &u8) -> bool {
+    *value == 255
+}
+
+/// A parsed variable-font axis setting, matching Ghostty's `font-variation` syntax `id=value`
+/// where `id` is a four-character axis tag (`wght`, `slnt`, `wdth`, `opsz`, …) and `value` a float.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FontVariation {
+    pub(crate) tag: [u8; 4],
+    pub(crate) value: f32,
+}
+
+// Stored in the glyph atlas cache key (`GlyphKey`), which must be `Hash + Eq`. `value` only comes
+// from `parse`, which rejects non-finite input, so hashing/eq via the bit pattern is sound.
+impl Eq for FontVariation {}
+
+impl std::hash::Hash for FontVariation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tag.hash(state);
+        self.value.to_bits().hash(state);
+    }
+}
+
+impl FontVariation {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let (tag, value) = text.split_once('=')?;
+        let tag = tag.trim();
+        let bytes = tag.as_bytes();
+        if bytes.len() != 4 || !bytes.iter().all(u8::is_ascii_graphic) {
+            return None;
+        }
+        let value: f32 = value.trim().parse().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        Some(Self {
+            tag: [bytes[0], bytes[1], bytes[2], bytes[3]],
+            value,
+        })
+    }
+}
+
+/// A parsed `font-codepoint-map` entry: a Unicode codepoint range mapped to a font family. Matches
+/// Ghostty's syntax `U+XXXX-U+YYYY=Family` (or a single `U+XXXX=Family`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CodepointMapEntry {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) family: String,
+}
+
+impl CodepointMapEntry {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let (range, family) = text.split_once('=')?;
+        let family = family.trim();
+        if family.is_empty() {
+            return None;
+        }
+        let range = range.trim();
+        let parse_cp = |token: &str| -> Option<u32> {
+            let hex = token.trim().strip_prefix("U+").or_else(|| token.trim().strip_prefix("u+"))?;
+            u32::from_str_radix(hex, 16).ok().filter(|cp| char::from_u32(*cp).is_some())
+        };
+        let (start, end) = match range.split_once('-') {
+            Some((lo, hi)) => (parse_cp(lo)?, parse_cp(hi)?),
+            None => {
+                let cp = parse_cp(range)?;
+                (cp, cp)
+            }
+        };
+        if start > end {
+            return None;
+        }
+        Some(Self {
+            start,
+            end,
+            family: family.to_owned(),
+        })
+    }
+
+    pub(crate) fn contains(&self, codepoint: u32) -> bool {
+        (self.start..=self.end).contains(&codepoint)
+    }
+}
+
+/// A parsed OpenType feature override, matching Ghostty's `font-feature` / HarfBuzz syntax.
+/// Accepts `feat`, `+feat`, `feat on`, `feat=1` (enable); `-feat`, `feat off`, `feat=0` (disable);
+/// and `feat=N` for a specific selector value. The tag is exactly four ASCII characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FontFeature {
+    /// The four-byte OpenType feature tag (e.g. `liga`, `calt`, `ss01`).
+    pub(crate) tag: [u8; 4],
+    /// The selector value: 0 disables, 1 enables, >1 selects an alternate.
+    pub(crate) value: u32,
+}
+
+impl FontFeature {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Split an optional `=value` or trailing ` on`/` off`, and a leading `+`/`-`.
+        let (mut name, mut value): (&str, u32) = (trimmed, 1);
+        if let Some((lhs, rhs)) = trimmed.split_once('=') {
+            name = lhs.trim();
+            value = rhs.trim().parse().ok()?;
+        } else if let Some(rest) = trimmed.strip_suffix(" on").map(str::trim) {
+            name = rest;
+            value = 1;
+        } else if let Some(rest) = trimmed.strip_suffix(" off").map(str::trim) {
+            name = rest;
+            value = 0;
+        }
+        if let Some(rest) = name.strip_prefix('+') {
+            name = rest.trim();
+            value = 1;
+        } else if let Some(rest) = name.strip_prefix('-') {
+            name = rest.trim();
+            value = 0;
+        }
+        // Tags are commonly quoted in CSS-style syntax; strip a matching pair.
+        let name = name.trim_matches(|c| c == '"' || c == '\'');
+        let bytes = name.as_bytes();
+        if bytes.len() != 4 || !bytes.iter().all(u8::is_ascii_graphic) {
+            return None;
+        }
+        Some(Self {
+            tag: [bytes[0], bytes[1], bytes[2], bytes[3]],
+            value,
+        })
+    }
+}
+
+/// A single metric adjustment, matching Ghostty's `MetricModifier` (`src/font/Metrics.zig`). A
+/// value is stored as a human-editable string in `settings.json` (`""` / absent means "no change")
+/// and parsed into this enum. `Percent` scales the base metric (`"20%"` → ×1.2, `"-20%"` → ×0.8);
+/// `Absolute` is a signed pixel delta (`"2"` → +2px, `"-1"` → −1px). Both are *deltas* on the
+/// font-derived base metric, never absolute replacements.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MetricModifier {
+    /// Multiplier around 1.0 (e.g. `1.2` for `+20%`). Clamped so the metric never goes negative.
+    Percent(f64),
+    /// Signed pixel delta added to the base metric.
+    Absolute(i32),
+}
+
+// `MetricModifier` is stored in the glyph atlas cache key (`GlyphKey`), which must be `Hash + Eq`.
+// The `Percent` variant holds an `f64`, so hash/eq go through the bit pattern. Values only ever come
+// from `parse`, which rejects non-finite input, so equality is reflexive (no NaN) and this is sound.
+impl Eq for MetricModifier {}
+
+impl std::hash::Hash for MetricModifier {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Percent(value) => {
+                0u8.hash(state);
+                value.to_bits().hash(state);
+            }
+            Self::Absolute(value) => {
+                1u8.hash(state);
+                value.hash(state);
+            }
+        }
+    }
+}
+
+impl MetricModifier {
+    /// Parse the on-disk string form. A trailing `%` is a percent adjustment; otherwise a signed
+    /// integer pixel delta. Returns `None` for empty/whitespace or unparseable input so `normalize`
+    /// can drop bad entries instead of persisting them.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(percent) = trimmed.strip_suffix('%') {
+            let value: f64 = percent.trim().parse().ok()?;
+            if !value.is_finite() {
+                return None;
+            }
+            // Ghostty clamps `≤ -100%` to a 0 multiplier (metric fully collapses, then Minimums
+            // re-clamps where required). Mirror that: 1 + value/100, floored at 0.
+            return Some(Self::Percent((1.0 + value / 100.0).max(0.0)));
+        }
+        let value: i32 = trimmed.parse().ok()?;
+        Some(Self::Absolute(value))
+    }
+
+    /// Apply this modifier to a base metric value (in pixels). Percent scales; absolute adds.
+    pub(crate) fn apply(self, base: f32) -> f32 {
+        match self {
+            Self::Percent(multiplier) => base * multiplier as f32,
+            Self::Absolute(delta) => base + delta as f32,
+        }
+    }
+
+    /// Convert to device space for a given `scale_factor`. `Percent` is scale-independent (a pure
+    /// multiplier) and passes through; `Absolute` is a logical-pixel delta, so it is scaled to
+    /// device pixels. This lets a modifier be baked into a device-space cache key (`GlyphKey`) and
+    /// applied later without needing the scale factor again.
+    pub(crate) fn prescale(self, scale_factor: f32) -> Self {
+        match self {
+            Self::Percent(_) => self,
+            Self::Absolute(delta) => Self::Absolute((delta as f32 * scale_factor).round() as i32),
+        }
+    }
+}
+
+/// Pre-parsed, `Copy` form of [`FontMetricAdjustments`] for cheap threading through the render
+/// pipeline (and into cache keys, which need value equality). Each field is `None` when the
+/// corresponding setting is unset or invalid.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ResolvedMetricAdjustments {
+    pub(crate) cell_width: Option<MetricModifier>,
+    pub(crate) cell_height: Option<MetricModifier>,
+    pub(crate) font_baseline: Option<MetricModifier>,
+    pub(crate) underline_position: Option<MetricModifier>,
+    pub(crate) underline_thickness: Option<MetricModifier>,
+    pub(crate) strikethrough_position: Option<MetricModifier>,
+    pub(crate) strikethrough_thickness: Option<MetricModifier>,
+    pub(crate) cursor_thickness: Option<MetricModifier>,
+    pub(crate) box_thickness: Option<MetricModifier>,
+}
+
+impl ResolvedMetricAdjustments {
+    /// Optionally apply a modifier to a base pixel value, clamping to `floor`.
+    pub(crate) fn adjust(modifier: Option<MetricModifier>, base: f32, floor: f32) -> f32 {
+        match modifier {
+            Some(modifier) => modifier.apply(base).max(floor),
+            None => base,
+        }
+    }
+}
+
+impl FontMetricAdjustments {
+    /// Parse every field into its `MetricModifier` form once (invalid entries become `None`).
+    pub(crate) fn resolve(&self) -> ResolvedMetricAdjustments {
+        let parse = |slot: &Option<String>| slot.as_deref().and_then(MetricModifier::parse);
+        ResolvedMetricAdjustments {
+            cell_width: parse(&self.cell_width),
+            cell_height: parse(&self.cell_height),
+            font_baseline: parse(&self.font_baseline),
+            underline_position: parse(&self.underline_position),
+            underline_thickness: parse(&self.underline_thickness),
+            strikethrough_position: parse(&self.strikethrough_position),
+            strikethrough_thickness: parse(&self.strikethrough_thickness),
+            cursor_thickness: parse(&self.cursor_thickness),
+            box_thickness: parse(&self.box_thickness),
+        }
+    }
+}
+
 const DEFAULT_PALETTE: [u32; 16] = [
     0x1d2027, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370,
     0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
@@ -179,6 +451,74 @@ impl CursorBlink {
     }
 }
 
+/// Which styles Ghostty-style synthesis is allowed to fabricate when a font lacks a native face,
+/// matching `font-synthetic-style`. Default: all enabled. When disabled for a style, a missing face
+/// falls back to the regular font instead of synthesizing bold (stroke) / italic (skew).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct FontSyntheticStyle {
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) bold_italic: bool,
+}
+
+impl Default for FontSyntheticStyle {
+    fn default() -> Self {
+        Self {
+            bold: true,
+            italic: true,
+            bold_italic: true,
+        }
+    }
+}
+
+impl FontSyntheticStyle {
+    fn is_all_enabled(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The four resolved font families (regular + per-style, each already falling back to regular when
+/// unset) plus the synthetic-style policy, threaded through the render pipeline. Cheap to clone.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResolvedFontFamilies {
+    pub(crate) regular: std::sync::Arc<str>,
+    pub(crate) bold: std::sync::Arc<str>,
+    pub(crate) italic: std::sync::Arc<str>,
+    pub(crate) bold_italic: std::sync::Arc<str>,
+    pub(crate) synthetic: FontSyntheticStyle,
+}
+
+impl ResolvedFontFamilies {
+    /// Select the family for a `(bold, italic)` style. Every slot already falls back to regular, so
+    /// this is a direct pick.
+    pub(crate) fn family(&self, bold: bool, italic: bool) -> &std::sync::Arc<str> {
+        match (bold, italic) {
+            (false, false) => &self.regular,
+            (true, false) => &self.bold,
+            (false, true) => &self.italic,
+            (true, true) => &self.bold_italic,
+        }
+    }
+
+    /// Whether synthesis (CoreText symbolic-trait substitution) is allowed for a `(bold, italic)`
+    /// style. Only meaningful when that style has no dedicated family (otherwise the family wins).
+    pub(crate) fn allows_synthesis(&self, bold: bool, italic: bool) -> bool {
+        match (bold, italic) {
+            (false, false) => true,
+            (true, false) => self.synthetic.bold,
+            (false, true) => self.synthetic.italic,
+            (true, true) => self.synthetic.bold_italic,
+        }
+    }
+
+    /// Whether the `(bold, italic)` style resolved to a dedicated (non-regular) family.
+    pub(crate) fn has_dedicated_family(&self, bold: bool, italic: bool) -> bool {
+        !std::sync::Arc::ptr_eq(self.family(bold, italic), &self.regular)
+            && self.family(bold, italic).as_ref() != self.regular.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
@@ -187,6 +527,41 @@ pub(crate) struct AppSettings {
     pub(crate) dark_theme: String,
     pub(crate) light_theme: String,
     pub(crate) font_family: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) font_family_bold: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) font_family_italic: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) font_family_bold_italic: String,
+    #[serde(default, skip_serializing_if = "FontSyntheticStyle::is_all_enabled")]
+    pub(crate) font_synthetic_style: FontSyntheticStyle,
+    /// Master ligature toggle. When off, text renders per-grapheme (no cross-cell shaping) — the
+    /// fast path. When on, contiguous same-style runs are shaped together so programming ligatures
+    /// (`->`, `==>`, …) form. Default on, matching Ghostty (`liga`/`calt` default-enabled).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) ligatures: bool,
+    /// Advanced OpenType feature overrides applied on top of the font defaults, HarfBuzz-style
+    /// (`ss01`, `+cv01`, `-calt`, `cv02=2`). Empty = font defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) font_features: Vec<String>,
+    /// Break shaping runs at the cursor cell so the character under the cursor renders un-ligated
+    /// (matching Ghostty `font-shaping-break = cursor`). Default on.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) font_shaping_break_cursor: bool,
+    /// Variable-font axis settings applied to every style, HarfBuzz-style (`wght=200`, `slnt=-10`).
+    /// Empty = font defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) font_variations: Vec<String>,
+    /// Thicken glyph strokes via macOS font smoothing (matching Ghostty `font-thicken`). Default off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) font_thicken: bool,
+    /// Thickening strength 0–255 when `font_thicken` is on (matching `font-thicken-strength`).
+    #[serde(default = "default_thicken_strength", skip_serializing_if = "is_full_strength")]
+    pub(crate) font_thicken_strength: u8,
+    /// Per-codepoint-range font overrides, matching Ghostty's `font-codepoint-map`. Each entry is
+    /// `U+XXXX-U+YYYY=Family` or `U+XXXX=Family`. Empty = no overrides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) font_codepoint_map: Vec<String>,
     pub(crate) font_size: f32,
     pub(crate) terminal_padding_x: f32,
     pub(crate) terminal_padding_y: f32,
@@ -199,8 +574,64 @@ pub(crate) struct AppSettings {
     pub(crate) cursor_shape: CursorShapeSetting,
     pub(crate) cursor_blink: CursorBlink,
     pub(crate) bell_mode: BellMode,
+    #[serde(default, skip_serializing_if = "FontMetricAdjustments::is_empty")]
+    pub(crate) font_metrics: FontMetricAdjustments,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) keybindings: std::collections::BTreeMap<String, String>,
+}
+
+/// Per-metric adjustments matching Ghostty's `adjust-*` config keys. Each is an optional
+/// human-editable string (`"2"`, `"-1"`, `"20%"`); `None`/absent means "use the font-derived
+/// value unchanged". Only metrics Eggie actually renders are exposed — `adjust-overline-*` is
+/// omitted because the vte kernel never emits an overline attribute (no SGR 53), so it would be
+/// dead config. `adjust-icon-height` lands with the Nerd Font work.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct FontMetricAdjustments {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cell_width: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cell_height: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) font_baseline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) underline_position: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) underline_thickness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) strikethrough_position: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) strikethrough_thickness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cursor_thickness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) box_thickness: Option<String>,
+}
+
+impl FontMetricAdjustments {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Drop any entry that isn't a valid `MetricModifier` string so bad input never persists and
+    /// downstream code can treat "present" as "valid".
+    fn normalize(&mut self) {
+        for slot in [
+            &mut self.cell_width,
+            &mut self.cell_height,
+            &mut self.font_baseline,
+            &mut self.underline_position,
+            &mut self.underline_thickness,
+            &mut self.strikethrough_position,
+            &mut self.strikethrough_thickness,
+            &mut self.cursor_thickness,
+            &mut self.box_thickness,
+        ] {
+            if slot.as_deref().and_then(MetricModifier::parse).is_none() {
+                *slot = None;
+            }
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -211,6 +642,17 @@ impl Default for AppSettings {
             dark_theme: DEFAULT_DARK_THEME.to_owned(),
             light_theme: DEFAULT_LIGHT_THEME.to_owned(),
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
+            font_family_bold: String::new(),
+            font_family_italic: String::new(),
+            font_family_bold_italic: String::new(),
+            font_synthetic_style: FontSyntheticStyle::default(),
+            ligatures: true,
+            font_features: Vec::new(),
+            font_shaping_break_cursor: true,
+            font_variations: Vec::new(),
+            font_thicken: false,
+            font_thicken_strength: 255,
+            font_codepoint_map: Vec::new(),
             font_size: DEFAULT_FONT_SIZE,
             terminal_padding_x: DEFAULT_TERMINAL_PADDING_X,
             terminal_padding_y: DEFAULT_TERMINAL_PADDING_Y,
@@ -223,6 +665,7 @@ impl Default for AppSettings {
             cursor_shape: CursorShapeSetting::default(),
             cursor_blink: CursorBlink::default(),
             bell_mode: BellMode::default(),
+            font_metrics: FontMetricAdjustments::default(),
             keybindings: std::collections::BTreeMap::new(),
         }
     }
@@ -239,6 +682,17 @@ impl AppSettings {
         }
         if self.font_family.trim().is_empty() {
             self.font_family = DEFAULT_FONT_FAMILY.to_owned();
+        }
+        // Per-style families are optional: a blank (or whitespace-only) value means "fall back to
+        // the regular family", so normalize whitespace-only entries to empty rather than to Menlo.
+        for family in [
+            &mut self.font_family_bold,
+            &mut self.font_family_italic,
+            &mut self.font_family_bold_italic,
+        ] {
+            if family.trim().is_empty() {
+                family.clear();
+            }
         }
         if !self.font_size.is_finite() {
             self.font_size = DEFAULT_FONT_SIZE;
@@ -273,6 +727,66 @@ impl AppSettings {
                 && gpui::Keystroke::parse(keystroke).is_ok()
                 && crate::keybindings::default_keystroke(id) != Some(keystroke.as_str())
         });
+        self.font_metrics.normalize();
+    }
+
+    /// Build the resolved font families, each per-style slot falling back to the regular family
+    /// when its dedicated family is unset (matching Ghostty's `finalize` behavior).
+    pub(crate) fn resolved_font_families(&self) -> ResolvedFontFamilies {
+        let regular: std::sync::Arc<str> = std::sync::Arc::from(self.font_family.as_str());
+        let resolve = |name: &str| -> std::sync::Arc<str> {
+            if name.trim().is_empty() {
+                std::sync::Arc::clone(&regular)
+            } else {
+                std::sync::Arc::from(name)
+            }
+        };
+        ResolvedFontFamilies {
+            bold: resolve(&self.font_family_bold),
+            italic: resolve(&self.font_family_italic),
+            bold_italic: resolve(&self.font_family_bold_italic),
+            regular,
+            synthetic: self.font_synthetic_style,
+        }
+    }
+
+    /// The effective OpenType features to apply during shaping. When the master `ligatures` toggle
+    /// is off, `liga`/`calt`/`dlig` are force-disabled up front; user `font_features` overrides are
+    /// then parsed and appended (so an explicit `+liga` could re-enable it, matching Ghostty's
+    /// "later wins" ordering). Invalid entries are dropped.
+    pub(crate) fn resolved_font_features(&self) -> Vec<FontFeature> {
+        let mut features = Vec::new();
+        if !self.ligatures {
+            for tag in ["liga", "calt", "dlig"] {
+                let bytes = tag.as_bytes();
+                features.push(FontFeature {
+                    tag: [bytes[0], bytes[1], bytes[2], bytes[3]],
+                    value: 0,
+                });
+            }
+        }
+        features.extend(
+            self.font_features
+                .iter()
+                .filter_map(|feature| FontFeature::parse(feature)),
+        );
+        features
+    }
+
+    /// Parse the variable-font axis settings, dropping any malformed entries.
+    pub(crate) fn resolved_font_variations(&self) -> Vec<FontVariation> {
+        self.font_variations
+            .iter()
+            .filter_map(|variation| FontVariation::parse(variation))
+            .collect()
+    }
+
+    /// Parse the codepoint→family map, dropping malformed entries.
+    pub(crate) fn resolved_codepoint_map(&self) -> Vec<CodepointMapEntry> {
+        self.font_codepoint_map
+            .iter()
+            .filter_map(|entry| CodepointMapEntry::parse(entry))
+            .collect()
     }
 
     pub(crate) fn effective_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
@@ -616,6 +1130,17 @@ mod tests {
             dark_theme: "Catppuccin Mocha".to_owned(),
             light_theme: "Ayu Light".to_owned(),
             font_family: "Menlo".to_owned(),
+            font_family_bold: String::new(),
+            font_family_italic: String::new(),
+            font_family_bold_italic: String::new(),
+            font_synthetic_style: FontSyntheticStyle::default(),
+            ligatures: true,
+            font_features: Vec::new(),
+            font_shaping_break_cursor: true,
+            font_variations: Vec::new(),
+            font_thicken: false,
+            font_thicken_strength: 255,
+            font_codepoint_map: Vec::new(),
             font_size: 100.,
             terminal_padding_x: -20.,
             terminal_padding_y: f32::NAN,
@@ -628,6 +1153,7 @@ mod tests {
             cursor_shape: CursorShapeSetting::Bar,
             cursor_blink: CursorBlink::On,
             bell_mode: BellMode::Sound,
+            font_metrics: FontMetricAdjustments::default(),
             keybindings: std::collections::BTreeMap::new(),
         };
         config.normalize();
@@ -855,5 +1381,318 @@ mod tests {
         assert_eq!(minimum_contrast_rgb(0x222222, 0x222222, 1.1), 0xffffff);
         assert_eq!(minimum_contrast_rgb(0xeeeeee, 0xeeeeee, 1.1), 0x000000);
         assert_eq!(minimum_contrast_rgb(0xffffff, 0x000000, 21.), 0xffffff);
+    }
+
+    #[test]
+    fn metric_modifier_parses_percent_and_absolute() {
+        assert_eq!(MetricModifier::parse("2"), Some(MetricModifier::Absolute(2)));
+        assert_eq!(
+            MetricModifier::parse("-1"),
+            Some(MetricModifier::Absolute(-1))
+        );
+        assert!(matches!(
+            MetricModifier::parse("20%"),
+            Some(MetricModifier::Percent(m)) if (m - 1.2).abs() < 1e-9
+        ));
+        assert!(matches!(
+            MetricModifier::parse("-20%"),
+            Some(MetricModifier::Percent(m)) if (m - 0.8).abs() < 1e-9
+        ));
+        // ≤ -100% collapses the metric to a zero multiplier (Ghostty semantics).
+        assert!(matches!(
+            MetricModifier::parse("-150%"),
+            Some(MetricModifier::Percent(m)) if m == 0.0
+        ));
+        // Empty / garbage → None so bad input never persists.
+        assert_eq!(MetricModifier::parse(""), None);
+        assert_eq!(MetricModifier::parse("  "), None);
+        assert_eq!(MetricModifier::parse("abc"), None);
+        assert_eq!(MetricModifier::parse("1.5"), None); // not an integer delta
+    }
+
+    #[test]
+    fn metric_modifier_apply_scales_or_adds() {
+        assert!((MetricModifier::Percent(1.2).apply(10.) - 12.).abs() < 1e-6);
+        assert!((MetricModifier::Absolute(3).apply(10.) - 13.).abs() < 1e-6);
+        assert!((MetricModifier::Absolute(-4).apply(10.) - 6.).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolved_adjust_honors_floor_and_absence() {
+        assert_eq!(
+            ResolvedMetricAdjustments::adjust(None, 10., 1.),
+            10.
+        );
+        assert!(
+            (ResolvedMetricAdjustments::adjust(Some(MetricModifier::Absolute(2)), 10., 1.) - 12.)
+                .abs()
+                < 1e-6
+        );
+        // A large negative delta is clamped to the floor.
+        assert_eq!(
+            ResolvedMetricAdjustments::adjust(Some(MetricModifier::Absolute(-100)), 3., 1.),
+            1.
+        );
+    }
+
+    #[test]
+    fn normalize_drops_invalid_metric_adjustments_and_keeps_valid_ones() {
+        let mut config = AppSettings::default();
+        config.font_metrics.cell_height = Some("20%".to_owned());
+        config.font_metrics.underline_thickness = Some("bogus".to_owned());
+        config.font_metrics.cursor_thickness = Some("".to_owned());
+        config.normalize();
+        assert_eq!(config.font_metrics.cell_height.as_deref(), Some("20%"));
+        assert_eq!(config.font_metrics.underline_thickness, None);
+        assert_eq!(config.font_metrics.cursor_thickness, None);
+    }
+
+    #[test]
+    fn font_metrics_only_serialize_when_present() {
+        let config = AppSettings::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("font_metrics"),
+            "empty font_metrics should be skipped: {json}"
+        );
+
+        let mut with_adjust = AppSettings::default();
+        with_adjust.font_metrics.cell_height = Some("2".to_owned());
+        let json = serde_json::to_string(&with_adjust).unwrap();
+        assert!(json.contains("font_metrics"));
+        assert!(json.contains("cell_height"));
+    }
+
+    #[test]
+    fn legacy_settings_without_font_metrics_default_to_empty() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.font_metrics, FontMetricAdjustments::default());
+    }
+
+    #[test]
+    fn per_style_families_default_to_empty_and_fall_back_to_regular() {
+        let config = AppSettings::default();
+        assert!(config.font_family_bold.is_empty());
+        assert!(config.font_family_italic.is_empty());
+        assert!(config.font_family_bold_italic.is_empty());
+        let families = config.resolved_font_families();
+        // Every style resolves to the regular family when no dedicated family is set.
+        assert_eq!(families.family(false, false).as_ref(), config.font_family);
+        assert_eq!(families.family(true, false).as_ref(), config.font_family);
+        assert_eq!(families.family(false, true).as_ref(), config.font_family);
+        assert_eq!(families.family(true, true).as_ref(), config.font_family);
+        assert!(!families.has_dedicated_family(true, false));
+    }
+
+    #[test]
+    fn dedicated_bold_family_is_selected_for_bold_style() {
+        let mut config = AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        config.font_family_bold = "Menlo Bold".to_owned();
+        let families = config.resolved_font_families();
+        assert_eq!(families.family(true, false).as_ref(), "Menlo Bold");
+        assert!(families.has_dedicated_family(true, false));
+        // Italic has no dedicated family, so it still falls back to regular.
+        assert_eq!(families.family(false, true).as_ref(), "Menlo");
+        assert!(!families.has_dedicated_family(false, true));
+    }
+
+    #[test]
+    fn font_synthetic_style_defaults_to_all_enabled_and_gates_synthesis() {
+        let config = AppSettings::default();
+        assert_eq!(config.font_synthetic_style, FontSyntheticStyle::default());
+        let families = config.resolved_font_families();
+        assert!(families.allows_synthesis(true, false));
+        assert!(families.allows_synthesis(false, true));
+
+        let mut disabled = AppSettings::default();
+        disabled.font_synthetic_style.italic = false;
+        let families = disabled.resolved_font_families();
+        assert!(!families.allows_synthesis(false, true));
+        assert!(families.allows_synthesis(true, false));
+    }
+
+    #[test]
+    fn legacy_settings_without_font_family_styles_default_to_empty_and_synthetic_on() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert!(config.font_family_bold.is_empty());
+        assert!(config.font_family_italic.is_empty());
+        assert!(config.font_family_bold_italic.is_empty());
+        assert_eq!(config.font_synthetic_style, FontSyntheticStyle::default());
+    }
+
+    #[test]
+    fn normalize_clears_whitespace_only_style_families() {
+        let mut config = AppSettings::default();
+        config.font_family_bold = "   ".to_owned();
+        config.normalize();
+        assert!(config.font_family_bold.is_empty());
+    }
+
+    #[test]
+    fn font_feature_parses_harfbuzz_forms() {
+        let liga_on = FontFeature::parse("liga").unwrap();
+        assert_eq!(&liga_on.tag, b"liga");
+        assert_eq!(liga_on.value, 1);
+        assert_eq!(FontFeature::parse("+calt").unwrap().value, 1);
+        assert_eq!(FontFeature::parse("-calt").unwrap().value, 0);
+        assert_eq!(FontFeature::parse("calt off").unwrap().value, 0);
+        assert_eq!(FontFeature::parse("calt on").unwrap().value, 1);
+        assert_eq!(FontFeature::parse("cv01=2").unwrap().value, 2);
+        assert_eq!(&FontFeature::parse("\"ss01\"").unwrap().tag, b"ss01");
+        // Tags must be exactly four ASCII characters.
+        assert_eq!(FontFeature::parse("lig"), None);
+        assert_eq!(FontFeature::parse("ligas"), None);
+        assert_eq!(FontFeature::parse(""), None);
+        assert_eq!(FontFeature::parse("liga=x"), None);
+    }
+
+    #[test]
+    fn ligatures_default_on_and_resolve_to_no_features() {
+        let config = AppSettings::default();
+        assert!(config.ligatures);
+        assert!(config.font_shaping_break_cursor);
+        assert!(config.resolved_font_features().is_empty());
+    }
+
+    #[test]
+    fn ligatures_off_disables_liga_calt_dlig() {
+        let mut config = AppSettings::default();
+        config.ligatures = false;
+        let features = config.resolved_font_features();
+        let disabled: Vec<_> = features
+            .iter()
+            .filter(|f| f.value == 0)
+            .map(|f| f.tag)
+            .collect();
+        assert!(disabled.contains(b"liga"));
+        assert!(disabled.contains(b"calt"));
+        assert!(disabled.contains(b"dlig"));
+    }
+
+    #[test]
+    fn user_font_features_append_after_master_toggle() {
+        let mut config = AppSettings::default();
+        config.ligatures = false;
+        config.font_features = vec!["+liga".to_owned(), "ss01".to_owned(), "bogus".to_owned()];
+        let features = config.resolved_font_features();
+        // The last `liga` entry (user +liga) wins under HarfBuzz "later wins" ordering.
+        let last_liga = features.iter().rev().find(|f| &f.tag == b"liga").unwrap();
+        assert_eq!(last_liga.value, 1);
+        assert!(features.iter().any(|f| &f.tag == b"ss01" && f.value == 1));
+        // Invalid entries are dropped.
+        assert!(features.len() == 3 /* liga,calt,dlig */ + 2 /* +liga, ss01 */);
+    }
+
+    #[test]
+    fn legacy_settings_without_ligature_fields_default_on() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert!(config.ligatures);
+        assert!(config.font_shaping_break_cursor);
+        assert!(config.font_features.is_empty());
+    }
+
+    #[test]
+    fn default_ligature_fields_are_not_serialized() {
+        let config = AppSettings::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("ligatures"), "default ligatures skipped: {json}");
+        assert!(!json.contains("font_shaping_break_cursor"));
+        assert!(!json.contains("font_features"));
+    }
+
+    #[test]
+    fn font_variation_parses_axis_settings() {
+        let wght = FontVariation::parse("wght=200").unwrap();
+        assert_eq!(&wght.tag, b"wght");
+        assert!((wght.value - 200.).abs() < 1e-6);
+        assert!((FontVariation::parse("slnt=-10").unwrap().value + 10.).abs() < 1e-6);
+        assert!((FontVariation::parse(" wdth = 87.5 ").unwrap().value - 87.5).abs() < 1e-6);
+        // Tag must be exactly four chars; value must be a finite number.
+        assert_eq!(FontVariation::parse("wght"), None);
+        assert_eq!(FontVariation::parse("wg=100"), None);
+        assert_eq!(FontVariation::parse("wght=abc"), None);
+    }
+
+    #[test]
+    fn resolved_font_variations_drops_invalid_entries() {
+        let mut config = AppSettings::default();
+        config.font_variations = vec!["wght=300".to_owned(), "bad".to_owned()];
+        let variations = config.resolved_font_variations();
+        assert_eq!(variations.len(), 1);
+        assert_eq!(&variations[0].tag, b"wght");
+    }
+
+    #[test]
+    fn thicken_defaults_off_at_full_strength_and_is_not_serialized() {
+        let config = AppSettings::default();
+        assert!(!config.font_thicken);
+        assert_eq!(config.font_thicken_strength, 255);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("font_thicken"), "defaults skipped: {json}");
+        assert!(!json.contains("font_variations"));
+    }
+
+    #[test]
+    fn legacy_settings_without_variation_or_thicken_use_defaults() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{ "font_family": "Menlo", "font_size": 14 }"#,
+        )
+        .unwrap();
+        assert!(config.font_variations.is_empty());
+        assert!(!config.font_thicken);
+        assert_eq!(config.font_thicken_strength, 255);
+    }
+
+    #[test]
+    fn codepoint_map_parses_ranges_and_single_points() {
+        let range = CodepointMapEntry::parse("U+E000-U+E00A=Symbols Nerd Font").unwrap();
+        assert_eq!(range.start, 0xE000);
+        assert_eq!(range.end, 0xE00A);
+        assert_eq!(range.family, "Symbols Nerd Font");
+        assert!(range.contains(0xE005));
+        assert!(!range.contains(0xE00B));
+
+        let single = CodepointMapEntry::parse("U+2764=Apple Color Emoji").unwrap();
+        assert_eq!(single.start, 0x2764);
+        assert_eq!(single.end, 0x2764);
+
+        // Malformed entries are rejected.
+        assert_eq!(CodepointMapEntry::parse("E000=Foo"), None); // missing U+
+        assert_eq!(CodepointMapEntry::parse("U+E000="), None); // empty family
+        assert_eq!(CodepointMapEntry::parse("U+E00A-U+E000=Foo"), None); // reversed range
+        assert_eq!(CodepointMapEntry::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn resolved_codepoint_map_drops_invalid_entries() {
+        let mut config = AppSettings::default();
+        config.font_codepoint_map =
+            vec!["U+E000-U+E0FF=Nerd".to_owned(), "garbage".to_owned()];
+        let map = config.resolved_codepoint_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].family, "Nerd");
+        // Default is empty and not serialized.
+        assert!(AppSettings::default().resolved_codepoint_map().is_empty());
+        let json = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(!json.contains("font_codepoint_map"));
     }
 }

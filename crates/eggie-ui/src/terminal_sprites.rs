@@ -68,14 +68,19 @@ pub(crate) fn skips_minimum_contrast(character: char) -> bool {
     )
 }
 
-pub(crate) fn rasterize(character: char, width: usize, height: usize) -> Option<Vec<u8>> {
+pub(crate) fn rasterize(
+    character: char,
+    width: usize,
+    height: usize,
+    box_thickness: Option<crate::settings::MetricModifier>,
+) -> Option<Vec<u8>> {
     if width == 0 || height == 0 {
         return None;
     }
     match SpriteKind::for_char(character)? {
         SpriteKind::Block => Some(rasterize_block(character, width, height)),
         SpriteKind::Box => antialiased(width, height, |width, height| {
-            rasterize_box(character, width, height)
+            rasterize_box(character, width, height, box_thickness)
         }),
         SpriteKind::Braille => Some(rasterize_braille(character, width, height)),
         SpriteKind::Geometric => antialiased(width, height, |width, height| {
@@ -376,10 +381,25 @@ fn box_lines(cp: u32) -> Option<BoxLines> {
     Some(lines)
 }
 
-fn rasterize_box(character: char, width: usize, height: usize) -> Option<Vec<u8>> {
+fn rasterize_box(
+    character: char,
+    width: usize,
+    height: usize,
+    box_thickness: Option<crate::settings::MetricModifier>,
+) -> Option<Vec<u8>> {
     let cp = character as u32;
     let mut mask = Mask::new(width, height);
-    let light = ((width.min(height) as f32 * 0.11).round() as usize).max(1);
+    let base_light = (width.min(height) as f32 * 0.11).round().max(1.);
+    // `adjust-box-thickness` scales the light stroke; heavy stays 2×. The modifier is device-px,
+    // but this runs in oversampled space (`VECTOR_OVERSAMPLE`), so an absolute delta is scaled up.
+    let light = match box_thickness {
+        Some(modifier) => modifier
+            .prescale(VECTOR_OVERSAMPLE as f32)
+            .apply(base_light)
+            .round()
+            .max(1.) as usize,
+        None => base_light as usize,
+    };
     let heavy = (light * 2).max(2);
 
     if let Some(lines) = box_lines(cp) {
@@ -2438,7 +2458,7 @@ mod tests {
             for cp in range {
                 let character = char::from_u32(cp).unwrap();
                 assert!(
-                    rasterize(character, 16, 32).is_some(),
+                    rasterize(character, 16, 32, None).is_some(),
                     "missing builtin rasterizer for U+{cp:04X}"
                 );
             }
@@ -2448,7 +2468,7 @@ mod tests {
             0xe0b2, 0xe0b3, 0xe0b4, 0xe0b5, 0xe0b6, 0xe0b7, 0xe0b8, 0xe0b9, 0xe0ba, 0xe0bb, 0xe0bc,
             0xe0bd, 0xe0be, 0xe0bf, 0xe0d2, 0xe0d4,
         ] {
-            assert!(rasterize(char::from_u32(cp).unwrap(), 16, 32).is_some());
+            assert!(rasterize(char::from_u32(cp).unwrap(), 16, 32, None).is_some());
         }
     }
 
@@ -2456,7 +2476,7 @@ mod tests {
     fn typographic_fractions_are_left_to_core_text() {
         for character in "¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞⅟↉".chars() {
             assert_eq!(SpriteKind::for_char(character), None);
-            assert_eq!(rasterize(character, 17, 37), None);
+            assert_eq!(rasterize(character, 17, 37, None), None);
         }
     }
 
@@ -2464,14 +2484,14 @@ mod tests {
     fn unicode_16_octants_fill_exact_cell_quarters() {
         for cp in 0x1cd00..=0x1cde5 {
             let character = char::from_u32(cp).unwrap();
-            let mask = rasterize(character, 10, 20)
+            let mask = rasterize(character, 10, 20, None)
                 .unwrap_or_else(|| panic!("missing octant sprite U+{cp:04X}"));
             assert_eq!(mask.len(), 10 * 20);
             assert!(mask.contains(&255));
         }
 
         // U+1CD00 BLOCK OCTANT-3 occupies the left half of the second quarter only.
-        let third = rasterize('\u{1cd00}', 10, 20).unwrap();
+        let third = rasterize('\u{1cd00}', 10, 20, None).unwrap();
         for y in 0..20 {
             for x in 0..10 {
                 let expected = x < 5 && (5..10).contains(&y);
@@ -2496,7 +2516,7 @@ mod tests {
         ];
 
         for (character, expected) in expected_edges {
-            let mask = rasterize(character, width, height).unwrap();
+            let mask = rasterize(character, width, height, None).unwrap();
             let actual = [
                 mask[..width].iter().any(|alpha| *alpha != 0),
                 (0..height).any(|y| mask[y * width + width - 1] != 0),
@@ -2522,9 +2542,9 @@ mod tests {
         let width = 16;
         let height = 32;
         for (upper, extension, lower) in [('⎛', '⎜', '⎝'), ('⎞', '⎟', '⎠')] {
-            let upper = rasterize(upper, width, height).unwrap();
-            let extension = rasterize(extension, width, height).unwrap();
-            let lower = rasterize(lower, width, height).unwrap();
+            let upper = rasterize(upper, width, height, None).unwrap();
+            let extension = rasterize(extension, width, height, None).unwrap();
+            let lower = rasterize(lower, width, height, None).unwrap();
 
             assert_eq!(
                 &upper[(height - 1) * width..],
@@ -2548,9 +2568,9 @@ mod tests {
         let width = 16;
         let height = 32;
         for (upper, extension, lower) in [('⎡', '⎢', '⎣'), ('⎤', '⎥', '⎦')] {
-            let upper = rasterize(upper, width, height).unwrap();
-            let extension = rasterize(extension, width, height).unwrap();
-            let lower = rasterize(lower, width, height).unwrap();
+            let upper = rasterize(upper, width, height, None).unwrap();
+            let extension = rasterize(extension, width, height, None).unwrap();
+            let lower = rasterize(lower, width, height, None).unwrap();
 
             assert_eq!(&upper[(height - 1) * width..], &extension[..width]);
             assert_eq!(&extension[(height - 1) * width..], &lower[..width]);
@@ -2561,11 +2581,11 @@ mod tests {
     fn extensible_curly_brackets_connect_through_shared_extensions() {
         let width = 16;
         let height = 32;
-        let extension = rasterize('⎪', width, height).unwrap();
+        let extension = rasterize('⎪', width, height, None).unwrap();
         for (upper, middle, lower) in [('⎧', '⎨', '⎩'), ('⎫', '⎬', '⎭')] {
-            let upper = rasterize(upper, width, height).unwrap();
-            let middle = rasterize(middle, width, height).unwrap();
-            let lower = rasterize(lower, width, height).unwrap();
+            let upper = rasterize(upper, width, height, None).unwrap();
+            let middle = rasterize(middle, width, height, None).unwrap();
+            let lower = rasterize(lower, width, height, None).unwrap();
 
             assert_eq!(&upper[(height - 1) * width..], &extension[..width]);
             assert_eq!(&extension[(height - 1) * width..], &middle[..width]);
@@ -2577,8 +2597,8 @@ mod tests {
             );
         }
 
-        let left_middle = rasterize('⎨', width, height).unwrap();
-        let right_middle = rasterize('⎬', width, height).unwrap();
+        let left_middle = rasterize('⎨', width, height, None).unwrap();
+        let right_middle = rasterize('⎬', width, height, None).unwrap();
         assert!((0..height).any(|y| left_middle[y * width + width / 4] != 0));
         assert!((0..height).any(|y| right_middle[y * width + width * 3 / 4] != 0));
     }
@@ -2587,10 +2607,10 @@ mod tests {
     fn integral_and_vertical_extensions_connect_across_every_row_boundary() {
         let width = 16;
         let height = 32;
-        let upper = rasterize('⌠', width, height).unwrap();
-        let extension = rasterize('⎮', width, height).unwrap();
-        let lower = rasterize('⌡', width, height).unwrap();
-        let plain_extension = rasterize('⏐', width, height).unwrap();
+        let upper = rasterize('⌠', width, height, None).unwrap();
+        let extension = rasterize('⎮', width, height, None).unwrap();
+        let lower = rasterize('⌡', width, height, None).unwrap();
+        let plain_extension = rasterize('⏐', width, height, None).unwrap();
 
         assert_eq!(&upper[(height - 1) * width..], &extension[..width]);
         assert_eq!(&extension[(height - 1) * width..], &lower[..width]);
@@ -2604,10 +2624,10 @@ mod tests {
     fn remaining_vertical_math_sections_share_exact_boundary_pixels() {
         let width = 16;
         let height = 32;
-        let descends_left = rasterize('⎰', width, height).unwrap();
-        let descends_right = rasterize('⎱', width, height).unwrap();
-        let summation_top = rasterize('⎲', width, height).unwrap();
-        let summation_bottom = rasterize('⎳', width, height).unwrap();
+        let descends_left = rasterize('⎰', width, height, None).unwrap();
+        let descends_right = rasterize('⎱', width, height, None).unwrap();
+        let summation_top = rasterize('⎲', width, height, None).unwrap();
+        let summation_bottom = rasterize('⎳', width, height, None).unwrap();
 
         assert_eq!(
             &descends_left[(height - 1) * width..],
@@ -2628,7 +2648,7 @@ mod tests {
         let width = 16;
         let height = 32;
         for character in ['⎯', '⎺', '⎻', '⎼', '⎽'] {
-            let mask = rasterize(character, width, height).unwrap();
+            let mask = rasterize(character, width, height, None).unwrap();
             assert_eq!(
                 column(&mask, width, height, 0),
                 column(&mask, width, height, width - 1),
@@ -2636,8 +2656,8 @@ mod tests {
             );
         }
 
-        let radical = rasterize('⎷', width, height).unwrap();
-        let extension = rasterize('⎯', width, height).unwrap();
+        let radical = rasterize('⎷', width, height, None).unwrap();
+        let extension = rasterize('⎯', width, height, None).unwrap();
         assert_eq!(
             column(&radical, width, height, width - 1),
             column(&extension, width, height, 0),
@@ -2668,7 +2688,7 @@ mod tests {
         ];
 
         for (character, edges) in expected {
-            let mask = rasterize(character, width, height).unwrap();
+            let mask = rasterize(character, width, height, None).unwrap();
             assert_eq!(edge_presence(&mask, width, height), edges, "{character}");
         }
     }
@@ -2676,7 +2696,7 @@ mod tests {
     #[test]
     fn horizontal_math_brackets_are_real_antialiased_sprites() {
         for character in "⎴⎵⎶⏜⏝⏞⏟⏠⏡".chars() {
-            let mask = rasterize(character, 16, 32).unwrap();
+            let mask = rasterize(character, 16, 32, None).unwrap();
             assert!(mask.iter().any(|alpha| *alpha != 0), "{character}");
             assert!(
                 mask.iter().any(|alpha| (1..=254).contains(alpha)),
@@ -2688,14 +2708,14 @@ mod tests {
     #[test]
     fn block_shades_are_uniform_cell_alpha() {
         for (character, alpha) in [('░', 0x40), ('▒', 0x80), ('▓', 0xc0)] {
-            let mask = rasterize(character, 13, 27).unwrap();
+            let mask = rasterize(character, 13, 27, None).unwrap();
             assert!(mask.iter().all(|value| *value == alpha));
         }
     }
 
     #[test]
     fn neighboring_full_blocks_reach_every_cell_edge() {
-        let mask = rasterize('█', 13, 27).unwrap();
+        let mask = rasterize('█', 13, 27, None).unwrap();
         assert!(mask.iter().all(|value| *value == 255));
     }
 
@@ -2707,7 +2727,7 @@ mod tests {
                 SpriteKind::for_char(character),
                 Some(SpriteKind::SegmentedDigit)
             );
-            let mask = rasterize(character, 16, 32).unwrap();
+            let mask = rasterize(character, 16, 32, None).unwrap();
             assert_eq!(mask.len(), 16 * 32);
             assert!(mask.iter().any(|alpha| *alpha != 0), "U+{cp:04X}");
         }
@@ -2723,7 +2743,7 @@ mod tests {
         ] {
             for cp in range {
                 let character = char::from_u32(cp).unwrap();
-                let mask = rasterize(character, 16, 32)
+                let mask = rasterize(character, 16, 32, None)
                     .unwrap_or_else(|| panic!("missing rasterizer for U+{cp:04X}"));
                 assert_eq!(mask.len(), 16 * 32, "U+{cp:04X}");
             }
@@ -2733,7 +2753,7 @@ mod tests {
     #[test]
     fn smooth_mosaics_fill_their_selected_cell_edges() {
         for cp in 0x1fb3c..=0x1fb67 {
-            let mask = rasterize(char::from_u32(cp).unwrap(), 16, 32).unwrap();
+            let mask = rasterize(char::from_u32(cp).unwrap(), 16, 32, None).unwrap();
             assert!(mask.iter().any(|alpha| *alpha != 0), "U+{cp:04X}");
             assert!(
                 (0..32).any(|y| mask[y * 16] != 0)
@@ -2749,11 +2769,11 @@ mod tests {
     fn rounded_box_corners_join_adjacent_straight_lines_at_cell_edges() {
         let width = 16;
         let height = 32;
-        let horizontal = rasterize('─', width, height).unwrap();
-        let vertical = rasterize('│', width, height).unwrap();
+        let horizontal = rasterize('─', width, height, None).unwrap();
+        let vertical = rasterize('│', width, height, None).unwrap();
 
         for character in ['╭', '╰'] {
-            let corner = rasterize(character, width, height).unwrap();
+            let corner = rasterize(character, width, height, None).unwrap();
             for y in 0..height {
                 assert_eq!(
                     corner[y * width + width - 1],
@@ -2763,8 +2783,8 @@ mod tests {
             }
         }
 
-        let top = rasterize('╰', width, height).unwrap();
-        let bottom = rasterize('╭', width, height).unwrap();
+        let top = rasterize('╰', width, height, None).unwrap();
+        let bottom = rasterize('╭', width, height, None).unwrap();
         for x in 0..width {
             assert_eq!(
                 top[x],
@@ -2782,7 +2802,7 @@ mod tests {
     #[test]
     fn rounded_box_corners_have_antialiased_curve_edges() {
         for character in ['╭', '╮', '╯', '╰'] {
-            let mask = rasterize(character, 16, 32).unwrap();
+            let mask = rasterize(character, 16, 32, None).unwrap();
             assert!(
                 mask.iter().any(|alpha| (1..=254).contains(alpha)),
                 "{character} must contain partial coverage at its curved edge"

@@ -381,6 +381,14 @@ pub struct EggieApp {
     terminal_padding_x: f32,
     terminal_padding_y: f32,
     terminal_minimum_contrast: f32,
+    terminal_metric_adjustments: crate::settings::ResolvedMetricAdjustments,
+    terminal_font_families: crate::settings::ResolvedFontFamilies,
+    terminal_font_features: std::sync::Arc<[crate::settings::FontFeature]>,
+    terminal_ligatures: bool,
+    terminal_shaping_break_cursor: bool,
+    terminal_font_variations: std::sync::Arc<[crate::settings::FontVariation]>,
+    terminal_font_thicken: Option<u8>,
+    terminal_font_codepoint_map: std::sync::Arc<[crate::settings::CodepointMapEntry]>,
     terminal_renderer: MetalTerminalRenderer,
     terminal_images_in_flight: HashSet<TerminalImageStreamKey>,
     terminal_frame_scheduled: bool,
@@ -771,6 +779,13 @@ impl EggieApp {
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
+        let terminal_font_families = config.resolved_font_families();
+        let terminal_font_features: std::sync::Arc<[crate::settings::FontFeature]> =
+            config.resolved_font_features().into();
+        let terminal_font_variations: std::sync::Arc<[crate::settings::FontVariation]> =
+            config.resolved_font_variations().into();
+        let terminal_font_codepoint_map: std::sync::Arc<[crate::settings::CodepointMapEntry]> =
+            config.resolved_codepoint_map().into();
         let mut app = Self {
             input_sender: client
                 .input_sender()
@@ -786,6 +801,14 @@ impl EggieApp {
             terminal_padding_x: config.terminal_padding_x,
             terminal_padding_y: config.terminal_padding_y,
             terminal_minimum_contrast: config.minimum_contrast,
+            terminal_metric_adjustments: config.font_metrics.resolve(),
+            terminal_font_families,
+            terminal_font_features,
+            terminal_ligatures: config.ligatures,
+            terminal_shaping_break_cursor: config.font_shaping_break_cursor,
+            terminal_font_variations,
+            terminal_font_thicken: config.font_thicken.then_some(config.font_thicken_strength),
+            terminal_font_codepoint_map,
             terminal_renderer: MetalTerminalRenderer::default(),
             terminal_images_in_flight: HashSet::new(),
             terminal_frame_scheduled: false,
@@ -4612,6 +4635,7 @@ impl EggieApp {
                     .then(|| TerminalInputContext::new(app.clone(), self.focus_handle.clone()));
                 // Resolve the blink phase before `snapshot` is moved into the renderer.
                 let cursor_visible = self.cursor_visible_this_frame(&snapshot);
+                let metric_adjustments = self.terminal_metric_adjustments;
                 div()
                     .size_full()
                     .overflow_hidden()
@@ -4624,7 +4648,8 @@ impl EggieApp {
                         let Some(bounds) = children.first().copied() else {
                             return;
                         };
-                        let (cell_width, line_height) = terminal_cell_metrics(window);
+                        let (cell_width, line_height) =
+                            terminal_cell_metrics(window, metric_adjustments);
                         let size = terminal_size_for_viewport(
                             f32::from(bounds.size.width),
                             f32::from(bounds.size.height),
@@ -4661,7 +4686,19 @@ impl EggieApp {
                         )
                         .with_search(search)
                         .with_url_hover(url_hover)
-                        .with_cursor_visible(cursor_visible),
+                        .with_cursor_visible(cursor_visible)
+                        .with_metric_adjustments(metric_adjustments)
+                        .with_font_families(self.terminal_font_families.clone())
+                        .with_font_features(
+                            self.terminal_font_features.clone(),
+                            self.terminal_ligatures,
+                            self.terminal_shaping_break_cursor,
+                        )
+                        .with_font_variations(
+                            self.terminal_font_variations.clone(),
+                            self.terminal_font_thicken,
+                        )
+                        .with_codepoint_map(self.terminal_font_codepoint_map.clone()),
                     ))
                     .into_any_element()
             })
@@ -5036,11 +5073,20 @@ impl gpui::Render for EggieApp {
             }
         }
         self.colors = UiColors::from_theme(self.terminal_theme);
+        self.terminal_font_families = config.resolved_font_families();
+        self.terminal_font_features = config.resolved_font_features().into();
+        self.terminal_ligatures = config.ligatures;
+        self.terminal_shaping_break_cursor = config.font_shaping_break_cursor;
+        self.terminal_font_variations = config.resolved_font_variations().into();
+        self.terminal_font_thicken =
+            config.font_thicken.then_some(config.font_thicken_strength);
+        self.terminal_font_codepoint_map = config.resolved_codepoint_map().into();
         self.terminal_font_family = config.font_family.into();
         self.terminal_font_size = config.font_size;
         self.terminal_padding_x = config.terminal_padding_x;
         self.terminal_padding_y = config.terminal_padding_y;
         self.terminal_minimum_contrast = config.minimum_contrast;
+        self.terminal_metric_adjustments = config.font_metrics.resolve();
         let progress_timeouts = TerminalProgressTimeouts {
             completed_ms: config.progress_complete_timeout_secs.saturating_mul(1_000),
             stale_ms: config.progress_stale_timeout_secs.saturating_mul(1_000),

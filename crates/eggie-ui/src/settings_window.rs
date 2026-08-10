@@ -74,6 +74,9 @@ enum SelectorKind {
     DarkTheme,
     LightTheme,
     Font,
+    FontBold,
+    FontItalic,
+    FontBoldItalic,
 }
 
 impl SelectorKind {
@@ -82,6 +85,9 @@ impl SelectorKind {
             Self::DarkTheme => 0,
             Self::LightTheme => 1,
             Self::Font => 2,
+            Self::FontBold => 3,
+            Self::FontItalic => 4,
+            Self::FontBoldItalic => 5,
         }
     }
 }
@@ -96,6 +102,99 @@ enum PaddingAxis {
 enum ProgressTimeoutKind {
     Complete,
     Stale,
+}
+
+/// Which synthetic style the toggle controls (`font-synthetic-style`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyntheticStyleKind {
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+impl SyntheticStyleKind {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Bold => "bold",
+            Self::Italic => "italic",
+            Self::BoldItalic => "bold-italic",
+        }
+    }
+}
+
+/// The nine renderable font-metric adjustments (`adjust-*`). The settings window edits each as an
+/// integer pixel delta (0 = unset / use the font-derived value); percent forms remain editable by
+/// hand in settings.json. `adjust-overline-*` is intentionally absent — the vte kernel never emits
+/// an overline attribute, so it would be dead config. `adjust-icon-height` arrives with Nerd Font.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetricAdjustmentKind {
+    CellWidth,
+    CellHeight,
+    FontBaseline,
+    UnderlinePosition,
+    UnderlineThickness,
+    StrikethroughPosition,
+    StrikethroughThickness,
+    CursorThickness,
+    BoxThickness,
+}
+
+impl MetricAdjustmentKind {
+    const ALL: [Self; 9] = [
+        Self::CellWidth,
+        Self::CellHeight,
+        Self::FontBaseline,
+        Self::UnderlinePosition,
+        Self::UnderlineThickness,
+        Self::StrikethroughPosition,
+        Self::StrikethroughThickness,
+        Self::CursorThickness,
+        Self::BoxThickness,
+    ];
+
+    /// A stable ascii slug for element ids (not user-facing).
+    fn slug(self) -> &'static str {
+        match self {
+            Self::CellWidth => "cell-width",
+            Self::CellHeight => "cell-height",
+            Self::FontBaseline => "font-baseline",
+            Self::UnderlinePosition => "underline-position",
+            Self::UnderlineThickness => "underline-thickness",
+            Self::StrikethroughPosition => "strikethrough-position",
+            Self::StrikethroughThickness => "strikethrough-thickness",
+            Self::CursorThickness => "cursor-thickness",
+            Self::BoxThickness => "box-thickness",
+        }
+    }
+
+    /// Mutable access to the backing field within [`FontMetricAdjustments`].
+    fn slot(self, metrics: &mut crate::settings::FontMetricAdjustments) -> &mut Option<String> {
+        match self {
+            Self::CellWidth => &mut metrics.cell_width,
+            Self::CellHeight => &mut metrics.cell_height,
+            Self::FontBaseline => &mut metrics.font_baseline,
+            Self::UnderlinePosition => &mut metrics.underline_position,
+            Self::UnderlineThickness => &mut metrics.underline_thickness,
+            Self::StrikethroughPosition => &mut metrics.strikethrough_position,
+            Self::StrikethroughThickness => &mut metrics.strikethrough_thickness,
+            Self::CursorThickness => &mut metrics.cursor_thickness,
+            Self::BoxThickness => &mut metrics.box_thickness,
+        }
+    }
+
+    fn value(self, metrics: &crate::settings::FontMetricAdjustments) -> &Option<String> {
+        match self {
+            Self::CellWidth => &metrics.cell_width,
+            Self::CellHeight => &metrics.cell_height,
+            Self::FontBaseline => &metrics.font_baseline,
+            Self::UnderlinePosition => &metrics.underline_position,
+            Self::UnderlineThickness => &metrics.underline_thickness,
+            Self::StrikethroughPosition => &metrics.strikethrough_position,
+            Self::StrikethroughThickness => &metrics.strikethrough_thickness,
+            Self::CursorThickness => &metrics.cursor_thickness,
+            Self::BoxThickness => &metrics.box_thickness,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -292,7 +391,7 @@ struct SettingsWindow {
     selector_search_input: Entity<TextInput>,
     selector_scroll_handle: ScrollHandle,
     settings_scroll_handle: ScrollHandle,
-    selector_bounds: [Option<Bounds<Pixels>>; 3],
+    selector_bounds: [Option<Bounds<Pixels>>; 6],
     moving_window: bool,
     selected_section: SettingsSection,
     /// The action id currently being recorded (its shortcut cell is capturing keys), if any.
@@ -344,7 +443,7 @@ impl SettingsWindow {
             selector_search_input,
             selector_scroll_handle: ScrollHandle::new(),
             settings_scroll_handle: ScrollHandle::new(),
-            selector_bounds: [None; 3],
+            selector_bounds: [None; 6],
             moving_window: false,
             selected_section: SettingsSection::default(),
             recording: None,
@@ -389,7 +488,10 @@ impl SettingsWindow {
         let names = match kind {
             SelectorKind::DarkTheme => &self.dark_theme_names,
             SelectorKind::LightTheme => &self.light_theme_names,
-            SelectorKind::Font => &self.font_names,
+            SelectorKind::Font
+            | SelectorKind::FontBold
+            | SelectorKind::FontItalic
+            | SelectorKind::FontBoldItalic => &self.font_names,
         };
         let Some(choice) = names
             .iter()
@@ -404,6 +506,11 @@ impl SettingsWindow {
                     SelectorKind::DarkTheme => config.dark_theme = choice.clone(),
                     SelectorKind::LightTheme => config.light_theme = choice.clone(),
                     SelectorKind::Font => config.font_family = choice.clone(),
+                    SelectorKind::FontBold => config.font_family_bold = choice.clone(),
+                    SelectorKind::FontItalic => config.font_family_italic = choice.clone(),
+                    SelectorKind::FontBoldItalic => {
+                        config.font_family_bold_italic = choice.clone()
+                    }
                 },
                 cx,
             )
@@ -439,6 +546,60 @@ impl SettingsWindow {
     fn set_copy_on_select(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.copy_on_select = enabled, cx)
+        });
+    }
+
+    fn set_ligatures(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.ligatures = enabled, cx)
+        });
+    }
+
+    fn set_shaping_break_cursor(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.font_shaping_break_cursor = enabled, cx)
+        });
+    }
+
+    fn set_font_thicken(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.font_thicken = enabled, cx)
+        });
+    }
+
+    fn change_font_thicken_strength(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |settings| {
+                    settings.font_thicken_strength = (i32::from(settings.font_thicken_strength)
+                        + delta)
+                        .clamp(0, 255) as u8;
+                },
+                cx,
+            )
+        });
+    }
+
+    fn set_synthetic_style(
+        &mut self,
+        kind: SyntheticStyleKind,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |settings| {
+                    let field = match kind {
+                        SyntheticStyleKind::Bold => &mut settings.font_synthetic_style.bold,
+                        SyntheticStyleKind::Italic => &mut settings.font_synthetic_style.italic,
+                        SyntheticStyleKind::BoldItalic => {
+                            &mut settings.font_synthetic_style.bold_italic
+                        }
+                    };
+                    *field = enabled;
+                },
+                cx,
+            )
         });
     }
 
@@ -490,6 +651,35 @@ impl SettingsWindow {
                         PaddingAxis::Vertical => &mut settings.terminal_padding_y,
                     };
                     *value = (*value + delta).round();
+                },
+                cx,
+            )
+        });
+    }
+
+    /// Step a font-metric adjustment by `delta` integer pixels. The GUI only edits the integer
+    /// (absolute) form; a value of 0 clears the entry back to "unset". A hand-written percent value
+    /// is treated as a 0 baseline for stepping (the next step replaces it with an integer delta).
+    fn change_metric_adjustment(
+        &mut self,
+        kind: MetricAdjustmentKind,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |settings| {
+                    let slot = kind.slot(&mut settings.font_metrics);
+                    let current = slot
+                        .as_deref()
+                        .and_then(|text| text.trim().parse::<i32>().ok())
+                        .unwrap_or(0);
+                    let next = (current + delta).clamp(-64, 64);
+                    *slot = if next == 0 {
+                        None
+                    } else {
+                        Some(next.to_string())
+                    };
                 },
                 cx,
             )
@@ -809,6 +999,232 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn render_synthetic_style_control(
+        &self,
+        kind: SyntheticStyleKind,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    let id = SharedString::from(format!("synthetic-{}-{label}", kind.slug()));
+                    control.child(
+                        div()
+                            .id(id)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_synthetic_style(kind, value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_ligatures_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("ligatures-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_ligatures(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_shaping_break_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("shaping-break-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_shaping_break_cursor(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_font_thicken_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("font-thicken-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_font_thicken(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_font_thicken_strength_control(
+        &self,
+        strength: u8,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = |id: &'static str,
+                      label: &'static str,
+                      enabled: bool,
+                      delta: i32,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(30.))
+                .text_size(px(16.))
+                .cursor_pointer()
+                .text_color(rgb(if enabled {
+                    self.colors.text
+                } else {
+                    self.colors.muted
+                }))
+                .when(enabled, |element| {
+                    element
+                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            settings.change_font_thicken_strength(delta, cx)
+                        }))
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .overflow_hidden()
+            .child(button(
+                "decrease-font-thicken-strength",
+                "−",
+                strength > 0,
+                -16,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(54.))
+                    .h(px(30.))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(self.colors.border))
+                    .child(format!("{strength}")),
+            )
+            .child(button(
+                "increase-font-thicken-strength",
+                "+",
+                strength < 255,
+                16,
+                cx,
+            ))
+            .into_any_element()
+    }
+
     fn render_copy_on_select_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
         [(false, language.disabled()), (true, language.enabled())]
@@ -845,6 +1261,50 @@ impl SettingsWindow {
                 },
             )
             .into_any_element()
+    }
+
+    fn metric_adjustment_labels(
+        language: Language,
+        kind: MetricAdjustmentKind,
+    ) -> (&'static str, &'static str) {
+        match kind {
+            MetricAdjustmentKind::CellWidth => (
+                language.adjust_cell_width_row(),
+                language.adjust_cell_width_description(),
+            ),
+            MetricAdjustmentKind::CellHeight => (
+                language.adjust_cell_height_row(),
+                language.adjust_cell_height_description(),
+            ),
+            MetricAdjustmentKind::FontBaseline => (
+                language.adjust_font_baseline_row(),
+                language.adjust_font_baseline_description(),
+            ),
+            MetricAdjustmentKind::UnderlinePosition => (
+                language.adjust_underline_position_row(),
+                language.adjust_underline_position_description(),
+            ),
+            MetricAdjustmentKind::UnderlineThickness => (
+                language.adjust_underline_thickness_row(),
+                language.adjust_underline_thickness_description(),
+            ),
+            MetricAdjustmentKind::StrikethroughPosition => (
+                language.adjust_strikethrough_position_row(),
+                language.adjust_strikethrough_position_description(),
+            ),
+            MetricAdjustmentKind::StrikethroughThickness => (
+                language.adjust_strikethrough_thickness_row(),
+                language.adjust_strikethrough_thickness_description(),
+            ),
+            MetricAdjustmentKind::CursorThickness => (
+                language.adjust_cursor_thickness_row(),
+                language.adjust_cursor_thickness_description(),
+            ),
+            MetricAdjustmentKind::BoxThickness => (
+                language.adjust_box_thickness_row(),
+                language.adjust_box_thickness_description(),
+            ),
+        }
     }
 
     fn cursor_shape_label(language: Language, shape: CursorShapeSetting) -> &'static str {
@@ -1060,7 +1520,10 @@ impl SettingsWindow {
                             let placeholder = match kind {
                                 SelectorKind::DarkTheme => language.search_dark_themes(),
                                 SelectorKind::LightTheme => language.search_light_themes(),
-                                SelectorKind::Font => language.search_fonts(),
+                                SelectorKind::Font
+                                | SelectorKind::FontBold
+                                | SelectorKind::FontItalic
+                                | SelectorKind::FontBoldItalic => language.search_fonts(),
                             };
                             settings.selector_search_input.update(cx, |input, cx| {
                                 input.set_placeholder(placeholder);
@@ -1128,6 +1591,16 @@ impl SettingsWindow {
                 config.font_family.clone(),
                 self.font_names.clone(),
             ),
+            SelectorKind::FontBold => {
+                (config.font_family_bold.clone(), self.font_names.clone())
+            }
+            SelectorKind::FontItalic => {
+                (config.font_family_italic.clone(), self.font_names.clone())
+            }
+            SelectorKind::FontBoldItalic => (
+                config.font_family_bold_italic.clone(),
+                self.font_names.clone(),
+            ),
         };
         let query_owned = self.selector_search_input.read(cx).content().trim().to_owned();
         let items = items
@@ -1165,9 +1638,16 @@ impl SettingsWindow {
                             .bg(rgb(self.colors.panel_alt))
                             .text_color(rgb(self.colors.accent))
                     })
-                    .when(kind == SelectorKind::Font, |element| {
-                        element.font_family(SharedString::from(item.clone()))
-                    })
+                    .when(
+                        matches!(
+                            kind,
+                            SelectorKind::Font
+                                | SelectorKind::FontBold
+                                | SelectorKind::FontItalic
+                                | SelectorKind::FontBoldItalic
+                        ),
+                        |element| element.font_family(SharedString::from(item.clone())),
+                    )
                     .hover(|element| element.bg(rgb(self.colors.panel_alt)))
                     .on_click(cx.listener(move |settings, _, _, cx| {
                         settings.settings.update(cx, |store, cx| {
@@ -1181,6 +1661,15 @@ impl SettingsWindow {
                                     }
                                     SelectorKind::Font => {
                                         config.font_family = selected_item.clone()
+                                    }
+                                    SelectorKind::FontBold => {
+                                        config.font_family_bold = selected_item.clone()
+                                    }
+                                    SelectorKind::FontItalic => {
+                                        config.font_family_italic = selected_item.clone()
+                                    }
+                                    SelectorKind::FontBoldItalic => {
+                                        config.font_family_bold_italic = selected_item.clone()
                                     }
                                 },
                                 cx,
@@ -1745,6 +2234,79 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn render_metric_adjustment_control(
+        &self,
+        kind: MetricAdjustmentKind,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Parse the current integer pixel delta (percent values, hand-edited in settings.json,
+        // display as their raw string and step from 0).
+        let raw = kind
+            .value(&self.settings.read(cx).config().font_metrics)
+            .clone();
+        let numeric = raw
+            .as_deref()
+            .and_then(|text| text.trim().parse::<i32>().ok());
+        let display = match (&raw, numeric) {
+            (Some(text), None) => text.clone(), // percent or other non-integer form
+            (_, Some(value)) if value > 0 => format!("+{value}"),
+            (_, Some(value)) => format!("{value}"),
+            (None, _) => "0".to_owned(),
+        };
+        let current = numeric.unwrap_or(0);
+        let decrease_id = SharedString::from(format!("decrease-adjust-{}", kind.slug()));
+        let increase_id = SharedString::from(format!("increase-adjust-{}", kind.slug()));
+        let button = |id: SharedString,
+                      label: &'static str,
+                      enabled: bool,
+                      delta: i32,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(30.))
+                .text_size(px(16.))
+                .cursor_pointer()
+                .text_color(rgb(if enabled {
+                    self.colors.text
+                } else {
+                    self.colors.muted
+                }))
+                .when(enabled, |element| {
+                    element
+                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            settings.change_metric_adjustment(kind, delta, cx)
+                        }))
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .overflow_hidden()
+            .child(button(decrease_id, "−", current > -64, -1, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(54.))
+                    .h(px(30.))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(self.colors.border))
+                    .child(display),
+            )
+            .child(button(increase_id, "+", current < 64, 1, cx))
+            .into_any_element()
+    }
+
     fn render_progress_timeout_control(
         &self,
         kind: ProgressTimeoutKind,
@@ -1904,6 +2466,72 @@ impl gpui::Render for SettingsWindow {
             window,
             cx,
         );
+        // Per-style family selectors. An empty stored value means "fall back to the regular family";
+        // show a localized hint and preview in the regular family in that case.
+        let style_family_selector = |this: &Self,
+                                      id: &'static str,
+                                      stored: &str,
+                                      kind: SelectorKind,
+                                      window: &Window,
+                                      cx: &mut Context<Self>| {
+            let has_value = !stored.trim().is_empty();
+            let display = if has_value {
+                stored.to_owned()
+            } else {
+                language.font_family_use_regular().to_owned()
+            };
+            let preview_family = if has_value {
+                stored.to_owned()
+            } else {
+                config.font_family.clone()
+            };
+            this.render_selector(id, display, Some(preview_family), kind, window, cx)
+        };
+        let font_bold_selector = style_family_selector(
+            self,
+            "font-bold-selector",
+            &config.font_family_bold,
+            SelectorKind::FontBold,
+            window,
+            cx,
+        );
+        let font_italic_selector = style_family_selector(
+            self,
+            "font-italic-selector",
+            &config.font_family_italic,
+            SelectorKind::FontItalic,
+            window,
+            cx,
+        );
+        let font_bold_italic_selector = style_family_selector(
+            self,
+            "font-bold-italic-selector",
+            &config.font_family_bold_italic,
+            SelectorKind::FontBoldItalic,
+            window,
+            cx,
+        );
+        let synthetic_bold_control = self.render_synthetic_style_control(
+            SyntheticStyleKind::Bold,
+            config.font_synthetic_style.bold,
+            cx,
+        );
+        let synthetic_italic_control = self.render_synthetic_style_control(
+            SyntheticStyleKind::Italic,
+            config.font_synthetic_style.italic,
+            cx,
+        );
+        let synthetic_bold_italic_control = self.render_synthetic_style_control(
+            SyntheticStyleKind::BoldItalic,
+            config.font_synthetic_style.bold_italic,
+            cx,
+        );
+        let ligatures_control = self.render_ligatures_control(config.ligatures, cx);
+        let shaping_break_control =
+            self.render_shaping_break_control(config.font_shaping_break_cursor, cx);
+        let font_thicken_control = self.render_font_thicken_control(config.font_thicken, cx);
+        let font_thicken_strength_control =
+            self.render_font_thicken_strength_control(config.font_thicken_strength, cx);
         let font_size_control = self.render_font_size_control(config.font_size, cx);
         let cursor_shape_control = self.render_cursor_shape_control(config.cursor_shape, cx);
         let cursor_blink_control = self.render_cursor_blink_control(config.cursor_blink, cx);
@@ -1919,6 +2547,19 @@ impl gpui::Render for SettingsWindow {
             config.terminal_padding_y,
             cx,
         );
+        // Build the nine font-metric adjustment rows up front (label + description + stepper).
+        let metric_rows: Vec<AnyElement> = MetricAdjustmentKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let (label, description) = Self::metric_adjustment_labels(language, kind);
+                settings_row(
+                    label,
+                    description,
+                    self.render_metric_adjustment_control(kind, cx),
+                    self.colors,
+                )
+            })
+            .collect();
         let progress_complete_timeout_control = self.render_progress_timeout_control(
             ProgressTimeoutKind::Complete,
             config.progress_complete_timeout_secs,
@@ -2148,6 +2789,66 @@ impl gpui::Render for SettingsWindow {
                                                                         self.colors,
                                                                     ),
                                                                     settings_row(
+                                                                        language.font_bold_row(),
+                                                                        language.font_bold_description(),
+                                                                        font_bold_selector,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.font_italic_row(),
+                                                                        language.font_italic_description(),
+                                                                        font_italic_selector,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.font_bold_italic_row(),
+                                                                        language.font_bold_italic_description(),
+                                                                        font_bold_italic_selector,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.synthetic_bold_row(),
+                                                                        language.synthetic_bold_description(),
+                                                                        synthetic_bold_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.synthetic_italic_row(),
+                                                                        language.synthetic_italic_description(),
+                                                                        synthetic_italic_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.synthetic_bold_italic_row(),
+                                                                        language.synthetic_bold_italic_description(),
+                                                                        synthetic_bold_italic_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.ligatures_row(),
+                                                                        language.ligatures_description(),
+                                                                        ligatures_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.shaping_break_row(),
+                                                                        language.shaping_break_description(),
+                                                                        shaping_break_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.font_thicken_row(),
+                                                                        language.font_thicken_description(),
+                                                                        font_thicken_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.font_thicken_strength_row(),
+                                                                        language.font_thicken_strength_description(),
+                                                                        font_thicken_strength_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
                                                                         language.font_size_row(),
                                                                         language.font_size_description(),
                                                                         font_size_control,
@@ -2190,6 +2891,11 @@ impl gpui::Render for SettingsWindow {
                                                                         self.colors,
                                                                     ),
                                                                 ],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
+                                                                language.font_metrics_section(),
+                                                                metric_rows,
                                                                 self.colors,
                                                             ),
                                                         ],
