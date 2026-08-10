@@ -109,6 +109,76 @@ impl BellMode {
     }
 }
 
+/// The default cursor shape. A running program can still override this at runtime via DECSCUSR
+/// (`CSI Ps SP q`); this only sets the shape used when the program hasn't requested one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CursorShapeSetting {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+    BlockHollow,
+}
+
+impl CursorShapeSetting {
+    pub(crate) const ALL: [Self; 4] = [Self::Block, Self::Bar, Self::Underline, Self::BlockHollow];
+
+    /// A stable ascii slug for element ids (not user-facing; display text comes from i18n).
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+            Self::BlockHollow => "block-hollow",
+        }
+    }
+
+    pub(crate) fn to_protocol(self) -> eggie_protocol::TerminalCursorShape {
+        use eggie_protocol::TerminalCursorShape;
+        match self {
+            Self::Block => TerminalCursorShape::Block,
+            Self::Bar => TerminalCursorShape::Beam,
+            Self::Underline => TerminalCursorShape::Underline,
+            Self::BlockHollow => TerminalCursorShape::HollowBlock,
+        }
+    }
+}
+
+/// Whether the cursor blinks. `Program` follows what the running program requests (DECSCUSR /
+/// DEC Mode 12); `On`/`Off` force blinking regardless of the program (matching Ghostty's
+/// `cursor-style-blink`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CursorBlink {
+    #[default]
+    Program,
+    On,
+    Off,
+}
+
+impl CursorBlink {
+    pub(crate) const ALL: [Self; 3] = [Self::Program, Self::On, Self::Off];
+
+    /// A stable ascii slug for element ids (not user-facing; display text comes from i18n).
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Program => "program",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// Resolve whether the cursor should blink, given the shape's program-reported blinking bit.
+    pub(crate) fn resolve(self, program_blinking: bool) -> bool {
+        match self {
+            Self::Program => program_blinking,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
@@ -125,6 +195,9 @@ pub(crate) struct AppSettings {
     pub(crate) progress_stale_timeout_secs: u32,
     pub(crate) allow_osc_clipboard_read: bool,
     pub(crate) detect_urls: bool,
+    pub(crate) copy_on_select: bool,
+    pub(crate) cursor_shape: CursorShapeSetting,
+    pub(crate) cursor_blink: CursorBlink,
     pub(crate) bell_mode: BellMode,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) keybindings: std::collections::BTreeMap<String, String>,
@@ -146,6 +219,9 @@ impl Default for AppSettings {
             progress_stale_timeout_secs: DEFAULT_PROGRESS_STALE_TIMEOUT_SECS,
             allow_osc_clipboard_read: false,
             detect_urls: true,
+            copy_on_select: true,
+            cursor_shape: CursorShapeSetting::default(),
+            cursor_blink: CursorBlink::default(),
             bell_mode: BellMode::default(),
             keybindings: std::collections::BTreeMap::new(),
         }
@@ -548,6 +624,9 @@ mod tests {
             progress_stale_timeout_secs: u32::MAX,
             allow_osc_clipboard_read: true,
             detect_urls: false,
+            copy_on_select: false,
+            cursor_shape: CursorShapeSetting::Bar,
+            cursor_blink: CursorBlink::On,
             bell_mode: BellMode::Sound,
             keybindings: std::collections::BTreeMap::new(),
         };
@@ -615,6 +694,75 @@ mod tests {
     fn bell_mode_defaults_to_flash() {
         assert_eq!(BellMode::default(), BellMode::Flash);
         assert_eq!(AppSettings::default().bell_mode, BellMode::Flash);
+    }
+
+    #[test]
+    fn copy_on_select_defaults_to_enabled() {
+        assert!(AppSettings::default().copy_on_select);
+    }
+
+    #[test]
+    fn legacy_settings_without_copy_on_select_default_to_enabled() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "theme_mode": "system",
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert!(config.copy_on_select);
+    }
+
+    #[test]
+    fn cursor_shape_defaults_to_block() {
+        assert_eq!(CursorShapeSetting::default(), CursorShapeSetting::Block);
+        assert_eq!(
+            AppSettings::default().cursor_shape,
+            CursorShapeSetting::Block
+        );
+    }
+
+    #[test]
+    fn legacy_settings_without_cursor_shape_default_to_block() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "theme_mode": "system",
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.cursor_shape, CursorShapeSetting::Block);
+    }
+
+    #[test]
+    fn cursor_blink_defaults_to_program() {
+        assert_eq!(CursorBlink::default(), CursorBlink::Program);
+        assert_eq!(AppSettings::default().cursor_blink, CursorBlink::Program);
+    }
+
+    #[test]
+    fn cursor_blink_resolve_follows_the_three_states() {
+        // Program follows the program-reported bit.
+        assert!(CursorBlink::Program.resolve(true));
+        assert!(!CursorBlink::Program.resolve(false));
+        // On/Off force the outcome regardless of the program.
+        assert!(CursorBlink::On.resolve(false));
+        assert!(!CursorBlink::Off.resolve(true));
+    }
+
+    #[test]
+    fn legacy_settings_without_cursor_blink_default_to_program() {
+        let config: AppSettings = serde_json::from_str(
+            r#"{
+                "theme_mode": "system",
+                "font_family": "Menlo",
+                "font_size": 14
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.cursor_blink, CursorBlink::Program);
     }
 
     #[test]

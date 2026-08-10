@@ -73,6 +73,8 @@ pub(crate) struct TerminalRenderOptions {
     input_latency: InputLatencyTracker,
     search: Option<TerminalSearchHighlights>,
     url_hover: Option<TerminalLinkRange>,
+    /// Whether the cursor should be painted this frame. `false` during the "off" half of a blink.
+    cursor_visible: bool,
 }
 
 /// Viewport-relative search highlights to overlay on the terminal grid. `active` is the currently
@@ -116,6 +118,7 @@ impl TerminalRenderOptions {
             input_latency,
             search: None,
             url_hover: None,
+            cursor_visible: true,
         }
     }
 
@@ -126,6 +129,11 @@ impl TerminalRenderOptions {
 
     pub(crate) fn with_url_hover(mut self, url_hover: Option<TerminalLinkRange>) -> Self {
         self.url_hover = url_hover;
+        self
+    }
+
+    pub(crate) fn with_cursor_visible(mut self, cursor_visible: bool) -> Self {
+        self.cursor_visible = cursor_visible;
         self
     }
 }
@@ -177,6 +185,7 @@ struct PreparationKey {
     ime: Option<TerminalImeState>,
     search: Option<TerminalSearchHighlights>,
     url_hover: Option<TerminalLinkRange>,
+    cursor_visible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -221,6 +230,7 @@ impl MetalTerminalRenderer {
             input_latency: options.input_latency,
             search: options.search,
             url_hover: options.url_hover,
+            cursor_visible: options.cursor_visible,
         }
     }
 
@@ -270,6 +280,7 @@ pub(crate) struct MetalTerminalElement {
     input_latency: InputLatencyTracker,
     search: Option<TerminalSearchHighlights>,
     url_hover: Option<TerminalLinkRange>,
+    cursor_visible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -705,6 +716,7 @@ impl Element for MetalTerminalElement {
             ime: self.ime.clone(),
             search: self.search.clone(),
             url_hover: self.url_hover.clone(),
+            cursor_visible: self.cursor_visible,
         };
         let cached = self
             .renderer
@@ -735,6 +747,7 @@ impl Element for MetalTerminalElement {
                 self.ime.as_ref(),
                 self.search.as_ref(),
                 self.url_hover.as_ref(),
+                self.cursor_visible,
                 &image_cache,
             ));
             drop(image_cache);
@@ -870,6 +883,7 @@ fn prepare_terminal(
     ime: Option<&TerminalImeState>,
     search: Option<&TerminalSearchHighlights>,
     url_hover: Option<&TerminalLinkRange>,
+    cursor_visible: bool,
     image_cache: &FxHashMap<TerminalTextureKey, Arc<TerminalImageData>>,
 ) -> PreparedMetalTerminal {
     let palette = TerminalPalette::new(snapshot, theme);
@@ -899,7 +913,7 @@ fn prepare_terminal(
     // muted yellow; the active match uses a stronger orange so it stands out.
     let mut search_commands = prepare_search(search, snapshot, cell_width, line_height);
     let (mut cursor_background, mut cursor_foreground) =
-        if ime.is_some_and(|ime| !ime.text.is_empty()) {
+        if !cursor_visible || ime.is_some_and(|ime| !ime.text.is_empty()) {
             (Vec::new(), Vec::new())
         } else {
             prepare_cursor(snapshot, &palette, cell_width, line_height)
@@ -1693,6 +1707,7 @@ mod tests {
             cursor_column: 0,
             cursor_shape: TerminalCursorShape::Hidden,
             cursor_width: 1,
+            cursor_blinking: false,
             title: String::new(),
             revision: 0,
             last_input_sequence: 0,
@@ -2162,6 +2177,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             &image_cache,
         );
         let image_index = |id| {
@@ -2349,6 +2365,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
                 &image_cache,
             ))
             .commands

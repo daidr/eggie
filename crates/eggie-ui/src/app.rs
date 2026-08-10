@@ -5,8 +5,8 @@ use crate::native_menu::{
     prepare_process_menu, prepare_project_menu, prepare_tab_menu,
 };
 use crate::settings::{
-    DEFAULT_FONT_SIZE, Language, SettingsStore, TerminalTheme, UiColors,
-    system_uses_dark_appearance,
+    CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, SettingsStore, TerminalTheme,
+    UiColors, system_uses_dark_appearance,
 };
 use crate::settings_window::{
     ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
@@ -28,7 +28,8 @@ use eggie_domain::{
 use eggie_protocol::{
     ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionSummary,
     TERMINAL_SCROLL_DELTA_SCALE, TerminalAppearance, TerminalAttentionRequest,
-    TerminalClipboardContent, TerminalClipboardSelection, TerminalImageDescriptor,
+    TerminalClipboardContent, TerminalClipboardSelection, TerminalCursorShape,
+    TerminalImageDescriptor,
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
     TerminalMousePosition, TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
     TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollCommand,
@@ -110,6 +111,9 @@ const BELL_FLASH_DURATION: Duration = Duration::from_millis(420);
 const BELL_FLASH_STEP: Duration = Duration::from_millis(16);
 /// Peak alpha of the accent tint at the middle of the pulse (0x00..=0xff).
 const BELL_FLASH_PEAK_ALPHA: f32 = 0x66 as f32;
+/// Full cursor blink cycle (on + off). The cursor is solid for the first half and hidden for the
+/// second. ~1s matches the customary terminal blink rate.
+const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TerminalImageStreamKey {
@@ -387,6 +391,10 @@ pub struct EggieApp {
     bell_flash: HashMap<SessionId, Instant>,
     /// Whether the bell-flash animation loop is already running (prevents duplicate timers).
     bell_flash_scheduled: bool,
+    /// Phase origin for the terminal cursor blink; reset so the cursor is solid right after typing.
+    cursor_blink_epoch: Instant,
+    /// Whether the cursor-blink animation loop is already running (prevents duplicate timers).
+    cursor_blink_scheduled: bool,
     progress_timeouts: TerminalProgressTimeouts,
     snapshot_watchers: HashSet<SessionId>,
     progress_watchers: HashSet<SessionId>,
@@ -432,6 +440,9 @@ pub struct EggieApp {
     notification_routes: NotificationRoutes,
     allow_osc_clipboard_read: bool,
     detect_urls: bool,
+    copy_on_select: bool,
+    cursor_shape: CursorShapeSetting,
+    cursor_blink: CursorBlink,
     language: Language,
     closing: bool,
     poll_error: Option<String>,
@@ -750,6 +761,12 @@ impl EggieApp {
             }) {
                 eprintln!("failed to set terminal URL detection: {error:#}");
             }
+            if let Err(error) = client.request(ClientRequest::SetCursorStyle {
+                session_id: session.id,
+                shape: config.cursor_shape.to_protocol(),
+            }) {
+                eprintln!("failed to set terminal cursor style: {error:#}");
+            }
         }
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
@@ -777,6 +794,8 @@ impl EggieApp {
             progress_animation_epoch: Instant::now(),
             bell_flash: HashMap::new(),
             bell_flash_scheduled: false,
+            cursor_blink_epoch: Instant::now(),
+            cursor_blink_scheduled: false,
             progress_timeouts,
             snapshot_watchers: HashSet::new(),
             progress_watchers: HashSet::new(),
@@ -821,6 +840,9 @@ impl EggieApp {
             notification_routes,
             allow_osc_clipboard_read: config.allow_osc_clipboard_read,
             detect_urls: config.detect_urls,
+            copy_on_select: config.copy_on_select,
+            cursor_shape: config.cursor_shape,
+            cursor_blink: config.cursor_blink,
             language: config.language,
             closing: false,
             poll_error: None,
@@ -1338,6 +1360,62 @@ impl EggieApp {
         let intensity = 0.5 - 0.5 * (progress * std::f32::consts::TAU).cos();
         let alpha = (intensity * BELL_FLASH_PEAK_ALPHA).round() as u32;
         Some((self.colors.accent << 8) | alpha.min(0xff))
+    }
+
+    /// Whether the given session's cursor should blink this session, per the user's `cursor_blink`
+    /// setting resolved against the program-reported blinking bit. A hidden cursor never blinks.
+    fn cursor_should_blink(&self, snapshot: &TerminalSnapshot) -> bool {
+        snapshot.cursor_shape != TerminalCursorShape::Hidden
+            && self.cursor_blink.resolve(snapshot.cursor_blinking)
+    }
+
+    /// Whether the cursor should be painted this frame: solid unless it is blinking and currently in
+    /// the "off" half of the blink cycle.
+    fn cursor_visible_this_frame(&self, snapshot: &TerminalSnapshot) -> bool {
+        if !self.cursor_should_blink(snapshot) {
+            return true;
+        }
+        let elapsed = self.cursor_blink_epoch.elapsed().as_secs_f32();
+        elapsed.rem_euclid(CURSOR_BLINK_PERIOD.as_secs_f32()) < CURSOR_BLINK_PERIOD.as_secs_f32() / 2.
+    }
+
+    /// Whether the active session's cursor is blinking right now (drives the blink timer loop).
+    fn active_cursor_blinks(&self) -> bool {
+        self.active_session_id()
+            .and_then(|session_id| self.snapshots.get(&session_id))
+            .is_some_and(|snapshot| self.cursor_should_blink(snapshot))
+    }
+
+    /// Drive the cursor blink: a background timer that repaints every half-cycle while the active
+    /// session's cursor is blinking, and exits as soon as it stops (so an idle, non-blinking cursor
+    /// costs nothing). Uses a background timer (not the display link) so it ticks regardless of
+    /// frontmost state, mirroring [`Self::ensure_bell_flash`].
+    fn ensure_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        if self.cursor_blink_scheduled || !self.active_cursor_blinks() {
+            return;
+        }
+        self.cursor_blink_scheduled = true;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(CURSOR_BLINK_PERIOD / 2).await;
+                let keep_going = this
+                    .update(cx, |app, cx| {
+                        if app.active_cursor_blinks() {
+                            cx.notify();
+                            true
+                        } else {
+                            app.cursor_blink_scheduled = false;
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn render_item_icon(
@@ -1955,6 +2033,15 @@ impl EggieApp {
             detect_urls: self.detect_urls,
         }) {
             eprintln!("failed to configure terminal URL detection for {session_id}: {error:#}");
+        }
+    }
+
+    fn configure_session_cursor_shape(&self, session_id: SessionId) {
+        if let Err(error) = self.client.request(ClientRequest::SetCursorStyle {
+            session_id,
+            shape: self.cursor_shape.to_protocol(),
+        }) {
+            eprintln!("failed to configure terminal cursor style for {session_id}: {error:#}");
         }
     }
 
@@ -2817,6 +2904,11 @@ impl EggieApp {
         };
         if !drag.dragged {
             let _ = self.input_sender.send_selection_clear(drag.session_id);
+        } else if self.copy_on_select {
+            // The user dragged out a real selection; mirror it to the system clipboard immediately.
+            // Uses the drag's own session (not the active one) so a selection in a background split
+            // still copies correctly.
+            self.copy_terminal_selection(drag.session_id, cx);
         }
         cx.notify();
     }
@@ -2825,6 +2917,10 @@ impl EggieApp {
         let Some(session_id) = self.active_session_id() else {
             return false;
         };
+        self.copy_terminal_selection(session_id, cx)
+    }
+
+    fn copy_terminal_selection(&self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
         // The daemon owns the selection and extracts its text from the terminal core (whole
         // scrollback span, soft-wrap unwrapped, trailing whitespace trimmed).
         let text = match self
@@ -4514,6 +4610,8 @@ impl EggieApp {
                 let app = cx.entity().downgrade();
                 let input = (self.workspace().active_group_id == group_id)
                     .then(|| TerminalInputContext::new(app.clone(), self.focus_handle.clone()));
+                // Resolve the blink phase before `snapshot` is moved into the renderer.
+                let cursor_visible = self.cursor_visible_this_frame(&snapshot);
                 div()
                     .size_full()
                     .overflow_hidden()
@@ -4562,7 +4660,8 @@ impl EggieApp {
                             self.input_latency.clone(),
                         )
                         .with_search(search)
-                        .with_url_hover(url_hover),
+                        .with_url_hover(url_hover)
+                        .with_cursor_visible(cursor_visible),
                     ))
                     .into_any_element()
             })
@@ -4964,7 +5063,17 @@ impl gpui::Render for EggieApp {
                 self.configure_session_url_detection(session_id);
             }
         }
+        if config.cursor_shape != self.cursor_shape {
+            self.cursor_shape = config.cursor_shape;
+            for session_id in self.window_session_ids() {
+                self.configure_session_cursor_shape(session_id);
+            }
+        }
+        self.cursor_blink = config.cursor_blink;
         self.language = config.language;
+        self.copy_on_select = config.copy_on_select;
+        // Keep the blink timer running while the active cursor blinks; it self-terminates otherwise.
+        self.ensure_cursor_blink(cx);
         div()
             .id("eggie-workspace")
             .relative()

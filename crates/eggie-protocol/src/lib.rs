@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -354,6 +354,12 @@ pub enum ClientRequest {
     SetUrlDetection {
         session_id: SessionId,
         detect_urls: bool,
+    },
+    /// Set the session's default cursor shape. A running program can still override this at runtime
+    /// via DECSCUSR (`CSI Ps SP q`); this only changes the shape used when the program hasn't asked.
+    SetCursorStyle {
+        session_id: SessionId,
+        shape: TerminalCursorShape,
     },
     Terminate {
         session_id: SessionId,
@@ -742,6 +748,8 @@ pub struct TerminalSnapshot {
     pub cursor_shape: TerminalCursorShape,
     #[serde(rename = "cw")]
     pub cursor_width: u8,
+    #[serde(rename = "cb", default, skip_serializing_if = "is_false")]
+    pub cursor_blinking: bool,
     #[serde(rename = "t")]
     pub title: String,
     #[serde(rename = "r")]
@@ -902,6 +910,8 @@ pub struct TerminalSnapshotDelta {
     pub cursor_shape: TerminalCursorShape,
     #[serde(rename = "cw")]
     pub cursor_width: u8,
+    #[serde(rename = "cb", default, skip_serializing_if = "is_false")]
+    pub cursor_blinking: bool,
     #[serde(rename = "t")]
     pub title: String,
     #[serde(rename = "r")]
@@ -994,6 +1004,7 @@ impl TerminalSnapshot {
             cursor_column: delta.cursor_column,
             cursor_shape: delta.cursor_shape,
             cursor_width: delta.cursor_width,
+            cursor_blinking: delta.cursor_blinking,
             title: delta.title.clone(),
             revision: delta.revision,
             last_input_sequence: delta.last_input_sequence,
@@ -1384,6 +1395,32 @@ mod tests {
     }
 
     #[test]
+    fn set_cursor_style_request_round_trips() {
+        for shape in [
+            TerminalCursorShape::Block,
+            TerminalCursorShape::Underline,
+            TerminalCursorShape::Beam,
+            TerminalCursorShape::HollowBlock,
+            TerminalCursorShape::Hidden,
+        ] {
+            let request = ClientRequest::SetCursorStyle {
+                session_id: Uuid::nil(),
+                shape,
+            };
+            let encoded = encode_line(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
+                request
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<ClientRequest>(&rmp_serde::to_vec_named(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn bell_osc_event_round_trips() {
         let payload = TerminalOscEventPayload::Bell;
         let json = serde_json::to_string(&payload).unwrap();
@@ -1577,6 +1614,7 @@ mod tests {
             cursor_column: 0,
             cursor_shape: TerminalCursorShape::Beam,
             cursor_width: 1,
+            cursor_blinking: true,
             title: "semantic snapshot".to_owned(),
             revision: 42,
             last_input_sequence: 9,
@@ -1634,6 +1672,36 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_cursor_blinking_defaults_to_false_when_absent() {
+        // A snapshot serialized before the field existed omits `cb`; it must decode as not-blinking.
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "s": {"columns": 1, "rows": 1, "cell_width": 8, "cell_height": 18},
+            "c": [],
+            "cl": 0,
+            "cc": 0,
+            "cs": "block",
+            "cw": 1,
+            "t": "",
+            "r": 1
+        }"#;
+        let snapshot: TerminalSnapshot = serde_json::from_str(json).unwrap();
+        assert!(!snapshot.cursor_blinking);
+
+        // And when present it round-trips.
+        let blinking = TerminalSnapshot {
+            cursor_blinking: true,
+            ..snapshot
+        };
+        let encoded = encode_line(&blinking).unwrap();
+        assert!(
+            serde_json::from_slice::<TerminalSnapshot>(&encoded)
+                .unwrap()
+                .cursor_blinking
+        );
+    }
+
+    #[test]
     fn snapshot_delta_replaces_and_clears_cells_without_losing_metadata() {
         let snapshot = TerminalSnapshot {
             session_id: Uuid::nil(),
@@ -1671,6 +1739,7 @@ mod tests {
             cursor_column: 1,
             cursor_shape: TerminalCursorShape::Block,
             cursor_width: 1,
+            cursor_blinking: false,
             title: "before".to_owned(),
             revision: 4,
             last_input_sequence: 1,
@@ -1731,6 +1800,7 @@ mod tests {
             cursor_column: 2,
             cursor_shape: TerminalCursorShape::Beam,
             cursor_width: 1,
+            cursor_blinking: false,
             title: "after".to_owned(),
             revision: 5,
             last_input_sequence: 2,
