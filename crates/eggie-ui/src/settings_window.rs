@@ -471,6 +471,14 @@ impl SettingsWindow {
             .detach();
         cx.subscribe_in(&shell_args_input, window, Self::on_shell_args_event)
             .detach();
+        // Safety net: if the window closes while a hover preview is still active (e.g. closed via
+        // keyboard while the pointer rested on an option), drop it so the main window's terminals
+        // don't stay stuck on the previewed theme.
+        cx.on_release(|this, cx| {
+            this.settings
+                .update(cx, |store, cx| store.clear_theme_preview(cx));
+        })
+        .detach();
         Self {
             settings,
             dark_theme_names: theme_catalog().dark_names(),
@@ -514,6 +522,7 @@ impl SettingsWindow {
             }
             TextInputEvent::Cancel => {
                 self.open_selector = None;
+                self.clear_theme_preview(cx);
                 cx.notify();
             }
         }
@@ -600,6 +609,7 @@ impl SettingsWindow {
                 cx,
             )
         });
+        self.clear_theme_preview(cx);
         self.open_selector = None;
         cx.notify();
     }
@@ -608,6 +618,21 @@ impl SettingsWindow {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.theme_mode = mode, cx)
         });
+    }
+
+    /// Light up `name` as a transient hover preview across the app (real terminals + the settings
+    /// preview). No-op if the name doesn't resolve to a known theme.
+    fn preview_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(theme) = theme_catalog().theme_by_name(name) {
+            self.settings
+                .update(cx, |store, cx| store.set_theme_preview(theme, cx));
+        }
+    }
+
+    /// Drop any active hover preview, restoring the persisted theme everywhere.
+    fn clear_theme_preview(&mut self, cx: &mut Context<Self>) {
+        self.settings
+            .update(cx, |store, cx| store.clear_theme_preview(cx));
     }
 
     fn set_bell_mode(&mut self, mode: BellMode, cx: &mut Context<Self>) {
@@ -1618,6 +1643,7 @@ impl SettingsWindow {
                     .on_click(cx.listener(move |settings, _, window, cx| {
                         if settings.open_selector == Some(kind) {
                             settings.open_selector = None;
+                            settings.clear_theme_preview(cx);
                         } else {
                             settings.open_selector = Some(kind);
                             let language = settings.settings.read(cx).config().language;
@@ -1780,9 +1806,14 @@ impl SettingsWindow {
                     ),
             );
         }
+        // Theme selectors get a live hover preview: resting on an option lights the theme up across
+        // the real terminals and the preview swatch. Font selectors don't (fonts can't preview live).
+        let is_theme_selector =
+            matches!(kind, SelectorKind::DarkTheme | SelectorKind::LightTheme);
         for (index, item) in items.into_iter().enumerate() {
             let selected = item == current;
             let selected_item = item.clone();
+            let hover_item = item.clone();
             list = list.child(
                 div()
                     .id(("settings-selector-option", index))
@@ -1811,7 +1842,20 @@ impl SettingsWindow {
                         |element| element.font_family(SharedString::from(item.clone())),
                     )
                     .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                    .when(is_theme_selector, |element| {
+                        element.on_hover(cx.listener(move |settings, hovered: &bool, _, cx| {
+                            // Preview on enter only; leaving an option to enter the next one must not
+                            // flip back to the persisted theme mid-glide. The dropdown container's
+                            // own on_hover clears the preview once the pointer leaves the list.
+                            if *hovered {
+                                settings.preview_theme(&hover_item, cx);
+                            }
+                        }))
+                    })
                     .on_click(cx.listener(move |settings, _, _, cx| {
+                        // Committing supersedes the preview: clear it so `resolved_theme` falls back
+                        // to the now-persisted value (identical pixels, but no stale override left).
+                        settings.clear_theme_preview(cx);
                         settings.settings.update(cx, |store, cx| {
                             store.update(
                                 |config| match kind {
@@ -1903,10 +1947,21 @@ impl SettingsWindow {
             // search input and list items still receive their own events.
             .occlude()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .when(is_theme_selector, |element| {
+                // Pointer left the dropdown entirely (or entered its blank gaps between options):
+                // drop the hover preview so the persisted theme comes back. Option-to-option glides
+                // stay previewed because each option re-arms the preview on enter.
+                element.on_hover(cx.listener(move |settings, hovered: &bool, _, cx| {
+                    if !*hovered {
+                        settings.clear_theme_preview(cx);
+                    }
+                }))
+            })
             .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
                 cx.defer_in(window, move |settings, _, cx| {
                     if settings.open_selector == Some(kind) {
                         settings.open_selector = None;
+                        settings.clear_theme_preview(cx);
                         cx.notify();
                     }
                 });
@@ -2693,7 +2748,12 @@ impl SettingsWindow {
 impl gpui::Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = self.settings.read(cx).config().clone();
-        let theme = config.effective_theme(is_dark_appearance(window.appearance()));
+        let system_is_dark = is_dark_appearance(window.appearance());
+        // The whole settings window follows the *resolved* theme: hovering a theme option repaints
+        // the entire window (chrome + preview swatch) alongside the real terminals, so the preview is
+        // truly WYSIWYG. `resolved_theme` returns the live hover preview if one is active, otherwise
+        // the persisted theme.
+        let theme = self.settings.read(cx).resolved_theme(system_is_dark);
         self.colors = UiColors::from_theme(theme);
 
         let language = config.language;
