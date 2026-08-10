@@ -5103,7 +5103,12 @@ impl EggieApp {
 impl gpui::Render for EggieApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = self.settings.read(cx).config().clone();
-        self.terminal_theme = config.effective_theme(is_dark_appearance(window.appearance()));
+        // Read the *resolved* theme (persisted theme, or the settings window's live hover preview if
+        // one is active) so a hovered theme lights up the real terminals here, not just the preview.
+        self.terminal_theme = self
+            .settings
+            .read(cx)
+            .resolved_theme(is_dark_appearance(window.appearance()));
         let appearance = self.terminal_theme.appearance();
         if appearance != self.terminal_appearance {
             self.terminal_appearance = appearance;

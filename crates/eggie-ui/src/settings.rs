@@ -895,6 +895,10 @@ fn relative_luminance_rgb(color: u32) -> f32 {
 pub(crate) struct SettingsStore {
     config: AppSettings,
     path: PathBuf,
+    /// Transient theme override driven by the settings window's hover preview. Never persisted and
+    /// never serialized — it only overrides what `resolved_theme` returns while the pointer rests on
+    /// a theme option. Cleared when the pointer leaves, the dropdown closes, or the window closes.
+    theme_preview: Option<&'static TerminalTheme>,
 }
 
 impl SettingsStore {
@@ -908,11 +912,47 @@ impl SettingsStore {
             .and_then(|bytes| serde_json::from_slice::<AppSettings>(&bytes).ok())
             .unwrap_or_default();
         config.normalize();
-        Self { config, path }
+        Self {
+            config,
+            path,
+            theme_preview: None,
+        }
     }
 
     pub(crate) fn config(&self) -> &AppSettings {
         &self.config
+    }
+
+    /// The terminal theme actually in effect: the live hover preview if one is active, otherwise the
+    /// persisted `effective_theme`. Both the main window's terminals and the settings preview read
+    /// through here so a hovered theme lights up everywhere at once.
+    pub(crate) fn resolved_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
+        self.theme_preview
+            .unwrap_or_else(|| self.config.effective_theme(system_is_dark))
+    }
+
+    /// Set the transient hover preview to `theme`. No-op (and no notify) if it is already the active
+    /// preview, so a stream of repeated hover events over the same option doesn't churn renders.
+    pub(crate) fn set_theme_preview(
+        &mut self,
+        theme: &'static TerminalTheme,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .theme_preview
+            .is_some_and(|current| std::ptr::eq(current, theme))
+        {
+            return;
+        }
+        self.theme_preview = Some(theme);
+        cx.notify();
+    }
+
+    /// Drop any active hover preview, restoring the persisted theme. No-op if none is active.
+    pub(crate) fn clear_theme_preview(&mut self, cx: &mut Context<Self>) {
+        if self.theme_preview.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn update(&mut self, update: impl FnOnce(&mut AppSettings), cx: &mut Context<Self>) {
@@ -994,12 +1034,18 @@ impl ThemeCatalog {
         self.light.iter().map(|theme| theme.name.clone()).collect()
     }
 
-    fn dark_theme(&self, name: &str) -> Option<&TerminalTheme> {
+    pub(crate) fn dark_theme(&self, name: &str) -> Option<&TerminalTheme> {
         self.dark.iter().find(|theme| theme.name == name)
     }
 
-    fn light_theme(&self, name: &str) -> Option<&TerminalTheme> {
+    pub(crate) fn light_theme(&self, name: &str) -> Option<&TerminalTheme> {
         self.light.iter().find(|theme| theme.name == name)
+    }
+
+    /// Look a theme up by name across both the dark and light lists. Used by the settings
+    /// window's live hover preview, which resolves whichever theme the pointer is over.
+    pub(crate) fn theme_by_name(&self, name: &str) -> Option<&TerminalTheme> {
+        self.dark_theme(name).or_else(|| self.light_theme(name))
     }
 }
 
@@ -1164,6 +1210,49 @@ mod tests {
         assert!(catalog.light.len() > 20);
         assert!(catalog.dark_theme("Catppuccin Mocha").is_some());
         assert!(catalog.light_theme("Ayu Light").is_some());
+    }
+
+    #[test]
+    fn theme_by_name_resolves_across_dark_and_light_lists() {
+        let catalog = theme_catalog();
+        // A dark theme and a light theme both resolve through the unified lookup the hover preview
+        // uses, and an unknown name yields None (so preview_theme becomes a no-op).
+        assert_eq!(
+            catalog.theme_by_name("Catppuccin Mocha").map(|t| t.name.as_str()),
+            Some("Catppuccin Mocha")
+        );
+        assert_eq!(
+            catalog.theme_by_name("Ayu Light").map(|t| t.name.as_str()),
+            Some("Ayu Light")
+        );
+        assert!(catalog.theme_by_name("No Such Theme").is_none());
+    }
+
+    #[test]
+    fn resolved_theme_prefers_the_hover_preview_then_falls_back() {
+        let catalog = theme_catalog();
+        let mut store = SettingsStore {
+            config: AppSettings {
+                theme_mode: ThemeMode::Dark,
+                dark_theme: "Builtin Dark".to_owned(),
+                ..AppSettings::default()
+            },
+            path: std::path::PathBuf::from("unused"),
+            theme_preview: None,
+        };
+
+        // No preview active: resolves to the persisted effective theme.
+        assert_eq!(store.resolved_theme(true).name, "Builtin Dark");
+
+        // A preview override wins over the persisted theme, regardless of light/dark or system mode.
+        let preview = catalog.theme_by_name("Catppuccin Mocha").unwrap();
+        store.theme_preview = Some(preview);
+        assert_eq!(store.resolved_theme(true).name, "Catppuccin Mocha");
+        assert_eq!(store.resolved_theme(false).name, "Catppuccin Mocha");
+
+        // Clearing the override restores the persisted theme.
+        store.theme_preview = None;
+        assert_eq!(store.resolved_theme(true).name, "Builtin Dark");
     }
 
     #[test]
