@@ -6,6 +6,9 @@ pub type ProjectId = Uuid;
 pub type GroupId = Uuid;
 pub type ItemId = Uuid;
 pub type SessionId = Uuid;
+/// Identity of a GUI window. A session in the daemon is tagged with the id of the window that owns
+/// it so that each window sees only its own sessions; `None` ownership marks a detached session.
+pub type WindowId = Uuid;
 /// Identity of a split node in a [`LayoutNode`] tree. Distinct from [`GroupId`] so a split is never
 /// confused with the groups it contains.
 pub type SplitId = Uuid;
@@ -187,6 +190,19 @@ impl LayoutNode {
     pub fn group(item: TabItem) -> Self {
         Self::Group {
             group: TabGroup::new(item),
+        }
+    }
+
+    /// A layout with a single empty group and no tabs. Used for a project that currently has no
+    /// terminal in this window (e.g. a project synced from another window, or one whose sessions
+    /// were all detached): the group is a valid drop target for the first new terminal.
+    pub fn empty() -> Self {
+        Self::Group {
+            group: TabGroup {
+                id: Uuid::new_v4(),
+                items: Vec::new(),
+                active_item_id: None,
+            },
         }
     }
 

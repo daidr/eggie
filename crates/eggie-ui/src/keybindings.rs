@@ -16,8 +16,8 @@ use gpui::{App, DummyKeyboardMapper, KeyBinding, Keystroke};
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
     ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
-    NewTab, NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop,
-    SplitDown, SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
+    NewTab, NewWindow, NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom,
+    ScrollTop, SplitDown, SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
 };
 
 /// One user-configurable action. `ACTION_SPECS` is the single source of truth;
@@ -57,6 +57,12 @@ pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
         default_keystroke: "cmd-,",
         label: Language::action_open_settings,
         build: |ks| load_binding(ks, OpenSettings),
+    },
+    ActionSpec {
+        id: "new_window",
+        default_keystroke: "cmd-n",
+        label: Language::action_new_window,
+        build: |ks| load_binding(ks, NewWindow),
     },
     ActionSpec {
         id: "quit",

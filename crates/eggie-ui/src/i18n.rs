@@ -149,6 +149,70 @@ impl Language {
         }
     }
 
+    /// Group heading in the detached-session popover for sessions whose project no longer exists.
+    pub(crate) fn detached_other_group(self) -> &'static str {
+        match self {
+            Self::English => "Other",
+            Self::SimplifiedChinese => "其它",
+        }
+    }
+
+    pub(crate) fn collapse_sidebar_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Collapse sidebar",
+            Self::SimplifiedChinese => "折叠侧边栏",
+        }
+    }
+
+    pub(crate) fn expand_sidebar_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Expand sidebar",
+            Self::SimplifiedChinese => "展开侧边栏",
+        }
+    }
+
+    pub(crate) fn new_terminal_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "New terminal",
+            Self::SimplifiedChinese => "新建终端",
+        }
+    }
+
+    pub(crate) fn toggle_right_sidebar_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Toggle info panel",
+            Self::SimplifiedChinese => "切换信息面板",
+        }
+    }
+
+    pub(crate) fn detached_sessions_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Detached sessions",
+            Self::SimplifiedChinese => "游离会话",
+        }
+    }
+
+    pub(crate) fn add_project_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Add project",
+            Self::SimplifiedChinese => "添加项目",
+        }
+    }
+
+    pub(crate) fn claim_session_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Claim to this window",
+            Self::SimplifiedChinese => "接管到此窗口",
+        }
+    }
+
+    pub(crate) fn destroy_session_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Destroy session",
+            Self::SimplifiedChinese => "销毁会话",
+        }
+    }
+
     pub(crate) fn ports_label(self) -> &'static str {
         match self {
             Self::English => "PORTS",
@@ -496,6 +560,20 @@ impl Language {
         match self {
             Self::English => "Edit",
             Self::SimplifiedChinese => "编辑",
+        }
+    }
+
+    pub(crate) fn file_menu(self) -> &'static str {
+        match self {
+            Self::English => "File",
+            Self::SimplifiedChinese => "文件",
+        }
+    }
+
+    pub(crate) fn new_window_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "New Window",
+            Self::SimplifiedChinese => "新建窗口",
         }
     }
 
@@ -1504,6 +1582,13 @@ impl Language {
         match self {
             Self::English => "New Tab",
             Self::SimplifiedChinese => "新建标签页",
+        }
+    }
+
+    pub(crate) fn action_new_window(self) -> &'static str {
+        match self {
+            Self::English => "New Window",
+            Self::SimplifiedChinese => "新建窗口",
         }
     }
 

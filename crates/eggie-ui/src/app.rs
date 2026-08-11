@@ -4,9 +4,10 @@ use crate::native_menu::{
     NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand,
     prepare_process_menu, prepare_project_menu, prepare_tab_menu,
 };
+use crate::project_store::ProjectStore;
 use crate::settings::{
     CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, SettingsStore, TerminalTheme,
-    UiColors, system_uses_dark_appearance,
+    UiColors,
 };
 use crate::settings_window::{
     ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
@@ -23,7 +24,7 @@ use crate::terminal_renderer::{
 use eggie_daemon::{DaemonClient, DaemonInputSender};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
-    SplitId, TabGroup, TabItem,
+    SplitId, TabGroup, TabItem, WindowId,
 };
 use eggie_protocol::{
     ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionSummary,
@@ -39,19 +40,20 @@ use eggie_protocol::{
     TerminalSize, TerminalSnapshot,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
+    Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
     DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions,
     Pixels, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     Stateful, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
-    TouchPhase, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, canvas, div,
-    linear_color_stop, linear_gradient, point, prelude::*, px, quad, relative, rgb, rgba, size,
+    TouchPhase, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, anchored,
+    canvas, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
+    relative, rgb, rgba, size,
 };
 use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
@@ -196,14 +198,14 @@ const HUGEICONS_FONT: &[u8] = include_bytes!("../assets/hgi-stroke-rounded.ttf")
 static NEXT_INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-struct NotificationRoute {
+pub(crate) struct NotificationRoute {
     app: WeakEntity<EggieApp>,
     client: DaemonClient,
     session_id: SessionId,
     notification_id: String,
 }
 
-type NotificationRoutes = Rc<RefCell<HashMap<String, NotificationRoute>>>;
+pub(crate) type NotificationRoutes = Rc<RefCell<HashMap<String, NotificationRoute>>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RightTab {
@@ -356,16 +358,90 @@ impl gpui::Render for ProgressTooltip {
     }
 }
 
+/// A reusable single-line text tooltip. Shares [`ProgressTooltip`]'s styling but is generic over any
+/// label, so buttons can attach a hover hint with [`tooltip_text`].
+struct TextTooltip {
+    text: SharedString,
+    colors: UiColors,
+}
+
+impl gpui::Render for TextTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .bg(rgb(self.colors.panel_alt))
+            .text_color(rgb(self.colors.text))
+            .text_size(px(11.))
+            .shadow_md()
+            .child(self.text.clone())
+    }
+}
+
+/// Build a `.tooltip(...)` callback showing `text`. Use as `element.tooltip(tooltip_text(label, colors))`.
+fn tooltip_text(
+    text: impl Into<SharedString>,
+    colors: UiColors,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |_, cx| {
+        cx.new(|_| TextTooltip {
+            text: text.clone(),
+            colors,
+        })
+        .into()
+    }
+}
+
 impl gpui::Render for DraggedTabPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         self.tab.preview_element()
     }
 }
 
-struct ProjectWorkspace {
-    project: Project,
+/// Per-window, per-project view state. The `Project` itself (id/name/root) lives in the shared
+/// [`ProjectStore`] so it syncs across windows; the layout tree and the active group are local to
+/// this window because sessions are not shared between windows.
+struct WindowProjectView {
     layout: LayoutNode,
     active_group_id: GroupId,
+}
+
+impl WindowProjectView {
+    /// A view for a project that currently has no terminal in this window: an empty layout whose
+    /// single empty group is the active group (and a valid drop target for the first new terminal).
+    fn empty() -> Self {
+        let layout = LayoutNode::empty();
+        let active_group_id = layout.first_group_id();
+        Self {
+            layout,
+            active_group_id,
+        }
+    }
+}
+
+/// How a freshly opened window should seed its initial project/session state.
+pub(crate) enum NewWindowInit {
+    /// The process's first window (cold start). Reconcile the persisted project list with the
+    /// daemon's existing sessions: adopt a project for `project_root`, claim surviving sessions into
+    /// this window, and open a default terminal if the daemon had nothing.
+    ColdStart { project_root: PathBuf },
+    /// A `New Window` (Cmd+N) opened at runtime. The shared project list already exists; activate the
+    /// first project and show it empty (D7: no terminal is spawned until the user acts).
+    Empty,
+    /// A single-instance wake (`eggie <dir>`). Activate `project_id` and open one default terminal in
+    /// it, since running `eggie <dir>` is an explicit request for a terminal there.
+    OpenDir { project_id: ProjectId },
+}
+
+/// Fallback working directory when a project's root can't be resolved: the user's home, or `.`.
+fn fallback_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub struct EggieApp {
@@ -409,10 +485,33 @@ pub struct EggieApp {
     osc_watchers: HashSet<SessionId>,
     progress_updates: HashMap<SessionId, TerminalProgressUpdate>,
     pending_progress_updates: HashMap<SessionId, TerminalProgressUpdate>,
-    projects: Vec<ProjectWorkspace>,
-    active_project: usize,
+    /// Identity of this window, generated once at construction. Every session this window creates is
+    /// tagged with it in the daemon, so `ListSessions` results can be filtered to this window's own
+    /// sessions (plus detached ones). Not persisted: a window id is meaningless once the window closes.
+    window_id: WindowId,
+    /// Shared, cross-window project list (name/root/order). Cloned handle of the one `Entity` all
+    /// windows observe; mutating it re-renders every window and re-syncs their `project_views`.
+    project_store: Entity<ProjectStore>,
+    /// Local ordered mirror of `project_store.projects()`, refreshed by `reconcile_project_views`.
+    /// Kept so render/iteration can read projects without holding a `cx` borrow on the entity.
+    projects: Vec<Project>,
+    /// Per-window layout/active-group for each project, keyed by project id. Rebuilt to track the
+    /// shared list: a project synced in from another window starts as an empty view (no session).
+    project_views: HashMap<ProjectId, WindowProjectView>,
+    /// The project this window currently shows. A `ProjectId` (not an index) because the shared list
+    /// can be reordered by another window, which would invalidate an index.
+    active_project: ProjectId,
     collapsed_projects: HashSet<ProjectId>,
+    /// Sessions owned by this window (daemon `window_id == self.window_id`), refreshed by polling.
     sessions: Vec<SessionSummary>,
+    /// Detached sessions (daemon `window_id == None`): survive their closed window and are claimable
+    /// from any window. Surfaced through the sidebar's floating-session popover (not the project tree).
+    detached_sessions: Vec<SessionSummary>,
+    /// Whether the detached-session popover is open.
+    detached_popover_open: bool,
+    /// On-screen bounds of the detached-sessions toggle button, captured at paint so the popover can
+    /// anchor just below it (like the settings dropdowns) instead of snapping to the window corner.
+    detached_toggle_bounds: Option<Bounds<Pixels>>,
     snapshots: HashMap<SessionId, Arc<TerminalSnapshot>>,
     terminal_sizes: HashMap<SessionId, TerminalSize>,
     terminal_resize_in_flight: HashMap<SessionId, TerminalSize>,
@@ -573,87 +672,7 @@ fn prompt_for_text(
 impl EggieApp {
     pub fn launch(project_root: PathBuf, client: DaemonClient) {
         let settings_store = SettingsStore::load();
-        let initial_appearance = settings_store
-            .config()
-            .effective_theme(system_uses_dark_appearance())
-            .appearance();
-        let initial_scrollback = settings_store.config().scrollback_lines;
-        let initial_shell_program = settings_store.config().shell_program.clone();
-        let initial_shell_args = settings_store.config().shell_args.clone();
-        let initial_shell_features = settings_store.config().shell_features_string();
-        let all_sessions = match client.request(ClientRequest::ListSessions) {
-            Ok(DaemonResponse::Sessions { sessions }) => sessions,
-            _ => Vec::new(),
-        };
-        // If there are no existing sessions at all, start with a default "Home" project whose
-        // terminals open in the user's home directory.
-        let (project, sessions) = if all_sessions.is_empty() {
-            let project = Project::new("Home".to_owned());
-            let response = client
-                .request(ClientRequest::CreateSession {
-                    project_id: project.id,
-                    cwd: project.effective_root(),
-                    size: TerminalSize::default(),
-                    appearance: initial_appearance,
-                    scrollback_limit: initial_scrollback,
-                    shell_program: initial_shell_program.clone(),
-                    shell_args: initial_shell_args.clone(),
-                    shell_features: initial_shell_features.clone(),
-                })
-                .expect("failed to create initial terminal session");
-            let session = match response {
-                DaemonResponse::SessionCreated { session } => session,
-                response => panic!("unexpected create-session response: {response:?}"),
-            };
-            (project, vec![session])
-        } else {
-            let mut project = Project::from_root(project_root.clone());
-            let mut sessions = all_sessions
-                .into_iter()
-                .filter(|session| session.initial_directory == project_root)
-                .collect::<Vec<_>>();
-            if let Some(existing) = sessions.first() {
-                project.id = existing.project_id;
-            } else {
-                let response = client
-                    .request(ClientRequest::CreateSession {
-                        project_id: project.id,
-                        cwd: project_root,
-                        size: TerminalSize::default(),
-                        appearance: initial_appearance,
-                        scrollback_limit: initial_scrollback,
-                        shell_program: initial_shell_program.clone(),
-                        shell_args: initial_shell_args.clone(),
-                        shell_features: initial_shell_features.clone(),
-                    })
-                    .expect("failed to create initial terminal session");
-                let session = match response {
-                    DaemonResponse::SessionCreated { session } => session,
-                    response => panic!("unexpected create-session response: {response:?}"),
-                };
-                sessions.push(session);
-            }
-            (project, sessions)
-        };
-        for session in &sessions {
-            if let Err(error) = client.request(ClientRequest::SetAppearance {
-                session_id: session.id,
-                appearance: initial_appearance,
-            }) {
-                eprintln!("failed to initialize terminal appearance: {error:#}");
-            }
-        }
-        let snapshots = sessions
-            .iter()
-            .filter_map(|session| {
-                match client.request(ClientRequest::Snapshot {
-                    session_id: session.id,
-                }) {
-                    Ok(DaemonResponse::Snapshot { snapshot }) => Some((session.id, snapshot)),
-                    _ => None,
-                }
-            })
-            .collect::<HashMap<_, _>>();
+        let project_store = ProjectStore::load();
 
         gpui_platform::application().run(move |cx: &mut App| {
             cx.set_app_identity("me.daidr.eggie", "Eggie");
@@ -684,73 +703,306 @@ impl EggieApp {
                 .add_fonts(vec![Cow::Borrowed(HUGEICONS_FONT)])
                 .expect("failed to register the embedded Hugeicons font");
             let settings = cx.new(|_| settings_store);
-            crate::settings_window::install(settings.clone(), cx);
-            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-            let project = project.clone();
-            let sessions = sessions.clone();
-            let snapshots = snapshots.clone();
-            let client = client.clone();
-            let settings = settings.clone();
-            let notification_routes = notification_routes.clone();
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(
-                            px(TRAFFIC_LIGHT_INSET),
-                            px(TRAFFIC_LIGHT_INSET),
-                        )),
-                    }),
-                    app_owns_titlebar_drag: true,
-                    window_min_size: Some(size(px(760.), px(480.))),
-                    ..Default::default()
+            let project_store = cx.new(|_| project_store);
+            crate::settings_window::install(
+                settings.clone(),
+                project_store.clone(),
+                client.clone(),
+                notification_routes.clone(),
+                cx,
+            );
+            Self::open_new_window(
+                cx,
+                client.clone(),
+                settings.clone(),
+                project_store.clone(),
+                notification_routes.clone(),
+                NewWindowInit::ColdStart {
+                    project_root: project_root.clone(),
                 },
-                move |window, cx| {
-                    cx.new(|cx| {
-                        Self::new(
-                            project.clone(),
-                            sessions.clone(),
-                            snapshots.clone(),
-                            client.clone(),
-                            settings.clone(),
-                            notification_routes.clone(),
-                            window,
-                            cx,
-                        )
-                    })
-                },
-            )
-            .expect("failed to open Eggie window");
+            );
+            // Single-instance listener: bind the GUI wake socket so subsequent `eggie` invocations
+            // open a window here instead of starting a second process.
+            Self::spawn_wake_listener(
+                cx,
+                client.clone(),
+                settings.clone(),
+                project_store.clone(),
+                notification_routes.clone(),
+            );
+            // D9: quitting when the last main window closes. The daemon and its sessions live on
+            // independently; the next `eggie` invocation reopens a window and reclaims them. The
+            // settings window alone must not keep the process alive, so only count `EggieApp` windows.
+            cx.on_window_closed(|cx, _closed_window_id| {
+                let has_main_window = cx
+                    .windows()
+                    .into_iter()
+                    .any(|window| window.downcast::<EggieApp>().is_some());
+                if !has_main_window {
+                    cx.quit();
+                }
+            })
+            .detach();
             cx.activate(true);
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        project: Project,
-        sessions: Vec<SessionSummary>,
-        snapshots: HashMap<SessionId, Arc<TerminalSnapshot>>,
+    /// Bind the GUI single-instance socket and serve wake requests. A blocking `accept` loop runs on
+    /// a dedicated std thread (the socket API is blocking); each decoded [`GuiWakeMessage`] is pushed
+    /// onto a channel that a foreground task drains, so window creation happens on the main thread.
+    fn spawn_wake_listener(
+        cx: &mut App,
         client: DaemonClient,
         settings: Entity<SettingsStore>,
+        project_store: Entity<ProjectStore>,
         notification_routes: NotificationRoutes,
+    ) {
+        crate::gui_ipc::reap_stale_gui_sockets();
+        let listener = match crate::gui_ipc::bind_listener() {
+            Ok(listener) => listener,
+            Err(error) => {
+                // Losing the bind race just means another instance is the primary; degrade to a
+                // standalone window rather than failing.
+                eprintln!("single-instance listener unavailable: {error:#}");
+                return;
+            }
+        };
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+        std::thread::Builder::new()
+            .name("eggie-gui-wake".to_owned())
+            .spawn(move || {
+                crate::gui_ipc::serve(listener, |message| match message {
+                    crate::gui_ipc::GuiWakeMessage::OpenWindow { cwd } => {
+                        let _ = tx.unbounded_send(cwd);
+                    }
+                });
+            })
+            .expect("failed to start GUI wake listener thread");
+
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            use futures::StreamExt;
+            while let Some(cwd) = rx.next().await {
+                let client = client.clone();
+                let settings = settings.clone();
+                let project_store = project_store.clone();
+                let notification_routes = notification_routes.clone();
+                cx.update(|cx| {
+                    // D4: reuse a project with the same root, otherwise add one, then open a window
+                    // focused on it.
+                    let (project_id, _created) = project_store
+                        .update(cx, |store, cx| store.upsert_by_root(cwd.clone(), cx));
+                    Self::open_new_window(
+                        cx,
+                        client,
+                        settings,
+                        project_store.clone(),
+                        notification_routes,
+                        NewWindowInit::OpenDir { project_id },
+                    );
+                    cx.activate(true);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Open a new main window on an already-running app. Called for the first (cold-start) window
+    /// and for every subsequent `New Window` / single-instance wake. All windows share the same
+    /// `settings` and `project_store` entities, so their project lists stay in sync.
+    pub(crate) fn open_new_window(
+        cx: &mut App,
+        client: DaemonClient,
+        settings: Entity<SettingsStore>,
+        project_store: Entity<ProjectStore>,
+        notification_routes: NotificationRoutes,
+        init: NewWindowInit,
+    ) {
+        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(
+                        px(TRAFFIC_LIGHT_INSET),
+                        px(TRAFFIC_LIGHT_INSET),
+                    )),
+                }),
+                app_owns_titlebar_drag: true,
+                window_min_size: Some(size(px(760.), px(480.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                cx.new(|cx| {
+                    Self::new(
+                        WindowId::new_v4(),
+                        client,
+                        settings,
+                        project_store,
+                        notification_routes,
+                        init,
+                        window,
+                        cx,
+                    )
+                })
+            },
+        )
+        .expect("failed to open Eggie window");
+    }
+
+    /// Resolve a [`NewWindowInit`] into this window's `(active_project, owned_sessions)`, mutating the
+    /// shared [`ProjectStore`] as needed. Runs before the `EggieApp` struct exists, so it takes the
+    /// pieces it needs explicitly and talks to the daemon directly.
+    fn seed_window(
+        init: &NewWindowInit,
+        window_id: WindowId,
+        client: &DaemonClient,
+        project_store: &Entity<ProjectStore>,
+        config: &crate::settings::AppSettings,
+        appearance: TerminalAppearance,
+        cx: &mut Context<Self>,
+    ) -> (ProjectId, Vec<SessionSummary>) {
+        match init {
+            NewWindowInit::ColdStart { project_root } => {
+                Self::seed_cold_start(project_root, window_id, client, project_store, config, appearance, cx)
+            }
+            NewWindowInit::OpenDir { project_id } => {
+                // The project already exists in the shared store (added by the waking path). Open one
+                // terminal in it, since `eggie <dir>` is an explicit request for a terminal there.
+                let root = project_store
+                    .read(cx)
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == *project_id)
+                    .map(|project| project.effective_root())
+                    .unwrap_or_else(fallback_home_dir);
+                let sessions = Self::create_session(client, *project_id, window_id, root, config, appearance)
+                    .into_iter()
+                    .collect();
+                (*project_id, sessions)
+            }
+            NewWindowInit::Empty => {
+                // New Window (Cmd+N): activate the first shared project, show it empty (D7).
+                let active = project_store
+                    .read(cx)
+                    .projects()
+                    .first()
+                    .map(|project| project.id);
+                match active {
+                    Some(id) => (id, Vec::new()),
+                    None => {
+                        // No projects at all (should not happen once Home exists); create one.
+                        let project = Project::new("Home".to_owned());
+                        let id = project.id;
+                        project_store.update(cx, |store, cx| store.add(project, cx));
+                        (id, Vec::new())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cold-start seeding: reconcile the persisted project list with the daemon's surviving sessions.
+    fn seed_cold_start(
+        project_root: &Path,
+        window_id: WindowId,
+        client: &DaemonClient,
+        project_store: &Entity<ProjectStore>,
+        config: &crate::settings::AppSettings,
+        appearance: TerminalAppearance,
+        cx: &mut Context<Self>,
+    ) -> (ProjectId, Vec<SessionSummary>) {
+        let all_sessions = match client.request(ClientRequest::ListSessions) {
+            Ok(DaemonResponse::Sessions { sessions }) => sessions,
+            _ => Vec::new(),
+        };
+        // Adopt a project for the launch directory: reuse a persisted project with the same root,
+        // otherwise create one. If there are no persisted projects at all, fall back to Home.
+        let (active_project, project_root_buf) = project_store.update(cx, |store, cx| {
+            let (id, _) = store.upsert_by_root(project_root.to_path_buf(), cx);
+            (id, project_root.to_path_buf())
+        });
+
+        // Claim every surviving session whose project this window is adopting, and any that match the
+        // launch directory, into this window. This preserves the old "restart keeps your terminals".
+        let mut owned: Vec<SessionSummary> = Vec::new();
+        for session in all_sessions {
+            let belongs = session.project_id == active_project
+                || session.initial_directory == project_root_buf;
+            if !belongs {
+                continue;
+            }
+            if let Ok(DaemonResponse::SessionClaimed { session }) =
+                client.request(ClientRequest::ClaimSession {
+                    session_id: session.id,
+                    window_id,
+                })
+            {
+                owned.push(session);
+            }
+        }
+
+        // Nothing to adopt: open a fresh terminal so the window is not empty on first launch.
+        if owned.is_empty() {
+            let root = project_store
+                .read(cx)
+                .projects()
+                .iter()
+                .find(|project| project.id == active_project)
+                .map(|project| project.effective_root())
+                .unwrap_or(project_root_buf);
+            owned.extend(Self::create_session(
+                client,
+                active_project,
+                window_id,
+                root,
+                config,
+                appearance,
+            ));
+        }
+        (active_project, owned)
+    }
+
+    /// Spawn a single terminal session in the daemon, returning its summary (or `None` on error).
+    fn create_session(
+        client: &DaemonClient,
+        project_id: ProjectId,
+        window_id: WindowId,
+        cwd: PathBuf,
+        config: &crate::settings::AppSettings,
+        appearance: TerminalAppearance,
+    ) -> Option<SessionSummary> {
+        match client.request(ClientRequest::CreateSession {
+            project_id,
+            window_id,
+            cwd,
+            size: TerminalSize::default(),
+            appearance,
+            scrollback_limit: config.scrollback_lines,
+            shell_program: config.shell_program.clone(),
+            shell_args: config.shell_args.clone(),
+            shell_features: config.shell_features_string(),
+        }) {
+            Ok(DaemonResponse::SessionCreated { session }) => Some(session),
+            other => {
+                eprintln!("failed to create terminal session: {other:?}");
+                None
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        window_id: WindowId,
+        client: DaemonClient,
+        settings: Entity<SettingsStore>,
+        project_store: Entity<ProjectStore>,
+        notification_routes: NotificationRoutes,
+        init: NewWindowInit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut session_iter = sessions.iter();
-        let first = session_iter
-            .next()
-            .expect("a project must start with a terminal");
-        let mut layout = LayoutNode::group(TabItem::terminal(first.id, first.title.clone()));
-        let first_group_id = layout.first_group_id();
-        let group = layout
-            .find_group_mut(first_group_id)
-            .expect("new layout must contain its first group");
-        for session in session_iter {
-            group.add_item(TabItem::terminal(session.id, session.title.clone()));
-        }
-        let active_group_id = layout.first_group_id();
         let config = settings.read(cx).config().clone();
         let terminal_theme = config.effective_theme(is_dark_appearance(window.appearance()));
         let terminal_appearance = terminal_theme.appearance();
@@ -759,6 +1011,36 @@ impl EggieApp {
             stale_ms: config.progress_stale_timeout_secs.saturating_mul(1_000),
         };
         let colors = UiColors::from_theme(terminal_theme);
+
+        // Resolve the requested init into this window's active project and owned sessions, mutating
+        // the shared project store as needed (seeding Home / adopting the launch directory).
+        let (active_project, sessions) = Self::seed_window(
+            &init,
+            window_id,
+            &client,
+            &project_store,
+            &config,
+            terminal_appearance,
+            cx,
+        );
+
+        // Build a per-window view for every shared project (empty by default), then place this
+        // window's sessions into their project's layout so adopted terminals show up as tabs.
+        let projects = project_store.read(cx).projects().to_vec();
+        let mut project_views: HashMap<ProjectId, WindowProjectView> = projects
+            .iter()
+            .map(|project| (project.id, WindowProjectView::empty()))
+            .collect();
+        for session in &sessions {
+            if let Some(view) = project_views.get_mut(&session.project_id) {
+                let group_id = view.layout.first_group_id();
+                if let Some(group) = view.layout.find_group_mut(group_id) {
+                    group.add_item(TabItem::terminal(session.id, session.title.clone()));
+                }
+                view.active_group_id = group_id;
+            }
+        }
+
         for session in &sessions {
             if let Err(error) = client.request(ClientRequest::SetAppearance {
                 session_id: session.id,
@@ -799,7 +1081,25 @@ impl EggieApp {
                 eprintln!("failed to set terminal scrollback limit: {error:#}");
             }
         }
+        let snapshots = sessions
+            .iter()
+            .filter_map(|session| {
+                match client.request(ClientRequest::Snapshot {
+                    session_id: session.id,
+                }) {
+                    Ok(DaemonResponse::Snapshot { snapshot }) => Some((session.id, snapshot)),
+                    _ => None,
+                }
+            })
+            .collect::<HashMap<_, _>>();
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        // Cross-window project sync: when any window mutates the shared store, reconcile this
+        // window's per-project views (add/drop) and re-render.
+        cx.observe(&project_store, |app, _, cx| {
+            app.reconcile_project_views(cx);
+            cx.notify();
+        })
+        .detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         let terminal_font_families = config.resolved_font_families();
@@ -848,14 +1148,16 @@ impl EggieApp {
             osc_watchers: HashSet::new(),
             progress_updates: HashMap::new(),
             pending_progress_updates: HashMap::new(),
-            projects: vec![ProjectWorkspace {
-                project,
-                layout,
-                active_group_id,
-            }],
-            active_project: 0,
+            window_id,
+            project_store,
+            projects,
+            project_views,
+            active_project,
             collapsed_projects: HashSet::new(),
             sessions,
+            detached_sessions: Vec::new(),
+            detached_popover_open: false,
+            detached_toggle_bounds: None,
             snapshots,
             terminal_sizes: HashMap::new(),
             terminal_resize_in_flight: HashMap::new(),
@@ -1811,19 +2113,7 @@ impl EggieApp {
                     .await;
                 let update = this.update_in(cx, |app, _window, cx| match result {
                     Ok(DaemonResponse::Sessions { sessions }) => {
-                        let mut changed = false;
-                        for session in &sessions {
-                            changed |= app.synchronize_session_title(session.id, &session.title);
-                        }
-                        if app.sessions != sessions {
-                            app.sessions = sessions;
-                            changed = true;
-                        }
-                        if changed {
-                            app.ensure_progress_watchers(cx);
-                            app.ensure_osc_watchers(cx);
-                            cx.notify();
-                        }
+                        app.apply_session_list(sessions, cx);
                     }
                     Ok(response) => eprintln!("unexpected sessions response: {response:?}"),
                     Err(error) => eprintln!("session polling failed: {error:#}"),
@@ -1836,6 +2126,96 @@ impl EggieApp {
             }
         })
         .detach();
+    }
+
+    /// Classify the daemon's flat session list into this window's own sessions and the detached
+    /// (unowned) ones, then reconcile local state. Sessions owned by other windows are ignored.
+    ///
+    /// A session this window previously owned can vanish from its own set here — either terminated
+    /// elsewhere, or (R10) claimed by another window between polls. In that case its tabs are pruned
+    /// from every project layout so the window never renders a terminal the daemon no longer assigns
+    /// to it.
+    fn apply_session_list(&mut self, sessions: Vec<SessionSummary>, cx: &mut Context<Self>) {
+        let mut owned = Vec::new();
+        let mut detached = Vec::new();
+        for session in sessions {
+            match session.window_id {
+                Some(window_id) if window_id == self.window_id => owned.push(session),
+                None => detached.push(session),
+                Some(_) => {} // owned by another window — not visible here
+            }
+        }
+
+        let mut changed = false;
+        for session in &owned {
+            changed |= self.synchronize_session_title(session.id, &session.title);
+        }
+
+        // Prune tabs for sessions this window no longer owns (terminated or claimed away).
+        let owned_ids: HashSet<SessionId> = owned.iter().map(|session| session.id).collect();
+        let vanished: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|session| !owned_ids.contains(&session.id))
+            .map(|session| session.id)
+            .collect();
+        for session_id in vanished {
+            changed |= self.prune_session_from_layouts(session_id);
+        }
+
+        if self.sessions != owned {
+            self.sessions = owned;
+            changed = true;
+        }
+        if self.detached_sessions != detached {
+            self.detached_sessions = detached;
+            changed = true;
+        }
+
+        if changed {
+            self.ensure_snapshot_watchers(cx);
+            self.ensure_progress_watchers(cx);
+            self.ensure_osc_watchers(cx);
+            self.sync_terminal_focus();
+            cx.notify();
+        }
+    }
+
+    /// Remove every tab backed by `session_id` from all project layouts, dropping any per-session
+    /// caches. Returns whether anything changed. Used when a session leaves this window's ownership.
+    fn prune_session_from_layouts(&mut self, session_id: SessionId) -> bool {
+        let mut changed = false;
+        // Collect (project_id, group_id, item_id) for every tab of this session across all views.
+        let targets: Vec<(ProjectId, GroupId, ItemId)> = self
+            .project_views
+            .iter()
+            .filter_map(|(project_id, view)| {
+                view.layout
+                    .find_terminal_item(session_id)
+                    .map(|(group_id, item_id)| (*project_id, group_id, item_id))
+            })
+            .collect();
+        for (project_id, group_id, item_id) in targets {
+            if let Some(view) = self.project_views.get_mut(&project_id) {
+                view.layout.close_item(group_id, item_id);
+                if view.layout.find_group(group_id).is_none() {
+                    view.active_group_id = view.layout.first_group_id();
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            if self.terminal_focused_session == Some(session_id) {
+                self.terminal_focused_session = None;
+            }
+            self.snapshots.remove(&session_id);
+            self.terminal_sizes.remove(&session_id);
+            self.terminal_resize_in_flight.remove(&session_id);
+            self.terminal_ime_states.remove(&session_id);
+            self.session_inspections.remove(&session_id);
+            self.session_inspection_errors.remove(&session_id);
+        }
+        changed
     }
 
     fn start_inspection_polling(&mut self, cx: &mut Context<Self>) {
@@ -1952,11 +2332,19 @@ impl EggieApp {
                     let _ = cx.update(|window, cx| {
                         let _ = app.update(cx, |app, _| {
                             if choice == 0 {
+                                // Terminate all: kill this window's sessions.
                                 for session_id in app.window_session_ids() {
                                     let _ = app
                                         .client
                                         .request(ClientRequest::Terminate { session_id });
                                 }
+                            } else {
+                                // Detach (choice == 1): clear this window's ownership so the sessions
+                                // survive as claimable, unowned terminals instead of pointing at a
+                                // window that is about to be destroyed.
+                                let _ = app.client.request(ClientRequest::DetachWindow {
+                                    window_id: app.window_id,
+                                });
                             }
                             app.closing = true;
                         });
@@ -1970,12 +2358,50 @@ impl EggieApp {
         });
     }
 
-    fn workspace(&self) -> &ProjectWorkspace {
-        &self.projects[self.active_project]
+    /// The per-window view for the active project. Invariant: `active_project` always names a
+    /// project that has a view (maintained by `reconcile_project_views` and the always-present Home
+    /// project), so this never returns `None` in practice — matching the old direct-index behaviour.
+    fn workspace(&self) -> &WindowProjectView {
+        self.project_views
+            .get(&self.active_project)
+            .expect("active_project must always have a window view")
     }
 
-    fn workspace_mut(&mut self) -> &mut ProjectWorkspace {
-        &mut self.projects[self.active_project]
+    fn workspace_mut(&mut self) -> &mut WindowProjectView {
+        self.project_views
+            .get_mut(&self.active_project)
+            .expect("active_project must always have a window view")
+    }
+
+    /// The shared `Project` (id/name/root) for the active project, from the local mirror.
+    fn active_project_data(&self) -> &Project {
+        self.projects
+            .iter()
+            .find(|project| project.id == self.active_project)
+            .expect("active_project must exist in the project mirror")
+    }
+
+    /// Rebuild `project_views` and the local `projects` mirror to track the shared store: create an
+    /// empty view for each newly-synced project, drop views for removed projects, and keep
+    /// `active_project` pointing at a project that still exists.
+    fn reconcile_project_views(&mut self, cx: &mut Context<Self>) {
+        self.projects = self.project_store.read(cx).projects().to_vec();
+        // Add views for projects that don't have one yet (synced in from another window).
+        for project in &self.projects {
+            self.project_views
+                .entry(project.id)
+                .or_insert_with(WindowProjectView::empty);
+        }
+        // Drop views for projects that no longer exist in the shared list.
+        let live: HashSet<ProjectId> = self.projects.iter().map(|project| project.id).collect();
+        self.project_views.retain(|id, _| live.contains(id));
+        self.collapsed_projects.retain(|id| live.contains(id));
+        // Keep the active project valid; fall back to the first project if it was removed.
+        if !live.contains(&self.active_project)
+            && let Some(first) = self.projects.first()
+        {
+            self.active_project = first.id;
+        }
     }
 
     fn active_session_id(&self) -> Option<SessionId> {
@@ -2024,16 +2450,10 @@ impl EggieApp {
         }
     }
 
+    /// Ids of the sessions this window owns. `self.sessions` is already filtered to this window's
+    /// sessions by the polling classifier, so this is just their ids.
     fn window_session_ids(&self) -> Vec<SessionId> {
-        self.sessions
-            .iter()
-            .filter(|session| {
-                self.projects
-                    .iter()
-                    .any(|project| project.project.id == session.project_id)
-            })
-            .map(|session| session.id)
-            .collect()
+        self.sessions.iter().map(|session| session.id).collect()
     }
 
     /// Keeps the daemon session summary and every tab model in lockstep. The sidebar renders the
@@ -2050,10 +2470,69 @@ impl EggieApp {
             session.title = title.to_owned();
             changed = true;
         }
-        for project in &mut self.projects {
-            changed |= project.layout.update_terminal_title(session_id, title);
+        for view in self.project_views.values_mut() {
+            changed |= view.layout.update_terminal_title(session_id, title);
         }
         changed
+    }
+
+    /// Claim a detached session into this window: set its owner to this window in the daemon, then
+    /// place it as a tab in its project's layout. If the session's project isn't in the shared list
+    /// (its project was deleted), fall back to the active project. Activates the claimed session.
+    fn claim_detached_session(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(DaemonResponse::SessionClaimed { session }) =
+            self.client.request(ClientRequest::ClaimSession {
+                session_id,
+                window_id: self.window_id,
+            })
+        else {
+            return;
+        };
+        // Choose the project this session lands in: its own project if this window has a view for it,
+        // otherwise the currently active project (orphaned project_id, R8).
+        let target_project = if self.project_views.contains_key(&session.project_id) {
+            session.project_id
+        } else {
+            self.active_project
+        };
+        if let Some(view) = self.project_views.get_mut(&target_project) {
+            let group_id = view.active_group_id;
+            if let Some(group) = view.layout.find_group_mut(group_id) {
+                group.add_item(TabItem::terminal(session.id, session.title.clone()));
+            }
+        }
+        self.configure_session_progress(session.id);
+        self.configure_session_osc_policy(session.id);
+        self.sessions.push(session);
+        self.detached_sessions
+            .retain(|candidate| candidate.id != session_id);
+        if self.detached_sessions.is_empty() {
+            self.detached_popover_open = false;
+        }
+        self.active_project = target_project;
+        self.activate_session(target_project, session_id, window, cx);
+        self.ensure_snapshot_watchers(cx);
+        self.ensure_progress_watchers(cx);
+        self.ensure_osc_watchers(cx);
+        cx.notify();
+    }
+
+    /// Permanently terminate a detached session from the popover.
+    fn destroy_detached_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let _ = self
+            .client
+            .request(ClientRequest::Terminate { session_id });
+        self.detached_sessions
+            .retain(|candidate| candidate.id != session_id);
+        if self.detached_sessions.is_empty() {
+            self.detached_popover_open = false;
+        }
+        cx.notify();
     }
 
     fn configure_session_progress(&self, session_id: SessionId) {
@@ -2107,7 +2586,7 @@ impl EggieApp {
         split: Option<Direction>,
         cx: &mut Context<Self>,
     ) {
-        let project = self.workspace().project.clone();
+        let project = self.active_project_data().clone();
         let config = self.settings.read(cx).config();
         let scrollback_limit = config.scrollback_lines;
         let shell_program = config.shell_program.clone();
@@ -2116,6 +2595,7 @@ impl EggieApp {
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
+                window_id: self.window_id,
                 cwd: project.effective_root(),
                 size: TerminalSize::default(),
                 appearance: self.terminal_appearance,
@@ -2175,48 +2655,27 @@ impl EggieApp {
             .detach();
     }
 
+    /// Add a new project to the shared store. Per D2/D7 this does NOT spawn a terminal — the new
+    /// project starts empty (an empty layout) and the first terminal is created when the user acts
+    /// in it. `reconcile_project_views` (driven by the store observer) creates the empty view; here
+    /// we just make the new project active in this window.
     fn add_project(&mut self, name: String, cx: &mut Context<Self>) {
         let project = Project::new(name);
-        let config = self.settings.read(cx).config();
-        let scrollback_limit = config.scrollback_lines;
-        let shell_program = config.shell_program.clone();
-        let shell_args = config.shell_args.clone();
-        let shell_features = config.shell_features_string();
-        let Ok(DaemonResponse::SessionCreated { session }) =
-            self.client.request(ClientRequest::CreateSession {
-                project_id: project.id,
-                cwd: project.effective_root(),
-                size: TerminalSize::default(),
-                appearance: self.terminal_appearance,
-                scrollback_limit,
-                shell_program,
-                shell_args,
-                shell_features,
-            })
-        else {
-            return;
-        };
-        self.sessions.push(session.clone());
-        let layout = LayoutNode::group(TabItem::terminal(session.id, session.title.clone()));
-        let active_group_id = layout.first_group_id();
-        self.projects.push(ProjectWorkspace {
-            project,
-            layout,
-            active_group_id,
-        });
-        self.configure_session_progress(session.id);
-        self.configure_session_osc_policy(session.id);
-        self.active_project = self.projects.len() - 1;
+        let id = project.id;
+        self.project_store
+            .update(cx, |store, cx| store.add(project, cx));
+        // The observer reconciles views asynchronously; reconcile now so `active_project` is valid
+        // immediately (the store update already notified, but our own view map lags until reconcile).
+        self.reconcile_project_views(cx);
+        self.active_project = id;
         self.ensure_snapshot_watchers(cx);
-        self.ensure_progress_watchers(cx);
-        self.ensure_osc_watchers(cx);
         self.sync_terminal_focus();
         cx.notify();
     }
 
-    fn activate_project(&mut self, project_index: usize, cx: &mut Context<Self>) {
-        if project_index < self.projects.len() {
-            self.active_project = project_index;
+    fn activate_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        if self.project_views.contains_key(&project_id) {
+            self.active_project = project_id;
             self.ensure_snapshot_watchers(cx);
             self.sync_terminal_focus();
             cx.notify();
@@ -2232,11 +2691,7 @@ impl EggieApp {
         cx.notify();
     }
 
-    fn prompt_set_project_root(
-        &mut self,
-        project_index: usize,
-        cx: &mut Context<Self>,
-    ) {
+    fn prompt_set_project_root(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -2248,10 +2703,8 @@ impl EggieApp {
             let mut paths = paths.await.ok()?.ok()??;
             let root = paths.pop()?;
             app.update(cx, move |app, cx| {
-                if let Some(workspace) = app.projects.get_mut(project_index) {
-                    workspace.project.root = Some(root);
-                    cx.notify();
-                }
+                app.project_store
+                    .update(cx, |store, cx| store.set_root(project_id, Some(root), cx));
             })
             .ok()?;
             Some(())
@@ -2261,15 +2714,15 @@ impl EggieApp {
 
     fn show_project_context_menu(
         &mut self,
-        project_index: usize,
+        project_id: ProjectId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        let Some(workspace) = self.projects.get(project_index) else {
+        let Some(view) = self.project_views.get(&project_id) else {
             return;
         };
-        let tab_count = workspace.layout.item_count();
+        let tab_count = view.layout.item_count();
         let Some(menu) = prepare_project_menu(window, tab_count, self.language) else {
             return;
         };
@@ -2278,21 +2731,21 @@ impl EggieApp {
                 return;
             };
             this.update(cx, move |app, cx| {
-                if app.projects.get(project_index).is_none() {
+                if !app.project_views.contains_key(&project_id) {
                     return;
                 }
                 match command {
                     NativeProjectMenuCommand::EditName => {
-                        app.prompt_rename_project(project_index, cx);
+                        app.prompt_rename_project(project_id, cx);
                     }
                     NativeProjectMenuCommand::SetRoot => {
-                        app.prompt_set_project_root(project_index, cx);
+                        app.prompt_set_project_root(project_id, cx);
                     }
                     NativeProjectMenuCommand::CloseTabs => {
-                        app.close_project_tabs(project_index, cx);
+                        app.close_project_tabs(project_id, cx);
                     }
                     NativeProjectMenuCommand::DeleteProject => {
-                        app.delete_project(project_index, cx);
+                        app.delete_project(project_id, cx);
                     }
                 }
             })
@@ -2347,11 +2800,11 @@ impl EggieApp {
         }
     }
 
-    fn prompt_rename_project(&mut self, project_index: usize, cx: &mut Context<Self>) {
-        let Some(workspace) = self.projects.get(project_index) else {
+    fn prompt_rename_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.iter().find(|project| project.id == project_id) else {
             return;
         };
-        let current_name = workspace.project.name.clone();
+        let current_name = project.name.clone();
         let language = self.language;
         let Some(window) = cx.active_window() else {
             return;
@@ -2374,10 +2827,9 @@ impl EggieApp {
                         return None;
                     }
                     app.update(cx, move |app, cx| {
-                        if let Some(workspace) = app.projects.get_mut(project_index) {
-                            workspace.project.name = name.to_owned();
-                            cx.notify();
-                        }
+                        app.project_store.update(cx, |store, cx| {
+                            store.rename(project_id, name.to_owned(), cx)
+                        });
                     })
                     .ok()?;
                     Some(())
@@ -2387,19 +2839,16 @@ impl EggieApp {
             .ok();
     }
 
-    fn close_project_tabs(&mut self, project_index: usize, cx: &mut Context<Self>) {
-        let Some(workspace) = self.projects.get(project_index) else {
+    fn close_project_tabs(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        let Some(view) = self.project_views.get(&project_id) else {
             return;
         };
-        let items_to_close: Vec<(GroupId, ItemId)> = workspace
+        let items_to_close: Vec<(GroupId, ItemId)> = view
             .layout
             .terminal_items()
             .filter_map(|item| {
-                item.session_id.and_then(|session_id| {
-                    workspace
-                        .layout
-                        .find_terminal_item(session_id)
-                })
+                item.session_id
+                    .and_then(|session_id| view.layout.find_terminal_item(session_id))
             })
             .collect();
         for (group_id, item_id) in items_to_close {
@@ -2407,30 +2856,29 @@ impl EggieApp {
         }
     }
 
-    fn delete_project(&mut self, project_index: usize, cx: &mut Context<Self>) {
-        if project_index >= self.projects.len() {
+    fn delete_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        let Some(view) = self.project_views.get(&project_id) else {
             return;
-        }
-        let workspace = self.projects.remove(project_index);
-        let items_to_close: Vec<(GroupId, ItemId)> = workspace
+        };
+        // Terminate this window's terminals in the project before dropping it from the shared list.
+        let items_to_close: Vec<(GroupId, ItemId)> = view
             .layout
             .terminal_items()
             .filter_map(|item| {
-                item.session_id.and_then(|session_id| {
-                    workspace
-                        .layout
-                        .find_terminal_item(session_id)
-                })
+                item.session_id
+                    .and_then(|session_id| view.layout.find_terminal_item(session_id))
             })
             .collect();
         for (group_id, item_id) in items_to_close {
             self.close_item(group_id, item_id, cx);
         }
-        self.collapsed_projects.remove(&workspace.project.id);
+        // Remove from the shared store (syncs to all windows); the observer reconciles views.
+        self.project_store
+            .update(cx, |store, cx| store.remove(project_id, cx));
+        self.reconcile_project_views(cx);
+        // D8: never leave the list empty — recreate a default Home project.
         if self.projects.is_empty() {
             self.add_project("Home".to_owned(), cx);
-        } else if self.active_project >= self.projects.len() {
-            self.active_project = self.projects.len() - 1;
         }
         self.ensure_snapshot_watchers(cx);
         self.sync_terminal_focus();
@@ -2479,19 +2927,19 @@ impl EggieApp {
 
     fn activate_session(
         &mut self,
-        project_index: usize,
+        project_id: ProjectId,
         session_id: SessionId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some((group_id, item_id)) = self
-            .projects
-            .get(project_index)
-            .and_then(|workspace| workspace.layout.find_terminal_item(session_id))
+            .project_views
+            .get(&project_id)
+            .and_then(|view| view.layout.find_terminal_item(session_id))
         else {
             return;
         };
-        self.active_project = project_index;
+        self.active_project = project_id;
         self.activate_item(group_id, item_id, window, cx);
     }
 
@@ -2501,12 +2949,13 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(project_index) = self
-            .projects
+        if let Some(project_id) = self
+            .project_views
             .iter()
-            .position(|workspace| workspace.layout.find_terminal_item(session_id).is_some())
+            .find(|(_, view)| view.layout.find_terminal_item(session_id).is_some())
+            .map(|(id, _)| *id)
         {
-            self.activate_session(project_index, session_id, window, cx);
+            self.activate_session(project_id, session_id, window, cx);
         }
     }
 
@@ -3451,6 +3900,7 @@ impl EggieApp {
                 IconName::ArrowUp,
                 "terminal-search-prev",
                 colors,
+                None,
                 cx.listener(|app, _, _, cx| {
                     cx.stop_propagation();
                     app.navigate_terminal_search(TerminalSearchDirection::Backward, cx);
@@ -3460,6 +3910,7 @@ impl EggieApp {
                 IconName::ArrowDown,
                 "terminal-search-next",
                 colors,
+                None,
                 cx.listener(|app, _, _, cx| {
                     cx.stop_propagation();
                     app.navigate_terminal_search(TerminalSearchDirection::Forward, cx);
@@ -3469,6 +3920,7 @@ impl EggieApp {
                 IconName::Close,
                 "terminal-search-close",
                 colors,
+                None,
                 cx.listener(|app, _, window, cx| {
                     cx.stop_propagation();
                     app.close_terminal_search(window, cx);
@@ -3753,6 +4205,7 @@ impl EggieApp {
                 IconName::PanelLeftOpen,
                 "collapse-left-sidebar",
                 self.colors,
+                Some(self.language.collapse_sidebar_tooltip().into()),
                 cx.listener(|app, _, _, cx| {
                     cx.stop_propagation();
                     app.toggle_left_sidebar(cx);
@@ -4072,13 +4525,12 @@ impl EggieApp {
     /// silently disappear from the sidebar.
     fn sidebar_sessions_in_layout_order<'a>(
         &'a self,
-        workspace: &'a ProjectWorkspace,
+        project_id: ProjectId,
+        view: &'a WindowProjectView,
     ) -> Vec<&'a SessionSummary> {
-        let project_id = workspace.project.id;
-
         // Reading-order position of each session within the layout tree.
         let mut layout_rank: HashMap<SessionId, usize> = HashMap::new();
-        for item in workspace.layout.terminal_items() {
+        for item in view.layout.terminal_items() {
             if let Some(session_id) = item.session_id {
                 let next_rank = layout_rank.len();
                 layout_rank.entry(session_id).or_insert(next_rank);
@@ -4098,6 +4550,199 @@ impl EggieApp {
         sessions
     }
 
+    /// The button next to "add project" that opens the detached-session popover. Rendered only when
+    /// there is at least one detached session (D6), with a count badge.
+    fn render_detached_sessions_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.detached_sessions.is_empty() {
+            return None;
+        }
+        let count = self.detached_sessions.len();
+        let colors = self.colors;
+        let tooltip: SharedString = self.language.detached_sessions_tooltip().into();
+        let control = cx.entity().downgrade();
+        Some(
+            div()
+                // Capture the toggle's on-screen bounds so the popover can anchor just below it.
+                .on_children_prepainted(move |children, _, cx| {
+                    let Some(bounds) = children.first().copied() else {
+                        return;
+                    };
+                    let control = control.clone();
+                    cx.defer(move |cx| {
+                        control
+                            .update(cx, |app, cx| {
+                                if app.detached_toggle_bounds != Some(bounds) {
+                                    app.detached_toggle_bounds = Some(bounds);
+                                    if app.detached_popover_open {
+                                        cx.notify();
+                                    }
+                                }
+                            })
+                            .ok();
+                    });
+                })
+                .child(
+                    div()
+                        .id("detached-sessions-toggle")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .h(px(24.))
+                        .px_2()
+                        .rounded_lg()
+                        .text_color(rgb(colors.muted))
+                        .cursor_pointer()
+                        .hover(move |element| {
+                            element
+                                .bg(rgb(colors.panel_alt))
+                                .text_color(rgb(colors.text))
+                        })
+                        .tooltip(tooltip_text(tooltip, colors))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.detached_popover_open = !app.detached_popover_open;
+                            cx.notify();
+                        }))
+                        .child(icon_sized(IconName::Terminal, 14.))
+                        .child(div().text_size(px(11.)).child(count.to_string())),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The popover listing detached (unowned) sessions grouped by project, each with claim/destroy
+    /// actions (D6). Uses the same anchored + deferred + `.occlude()` overlay pattern as the settings
+    /// dropdowns; `.occlude()` stops clicks on blank areas from falling through to the sidebar.
+    fn render_detached_sessions_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.detached_popover_open || self.detached_sessions.is_empty() {
+            return None;
+        }
+        let colors = self.colors;
+        let claim_tooltip: SharedString = self.language.claim_session_tooltip().into();
+        let destroy_tooltip: SharedString = self.language.destroy_session_tooltip().into();
+
+        // Group detached sessions by project, preserving the shared project order; sessions whose
+        // project no longer exists fall into a trailing "other" group.
+        let mut groups: Vec<(String, Vec<&SessionSummary>)> = Vec::new();
+        let mut grouped_projects: HashSet<ProjectId> = HashSet::new();
+        for project in &self.projects {
+            let members: Vec<&SessionSummary> = self
+                .detached_sessions
+                .iter()
+                .filter(|session| session.project_id == project.id)
+                .collect();
+            if !members.is_empty() {
+                grouped_projects.insert(project.id);
+                groups.push((project.name.clone(), members));
+            }
+        }
+        let mut orphans: Vec<&SessionSummary> = self
+            .detached_sessions
+            .iter()
+            .filter(|session| !grouped_projects.contains(&session.project_id))
+            .collect();
+        if !orphans.is_empty() {
+            orphans.sort_by(|a, b| a.initial_directory.cmp(&b.initial_directory));
+            groups.push((self.language.detached_other_group().to_owned(), orphans));
+        }
+
+        let mut list = div().flex().flex_col().py_1();
+        for (title, members) in groups {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.muted))
+                    .child(title),
+            );
+            for session in members {
+                let session_id = session.id;
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .hover(move |element| element.bg(rgb(colors.hover)))
+                        .child(icon_sized(IconName::Terminal, 14.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .child(session.title.clone()),
+                        )
+                        .child(icon_button(
+                            IconName::CombineIcon,
+                            SharedString::from(format!("claim-detached-{session_id}")),
+                            colors,
+                            Some(claim_tooltip.clone()),
+                            cx.listener(move |app, _, window, cx| {
+                                app.claim_detached_session(session_id, window, cx)
+                            }),
+                        ))
+                        .child(icon_button(
+                            IconName::Close,
+                            SharedString::from(format!("destroy-detached-{session_id}")),
+                            colors,
+                            Some(destroy_tooltip.clone()),
+                            cx.listener(move |app, _, _, cx| {
+                                app.destroy_detached_session(session_id, cx)
+                            }),
+                        )),
+                );
+            }
+        }
+
+        let popover = div()
+            .flex()
+            .flex_col()
+            .w(px(260.))
+            .max_h(px(360.))
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_lg()
+            // Floating overlay: block mouse events for the sidebar rows behind it so clicks on the
+            // popover's blank areas don't bubble through (see [[gpui-overlay-occlude]]).
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
+                cx.defer_in(window, move |app, _, cx| {
+                    if app.detached_popover_open {
+                        app.detached_popover_open = false;
+                        cx.notify();
+                    }
+                });
+            }))
+            .child(list);
+
+        // Anchor the popover just below the toggle button. Anchoring the popover's top-right corner
+        // to the button's bottom-right opens it downward and leftward, keeping it inside the sidebar.
+        // Fall back to a window-snapped corner until the button's bounds have been captured once.
+        let anchored_popover = match self.detached_toggle_bounds {
+            Some(bounds) => anchored()
+                .anchor(Anchor::TopRight)
+                .position(point(bounds.right(), bounds.bottom() + px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+            None => anchored()
+                .anchor(Anchor::TopRight)
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+        };
+
+        Some(deferred(anchored_popover).priority(2).into_any_element())
+    }
+
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div()
             .flex()
@@ -4111,22 +4756,37 @@ impl EggieApp {
             .child(
                 div().flex().flex_col().px_3().pb_3().gap_3().child(
                     div()
+                        .relative()
                         .flex()
                         .items_center()
                         .justify_between()
                         .child(section_label(self.language.projects_label(), self.colors))
-                        .child(icon_button(
-                            IconName::Add,
-                            "add-project",
-                            self.colors,
-                            cx.listener(|app, _, window, cx| app.prompt_add_project(window, cx)),
-                        )),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .children(self.render_detached_sessions_button(cx))
+                                .child(icon_button(
+                                    IconName::Add,
+                                    "add-project",
+                                    self.colors,
+                                    Some(self.language.add_project_tooltip().into()),
+                                    cx.listener(|app, _, window, cx| {
+                                        app.prompt_add_project(window, cx)
+                                    }),
+                                )),
+                        )
+                        .children(self.render_detached_sessions_popover(cx)),
                 ),
             );
-        for (index, workspace) in self.projects.iter().enumerate() {
-            let project_id = workspace.project.id;
+        for (index, project) in self.projects.iter().enumerate() {
+            let project_id = project.id;
+            let Some(view) = self.project_views.get(&project_id) else {
+                continue;
+            };
             let collapsed = self.collapsed_projects.contains(&project_id);
-            let project_index = index;
+            let is_active_project = project_id == self.active_project;
             panel = panel.child(
                 div()
                     .id(format!("project-{index}"))
@@ -4140,7 +4800,7 @@ impl EggieApp {
                     .py_1()
                     .rounded_md()
                     .mb_1()
-                    .when(index == self.active_project, |element| {
+                    .when(is_active_project, |element| {
                         element.bg(rgb(self.colors.panel_alt))
                     })
                     .hover({
@@ -4149,13 +4809,13 @@ impl EggieApp {
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |app, _, _, cx| {
-                        app.activate_project(project_index, cx);
+                        app.activate_project(project_id, cx);
                         app.toggle_project_collapsed(project_id, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |app, _, window, cx| {
-                            app.show_project_context_menu(project_index, window, cx)
+                            app.show_project_context_menu(project_id, window, cx)
                         }),
                     )
                     .child(div().flex_none().child(icon(if collapsed {
@@ -4168,7 +4828,7 @@ impl EggieApp {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(workspace.project.name.clone()),
+                            .child(project.name.clone()),
                     )
                     .child(
                         div()
@@ -4185,8 +4845,9 @@ impl EggieApp {
                     ),
             );
             if !collapsed {
-                for session in self.sidebar_sessions_in_layout_order(workspace) {
-                    let active = self.active_session_id() == Some(session.id);
+                for session in self.sidebar_sessions_in_layout_order(project_id, view) {
+                    let active = is_active_project
+                        && self.active_session_id() == Some(session.id);
                     let session_id = session.id;
                     panel = panel.child(
                         div()
@@ -4220,7 +4881,7 @@ impl EggieApp {
                         })
                         .cursor_pointer()
                         .on_click(cx.listener(move |app, _, window, cx| {
-                            app.activate_session(index, session_id, window, cx)
+                            app.activate_session(project_id, session_id, window, cx)
                         }))
                         .child(self.render_item_icon(
                             ItemKind::Terminal,
@@ -4370,6 +5031,7 @@ impl EggieApp {
                     self.colors,
                     false,
                     false,
+                    Some(self.language.expand_sidebar_tooltip().into()),
                     cx.listener(|app, _, _, cx| app.toggle_left_sidebar(cx)),
                 ));
         }
@@ -4613,6 +5275,7 @@ impl EggieApp {
                 self.colors,
                 false,
                 false,
+                Some(self.language.new_terminal_tooltip().into()),
                 cx.listener(move |app, _, _, cx| app.new_terminal(group_id, None, cx)),
             ));
         if is_top_right_group {
@@ -4627,6 +5290,7 @@ impl EggieApp {
                 self.colors,
                 false,
                 false,
+                Some(self.language.toggle_right_sidebar_tooltip().into()),
                 cx.listener(|app, _, _, cx| app.toggle_right_sidebar(cx)),
             ));
         }
@@ -6395,6 +7059,7 @@ fn icon_button(
     icon_name: IconName,
     id: impl Into<gpui::ElementId>,
     colors: UiColors,
+    tooltip: Option<SharedString>,
     listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -6411,6 +7076,9 @@ fn icon_button(
                 .bg(rgb(colors.panel_alt))
                 .text_color(rgb(colors.text))
         })
+        .when_some(tooltip, |element, text| {
+            element.tooltip(tooltip_text(text, colors))
+        })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(listener)
         .child(icon(icon_name))
@@ -6422,6 +7090,7 @@ fn top_bar_icon_button(
     colors: UiColors,
     border_left: bool,
     border_right: bool,
+    tooltip: Option<SharedString>,
     listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -6437,7 +7106,7 @@ fn top_bar_icon_button(
         .when(border_right, |element| {
             element.border_r_1().border_color(rgb(colors.border))
         })
-        .child(icon_button(icon_name, id, colors, listener))
+        .child(icon_button(icon_name, id, colors, tooltip, listener))
 }
 
 fn item_kind_icon(kind: ItemKind) -> IconName {
