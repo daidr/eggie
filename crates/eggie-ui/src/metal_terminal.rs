@@ -30,6 +30,7 @@ use core_text::{
     string_attributes::{kCTFontAttributeName, kCTForegroundColorFromContextAttributeName},
 };
 use gpui::MetalRenderContext;
+use memmap2::Mmap;
 use metal::{
     CompileOptions, Device, DeviceRef, MTLBlendFactor, MTLBlendOperation, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLStorageMode,
@@ -44,7 +45,7 @@ use std::{
     hash::Hash,
     mem,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
@@ -1839,28 +1840,45 @@ fn styled_font(family: &str, font_size: f32, bold: bool, italic: bool) -> Option
     })
 }
 
-/// Raw font file bytes plus the face index within the file (for `.ttc`/`.otc` collections).
-type FontFileData = (Arc<Vec<u8>>, u32);
-
-thread_local! {
-    /// Cache of font file bytes keyed by resolved PostScript name, so a run doesn't re-read the
-    /// font file every frame. Values include the face index within a font collection.
-    static FONT_DATA_CACHE: RefCell<FxHashMap<String, Option<FontFileData>>> =
-        RefCell::new(FxHashMap::default());
+/// Backing bytes for a font file: an mmap of the file (the common path, so identical files opened
+/// under different PostScript names share physical pages via the page cache and stay reclaimable),
+/// or an owned in-memory copy as a fallback when mmap fails (unusual file systems, sandboxing).
+enum FontBytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
 }
+
+impl std::ops::Deref for FontBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            FontBytes::Mapped(mmap) => mmap,
+            FontBytes::Owned(bytes) => bytes,
+        }
+    }
+}
+
+/// Raw font file bytes plus the face index within the file (for `.ttc`/`.otc` collections).
+type FontFileData = (Arc<FontBytes>, u32);
+
+/// Cache of font file bytes keyed by resolved PostScript name, so a run doesn't re-read the font
+/// file every frame. Shared across threads (not thread-local) so a given font file is mapped once
+/// process-wide, and `Arc<FontBytes>` clones are cheap. Values include the face index within a font
+/// collection.
+static FONT_DATA_CACHE: OnceLock<Mutex<FxHashMap<String, Option<FontFileData>>>> = OnceLock::new();
 
 /// Read a `CTFont`'s backing font file bytes and its face index within the file. Cached per
 /// PostScript name. Returns `None` if the font isn't backed by a readable file on disk.
 fn font_file_data(font: &CTFont) -> Option<FontFileData> {
     let key = font.postscript_name();
-    FONT_DATA_CACHE.with(|cache| {
-        if let Some(entry) = cache.borrow().get(&key) {
-            return entry.clone();
-        }
-        let loaded = load_font_file(font);
-        cache.borrow_mut().insert(key, loaded.clone());
-        loaded
-    })
+    let cache = FONT_DATA_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
+    if let Some(entry) = cache.lock().get(&key) {
+        return entry.clone();
+    }
+    let loaded = load_font_file(font);
+    cache.lock().insert(key, loaded.clone());
+    loaded
 }
 
 /// Load a `CTFont`'s file bytes and locate its face index (its position within a `.ttc`/`.otc`
@@ -1868,13 +1886,25 @@ fn font_file_data(font: &CTFont) -> Option<FontFileData> {
 fn load_font_file(font: &CTFont) -> Option<FontFileData> {
     let url = font.url()?;
     let path = url.to_path()?;
-    let data = std::fs::read(path).ok()?;
+    // Memory-map the font file rather than reading it into the heap: font files are large (a Nerd
+    // Font CJK build is ~20 MB) and rustybuzz only borrows a `&[u8]` slice, so the mapping's clean,
+    // demand-paged pages stay reclaimable and are shared by the kernel across every mapping of the
+    // same file (e.g. the same regular face opened under a synthesized bold PostScript name). The
+    // theoretical hazard is an external truncation causing SIGBUS mid-shape, but font files are
+    // stable for a process's lifetime; if mapping fails we fall back to an owned in-memory copy.
+    let bytes = match std::fs::File::open(&path) {
+        Ok(file) => match unsafe { Mmap::map(&file) } {
+            Ok(mmap) => FontBytes::Mapped(mmap),
+            Err(_) => FontBytes::Owned(std::fs::read(&path).ok()?),
+        },
+        Err(_) => FontBytes::Owned(std::fs::read(&path).ok()?),
+    };
     let target = font.postscript_name();
-    let face_index = rustybuzz::ttf_parser::fonts_in_collection(&data)
+    let face_index = rustybuzz::ttf_parser::fonts_in_collection(&bytes)
         .map(|count| {
             (0..count)
                 .find(|index| {
-                    rustybuzz::ttf_parser::Face::parse(&data, *index)
+                    rustybuzz::ttf_parser::Face::parse(&bytes, *index)
                         .ok()
                         .map(|face| postscript_name_matches(&face, &target))
                         .unwrap_or(false)
@@ -1882,7 +1912,7 @@ fn load_font_file(font: &CTFont) -> Option<FontFileData> {
                 .unwrap_or(0)
         })
         .unwrap_or(0);
-    Some((Arc::new(data), face_index))
+    Some((Arc::new(bytes), face_index))
 }
 
 /// Whether a ttf-parser face's PostScript name (name id 6) matches `target`.
