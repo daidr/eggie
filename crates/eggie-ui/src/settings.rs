@@ -396,6 +396,32 @@ impl BellMode {
     }
 }
 
+/// Which application opens a directory from the right-sidebar "open" button. Persisted so the last
+/// choice becomes the button's default action. `AppWindow`-style custom openers are future work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpenWith {
+    #[default]
+    Finder,
+    VsCode,
+}
+
+impl OpenWith {
+    pub(crate) const ALL: [Self; 2] = [Self::Finder, Self::VsCode];
+
+    /// A stable ascii slug for element ids and i18n lookup (not user-facing on its own).
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Finder => "finder",
+            Self::VsCode => "vscode",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Finder)
+    }
+}
+
 /// The default cursor shape. A running program can still override this at runtime via DECSCUSR
 /// (`CSI Ps SP q`); this only sets the shape used when the program hasn't requested one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +615,10 @@ pub(crate) struct AppSettings {
     pub(crate) cursor_shape: CursorShapeSetting,
     pub(crate) cursor_blink: CursorBlink,
     pub(crate) bell_mode: BellMode,
+    /// Which application the right-sidebar "open directory" button launches. Persisted so the last
+    /// choice sticks across restarts.
+    #[serde(default, skip_serializing_if = "OpenWith::is_default")]
+    pub(crate) open_directory_with: OpenWith,
     #[serde(default, skip_serializing_if = "FontMetricAdjustments::is_empty")]
     pub(crate) font_metrics: FontMetricAdjustments,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -703,6 +733,7 @@ impl Default for AppSettings {
             cursor_shape: CursorShapeSetting::default(),
             cursor_blink: CursorBlink::default(),
             bell_mode: BellMode::default(),
+            open_directory_with: OpenWith::default(),
             font_metrics: FontMetricAdjustments::default(),
             keybindings: std::collections::BTreeMap::new(),
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
@@ -1323,6 +1354,7 @@ mod tests {
             cursor_shape: CursorShapeSetting::Bar,
             cursor_blink: CursorBlink::On,
             bell_mode: BellMode::Sound,
+            open_directory_with: OpenWith::VsCode,
             font_metrics: FontMetricAdjustments::default(),
             keybindings: std::collections::BTreeMap::new(),
             scrollback_lines: MAX_SCROLLBACK_LINES + 1,
@@ -1344,6 +1376,8 @@ mod tests {
         assert_eq!(loaded.config.shell_args, vec!["-l".to_owned()]);
         // A non-default (false) value serializes and survives the round trip.
         assert!(!loaded.config.shell_integration_path);
+        // A non-default opener persists across the round trip.
+        assert_eq!(loaded.config.open_directory_with, OpenWith::VsCode);
         assert_eq!(
             loaded.config.progress_complete_timeout_secs,
             MIN_PROGRESS_TIMEOUT_SECS

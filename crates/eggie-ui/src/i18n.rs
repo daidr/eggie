@@ -280,6 +280,27 @@ impl Language {
         }
     }
 
+    pub(crate) fn copy_path(self) -> &'static str {
+        match self {
+            Self::English => "Copy path",
+            Self::SimplifiedChinese => "复制路径",
+        }
+    }
+
+    pub(crate) fn open_with_finder(self) -> &'static str {
+        match self {
+            Self::English => "Finder",
+            Self::SimplifiedChinese => "访达",
+        }
+    }
+
+    pub(crate) fn open_with_vscode(self) -> &'static str {
+        match self {
+            Self::English => "VS Code",
+            Self::SimplifiedChinese => "VS Code",
+        }
+    }
+
     pub(crate) fn loading_ports(self) -> &'static str {
         match self {
             Self::English => "Loading port information…",

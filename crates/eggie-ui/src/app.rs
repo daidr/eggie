@@ -6,8 +6,8 @@ use crate::native_menu::{
 };
 use crate::project_store::ProjectStore;
 use crate::settings::{
-    CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, SettingsStore, TerminalTheme,
-    UiColors,
+    CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, OpenWith, SettingsStore,
+    TerminalTheme, UiColors,
 };
 use crate::settings_window::{
     ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
@@ -410,6 +410,24 @@ struct WindowProjectView {
     active_group_id: GroupId,
 }
 
+/// Identifies one of the two directory rows in the right sidebar's Info tab. Used as the key for the
+/// per-row "open with" dropdown state so each row's split-button anchors its own dropdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DirectoryField {
+    Current,
+    Initial,
+}
+
+impl DirectoryField {
+    /// A stable ascii slug for element ids.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Initial => "initial",
+        }
+    }
+}
+
 impl WindowProjectView {
     /// A view for a project that currently has no terminal in this window: an empty layout whose
     /// single empty group is the active group (and a valid drop target for the first new terminal).
@@ -512,6 +530,11 @@ pub struct EggieApp {
     /// On-screen bounds of the detached-sessions toggle button, captured at paint so the popover can
     /// anchor just below it (like the settings dropdowns) instead of snapping to the window corner.
     detached_toggle_bounds: Option<Bounds<Pixels>>,
+    /// Which directory field's "open with" dropdown is currently open (right sidebar), if any.
+    open_with_dropdown: Option<DirectoryField>,
+    /// On-screen bounds of each directory field's split-button, captured at paint so its dropdown can
+    /// anchor just below the button.
+    open_with_dropdown_bounds: HashMap<DirectoryField, Bounds<Pixels>>,
     snapshots: HashMap<SessionId, Arc<TerminalSnapshot>>,
     terminal_sizes: HashMap<SessionId, TerminalSize>,
     terminal_resize_in_flight: HashMap<SessionId, TerminalSize>,
@@ -1158,6 +1181,8 @@ impl EggieApp {
             detached_sessions: Vec::new(),
             detached_popover_open: false,
             detached_toggle_bounds: None,
+            open_with_dropdown: None,
+            open_with_dropdown_bounds: HashMap::new(),
             snapshots,
             terminal_sizes: HashMap::new(),
             terminal_resize_in_flight: HashMap::new(),
@@ -4743,6 +4768,245 @@ impl EggieApp {
         Some(deferred(anchored_popover).priority(2).into_any_element())
     }
 
+    /// The copy-path + open-with split button pair shown under a directory row in the Info tab. The
+    /// open button's left half launches the persisted [`OpenWith`] app on `path`; its right half is a
+    /// caret that toggles a dropdown to pick (and persist) a different opener.
+    fn render_directory_actions(
+        &self,
+        field: DirectoryField,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors;
+        let language = self.language;
+        let opener = self.settings.read(cx).config().open_directory_with;
+        let slug = field.slug();
+
+        let copy_value = path.display().to_string();
+        let copy_button = div()
+            .id(SharedString::from(format!("copy-path-{slug}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(24.))
+            .px_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .text_color(rgb(colors.muted))
+            .cursor_pointer()
+            .hover(move |element| {
+                element
+                    .bg(rgb(colors.panel_alt))
+                    .text_color(rgb(colors.text))
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_value.clone()));
+            }))
+            .child(icon_sized(IconName::Copy, 14.))
+            .child(div().text_size(px(12.)).child(language.copy_path()));
+
+        let open_path = path.to_path_buf();
+        // Left half: launch the persisted opener on the directory.
+        let open_action = div()
+            .id(SharedString::from(format!("open-with-{slug}")))
+            .flex()
+            .flex_1()
+            .items_center()
+            .gap_1()
+            .h_full()
+            .px_2()
+            .cursor_pointer()
+            .hover(move |element| element.bg(rgb(colors.panel_alt)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |_, _, _, _| {
+                open_path_with(&open_path, opener);
+            }))
+            .child(icon_sized(icon_for_open_with(opener), 14.))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .child(open_with_label(language, opener)),
+            );
+
+        // Right half: a caret that toggles this row's opener dropdown.
+        let caret = div()
+            .id(SharedString::from(format!("open-with-caret-{slug}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h_full()
+            .border_l_1()
+            .border_color(rgb(colors.border))
+            .cursor_pointer()
+            .hover(move |element| element.bg(rgb(colors.panel_alt)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |app, _, _, cx| {
+                app.open_with_dropdown = if app.open_with_dropdown == Some(field) {
+                    None
+                } else {
+                    Some(field)
+                };
+                cx.notify();
+            }))
+            .child(icon_sized(IconName::ArrowDown, 12.));
+
+        let control = cx.entity().downgrade();
+        let mut open_button = div()
+            // Capture the split-button's bounds so the dropdown can anchor just below it.
+            .on_children_prepainted(move |children, _, cx| {
+                let Some(bounds) = children.first().copied() else {
+                    return;
+                };
+                let control = control.clone();
+                cx.defer(move |cx| {
+                    control
+                        .update(cx, |app, cx| {
+                            if app.open_with_dropdown_bounds.get(&field) != Some(&bounds) {
+                                app.open_with_dropdown_bounds.insert(field, bounds);
+                                if app.open_with_dropdown == Some(field) {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(24.))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .text_color(rgb(colors.muted))
+                    .child(open_action)
+                    .child(caret),
+            );
+        if let Some(dropdown) = self.render_open_with_dropdown(field, cx) {
+            open_button = open_button.child(dropdown);
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(copy_button)
+            .child(open_button)
+            .into_any_element()
+    }
+
+    /// The dropdown listing the available [`OpenWith`] apps for `field`, anchored below its split
+    /// button. Selecting an option persists it as the new default opener. Same anchored + deferred +
+    /// `.occlude()` overlay pattern as the settings dropdowns.
+    fn render_open_with_dropdown(
+        &self,
+        field: DirectoryField,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.open_with_dropdown != Some(field) {
+            return None;
+        }
+        let colors = self.colors;
+        let language = self.language;
+        let selected = self.settings.read(cx).config().open_directory_with;
+        let slug = field.slug();
+
+        let mut list = div().flex().flex_col().py_1();
+        for option in OpenWith::ALL {
+            let is_selected = option == selected;
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "open-with-{slug}-{}",
+                        option.slug()
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_selected, |element| {
+                        element
+                            .bg(rgb(colors.panel_alt))
+                            .text_color(rgb(colors.accent))
+                    })
+                    .hover(move |element| element.bg(rgb(colors.panel_alt)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.set_open_directory_with(option, cx);
+                        app.open_with_dropdown = None;
+                        cx.notify();
+                    }))
+                    .child(icon_sized(icon_for_open_with(option), 14.))
+                    .child(div().text_size(px(12.)).child(open_with_label(language, option))),
+            );
+        }
+
+        let popover = div()
+            .flex()
+            .flex_col()
+            .w(px(160.))
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_lg()
+            // Floating overlay: block clicks on blank areas from bubbling through (see
+            // [[gpui-overlay-occlude]]).
+            .occlude()
+            .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
+                cx.defer_in(window, move |app, _, cx| {
+                    if app.open_with_dropdown == Some(field) {
+                        app.open_with_dropdown = None;
+                        cx.notify();
+                    }
+                });
+            }))
+            .child(list);
+
+        // Anchor the dropdown just below the split button (top-left corner to the button's
+        // bottom-left), falling back to a window-snapped corner until bounds are captured once.
+        let anchored_dropdown = match self.open_with_dropdown_bounds.get(&field).copied() {
+            Some(bounds) => anchored()
+                .anchor(Anchor::TopLeft)
+                .position(point(bounds.left(), bounds.bottom() + px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+            None => anchored()
+                .anchor(Anchor::TopLeft)
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+        };
+
+        Some(deferred(anchored_dropdown).priority(2).into_any_element())
+    }
+
+    /// Persist a new default directory opener. No-op (and no save) if it is already selected.
+    fn set_open_directory_with(&mut self, opener: OpenWith, cx: &mut Context<Self>) {
+        if self.settings.read(cx).config().open_directory_with == opener {
+            return;
+        }
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |config| config.open_directory_with = opener,
+                cx,
+            );
+        });
+    }
+
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div()
             .flex()
@@ -5701,16 +5965,38 @@ impl EggieApp {
                 if let Some(session) = session {
                     content = content
                         .child(process_summary(&session.current_process, self.colors, self.language))
-                        .child(info_row(
-                            self.language.current_directory(),
-                            session.current_directory.display().to_string(),
-                            self.colors,
-                        ))
-                        .child(info_row(
-                            self.language.initial_directory(),
-                            session.initial_directory.display().to_string(),
-                            self.colors,
-                        ));
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(info_row(
+                                    self.language.current_directory(),
+                                    session.current_directory.display().to_string(),
+                                    self.colors,
+                                ))
+                                .child(self.render_directory_actions(
+                                    DirectoryField::Current,
+                                    &session.current_directory,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(info_row(
+                                    self.language.initial_directory(),
+                                    session.initial_directory.display().to_string(),
+                                    self.colors,
+                                ))
+                                .child(self.render_directory_actions(
+                                    DirectoryField::Initial,
+                                    &session.initial_directory,
+                                    cx,
+                                )),
+                        );
                     if let Some(inspection) = self.session_inspections.get(&session.id) {
                         content =
                             content.child(process_section(&inspection.processes, self.colors, self.language, cx));
@@ -7115,6 +7401,40 @@ fn item_kind_icon(kind: ItemKind) -> IconName {
         ItemKind::File => IconName::File,
         ItemKind::Browser => IconName::Browser,
         ItemKind::Settings => IconName::Settings,
+    }
+}
+
+/// The button glyph for a directory opener. A future custom opener falls back to
+/// [`IconName::AppWindow`].
+fn icon_for_open_with(opener: OpenWith) -> IconName {
+    match opener {
+        OpenWith::Finder => IconName::Finder,
+        OpenWith::VsCode => IconName::VsCode,
+    }
+}
+
+fn open_with_label(language: Language, opener: OpenWith) -> &'static str {
+    match opener {
+        OpenWith::Finder => language.open_with_finder(),
+        OpenWith::VsCode => language.open_with_vscode(),
+    }
+}
+
+/// Open `path` in the chosen application via macOS `open`. Finder opens the directory directly;
+/// VS Code is launched by bundle name so it works without the `code` CLI on `PATH`. Failures are
+/// logged, not surfaced — the button is best-effort.
+fn open_path_with(path: &Path, opener: OpenWith) {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    match opener {
+        OpenWith::Finder => {
+            command.arg(path);
+        }
+        OpenWith::VsCode => {
+            command.args(["-a", "Visual Studio Code"]).arg(path);
+        }
+    }
+    if let Err(error) = command.spawn() {
+        eprintln!("failed to open {} with {}: {error}", path.display(), opener.slug());
     }
 }
 
