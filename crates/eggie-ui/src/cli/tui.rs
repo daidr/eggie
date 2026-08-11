@@ -612,7 +612,7 @@ fn draw_preview(buf: &mut Buffer, area: Rect, app: &App) {
     draw_rule(buf, x0 + 2, y, right, '┴', grid);
     y += 1;
     // starship 提示符两行。
-    let mut sx = put(buf, x0 + 2, y, right, "ghostty ", Tok::Kw.style(theme, bg));
+    let mut sx = put(buf, x0 + 2, y, right, "Eggie ", Tok::Kw.style(theme, bg));
     sx = put(buf, sx, y, right, "on ", standard);
     sx = put(buf, sx, y, right, " main ", Tok::Num.style(theme, bg));
     sx = put(buf, sx, y, right, "[+] ", Tok::Op.style(theme, bg));
