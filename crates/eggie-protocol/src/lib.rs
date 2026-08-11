@@ -1,9 +1,9 @@
-use eggie_domain::{ProjectId, SessionId};
+use eggie_domain::{ProjectId, SessionId, WindowId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -212,6 +212,9 @@ pub enum ClientRequest {
     },
     CreateSession {
         project_id: ProjectId,
+        /// Identity of the window that owns this session. Each GUI window sees only the sessions it
+        /// owns (plus unowned/detached ones); the daemon tags the session with this id on creation.
+        window_id: WindowId,
         cwd: PathBuf,
         size: TerminalSize,
         appearance: TerminalAppearance,
@@ -386,6 +389,18 @@ pub enum ClientRequest {
     },
     Terminate {
         session_id: SessionId,
+    },
+    /// Reassign a session's owning window. Used to claim a detached (unowned) session into the
+    /// requesting window, or to move a session between windows. The daemon replies with
+    /// [`DaemonResponse::SessionClaimed`] carrying the updated summary.
+    ClaimSession {
+        session_id: SessionId,
+        window_id: WindowId,
+    },
+    /// Detach every session owned by `window_id`, clearing their ownership so they survive the
+    /// window closing and become claimable from any window. Sent right before a window is removed.
+    DetachWindow {
+        window_id: WindowId,
     },
 }
 
@@ -579,6 +594,10 @@ pub struct SessionInspection {
 pub struct SessionSummary {
     pub id: SessionId,
     pub project_id: ProjectId,
+    /// Owning window, or `None` when the session is detached (survives its window and is claimable
+    /// from any window). Clients filter the flat session list against their own window id using this.
+    #[serde(default)]
+    pub window_id: Option<WindowId>,
     pub title: String,
     pub initial_directory: PathBuf,
     pub current_directory: PathBuf,
@@ -1060,6 +1079,11 @@ pub enum DaemonResponse {
     SessionCreated {
         session: SessionSummary,
     },
+    /// Reply to [`ClientRequest::ClaimSession`]: the session's ownership was updated to the
+    /// requesting window. Carries the refreshed summary (with the new `window_id`).
+    SessionClaimed {
+        session: SessionSummary,
+    },
     Sessions {
         sessions: Vec<SessionSummary>,
     },
@@ -1473,6 +1497,7 @@ mod tests {
     fn create_session_carries_scrollback_and_shell_overrides() {
         let request = ClientRequest::CreateSession {
             project_id: Uuid::nil(),
+            window_id: Uuid::nil(),
             cwd: PathBuf::from("/tmp"),
             size: TerminalSize::default(),
             appearance: TerminalAppearance::default(),
@@ -1495,10 +1520,11 @@ mod tests {
 
     #[test]
     fn create_session_shell_overrides_default_to_empty_when_absent() {
-        // A request omitting the new fields (older client shape) decodes with empty/zero defaults.
+        // A request omitting the optional shell fields (older client shape) decodes with empty/zero
+        // defaults. `window_id` is required in v27, so it is always present.
         let appearance = serde_json::to_string(&TerminalAppearance::default()).unwrap();
         let json = format!(
-            r#"{{"type":"create_session","project_id":"00000000-0000-0000-0000-000000000000","cwd":"/tmp","size":{{"columns":80,"rows":24,"cell_width":8,"cell_height":16}},"appearance":{appearance}}}"#
+            r#"{{"type":"create_session","project_id":"00000000-0000-0000-0000-000000000000","window_id":"00000000-0000-0000-0000-000000000000","cwd":"/tmp","size":{{"columns":80,"rows":24,"cell_width":8,"cell_height":16}},"appearance":{appearance}}}"#
         );
         let decoded: ClientRequest = serde_json::from_str(&json).unwrap();
         match decoded {

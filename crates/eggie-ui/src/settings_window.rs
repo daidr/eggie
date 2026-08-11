@@ -1,7 +1,9 @@
 use std::sync::OnceLock;
 
 use crate::{
+    app::{EggieApp, NewWindowInit, NotificationRoutes},
     icons::{IconName, icon, icon_sized},
+    project_store::ProjectStore,
     settings::{
         AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, MAX_FONT_SIZE,
         MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING,
@@ -11,6 +13,7 @@ use crate::{
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
+use eggie_daemon::DaemonClient;
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Entity, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
@@ -25,6 +28,7 @@ actions!(
     eggie,
     [
         OpenSettings,
+        NewWindow,
         Hide,
         HideOthers,
         ShowAll,
@@ -221,9 +225,31 @@ impl SettingsSection {
     ];
 }
 
-pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
+pub(crate) fn install(
+    settings: Entity<SettingsStore>,
+    project_store: Entity<ProjectStore>,
+    client: DaemonClient,
+    notification_routes: NotificationRoutes,
+    cx: &mut App,
+) {
     let settings_for_action = settings.clone();
     cx.on_action(move |_: &OpenSettings, cx| open_settings_window(settings_for_action.clone(), cx));
+    // New Window is an app-level action (like OpenSettings): it works even when no Eggie window is
+    // focused, and opens a fresh main window sharing the same settings/project-store entities.
+    let settings_for_new_window = settings.clone();
+    let project_store_for_new_window = project_store.clone();
+    let client_for_new_window = client.clone();
+    let routes_for_new_window = notification_routes.clone();
+    cx.on_action(move |_: &NewWindow, cx| {
+        EggieApp::open_new_window(
+            cx,
+            client_for_new_window.clone(),
+            settings_for_new_window.clone(),
+            project_store_for_new_window.clone(),
+            routes_for_new_window.clone(),
+            NewWindowInit::Empty,
+        );
+    });
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -249,7 +275,7 @@ pub(crate) fn install(settings: Entity<SettingsStore>, cx: &mut App) {
     .detach();
 }
 
-fn build_menus(language: Language) -> [Menu; 2] {
+fn build_menus(language: Language) -> [Menu; 3] {
     [
         Menu::new("Eggie").items([
             MenuItem::action(language.settings_menu_item(), OpenSettings),
@@ -262,6 +288,10 @@ fn build_menus(language: Language) -> [Menu; 2] {
             MenuItem::separator(),
             MenuItem::action(language.quit_eggie(), Quit),
         ]),
+        Menu::new(language.file_menu()).items([MenuItem::action(
+            language.new_window_menu_item(),
+            NewWindow,
+        )]),
         Menu::new(language.edit_menu()).items([
             MenuItem::os_action(language.copy(), TerminalCopy, OsAction::Copy),
             MenuItem::os_action(language.paste(), TerminalPaste, OsAction::Paste),

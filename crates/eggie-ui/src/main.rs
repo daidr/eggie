@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod gui_ipc;
 mod i18n;
 mod icons;
 mod input_latency;
@@ -7,6 +8,7 @@ mod keybindings;
 #[cfg(target_os = "macos")]
 mod metal_terminal;
 mod native_menu;
+mod project_store;
 pub mod services;
 mod settings;
 mod settings_window;
@@ -32,6 +34,12 @@ fn main() -> Result<()> {
     }
 
     let project_root = std::env::current_dir().context("failed to determine current directory")?;
+    // Single instance: if a GUI is already running, ask it to open a window for this directory and
+    // exit, instead of starting a second GUI process. Falls through to launching our own GUI when
+    // there is no running instance to wake.
+    if gui_ipc::try_wake_existing(project_root.clone()) {
+        return Ok(());
+    }
     let client = DaemonClient::connect_default(BUILD_ID)?;
     app::EggieApp::launch(project_root, client);
     Ok(())

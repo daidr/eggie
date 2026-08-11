@@ -1608,6 +1608,7 @@ dependencies = [
  "parking_lot",
  "ratatui",
  "raw-window-handle",
+ "rmp-serde",
  "rustc-hash 2.1.3",
  "rustybuzz",
  "serde",

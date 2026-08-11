@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::read::DecoderReader;
-use eggie_domain::{ProjectId, SessionId};
+use eggie_domain::{ProjectId, SessionId, WindowId};
 #[cfg(test)]
 use eggie_protocol::encode_line;
 use eggie_protocol::{
@@ -2822,6 +2822,9 @@ impl EventListener for DaemonEventListener {
 struct TerminalSession {
     id: SessionId,
     project_id: ProjectId,
+    /// Owning GUI window, or `None` when the session is detached (its window closed but the shell
+    /// keeps running, so it survives as claimable). Mutated at runtime by `ClaimSession`/`DetachWindow`.
+    window_id: Mutex<Option<WindowId>>,
     initial_directory: PathBuf,
     shell_pid: u32,
     pty_fd: i32,
@@ -2885,6 +2888,8 @@ struct SessionRuntimeMetadata {
 /// thread positional arguments.
 struct SessionSpawnConfig {
     project_id: ProjectId,
+    /// Window that will own the freshly spawned session.
+    window_id: WindowId,
     cwd: PathBuf,
     size: TerminalSize,
     appearance: TerminalAppearance,
@@ -2904,6 +2909,7 @@ impl TerminalSession {
     fn spawn(config: SessionSpawnConfig) -> Result<Self> {
         let SessionSpawnConfig {
             project_id,
+            window_id,
             cwd,
             size,
             appearance,
@@ -2987,6 +2993,7 @@ impl TerminalSession {
         Ok(Self {
             id,
             project_id,
+            window_id: Mutex::new(Some(window_id)),
             initial_directory: cwd.clone(),
             shell_pid,
             pty_fd,
@@ -3025,6 +3032,7 @@ impl TerminalSession {
     ) -> Result<Self> {
         Self::spawn(SessionSpawnConfig {
             project_id,
+            window_id: WindowId::new_v4(),
             cwd,
             size,
             appearance,
@@ -3047,6 +3055,7 @@ impl TerminalSession {
         SessionSummary {
             id: self.id,
             project_id: self.project_id,
+            window_id: *self.window_id.lock(),
             title: self.events.title.read().clone(),
             initial_directory: self.initial_directory.clone(),
             current_directory,
@@ -4626,6 +4635,7 @@ impl DaemonState {
             }
             ClientRequest::CreateSession {
                 project_id,
+                window_id,
                 cwd,
                 size,
                 appearance,
@@ -4636,6 +4646,7 @@ impl DaemonState {
             } => {
                 let session = Arc::new(TerminalSession::spawn(SessionSpawnConfig {
                     project_id,
+                    window_id,
                     cwd,
                     size,
                     appearance,
@@ -4898,6 +4909,31 @@ impl DaemonState {
                     bail!("unknown terminal session {session_id}");
                 };
                 session.terminate();
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::ClaimSession {
+                session_id,
+                window_id,
+            } => {
+                let session = self.session(session_id)?;
+                *session.window_id.lock() = Some(window_id);
+                Ok(DaemonResponse::SessionClaimed {
+                    session: session.summary(),
+                })
+            }
+            ClientRequest::DetachWindow { window_id } => {
+                // Collect the matching ids under the read lock, then clear ownership one session at a
+                // time. This avoids holding the sessions lock across the per-session `window_id` locks.
+                let detached: Vec<Arc<TerminalSession>> = self
+                    .sessions
+                    .read()
+                    .values()
+                    .filter(|session| *session.window_id.lock() == Some(window_id))
+                    .cloned()
+                    .collect();
+                for session in detached {
+                    *session.window_id.lock() = None;
+                }
                 Ok(DaemonResponse::Ok)
             }
         }
@@ -6866,6 +6902,7 @@ mod tests {
         let _pty_guard = PTY_TEST_LOCK.lock();
         let session = TerminalSession::spawn(SessionSpawnConfig {
             project_id: ProjectId::new_v4(),
+            window_id: WindowId::new_v4(),
             cwd: std::env::current_dir().unwrap(),
             size: TerminalSize::default(),
             appearance: TerminalAppearance::default(),
@@ -6949,6 +6986,7 @@ mod tests {
         let _pty_guard = PTY_TEST_LOCK.lock();
         let session = TerminalSession::spawn(SessionSpawnConfig {
             project_id: ProjectId::new_v4(),
+            window_id: WindowId::new_v4(),
             cwd: std::env::current_dir().unwrap(),
             size: TerminalSize::default(),
             appearance: TerminalAppearance::default(),
