@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod i18n;
 mod icons;
 mod input_latency;
@@ -22,6 +23,12 @@ fn main() -> Result<()> {
     let arguments = std::env::args().collect::<Vec<_>>();
     if let Some(socket_path) = is_daemon_invocation(&arguments) {
         return run_daemon(&socket_path, BUILD_ID);
+    }
+
+    // 内置 CLI(`eggie +action` / `--version` / `-h`)。命中则执行并退出,
+    // 不进入 GUI 启动路径。
+    if let Some(exit_code) = cli::try_run_cli(&arguments) {
+        std::process::exit(exit_code);
     }
 
     let project_root = std::env::current_dir().context("failed to determine current directory")?;

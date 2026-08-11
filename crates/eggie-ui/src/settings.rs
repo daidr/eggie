@@ -605,6 +605,11 @@ pub(crate) struct AppSettings {
     /// (the settings UI edits it as a single space-separated line). New terminals only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) shell_args: Vec<String>,
+    /// `path` shell-integration feature: append Eggie's binary directory to the shell PATH so
+    /// `eggie +version` and the other CLI actions work inside the terminal (matching Ghostty's
+    /// `path` feature). Default on. New terminals only.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) shell_integration_path: bool,
 }
 
 /// Per-metric adjustments matching Ghostty's `adjust-*` config keys. Each is an optional
@@ -703,11 +708,40 @@ impl Default for AppSettings {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             shell_program: String::new(),
             shell_args: Vec::new(),
+            shell_integration_path: true,
         }
     }
 }
 
+/// Shell-integration feature toggles, assembled into the comma-separated `EGGIE_SHELL_FEATURES`
+/// environment string the daemon injects. Mirrors Ghostty's `shell-integration-features`. The
+/// client owns the feature vocabulary; the daemon just forwards the assembled string verbatim.
+/// Add a bool field + a token here when a new feature lands — the protocol does not change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShellFeatures {
+    pub(crate) path: bool,
+}
+
+impl ShellFeatures {
+    /// Join the enabled feature tokens with commas, in a stable order. Empty when all are off.
+    pub(crate) fn to_env_string(self) -> String {
+        let mut tokens: Vec<&str> = Vec::new();
+        if self.path {
+            tokens.push("path");
+        }
+        tokens.join(",")
+    }
+}
+
 impl AppSettings {
+    /// Assemble the `EGGIE_SHELL_FEATURES` string from the enabled feature toggles.
+    pub(crate) fn shell_features_string(&self) -> String {
+        ShellFeatures {
+            path: self.shell_integration_path,
+        }
+        .to_env_string()
+    }
+
     fn normalize(&mut self) {
         let catalog = theme_catalog();
         if catalog.dark_theme(&self.dark_theme).is_none() {
@@ -1294,6 +1328,7 @@ mod tests {
             scrollback_lines: MAX_SCROLLBACK_LINES + 1,
             shell_program: "  /bin/fish  ".to_owned(),
             shell_args: vec!["-l".to_owned(), "  ".to_owned()],
+            shell_integration_path: false,
         };
         config.normalize();
         fs::create_dir_all(&directory).unwrap();
@@ -1307,6 +1342,8 @@ mod tests {
         assert_eq!(loaded.config.scrollback_lines, MAX_SCROLLBACK_LINES);
         assert_eq!(loaded.config.shell_program, "/bin/fish");
         assert_eq!(loaded.config.shell_args, vec!["-l".to_owned()]);
+        // A non-default (false) value serializes and survives the round trip.
+        assert!(!loaded.config.shell_integration_path);
         assert_eq!(
             loaded.config.progress_complete_timeout_secs,
             MIN_PROGRESS_TIMEOUT_SECS
@@ -1317,6 +1354,14 @@ mod tests {
         );
         assert_eq!(loaded.config.light_theme, "Ayu Light");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shell_features_assemble_into_the_env_string() {
+        assert_eq!(ShellFeatures { path: true }.to_env_string(), "path");
+        assert_eq!(ShellFeatures { path: false }.to_env_string(), "");
+        // Default settings enable the path feature.
+        assert_eq!(AppSettings::default().shell_features_string(), "path");
     }
 
     #[test]

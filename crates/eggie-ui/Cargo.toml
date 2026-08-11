@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 alacritty_terminal.workspace = true
 anyhow.workspace = true
+crossterm.workspace = true
 eggie-daemon.workspace = true
 eggie-domain.workspace = true
 eggie-protocol.workspace = true
@@ -16,6 +17,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
+ratatui.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

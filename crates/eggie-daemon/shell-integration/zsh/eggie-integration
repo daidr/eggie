@@ -38,6 +38,16 @@ eggie-integration() {
     # against stdout redirection (a dedicated cloexec TTY fd) is a follow-up.
     builtin typeset -gi _eggie_fd=1
 
+    # path feature: when EGGIE_SHELL_FEATURES contains the `path` token and Eggie told us where
+    # its binary lives (EGGIE_BIN_DIR), append that directory to PATH (skipping if already present)
+    # so `eggie +version` and the other CLI actions are runnable from this shell. Match with comma
+    # delimiters because the token list is comma-separated (e.g. `path,title`).
+    if [[ ",${EGGIE_SHELL_FEATURES}," == *",path,"* && -n "${EGGIE_BIN_DIR}" ]]; then
+        if [[ ":$PATH:" != *":$EGGIE_BIN_DIR:"* ]]; then
+            builtin export PATH="$PATH:$EGGIE_BIN_DIR"
+        fi
+    fi
+
     eggie_precmd() {
         builtin local -i cmd_status=$?
         builtin emulate -L zsh -o no_warn_create_global -o no_aliases

@@ -2895,6 +2895,9 @@ struct SessionSpawnConfig {
     /// Custom shell arguments. `None` uses Eggie's default launch args (`-l`, plus `--posix` for bash
     /// integration).
     shell_args: Option<Vec<String>>,
+    /// Comma-separated `EGGIE_SHELL_FEATURES` tokens (e.g. `"path"`), injected verbatim into the
+    /// shell environment. Empty = no features.
+    shell_features: String,
 }
 
 impl TerminalSession {
@@ -2907,6 +2910,7 @@ impl TerminalSession {
             scrollback_limit,
             shell_program,
             shell_args,
+            shell_features,
         } = config;
         let id = SessionId::new_v4();
         let last_input_sequence = Arc::new(AtomicU64::new(0));
@@ -2942,6 +2946,12 @@ impl TerminalSession {
                 None
             }
         };
+        // The daemon process *is* the eggie binary (launched with `--eggie-daemon`), so its own
+        // executable directory is where `eggie` lives. Injected as EGGIE_BIN_DIR so the `path`
+        // shell feature can add it to PATH. Non-fatal: if current_exe fails we simply don't inject.
+        let bin_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
         let launch = build_shell_env(
             &shell_name,
             &shell,
@@ -2950,6 +2960,8 @@ impl TerminalSession {
             std::env::var("ZDOTDIR").ok(),
             std::env::var("ENV").ok(),
             shell_args,
+            bin_dir.as_deref(),
+            &shell_features,
         );
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell, launch.args)),
@@ -3019,6 +3031,7 @@ impl TerminalSession {
             scrollback_limit: TERMINAL_SCROLLBACK_LIMIT,
             shell_program: None,
             shell_args: None,
+            shell_features: "path".to_owned(),
         })
     }
 
@@ -4619,6 +4632,7 @@ impl DaemonState {
                 scrollback_limit,
                 shell_program,
                 shell_args,
+                shell_features,
             } => {
                 let session = Arc::new(TerminalSession::spawn(SessionSpawnConfig {
                     project_id,
@@ -4628,6 +4642,7 @@ impl DaemonState {
                     scrollback_limit,
                     shell_program: (!shell_program.is_empty()).then_some(shell_program),
                     shell_args: (!shell_args.is_empty()).then_some(shell_args),
+                    shell_features,
                 })?);
                 let summary = session.summary();
                 self.sessions.write().insert(session.id, session);
@@ -4920,6 +4935,9 @@ struct ShellLaunch {
 /// bash's `--posix` is mandatory for the ENV-based integration hook, so it is force-prepended even
 /// over custom args (integration wins; the user's args are still honored after it). When
 /// `custom_args` is `None` the behavior is byte-identical to before this knob existed.
+// Every argument is an independent shell-launch input assembled into one env map; grouping them
+// into a struct would just move the same fields elsewhere without improving clarity.
+#[allow(clippy::too_many_arguments)]
 fn build_shell_env(
     shell_name: &str,
     shell_path: &str,
@@ -4928,6 +4946,8 @@ fn build_shell_env(
     user_zdotdir: Option<String>,
     user_env_var: Option<String>,
     custom_args: Option<Vec<String>>,
+    bin_dir: Option<&Path>,
+    shell_features: &str,
 ) -> ShellLaunch {
     let mut env = HashMap::new();
     env.insert("TERM".to_owned(), "alacritty".to_owned());
@@ -4940,6 +4960,20 @@ fn build_shell_env(
     env.insert(
         "TERM_PROGRAM_VERSION".to_owned(),
         env!("CARGO_PKG_VERSION").to_owned(),
+    );
+    // Shell-feature plumbing, injected unconditionally for every shell (even those without an
+    // integration script): EGGIE_BIN_DIR points at the eggie binary's directory, and
+    // EGGIE_SHELL_FEATURES is the comma-separated token list the integration scripts read. This
+    // way, once a shell's script learns to read them, the variables are already in place.
+    if let Some(dir) = bin_dir {
+        env.insert(
+            "EGGIE_BIN_DIR".to_owned(),
+            dir.to_string_lossy().into_owned(),
+        );
+    }
+    env.insert(
+        "EGGIE_SHELL_FEATURES".to_owned(),
+        shell_features.to_owned(),
     );
 
     let custom = custom_args.is_some();
@@ -6838,6 +6872,7 @@ mod tests {
             scrollback_limit: 500,
             shell_program: None,
             shell_args: None,
+            shell_features: "path".to_owned(),
         })
         .unwrap();
 
@@ -6920,6 +6955,7 @@ mod tests {
             scrollback_limit: TERMINAL_SCROLLBACK_LIMIT,
             shell_program: Some("/bin/sh".to_owned()),
             shell_args: None,
+            shell_features: "path".to_owned(),
         })
         .unwrap();
         // The configured shell's basename becomes the session's initial process name.
@@ -7567,6 +7603,8 @@ mod tests {
             Some("/home/user/.zsh".to_owned()),
             None,
             None,
+            None,
+            "path",
         );
         assert_eq!(
             launch.env.get("ZDOTDIR").map(String::as_str),
@@ -7586,7 +7624,7 @@ mod tests {
     fn zsh_env_without_user_zdotdir_sets_no_marker() {
         let terminfo = PathBuf::from("/tmp/eggie-terminfo");
         let root = PathBuf::from("/tmp/eggie-integration");
-        let launch = build_shell_env("zsh", "/bin/zsh", &terminfo, Some(&root), None, None, None);
+        let launch = build_shell_env("zsh", "/bin/zsh", &terminfo, Some(&root), None, None, None, None, "path");
         assert!(launch.env.contains_key("ZDOTDIR"));
         assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
     }
@@ -7604,6 +7642,8 @@ mod tests {
             None,
             Some("/home/user/env.sh".to_owned()),
             None,
+            None,
+            "path",
         );
         assert_eq!(
             launch.env.get("ENV").map(String::as_str),
@@ -7625,7 +7665,7 @@ mod tests {
     fn apple_bin_bash_skips_integration() {
         let terminfo = PathBuf::from("/tmp/eggie-terminfo");
         let root = PathBuf::from("/tmp/eggie-integration");
-        let launch = build_shell_env("bash", "/bin/bash", &terminfo, Some(&root), None, None, None);
+        let launch = build_shell_env("bash", "/bin/bash", &terminfo, Some(&root), None, None, None, None, "path");
         // Apple's /bin/bash cannot use the ENV-based POSIX startup path, so no injection.
         assert!(!launch.env.contains_key("ENV"));
         assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
@@ -7637,7 +7677,7 @@ mod tests {
         let terminfo = PathBuf::from("/tmp/eggie-terminfo");
         let root = PathBuf::from("/tmp/eggie-integration");
         let launch =
-            build_shell_env("fish", "/usr/bin/fish", &terminfo, Some(&root), None, None, None);
+            build_shell_env("fish", "/usr/bin/fish", &terminfo, Some(&root), None, None, None, None, "path");
         assert!(!launch.env.contains_key("ZDOTDIR"));
         assert!(!launch.env.contains_key("ENV"));
         assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
@@ -7657,10 +7697,89 @@ mod tests {
             Some("/home/user/.zsh".to_owned()),
             None,
             None,
+            None,
+            "path",
         );
         assert!(!launch.env.contains_key("ZDOTDIR"));
         assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
         assert_eq!(launch.args, vec!["-l".to_owned()]);
+    }
+
+    #[test]
+    fn injects_bin_dir_and_features() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        let bin_dir = PathBuf::from("/opt/eggie/bin");
+        let launch = build_shell_env(
+            "zsh",
+            "/bin/zsh",
+            &terminfo,
+            Some(&root),
+            None,
+            None,
+            None,
+            Some(&bin_dir),
+            "path",
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_BIN_DIR").map(String::as_str),
+            Some("/opt/eggie/bin")
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_SHELL_FEATURES").map(String::as_str),
+            Some("path")
+        );
+    }
+
+    #[test]
+    fn without_bin_dir_only_features_is_injected() {
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let root = PathBuf::from("/tmp/eggie-integration");
+        // current_exe() failure -> bin_dir None -> EGGIE_BIN_DIR omitted, but the feature list still
+        // ships so a shell that resolves the binary another way still knows what to enable.
+        let launch = build_shell_env(
+            "zsh",
+            "/bin/zsh",
+            &terminfo,
+            Some(&root),
+            None,
+            None,
+            None,
+            None,
+            "path",
+        );
+        assert!(!launch.env.contains_key("EGGIE_BIN_DIR"));
+        assert_eq!(
+            launch.env.get("EGGIE_SHELL_FEATURES").map(String::as_str),
+            Some("path")
+        );
+    }
+
+    #[test]
+    fn features_injected_even_for_non_integrated_shell() {
+        // fish has no integration script yet, but the env vars are injected unconditionally so its
+        // future script (or a manually-sourced one) can act on them.
+        let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+        let bin_dir = PathBuf::from("/opt/eggie/bin");
+        let launch = build_shell_env(
+            "fish",
+            "/usr/bin/fish",
+            &terminfo,
+            None,
+            None,
+            None,
+            None,
+            Some(&bin_dir),
+            "path",
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_BIN_DIR").map(String::as_str),
+            Some("/opt/eggie/bin")
+        );
+        assert_eq!(
+            launch.env.get("EGGIE_SHELL_FEATURES").map(String::as_str),
+            Some("path")
+        );
     }
 
     #[test]
@@ -7675,6 +7794,8 @@ mod tests {
             None,
             None,
             Some(vec!["-i".to_owned(), "-c".to_owned(), "echo hi".to_owned()]),
+            None,
+            "path",
         );
         // Custom args used verbatim (no implicit `-l`), integration env still applied.
         assert_eq!(
@@ -7696,6 +7817,8 @@ mod tests {
             None,
             None,
             Some(vec!["-i".to_owned()]),
+            None,
+            "path",
         );
         // `--posix` is mandatory for the ENV-based hook, so it is prepended before the user's args.
         assert_eq!(launch.args, vec!["--posix".to_owned(), "-i".to_owned()]);
@@ -7718,6 +7841,8 @@ mod tests {
             None,
             None,
             Some(vec!["--posix".to_owned(), "-c".to_owned(), "true".to_owned()]),
+            None,
+            "path",
         );
         assert_eq!(
             launch.args,
@@ -7737,6 +7862,8 @@ mod tests {
             None,
             None,
             Some(vec!["-C".to_owned(), "echo hi".to_owned()]),
+            None,
+            "path",
         );
         // fish gets no injection; custom args used verbatim.
         assert_eq!(launch.args, vec!["-C".to_owned(), "echo hi".to_owned()]);
