@@ -653,6 +653,12 @@ impl SettingsWindow {
         });
     }
 
+    fn set_shell_integration_path(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.shell_integration_path = enabled, cx)
+        });
+    }
+
     fn set_copy_on_select(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.copy_on_select = enabled, cx)
@@ -1116,6 +1122,48 @@ impl SettingsWindow {
                             })
                             .on_click(cx.listener(move |settings, _, _, cx| {
                                 settings.set_detect_urls(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_shell_integration_path_control(
+        &self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("shell-integration-path-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_shell_integration_path(value, cx)
                             }))
                             .child(label),
                     )
@@ -2900,6 +2948,8 @@ impl gpui::Render for SettingsWindow {
             self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
         let shell_args_control =
             self.render_shell_input_control("settings-shell-args", &self.shell_args_input);
+        let shell_integration_path_control =
+            self.render_shell_integration_path_control(config.shell_integration_path, cx);
         let terminal_preview = self.render_terminal_preview(&config, theme);
 
         div()
@@ -3298,6 +3348,12 @@ impl gpui::Render for SettingsWindow {
                                                                         language.shell_args_row(),
                                                                         language.shell_args_description(),
                                                                         shell_args_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.shell_integration_path_row(),
+                                                                        language.shell_integration_path_description(),
+                                                                        shell_integration_path_control,
                                                                         self.colors,
                                                                     ),
                                                                 ],

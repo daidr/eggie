@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -227,6 +227,11 @@ pub enum ClientRequest {
         /// mandatory `--posix` for bash integration).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         shell_args: Vec<String>,
+        /// Comma-separated `EGGIE_SHELL_FEATURES` tokens (e.g. `"path"`). The daemon injects this
+        /// verbatim into the shell environment; shell-integration scripts interpret the tokens they
+        /// know and ignore the rest. Empty = no features. The client always sends its resolved value.
+        #[serde(default = "default_shell_features")]
+        shell_features: String,
     },
     ListSessions,
     InspectSession {
@@ -382,6 +387,12 @@ pub enum ClientRequest {
     Terminate {
         session_id: SessionId,
     },
+}
+
+/// Default `CreateSession::shell_features` when deserializing a request that predates the field.
+/// Matches the client's default (the `path` feature on), so an old client still gets PATH support.
+fn default_shell_features() -> String {
+    "path".to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1468,6 +1479,7 @@ mod tests {
             scrollback_limit: 500,
             shell_program: "/opt/homebrew/bin/fish".to_owned(),
             shell_args: vec!["-l".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+            shell_features: "path".to_owned(),
         };
         let encoded = encode_line(&request).unwrap();
         assert_eq!(
@@ -1494,11 +1506,14 @@ mod tests {
                 scrollback_limit,
                 shell_program,
                 shell_args,
+                shell_features,
                 ..
             } => {
                 assert_eq!(scrollback_limit, 0);
                 assert!(shell_program.is_empty());
                 assert!(shell_args.is_empty());
+                // Absent field falls back to the default feature set (`path`), not empty.
+                assert_eq!(shell_features, "path");
             }
             other => panic!("unexpected decode: {other:?}"),
         }

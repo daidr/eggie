@@ -1,0 +1,5 @@
+rgb.txt 源自 X11 项目(freedesktop.org: https://gitlab.freedesktop.org/xorg/app/rgb)。
+该数据以 MIT/X11 许可证发布,原样内置于 Eggie 供 `eggie +list-colors` 使用。
+
+格式:每行 `R G B<TAB><TAB>name`,R/G/B 为十进制 0-255,name 可含空格;
+同一颜色可能有多个命名别名(各占一行),全部保留。

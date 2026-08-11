@@ -1243,6 +1243,24 @@ impl Language {
         }
     }
 
+    pub(crate) fn shell_integration_path_row(self) -> &'static str {
+        match self {
+            Self::English => "Add Eggie to PATH",
+            Self::SimplifiedChinese => "将 Eggie 加入 PATH",
+        }
+    }
+
+    pub(crate) fn shell_integration_path_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Append Eggie's binary directory to the shell PATH so `eggie +version` and other CLI commands work in the terminal. Applies to newly created terminals only."
+            }
+            Self::SimplifiedChinese => {
+                "将 Eggie 二进制所在目录追加到 shell PATH，使 `eggie +version` 等命令行命令可在终端内直接调用。仅对新建终端生效。"
+            }
+        }
+    }
+
     pub(crate) fn shell_program_placeholder(self) -> &'static str {
         match self {
             Self::English => "e.g. /opt/homebrew/bin/fish",

@@ -47,6 +47,15 @@ if [[ -n "${EGGIE_BASH_INJECT-}" && "$-" == *i* ]]; then
     builtin unset EGGIE_BASH_RCFILE 2>/dev/null
     builtin unset _eggie_inject
 
+    # path feature: append Eggie's binary directory to PATH (if the `path` token is set and not
+    # already present) so `eggie +...` is runnable here. Done *after* reloading the user's rc files
+    # above, so a .bashrc that resets PATH can't drop our directory. Comma-delimited token match.
+    if [[ ",${EGGIE_SHELL_FEATURES-}," == *",path,"* && -n "${EGGIE_BIN_DIR-}" ]]; then
+        if [[ ":$PATH:" != *":$EGGIE_BIN_DIR:"* ]]; then
+            builtin export PATH="$PATH:$EGGIE_BIN_DIR"
+        fi
+    fi
+
     _eggie_fd=1
     _eggie_running=""
 

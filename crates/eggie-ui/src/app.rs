@@ -580,6 +580,7 @@ impl EggieApp {
         let initial_scrollback = settings_store.config().scrollback_lines;
         let initial_shell_program = settings_store.config().shell_program.clone();
         let initial_shell_args = settings_store.config().shell_args.clone();
+        let initial_shell_features = settings_store.config().shell_features_string();
         let all_sessions = match client.request(ClientRequest::ListSessions) {
             Ok(DaemonResponse::Sessions { sessions }) => sessions,
             _ => Vec::new(),
@@ -597,6 +598,7 @@ impl EggieApp {
                     scrollback_limit: initial_scrollback,
                     shell_program: initial_shell_program.clone(),
                     shell_args: initial_shell_args.clone(),
+                    shell_features: initial_shell_features.clone(),
                 })
                 .expect("failed to create initial terminal session");
             let session = match response {
@@ -622,6 +624,7 @@ impl EggieApp {
                         scrollback_limit: initial_scrollback,
                         shell_program: initial_shell_program.clone(),
                         shell_args: initial_shell_args.clone(),
+                        shell_features: initial_shell_features.clone(),
                     })
                     .expect("failed to create initial terminal session");
                 let session = match response {
@@ -2109,6 +2112,7 @@ impl EggieApp {
         let scrollback_limit = config.scrollback_lines;
         let shell_program = config.shell_program.clone();
         let shell_args = config.shell_args.clone();
+        let shell_features = config.shell_features_string();
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
@@ -2118,6 +2122,7 @@ impl EggieApp {
                 scrollback_limit,
                 shell_program,
                 shell_args,
+                shell_features,
             })
         else {
             return;
@@ -2176,6 +2181,7 @@ impl EggieApp {
         let scrollback_limit = config.scrollback_lines;
         let shell_program = config.shell_program.clone();
         let shell_args = config.shell_args.clone();
+        let shell_features = config.shell_features_string();
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
@@ -2185,6 +2191,7 @@ impl EggieApp {
                 scrollback_limit,
                 shell_program,
                 shell_args,
+                shell_features,
             })
         else {
             return;
