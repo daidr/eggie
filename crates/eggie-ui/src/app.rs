@@ -6362,6 +6362,11 @@ impl gpui::Render for EggieApp {
         self.cursor_blink = config.cursor_blink;
         self.language = config.language;
         self.copy_on_select = config.copy_on_select;
+        // Keep the search input's edit-menu labels in sync with the current language. Cheap: clone
+        // the handle first to avoid overlapping the `self.terminal_search` borrow with `cx`.
+        if let Some(input) = self.terminal_search.as_ref().map(|s| s.input.clone()) {
+            input.update(cx, |input, _| input.set_language(config.language));
+        }
         // Keep the blink timer running while the active cursor blinks; it self-terminates otherwise.
         self.ensure_cursor_blink(cx);
         div()
