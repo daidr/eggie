@@ -276,6 +276,13 @@ impl MacPlatform {
                     let app: id = msg_send![APP_CLASS, sharedApplication];
                     app.setWindowsMenu_(menu);
                 }
+
+                // Mark the Help menu by role (not title) so localized titles still get the
+                // OS-provided Help search field.
+                if menu_config.help_menu {
+                    let app: id = msg_send![APP_CLASS, sharedApplication];
+                    let _: () = msg_send![app, setHelpMenu: menu];
+                }
             }
 
             application_menu
@@ -320,6 +327,7 @@ impl MacPlatform {
                     name,
                     action,
                     os_action,
+                    icon,
                     checked,
                     disabled,
                 } => {
@@ -421,6 +429,20 @@ impl MacPlatform {
                     }
                     item.setEnabled_(if *disabled { NO } else { YES });
 
+                    // Attach an SF Symbol icon if one was requested. Degrades gracefully:
+                    // an unknown symbol name yields nil and simply leaves the item icon-less.
+                    if let Some(icon) = icon {
+                        let symbol = ns_string(icon);
+                        let image: id = msg_send![
+                            class!(NSImage),
+                            imageWithSystemSymbolName: symbol
+                            accessibilityDescription: nil
+                        ];
+                        if image != nil {
+                            let _: () = msg_send![item, setImage: image];
+                        }
+                    }
+
                     let tag = actions.len() as NSInteger;
                     let _: () = msg_send![item, setTag: tag];
                     actions.push(action.boxed_clone());
@@ -430,6 +452,7 @@ impl MacPlatform {
                     name,
                     items,
                     disabled,
+                    ..
                 }) => {
                     let item = NSMenuItem::new(nil).autorelease();
                     let submenu = NSMenu::new(nil).autorelease();

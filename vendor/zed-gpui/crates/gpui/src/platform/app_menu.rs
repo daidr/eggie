@@ -10,6 +10,11 @@ pub struct Menu {
 
     /// Whether this menu is disabled
     pub disabled: bool,
+
+    /// Whether this is the application's Help menu. On macOS this lets the OS
+    /// attach its Help search field. Set via [`Menu::help`] so the role does not
+    /// depend on the (possibly localized) menu title.
+    pub help_menu: bool,
 }
 
 impl Menu {
@@ -19,6 +24,7 @@ impl Menu {
             name: name.into(),
             items: vec![],
             disabled: false,
+            help_menu: false,
         }
     }
 
@@ -34,12 +40,19 @@ impl Menu {
         self
     }
 
+    /// Mark this menu as the application's Help menu (macOS attaches Help search).
+    pub fn help(mut self) -> Self {
+        self.help_menu = true;
+        self
+    }
+
     /// Create an OwnedMenu from this Menu
     pub fn owned(self) -> OwnedMenu {
         OwnedMenu {
             name: self.name.to_string().into(),
             items: self.items.into_iter().map(|item| item.owned()).collect(),
             disabled: self.disabled,
+            help_menu: self.help_menu,
         }
     }
 }
@@ -95,6 +108,9 @@ pub enum MenuItem {
         /// See [`OsAction`] for more information
         os_action: Option<OsAction>,
 
+        /// An optional SF Symbol name to show as the item's icon (macOS only).
+        icon: Option<SharedString>,
+
         /// Whether this action is checked
         checked: bool,
 
@@ -128,6 +144,7 @@ impl MenuItem {
             name: name.into(),
             action: Box::new(action),
             os_action: None,
+            icon: None,
             checked: false,
             disabled: false,
         }
@@ -143,6 +160,7 @@ impl MenuItem {
             name: name.into(),
             action: Box::new(action),
             os_action: Some(os_action),
+            icon: None,
             checked: false,
             disabled: false,
         }
@@ -157,17 +175,29 @@ impl MenuItem {
                 name,
                 action,
                 os_action,
+                icon,
                 checked,
                 disabled,
             } => OwnedMenuItem::Action {
                 name: name.into(),
                 action,
                 os_action,
+                icon,
                 checked,
                 disabled,
             },
             MenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.owned()),
         }
+    }
+
+    /// Set the SF Symbol icon shown next to this menu item (macOS only).
+    ///
+    /// Only for [`MenuItem::Action`], otherwise, will be ignored
+    pub fn icon(mut self, icon: impl Into<SharedString>) -> Self {
+        if let MenuItem::Action { icon: old, .. } = &mut self {
+            *old = Some(icon.into());
+        }
+        self
     }
 
     /// Set whether this menu item is checked
@@ -244,6 +274,9 @@ pub struct OwnedMenu {
 
     /// Whether this menu is disabled
     pub disabled: bool,
+
+    /// Whether this is the application's Help menu (see [`Menu::help`]).
+    pub help_menu: bool,
 }
 
 /// The different kinds of items that can be in a menu
@@ -269,6 +302,9 @@ pub enum OwnedMenuItem {
         /// See [`OsAction`] for more information
         os_action: Option<OsAction>,
 
+        /// An optional SF Symbol name to show as the item's icon (macOS only).
+        icon: Option<SharedString>,
+
         /// Whether this action is checked
         checked: bool,
 
@@ -286,12 +322,14 @@ impl Clone for OwnedMenuItem {
                 name,
                 action,
                 os_action,
+                icon,
                 checked,
                 disabled,
             } => OwnedMenuItem::Action {
                 name: name.clone(),
                 action: action.boxed_clone(),
                 os_action: *os_action,
+                icon: icon.clone(),
                 checked: *checked,
                 disabled: *disabled,
             },
@@ -412,6 +450,7 @@ mod tests {
             name: "Submenu".into(),
             items: vec![],
             disabled: true,
+            help_menu: false,
         });
         assert_eq!(
             match &submenu {
