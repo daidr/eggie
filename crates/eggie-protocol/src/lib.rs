@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -312,6 +312,13 @@ pub enum ClientRequest {
     TerminalScrollTo {
         session_id: SessionId,
         command: TerminalScrollCommand,
+    },
+    /// Scroll the viewport to an absolute scrollback offset (0 = live bottom, `history_size` = top).
+    /// The daemon clamps the offset to the current history size. Used by the scrollbar thumb drag,
+    /// which needs precise absolute positioning rather than the wheel accumulator's relative deltas.
+    TerminalScrollToOffset {
+        session_id: SessionId,
+        offset: u32,
     },
     /// Begin an interactive selection at a viewport cell. The daemon converts the viewport point to
     /// an absolute grid point (accounting for the current scroll offset) and stores it as the
@@ -814,6 +821,13 @@ pub struct TerminalSnapshot {
     pub selection: Option<TerminalSelectionRange>,
     #[serde(rename = "dl", default, skip_serializing_if = "Vec::is_empty")]
     pub detected_links: Vec<TerminalLinkRange>,
+    /// Current scroll offset into the scrollback: 0 = at the live bottom, `history_size` = scrolled
+    /// to the oldest line. Used by the UI to position the scrollbar thumb.
+    #[serde(rename = "do", default, skip_serializing_if = "is_zero_u32")]
+    pub display_offset: u32,
+    /// Number of scrollback lines above the live screen. 0 = no scrollback (scrollbar hidden).
+    #[serde(rename = "hs", default, skip_serializing_if = "is_zero_u32")]
+    pub history_size: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -976,6 +990,10 @@ pub struct TerminalSnapshotDelta {
     pub selection: Option<TerminalSelectionRange>,
     #[serde(rename = "dl", default, skip_serializing_if = "Vec::is_empty")]
     pub detected_links: Vec<TerminalLinkRange>,
+    #[serde(rename = "do", default, skip_serializing_if = "is_zero_u32")]
+    pub display_offset: u32,
+    #[serde(rename = "hs", default, skip_serializing_if = "is_zero_u32")]
+    pub history_size: u32,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -1064,6 +1082,8 @@ impl TerminalSnapshot {
                 .unwrap_or_else(|| self.image_placements.clone()),
             selection: delta.selection,
             detected_links: delta.detected_links.clone(),
+            display_offset: delta.display_offset,
+            history_size: delta.history_size,
         })
     }
 }
@@ -1448,6 +1468,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_scroll_to_offset_round_trips() {
+        for offset in [0u32, 1, 200, 100_000, u32::MAX] {
+            let request = ClientRequest::TerminalScrollToOffset {
+                session_id: Uuid::nil(),
+                offset,
+            };
+            let encoded = encode_line(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
+                request
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<ClientRequest>(&rmp_serde::to_vec_named(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn set_cursor_style_request_round_trips() {
         for shape in [
             TerminalCursorShape::Block,
@@ -1782,6 +1822,8 @@ mod tests {
             }],
             selection: None,
             detected_links: Vec::new(),
+            display_offset: 37,
+            history_size: 512,
         };
         let encoded = encode_line(&DaemonResponse::Snapshot {
             snapshot: Arc::new(snapshot.clone()),
@@ -1824,6 +1866,37 @@ mod tests {
                 .unwrap()
                 .cursor_blinking
         );
+    }
+
+    #[test]
+    fn snapshot_without_scroll_position_keys_decodes_to_zero() {
+        // A snapshot serialized before the scroll fields existed omits `do`/`hs`; both must default
+        // to 0 (live bottom, no scrollback) so the scrollbar stays hidden for legacy frames.
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "s": {"columns": 1, "rows": 1, "cell_width": 8, "cell_height": 18},
+            "c": [],
+            "cl": 0,
+            "cc": 0,
+            "cs": "block",
+            "cw": 1,
+            "t": "",
+            "r": 1
+        }"#;
+        let snapshot: TerminalSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.display_offset, 0);
+        assert_eq!(snapshot.history_size, 0);
+
+        // And when present they round-trip.
+        let scrolled = TerminalSnapshot {
+            display_offset: 42,
+            history_size: 1000,
+            ..snapshot
+        };
+        let decoded: TerminalSnapshot =
+            serde_json::from_slice(&encode_line(&scrolled).unwrap()).unwrap();
+        assert_eq!(decoded.display_offset, 42);
+        assert_eq!(decoded.history_size, 1000);
     }
 
     #[test]
@@ -1899,6 +1972,8 @@ mod tests {
             }],
             selection: None,
             detected_links: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
         };
         let replacement = TerminalCell {
             line: 0,
@@ -1937,6 +2012,8 @@ mod tests {
             image_placements: Some(Vec::new()),
             selection: None,
             detected_links: Vec::new(),
+            display_offset: 5,
+            history_size: 200,
         };
 
         let updated = snapshot.apply_delta(&delta).unwrap();
@@ -1951,6 +2028,9 @@ mod tests {
             updated.image_placements,
             delta.image_placements.clone().unwrap()
         );
+        // Scroll position is taken from the delta (like cursor_line), not diffed against the base.
+        assert_eq!(updated.display_offset, 5);
+        assert_eq!(updated.history_size, 200);
         let mut wrong_base = delta;
         wrong_base.base_revision = 3;
         assert!(snapshot.apply_delta(&wrong_base).is_none());

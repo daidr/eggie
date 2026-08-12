@@ -10,6 +10,7 @@ pub(crate) enum IconName {
     #[allow(dead_code)]
     AppWindow,
     ArrowDown,
+    ArrowRight,
     ArrowUp,
     Browser,
     Close,
@@ -39,6 +40,7 @@ impl IconName {
             Self::Appearance => '\u{F1A23}',
             Self::AppWindow => '\u{F1FB0}',
             Self::ArrowDown => '\u{F15FC}',
+            Self::ArrowRight => '\u{F1623}',
             Self::ArrowUp => '\u{F1632}',
             Self::Browser => '\u{F17C8}',
             Self::Close => '\u{F18BC}',

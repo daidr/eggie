@@ -2171,6 +2171,8 @@ mod tests {
             image_placements: Vec::new(),
             selection: None,
             detected_links: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
         }
     }
 

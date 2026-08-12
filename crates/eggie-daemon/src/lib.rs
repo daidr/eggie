@@ -3339,6 +3339,28 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// Scroll the viewport to an absolute scrollback offset (0 = live bottom, `history_size` = the
+    /// oldest line). Drives the scrollbar thumb drag. The offset is clamped to the current history
+    /// size, and a new frame is published only when the viewport actually moved (matching
+    /// [`Self::scroll_to`]).
+    fn scroll_to_offset(&self, offset: u32) -> Result<()> {
+        let mut terminal = self.terminal.lock();
+        let history = terminal.grid().history_size();
+        let target = (offset as usize).min(history);
+        let initial = terminal.grid().display_offset();
+        // `Scroll::Delta` is positive-up (toward older lines / higher offset), so the delta to reach
+        // an absolute offset is simply `target - initial`.
+        let delta = target as i32 - initial as i32;
+        if delta != 0 {
+            terminal.scroll_display(Scroll::Delta(delta));
+            if terminal.grid().display_offset() != initial {
+                self.events.publish_terminal(&terminal);
+            }
+        }
+        drop(terminal);
+        Ok(())
+    }
+
     /// Scroll to the previous/next OSC 133 shell prompt. No-op (returns `Ok`) when shell integration
     /// recorded no reachable prompt in that direction, so the keybinding is silent without data.
     fn jump_to_prompt(&self, direction: TerminalJumpDirection) -> Result<()> {
@@ -3896,6 +3918,8 @@ fn snapshot_terminal(
         selection,
         // Filled in by `ListenerState::detect_urls_into` after this snapshot is built.
         detected_links: Vec::new(),
+        display_offset: display_offset as u32,
+        history_size: terminal.grid().history_size() as u32,
     }
 }
 
@@ -3976,6 +4000,8 @@ fn snapshot_delta(
             .then(|| current.image_placements.clone()),
         selection: current.selection,
         detected_links: current.detected_links.clone(),
+        display_offset: current.display_offset,
+        history_size: current.history_size,
     })
 }
 
@@ -4818,6 +4844,10 @@ impl DaemonState {
                 command,
             } => {
                 self.session(session_id)?.scroll_to(command)?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::TerminalScrollToOffset { session_id, offset } => {
+                self.session(session_id)?.scroll_to_offset(offset)?;
                 Ok(DaemonResponse::Ok)
             }
             ClientRequest::TerminalSearch {
@@ -6371,6 +6401,8 @@ mod tests {
             image_placements: Vec::new(),
             selection: None,
             detected_links: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
         });
         let response = DaemonResponse::Snapshot {
             snapshot: snapshot.clone(),
@@ -6425,6 +6457,8 @@ mod tests {
             image_placements: Vec::new(),
             selection: None,
             detected_links: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
         };
         let image = TerminalImageKey {
             id: 7,
@@ -8450,6 +8484,157 @@ mod tests {
                 .any(|line| line.contains("FIRSTLINE")),
             "scroll-to-bottom should leave scrollback again"
         );
+
+        session.terminate();
+    }
+
+    /// Fills the scrollback with numbered filler lines and returns the session once `marker` is
+    /// visible at the live bottom. Shared setup for the scroll-position tests below.
+    #[cfg(test)]
+    fn session_with_scrollback(marker: &str) -> TerminalSession {
+        let session = TerminalSession::spawn_default(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+        // Split the marker across a shell string concatenation so the echoed command line reads
+        // `"BO""TTOMMARK"` while only the printed OUTPUT line reads `BOTTOMMARK`. Otherwise the wait
+        // loop would match the echoed command before any filler ran, breaking out with empty
+        // scrollback (the source of a nasty flake).
+        let (head, tail) = marker.split_at(2);
+        session
+            .input(
+                format!(
+                    "for i in $(seq 1 60); do echo filler $i; done; printf '%s\\n' \"{head}\"\"{tail}\"\r"
+                )
+                .into_bytes(),
+                1,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if session
+                .snapshot()
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains(marker))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{marker} did not arrive");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Wait for the shell to go quiescent (prompt drawn, no more output) so `history_size` is
+        // stable. Otherwise trailing output keeps growing history and, while scrolled, the kernel
+        // advances display_offset to stay anchored — which would make the positioning asserts flaky.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = session.snapshot().history_size;
+        let mut stable_since = Instant::now();
+        loop {
+            thread::sleep(Duration::from_millis(50));
+            let now = session.snapshot().history_size;
+            if now == last {
+                if stable_since.elapsed() >= Duration::from_millis(300) {
+                    break;
+                }
+            } else {
+                last = now;
+                stable_since = Instant::now();
+            }
+            assert!(Instant::now() < deadline, "scrollback never went quiescent");
+        }
+        session
+    }
+
+    #[test]
+    fn snapshot_reports_display_offset_and_history_size() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = session_with_scrollback("BOTTOMMARK");
+
+        // At the live bottom there is scrollback above but the offset is zero.
+        let bottom = session.snapshot();
+        assert_eq!(bottom.display_offset, 0, "live bottom has zero offset");
+        assert!(bottom.history_size > 0, "filler lines built scrollback");
+
+        // Scrolling to the very top puts the offset at the full history size.
+        session.scroll_to(TerminalScrollCommand::Top).unwrap();
+        let top = session.snapshot();
+        assert_eq!(
+            top.display_offset, top.history_size,
+            "scroll-to-top offset equals history size"
+        );
+
+        session.terminate();
+    }
+
+    #[test]
+    fn scroll_to_offset_positions_viewport_and_clamps() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = session_with_scrollback("TAILMARK");
+        let history = session.snapshot().history_size;
+        assert!(history >= 4, "need enough scrollback to position within");
+
+        // An interior offset lands exactly there.
+        let target = history / 2;
+        session.scroll_to_offset(target).unwrap();
+        assert_eq!(session.snapshot().display_offset, target);
+
+        // Offsets past the history clamp to the top rather than panicking or overshooting.
+        session.scroll_to_offset(u32::MAX).unwrap();
+        assert_eq!(session.snapshot().display_offset, history);
+
+        // Offset zero returns to the live bottom.
+        session.scroll_to_offset(0).unwrap();
+        assert_eq!(session.snapshot().display_offset, 0);
+
+        session.terminate();
+    }
+
+    #[test]
+    fn output_while_scrolled_keeps_the_thumb_anchor() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = session_with_scrollback("ANCHORMARK");
+        let history = session.snapshot().history_size;
+
+        // Queue delayed output BEFORE scrolling. `input()` snaps the viewport to the live bottom
+        // (scroll-on-keystroke), so we must issue no further keystrokes after scrolling — the
+        // `sleep` lets the burst arrive on its own while we sit scrolled back.
+        session
+            .input(
+                b"sleep 0.6; for i in $(seq 1 10); do echo more $i; done\r".to_vec(),
+                2,
+            )
+            .unwrap();
+
+        // Scroll up into the middle of the scrollback and record the top-of-viewport index.
+        let offset = history / 2;
+        session.scroll_to_offset(offset).unwrap();
+        let scrolled = session.snapshot();
+        let anchor = scrolled.history_size - scrolled.display_offset;
+
+        // The delayed burst lands with no keystroke: the kernel advances display_offset in lockstep
+        // with history growth so the visible content (and thus the thumb) stays anchored —
+        // history_size - display_offset holds constant.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = session.snapshot();
+            if now.history_size > history {
+                assert_eq!(
+                    now.history_size - now.display_offset,
+                    anchor,
+                    "top-of-viewport index must stay constant while output arrives"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "additional output did not arrive");
+            thread::sleep(Duration::from_millis(20));
+        }
 
         session.terminate();
     }
