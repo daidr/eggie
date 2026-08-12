@@ -598,6 +598,75 @@ impl Language {
         }
     }
 
+    // --- Menu bar: menu titles and menu-only item labels -----------------------------------
+    // Items that map to a configurable action reuse that action's `action_*` label instead
+    // (e.g. New Tab -> `action_new_tab`), so only the menu-only strings live here.
+
+    pub(crate) fn view_menu(self) -> &'static str {
+        match self {
+            Self::English => "View",
+            Self::SimplifiedChinese => "显示",
+        }
+    }
+
+    pub(crate) fn window_menu(self) -> &'static str {
+        match self {
+            Self::English => "Window",
+            Self::SimplifiedChinese => "窗口",
+        }
+    }
+
+    pub(crate) fn help_menu(self) -> &'static str {
+        match self {
+            Self::English => "Help",
+            Self::SimplifiedChinese => "帮助",
+        }
+    }
+
+    pub(crate) fn about_eggie(self) -> &'static str {
+        match self {
+            Self::English => "About Eggie",
+            Self::SimplifiedChinese => "关于 Eggie",
+        }
+    }
+
+    pub(crate) fn secure_keyboard_entry(self) -> &'static str {
+        match self {
+            Self::English => "Secure Keyboard Entry",
+            Self::SimplifiedChinese => "安全键盘输入",
+        }
+    }
+
+    pub(crate) fn close_all_windows_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Close All Windows",
+            Self::SimplifiedChinese => "关闭全部窗口",
+        }
+    }
+
+    /// The Edit-menu Find item uses the ellipsis form (it opens the search bar), distinct from
+    /// the bare `action_terminal_find` label shown on the keybindings page.
+    pub(crate) fn find_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Find…",
+            Self::SimplifiedChinese => "查找…",
+        }
+    }
+
+    pub(crate) fn zoom_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Zoom",
+            Self::SimplifiedChinese => "缩放",
+        }
+    }
+
+    pub(crate) fn help_docs_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Eggie Help",
+            Self::SimplifiedChinese => "Eggie 帮助",
+        }
+    }
+
     pub(crate) fn cut(self) -> &'static str {
         match self {
             Self::English => "Cut",
@@ -1708,6 +1777,55 @@ impl Language {
         match self {
             Self::English => "Reset Font Size",
             Self::SimplifiedChinese => "重置字号",
+        }
+    }
+
+    pub(crate) fn action_split_left(self) -> &'static str {
+        match self {
+            Self::English => "Split Left",
+            Self::SimplifiedChinese => "向左分屏",
+        }
+    }
+
+    pub(crate) fn action_split_up(self) -> &'static str {
+        match self {
+            Self::English => "Split Up",
+            Self::SimplifiedChinese => "向上分屏",
+        }
+    }
+
+    pub(crate) fn action_find_next(self) -> &'static str {
+        match self {
+            Self::English => "Find Next",
+            Self::SimplifiedChinese => "查找下一个",
+        }
+    }
+
+    pub(crate) fn action_find_previous(self) -> &'static str {
+        match self {
+            Self::English => "Find Previous",
+            Self::SimplifiedChinese => "查找上一个",
+        }
+    }
+
+    pub(crate) fn action_close_window(self) -> &'static str {
+        match self {
+            Self::English => "Close Window",
+            Self::SimplifiedChinese => "关闭窗口",
+        }
+    }
+
+    pub(crate) fn action_minimize_window(self) -> &'static str {
+        match self {
+            Self::English => "Minimize",
+            Self::SimplifiedChinese => "最小化",
+        }
+    }
+
+    pub(crate) fn action_toggle_full_screen(self) -> &'static str {
+        match self {
+            Self::English => "Toggle Full Screen",
+            Self::SimplifiedChinese => "切换全屏",
         }
     }
 

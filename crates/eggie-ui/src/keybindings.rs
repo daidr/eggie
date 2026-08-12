@@ -15,9 +15,10 @@ use gpui::{App, DummyKeyboardMapper, KeyBinding, Keystroke};
 
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
-    ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
-    NewTab, NewWindow, NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom,
-    ScrollTop, SplitDown, SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
+    ClearScreen, CloseTab, CloseWindow, FindNext, FindPrevious, FontDecrease, FontIncrease,
+    FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow, NextTab,
+    OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown, SplitRight,
+    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
 };
 
 /// One user-configurable action. `ACTION_SPECS` is the single source of truth;
@@ -95,6 +96,18 @@ pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
         build: |ks| load_binding(ks, TerminalFind),
     },
     ActionSpec {
+        id: "find_next",
+        default_keystroke: "cmd-g",
+        label: Language::action_find_next,
+        build: |ks| load_binding(ks, FindNext),
+    },
+    ActionSpec {
+        id: "find_previous",
+        default_keystroke: "cmd-shift-g",
+        label: Language::action_find_previous,
+        build: |ks| load_binding(ks, FindPrevious),
+    },
+    ActionSpec {
         id: "new_tab",
         default_keystroke: "cmd-t",
         label: Language::action_new_tab,
@@ -105,6 +118,12 @@ pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
         default_keystroke: "cmd-w",
         label: Language::action_close_tab,
         build: |ks| load_binding(ks, CloseTab),
+    },
+    ActionSpec {
+        id: "close_window",
+        default_keystroke: "cmd-shift-w",
+        label: Language::action_close_window,
+        build: |ks| load_binding(ks, CloseWindow),
     },
     ActionSpec {
         id: "next_tab",
@@ -189,6 +208,18 @@ pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
         default_keystroke: "cmd-down",
         label: Language::action_jump_next_prompt,
         build: |ks| load_binding(ks, JumpNextPrompt),
+    },
+    ActionSpec {
+        id: "minimize_window",
+        default_keystroke: "cmd-m",
+        label: Language::action_minimize_window,
+        build: |ks| load_binding(ks, MinimizeWindow),
+    },
+    ActionSpec {
+        id: "toggle_full_screen",
+        default_keystroke: "ctrl-cmd-f",
+        label: Language::action_toggle_full_screen,
+        build: |ks| load_binding(ks, ToggleFullScreen),
     },
 ];
 

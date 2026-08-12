@@ -52,12 +52,27 @@ actions!(
         FontDecrease,
         FontReset,
         JumpPrevPrompt,
-        JumpNextPrompt
+        JumpNextPrompt,
+        About,
+        ToggleSecureKeyboardEntry,
+        CloseWindow,
+        CloseAllWindows,
+        FindNext,
+        FindPrevious,
+        SplitLeft,
+        SplitUp,
+        MinimizeWindow,
+        ZoomWindow,
+        ToggleFullScreen,
+        HelpDocs
     ]
 );
 
-const SETTINGS_WIDTH: f32 = 680.;
-const SETTINGS_HEIGHT: f32 = 540.;
+/// Destination for the Help menu's documentation item.
+// TODO: point at the real Eggie docs/repo once one exists (Cargo.toml has no `repository`).
+const EGGIE_HELP_URL: &str = "https://github.com/eggie-terminal/eggie";
+
+const SETTINGS_WIDTH: f32 = 680.;const SETTINGS_HEIGHT: f32 = 540.;
 const SETTINGS_MIN_WIDTH: f32 = 640.;
 const SETTINGS_MIN_HEIGHT: f32 = 420.;
 const SETTINGS_TITLEBAR_HEIGHT: f32 = 52.;
@@ -254,6 +269,23 @@ pub(crate) fn install(
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // App-level menu commands that don't act on a specific terminal window.
+    cx.on_action(|_: &About, _cx| crate::system_menu::show_about_panel());
+    cx.on_action(|_: &CloseAllWindows, cx| {
+        for handle in cx.windows() {
+            handle.update(cx, |_, window, _| window.remove_window()).ok();
+        }
+    });
+    cx.on_action(|_: &HelpDocs, cx| cx.open_url(EGGIE_HELP_URL));
+    // Toggling Secure Keyboard Entry flips a process-global input mode, then rebuilds the menu
+    // bar so the checkmark reflects the new state (menus have no in-place item update API).
+    let settings_for_secure_input = settings.clone();
+    cx.on_action(move |_: &ToggleSecureKeyboardEntry, cx| {
+        crate::system_menu::toggle_secure_input();
+        let config = settings_for_secure_input.read(cx).config().clone();
+        crate::keybindings::rebuild_keymap(&config, cx);
+        cx.set_menus(build_menus(config.language));
+    });
     // Build the keymap from settings (defaults + user overrides). This also
     // registers the text-input bindings in the correct order to preserve the
     // binding-index tiebreak. Action handlers above are registered exactly once
@@ -275,10 +307,17 @@ pub(crate) fn install(
     .detach();
 }
 
-fn build_menus(language: Language) -> [Menu; 3] {
-    [
+fn build_menus(language: Language) -> Vec<Menu> {
+    // SF Symbol names mirror ghostty's `setupMenuImages` where it has an equivalent item;
+    // the rest are chosen to match. Unknown symbols degrade to no icon (see gpui setImage).
+    vec![
         Menu::new("Eggie").items([
-            MenuItem::action(language.settings_menu_item(), OpenSettings),
+            MenuItem::action(language.about_eggie(), About).icon("info.circle"),
+            MenuItem::separator(),
+            MenuItem::action(language.settings_menu_item(), OpenSettings).icon("gear"),
+            MenuItem::action(language.secure_keyboard_entry(), ToggleSecureKeyboardEntry)
+                .icon("lock.display")
+                .checked(crate::system_menu::secure_input_enabled()),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
@@ -288,16 +327,73 @@ fn build_menus(language: Language) -> [Menu; 3] {
             MenuItem::separator(),
             MenuItem::action(language.quit_eggie(), Quit),
         ]),
-        Menu::new(language.file_menu()).items([MenuItem::action(
-            language.new_window_menu_item(),
-            NewWindow,
-        )]),
-        Menu::new(language.edit_menu()).items([
-            MenuItem::os_action(language.copy(), TerminalCopy, OsAction::Copy),
-            MenuItem::os_action(language.paste(), TerminalPaste, OsAction::Paste),
+        Menu::new(language.file_menu()).items([
+            MenuItem::action(language.action_new_tab(), NewTab).icon("macwindow"),
+            MenuItem::action(language.new_window_menu_item(), NewWindow)
+                .icon("macwindow.badge.plus"),
             MenuItem::separator(),
-            MenuItem::os_action(language.select_all(), TerminalSelectAll, OsAction::SelectAll),
+            MenuItem::action(language.action_split_right(), SplitRight)
+                .icon("rectangle.righthalf.inset.filled"),
+            MenuItem::action(language.action_split_left(), SplitLeft)
+                .icon("rectangle.leadinghalf.inset.filled"),
+            MenuItem::action(language.action_split_down(), SplitDown)
+                .icon("rectangle.bottomhalf.inset.filled"),
+            MenuItem::action(language.action_split_up(), SplitUp)
+                .icon("rectangle.tophalf.inset.filled"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_close_tab(), CloseTab).icon("xmark"),
+            MenuItem::action(language.action_close_window(), CloseWindow).icon("xmark.rectangle"),
+            MenuItem::action(language.close_all_windows_menu_item(), CloseAllWindows)
+                .icon("xmark.rectangle.fill"),
         ]),
+        Menu::new(language.edit_menu()).items([
+            MenuItem::os_action(language.copy(), TerminalCopy, OsAction::Copy).icon("doc.on.doc"),
+            MenuItem::os_action(language.paste(), TerminalPaste, OsAction::Paste)
+                .icon("doc.on.clipboard"),
+            MenuItem::separator(),
+            MenuItem::os_action(language.select_all(), TerminalSelectAll, OsAction::SelectAll)
+                .icon("text.justify"),
+            MenuItem::separator(),
+            MenuItem::action(language.find_menu_item(), TerminalFind).icon("magnifyingglass"),
+            MenuItem::action(language.action_find_next(), FindNext).icon("chevron.down"),
+            MenuItem::action(language.action_find_previous(), FindPrevious).icon("chevron.up"),
+        ]),
+        Menu::new(language.view_menu()).items([
+            MenuItem::action(language.action_font_increase(), FontIncrease)
+                .icon("textformat.size.larger"),
+            MenuItem::action(language.action_font_decrease(), FontDecrease)
+                .icon("textformat.size.smaller"),
+            MenuItem::action(language.action_font_reset(), FontReset).icon("textformat.size"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_scroll_top(), ScrollTop).icon("arrow.up.to.line"),
+            MenuItem::action(language.action_scroll_bottom(), ScrollBottom)
+                .icon("arrow.down.to.line"),
+            MenuItem::action(language.action_page_up(), PageUp).icon("arrow.up"),
+            MenuItem::action(language.action_page_down(), PageDown).icon("arrow.down"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_jump_prev_prompt(), JumpPrevPrompt)
+                .icon("arrowtriangle.up.circle"),
+            MenuItem::action(language.action_jump_next_prompt(), JumpNextPrompt)
+                .icon("arrowtriangle.down.circle"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_clear_screen(), ClearScreen).icon("clear"),
+        ]),
+        Menu::new(language.window_menu()).items([
+            MenuItem::action(language.action_minimize_window(), MinimizeWindow)
+                .icon("minus.rectangle"),
+            MenuItem::action(language.zoom_menu_item(), ZoomWindow)
+                .icon("arrow.up.left.and.arrow.down.right"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_toggle_full_screen(), ToggleFullScreen)
+                .icon("square.arrowtriangle.4.outward"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_next_tab(), NextTab).icon("chevron.right"),
+            MenuItem::action(language.action_prev_tab(), PrevTab).icon("chevron.left"),
+        ]),
+        Menu::new(language.help_menu())
+            .help()
+            .items([MenuItem::action(language.help_docs_menu_item(), HelpDocs)
+                .icon("questionmark.circle")]),
     ]
 }
 

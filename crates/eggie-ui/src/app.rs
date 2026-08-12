@@ -10,9 +10,10 @@ use crate::settings::{
     TerminalTheme, UiColors,
 };
 use crate::settings_window::{
-    ClearScreen, CloseTab, FontDecrease, FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt,
-    NewTab, NextTab, PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitRight,
-    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, is_dark_appearance,
+    ClearScreen, CloseTab, CloseWindow, FindNext, FindPrevious, FontDecrease, FontIncrease,
+    FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NextTab, PageDown, PageUp,
+    PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitLeft, SplitRight, SplitUp, TerminalCopy,
+    TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen, ZoomWindow, is_dark_appearance,
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
@@ -6474,6 +6475,44 @@ impl gpui::Render for EggieApp {
                 if app.scroll_active_terminal(TerminalScrollCommand::NextPrompt, cx) {
                     cx.stop_propagation();
                 }
+            }))
+            .on_action(cx.listener(|app, _: &SplitLeft, _, cx| {
+                if app.split_active_group(Direction::Left, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &SplitUp, _, cx| {
+                if app.split_active_group(Direction::Up, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &FindNext, _, cx| {
+                // No-op when the search bar is closed; always consume so the key never
+                // reaches the terminal grid.
+                app.navigate_terminal_search(TerminalSearchDirection::Forward, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &FindPrevious, _, cx| {
+                app.navigate_terminal_search(TerminalSearchDirection::Backward, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, cx| {
+                window.minimize_window();
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, cx| {
+                window.zoom_window();
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|_, _: &ToggleFullScreen, window, cx| {
+                window.toggle_fullscreen();
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, cx| {
+                // Direct close: bypasses the in-app close-confirmation prompt
+                // (`install_close_confirmation`), matching the menu's "close now" intent.
+                window.remove_window();
+                cx.stop_propagation();
             }))
             .on_mouse_move(cx.listener(|app, event, window, cx| {
                 app.resize_sidebar(event, window, cx);
