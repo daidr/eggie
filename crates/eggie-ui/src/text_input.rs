@@ -26,6 +26,9 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::native_menu::{NativeEditMenuCommand, prepare_edit_menu};
+use crate::settings::Language;
+
 actions!(
     eggie_text_input,
     [
@@ -94,6 +97,9 @@ pub(crate) struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     style: TextInputStyle,
+    /// Localized labels for the right-click edit menu. The parent pushes the current language each
+    /// frame via [`set_language`], so switching language at runtime never leaves stale menu text.
+    language: Language,
     /// Whether the field currently holds focus (maintained by focus_in/out observers). The caret
     /// is only drawn and only blinks while focused.
     focused: bool,
@@ -133,6 +139,7 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             style,
+            language: Language::English,
             focused: false,
             blink_epoch: Instant::now(),
             blink_scheduled: false,
@@ -153,6 +160,13 @@ impl TextInput {
 
     pub(crate) fn set_placeholder(&mut self, placeholder: impl Into<SharedString>) {
         self.placeholder = placeholder.into();
+    }
+
+    /// Update the language used for the right-click edit menu labels. Cheap enough to call every
+    /// frame from the parent's render; no `cx.notify()` because the menu reads `self.language`
+    /// lazily when it pops up, so a language change never affects already-painted content.
+    pub(crate) fn set_language(&mut self, language: Language) {
+        self.language = language;
     }
 
     /// Replace the content programmatically, clamping the selection and clearing any marked text.
@@ -198,6 +212,10 @@ impl TextInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.do_select_all(cx);
+    }
+
+    fn do_select_all(&mut self, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }
@@ -233,6 +251,10 @@ impl TextInput {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        self.do_paste(window, cx);
+    }
+
+    fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             // Single-line field: collapse any newlines to spaces.
             self.replace_text_in_range(None, &text.replace(['\r', '\n'], " "), window, cx);
@@ -240,6 +262,10 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        self.do_copy(cx);
+    }
+
+    fn do_copy(&mut self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -248,6 +274,10 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        self.do_cut(window, cx);
+    }
+
+    fn do_cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -293,6 +323,60 @@ impl TextInput {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
+        }
+    }
+
+    /// Right-click: pop up the native macOS edit menu (Cut / Copy / Paste / Select All).
+    fn on_right_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Same reasoning as the left handler: grab focus and stop the event here so it doesn't bubble
+        // to the terminal content region (which would steal focus and start a terminal selection).
+        window.focus(&self.focus_handle, cx);
+        cx.stop_propagation();
+
+        let has_selection = !self.selected_range.is_empty();
+        let has_content = !self.content.is_empty();
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .is_some();
+        let enabled = edit_menu_enabled(has_selection, has_content, can_paste);
+
+        let Some(menu) = prepare_edit_menu(window, enabled, self.language) else {
+            return; // Non-macOS, or the AppKit view / current event was unavailable.
+        };
+
+        // The AppKit menu runs a modal nested event loop, so it must run in a foreground future
+        // rather than inside this listener (which still holds the App borrow). `spawn_in` yields an
+        // `AsyncWindowContext`, so `update_in` can hand us back a `&mut Window` to run the action —
+        // required because `replace_text_in_range` (paste/cut) takes a `Window`.
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(command) = menu.show() else {
+                return;
+            };
+            this.update_in(cx, |input, window, cx| {
+                input.perform_edit_command(command, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn perform_edit_command(
+        &mut self,
+        command: NativeEditMenuCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            NativeEditMenuCommand::Cut => self.do_cut(window, cx),
+            NativeEditMenuCommand::Copy => self.do_copy(cx),
+            NativeEditMenuCommand::Paste => self.do_paste(window, cx),
+            NativeEditMenuCommand::SelectAll => self.do_select_all(cx),
         }
     }
 
@@ -471,6 +555,13 @@ impl TextInput {
     }
 }
 
+/// Compute the enabled flags for the edit menu, in native_menu tag order: `[cut, copy, paste,
+/// select_all]`. Cut/copy need a non-empty selection, paste needs clipboard text, select-all needs
+/// any content. Kept as a free function so it can be unit-tested without a GPUI context.
+fn edit_menu_enabled(has_selection: bool, has_content: bool, can_paste: bool) -> [bool; 4] {
+    [has_selection, has_selection, can_paste, has_content]
+}
+
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -644,6 +735,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::confirm_reverse))
             .on_action(cx.listener(Self::cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -896,7 +988,29 @@ impl Element for TextElement {
 
 #[cfg(test)]
 mod tests {
-    use super::TextInput;
+    use super::{TextInput, edit_menu_enabled};
+
+    #[test]
+    fn edit_menu_enabled_maps_state_to_flags() {
+        // [cut, copy, paste, select_all]
+        // 无选区 + 空内容 + 剪贴板空 → 全灰。
+        assert_eq!(
+            edit_menu_enabled(false, false, false),
+            [false, false, false, false]
+        );
+        // 有选区(可剪切/拷贝)+ 有内容(可全选)+ 剪贴板有内容(可粘贴)→ 全亮。
+        assert_eq!(edit_menu_enabled(true, true, true), [true, true, true, true]);
+        // 有内容但无选区:cut/copy 灰,select_all 亮。
+        assert_eq!(
+            edit_menu_enabled(false, true, false),
+            [false, false, false, true]
+        );
+        // 剪贴板有内容但输入框空:仅 paste 亮。
+        assert_eq!(
+            edit_menu_enabled(false, false, true),
+            [false, false, true, false]
+        );
+    }
 
     // Maps a UTF-16 selection offset (relative to the inserted marked text) to a UTF-8 byte length.
     // This is the mapping whose absence caused an out-of-bounds `selected_range` and the IME panic.

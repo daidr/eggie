@@ -2835,6 +2835,13 @@ impl gpui::Render for SettingsWindow {
         self.colors = UiColors::from_theme(theme);
 
         let language = config.language;
+        // Keep every input field's edit-menu labels in sync with the current language.
+        self.selector_search_input
+            .update(cx, |input, _| input.set_language(language));
+        self.shell_program_input
+            .update(cx, |input, _| input.set_language(language));
+        self.shell_args_input
+            .update(cx, |input, _| input.set_language(language));
         let language_control = self.render_language_control(language, cx);
         let bell_control = self.render_bell_control(config.bell_mode, window, cx);
         let mode_control = self.render_mode_control(config.theme_mode, cx);

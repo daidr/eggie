@@ -598,6 +598,13 @@ impl Language {
         }
     }
 
+    pub(crate) fn cut(self) -> &'static str {
+        match self {
+            Self::English => "Cut",
+            Self::SimplifiedChinese => "剪切",
+        }
+    }
+
     pub(crate) fn copy(self) -> &'static str {
         match self {
             Self::English => "Copy",
