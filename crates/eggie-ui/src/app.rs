@@ -1,4 +1,5 @@
 use crate::icons::{IconName, icon, icon_sized};
+use crate::command_palette::{PaletteEntry, command_matches, palette_entries};
 use crate::input_latency::InputLatencyTracker;
 use crate::native_menu::{
     NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand,
@@ -10,10 +11,11 @@ use crate::settings::{
     TerminalTheme, UiColors,
 };
 use crate::settings_window::{
-    ClearScreen, CloseTab, CloseWindow, FindNext, FindPrevious, FontDecrease, FontIncrease,
-    FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NextTab, PageDown, PageUp,
-    PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitLeft, SplitRight, SplitUp, TerminalCopy,
-    TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen, ZoomWindow, is_dark_appearance,
+    ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
+    FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NextTab,
+    PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitLeft, SplitRight, SplitUp,
+    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen, ZoomWindow,
+    is_dark_appearance,
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
@@ -282,6 +284,20 @@ struct TerminalSearchUi {
     /// The most recent result from the daemon, used to render highlights and the match counter.
     result: Option<TerminalSearchResult>,
     /// Subscription to the input's events; dropped (unsubscribed) when the search bar closes.
+    _subscription: Subscription,
+}
+
+/// State for the command palette (⌘⇧P). A centered modal listing every command; the query filters
+/// it, ↑/↓ move the selection, Enter/click runs the selected command, Esc closes. At most one is
+/// open at a time. The command data comes from [`crate::command_palette::palette_entries`].
+struct CommandPaletteUi {
+    /// The reusable text-input component holding the filter query, cursor, and focus.
+    input: Entity<TextInput>,
+    /// Index of the highlighted row within the *filtered* list (clamped on every change).
+    selected_index: usize,
+    /// Scroll handle for the results list, so the selected row can be kept in view.
+    scroll_handle: ScrollHandle,
+    /// Subscription to the input's events; dropped (unsubscribed) when the palette closes.
     _subscription: Subscription,
 }
 
@@ -560,6 +576,8 @@ pub struct EggieApp {
     terminal_viewports: HashMap<GroupId, TerminalViewport>,
     terminal_selection_drag: Option<TerminalSelectionDrag>,
     terminal_search: Option<TerminalSearchUi>,
+    /// The command palette (⌘⇧P) overlay, when open.
+    command_palette: Option<CommandPaletteUi>,
     hyperlink_mouse_down: bool,
     /// The auto-detected URL currently under the mouse, if any, for hover underline + pointer cursor.
     terminal_hovered_link: Option<(SessionId, eggie_protocol::TerminalLinkRange)>,
@@ -1215,6 +1233,7 @@ impl EggieApp {
             terminal_viewports: HashMap::new(),
             terminal_selection_drag: None,
             terminal_search: None,
+            command_palette: None,
             hyperlink_mouse_down: false,
             terminal_hovered_link: None,
             terminal_has_focus: false,
@@ -3982,6 +4001,284 @@ impl EggieApp {
         Some(bar.into_any_element())
     }
 
+    /// Toggle the command palette: open it (building a fresh input) if closed, close it if open.
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette.is_some() {
+            self.close_command_palette(window, cx);
+            return;
+        }
+        let colors = self.colors;
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(
+                window,
+                cx,
+                TextInputStyle {
+                    text_color: (colors.text << 8) | 0xff,
+                    placeholder_color: (colors.muted << 8) | 0xff,
+                    cursor_color: (colors.accent << 8) | 0xff,
+                    selection_color: (colors.accent << 8) | 0x55,
+                },
+            );
+            input.set_placeholder(self.language.command_palette_placeholder());
+            input
+        });
+        let subscription = cx.subscribe_in(&input, window, Self::on_palette_input_event);
+        let handle = input.read(cx).focus_handle();
+        self.command_palette = Some(CommandPaletteUi {
+            input,
+            selected_index: 0,
+            scroll_handle: ScrollHandle::new(),
+            _subscription: subscription,
+        });
+        handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Close the palette and return focus to the terminal so keyboard input keeps working.
+    fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.command_palette.take().is_none() {
+            return false;
+        }
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Route events emitted by the palette's filter input.
+    fn on_palette_input_event(
+        &mut self,
+        _input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextInputEvent::Changed => {
+                // A new query reshuffles the filtered list; reset the selection to the top.
+                if let Some(palette) = &mut self.command_palette {
+                    palette.selected_index = 0;
+                    palette.scroll_handle.set_offset(point(px(0.), px(0.)));
+                }
+                cx.notify();
+            }
+            TextInputEvent::Confirm | TextInputEvent::ConfirmReverse => {
+                self.run_selected_palette_command(window, cx);
+            }
+            TextInputEvent::Cancel => {
+                self.close_command_palette(window, cx);
+            }
+        }
+    }
+
+    /// The palette's current filter query (empty if the palette is closed).
+    fn command_palette_query(&self, cx: &App) -> String {
+        self.command_palette
+            .as_ref()
+            .map(|palette| palette.input.read(cx).content().trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// The palette entries matching the current query, in display order.
+    fn filtered_palette_entries(&self, cx: &App) -> Vec<PaletteEntry> {
+        let config = self.settings.read(cx).config();
+        let query = self.command_palette_query(cx);
+        palette_entries(config)
+            .into_iter()
+            .filter(|entry| command_matches(entry.label, &query))
+            .collect()
+    }
+
+    /// Move the palette selection by `delta`, clamped to the filtered list, and keep it in view.
+    fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.filtered_palette_entries(cx).len();
+        let Some(palette) = &mut self.command_palette else {
+            return;
+        };
+        if count == 0 {
+            palette.selected_index = 0;
+            return;
+        }
+        let last = count - 1;
+        let current = palette.selected_index.min(last) as isize;
+        let next = (current + delta).clamp(0, last as isize) as usize;
+        palette.selected_index = next;
+        palette.scroll_handle.scroll_to_item(next);
+        cx.notify();
+    }
+
+    /// Run the currently selected command: pull its action out of the filtered list, close the
+    /// palette (which returns focus to the terminal), then dispatch. Order matters — the dispatch
+    /// path is captured against the focused node, so focus must be back on the workspace root first
+    /// for window-level command handlers to receive it.
+    fn run_selected_palette_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &self.command_palette else {
+            return;
+        };
+        let index = palette.selected_index;
+        let mut entries = self.filtered_palette_entries(cx);
+        if index >= entries.len() {
+            return;
+        }
+        let action = entries.swap_remove(index).action;
+        self.close_command_palette(window, cx);
+        window.dispatch_action(action, cx);
+    }
+
+    /// Render the command palette as a centered modal over the whole workspace, or `None` when it is
+    /// closed. A dimmed backdrop catches clicks (and, via `.occlude()`, all other pointer events) to
+    /// close it; the panel holds the filter input above a scrollable, filterable command list.
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let palette = self.command_palette.as_ref()?;
+        let colors = self.colors;
+        let entries = self.filtered_palette_entries(cx);
+        let selected = palette.selected_index.min(entries.len().saturating_sub(1));
+
+        let mut list = div()
+            .id("command-palette-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&palette.scroll_handle)
+            .py_1();
+        if entries.is_empty() {
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(36.))
+                    .px_3()
+                    .text_color(rgb(colors.muted))
+                    .child(self.language.command_palette_empty()),
+            );
+        } else {
+            for (index, entry) in entries.into_iter().enumerate() {
+                let is_selected = index == selected;
+                let mut row = div()
+                    .id(("command-palette-row", index))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .flex_none()
+                    .h(px(34.))
+                    .mx_1()
+                    .px_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_selected, |element| {
+                        element
+                            .bg(rgb(colors.panel_alt))
+                            .text_color(rgb(colors.accent))
+                    })
+                    .hover(|element| element.bg(rgb(colors.panel_alt)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        if let Some(palette) = &mut app.command_palette {
+                            palette.selected_index = index;
+                        }
+                        app.run_selected_palette_command(window, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(entry.label.to_string()),
+                    );
+                if let Some(keystroke) = entry.keystroke {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(rgb(colors.muted))
+                            .child(keystroke),
+                    );
+                }
+                list = list.child(row);
+            }
+        }
+
+        let panel = div()
+            .id("command-palette-panel")
+            .flex()
+            .flex_col()
+            .w(px(560.))
+            .max_w(relative(0.9))
+            .max_h(relative(0.5))
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_lg()
+            // Swallow presses inside the panel so they don't bubble to the backdrop's close handler.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // ↑/↓ move the selection. The text input never binds these keys, so they bubble here
+            // uncontested; every other key falls through to the input.
+            .on_key_down(cx.listener(|app, event: &KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    "up" => {
+                        app.move_palette_selection(-1, cx);
+                        cx.stop_propagation();
+                    }
+                    "down" => {
+                        app.move_palette_selection(1, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_none()
+                    .h(px(40.))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(colors.border))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(colors.muted))
+                            .child(icon(IconName::Search)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .text_size(px(14.))
+                            .text_color(rgb(colors.text))
+                            .child(palette.input.clone()),
+                    ),
+            )
+            .child(list);
+
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_start()
+            .justify_center()
+            // Push the panel down from the top edge so it reads as a palette, not a dialog.
+            .pt(px(96.))
+            // Block every pointer event for the terminal content behind the modal.
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, _, window, cx| {
+                    app.close_command_palette(window, cx);
+                }),
+            )
+            .child(panel);
+        Some(backdrop.into_any_element())
+    }
+
     pub(crate) fn terminal_ime_state(&self, session_id: SessionId) -> Option<&TerminalImeState> {
         self.terminal_ime_states.get(&session_id)
     }
@@ -4035,13 +4332,17 @@ impl EggieApp {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // When the search input is focused it owns keyboard input; never leak keys into the
-        // terminal. The input's own handlers consume the keys; this guard covers the case where the
-        // event bubbles up to the workspace root before the input consumes it.
+        // When the search input or command palette is focused it owns keyboard input; never leak
+        // keys into the terminal. The input's own handlers consume the keys; this guard covers the
+        // case where the event bubbles up to the workspace root before the input consumes it.
         if self
             .terminal_search
             .as_ref()
             .is_some_and(|search| search.input.read(cx).is_focused(window))
+            || self
+                .command_palette
+                .as_ref()
+                .is_some_and(|palette| palette.input.read(cx).is_focused(window))
         {
             return;
         }
@@ -4066,12 +4367,17 @@ impl EggieApp {
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Mirror the key_down guard: while the search input is focused it owns keyboard input, so
-        // key releases must not leak into the terminal (e.g. as kitty key-release escape sequences).
+        // Mirror the key_down guard: while the search input or command palette is focused it owns
+        // keyboard input, so key releases must not leak into the terminal (e.g. as kitty key-release
+        // escape sequences).
         if self
             .terminal_search
             .as_ref()
             .is_some_and(|search| search.input.read(cx).is_focused(window))
+            || self
+                .command_palette
+                .as_ref()
+                .is_some_and(|palette| palette.input.read(cx).is_focused(window))
         {
             return;
         }
@@ -6514,6 +6820,10 @@ impl gpui::Render for EggieApp {
                 window.remove_window();
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|app, _: &CommandPalette, window, cx| {
+                app.toggle_command_palette(window, cx);
+                cx.stop_propagation();
+            }))
             .on_mouse_move(cx.listener(|app, event, window, cx| {
                 app.resize_sidebar(event, window, cx);
                 app.resize_split(event, window, cx);
@@ -6553,6 +6863,8 @@ impl gpui::Render for EggieApp {
                     .child(self.render_sidebar_resize_handle(SidebarEdge::Right, cx))
                     .child(self.render_right_sidebar(cx))
             })
+            // Centered modal overlay, painted last so it sits above the whole workspace.
+            .children(self.render_command_palette(cx))
     }
 }
 

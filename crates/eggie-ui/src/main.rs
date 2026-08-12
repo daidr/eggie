@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod command_palette;
 mod gui_ipc;
 mod i18n;
 mod icons;
