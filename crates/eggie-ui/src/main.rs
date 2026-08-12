@@ -12,6 +12,7 @@ mod project_store;
 pub mod services;
 mod settings;
 mod settings_window;
+mod system_menu;
 mod terminal_renderer;
 mod terminal_sprites;
 mod text_input;
