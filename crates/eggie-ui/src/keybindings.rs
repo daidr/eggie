@@ -4,9 +4,10 @@
 //! runtime `name -> constructor` table. This module bridges that gap with a
 //! `&'static` metadata slice ([`ACTION_SPECS`]) where each entry maps a stable
 //! string id to everything needed to render, store, and rebuild a keybinding:
-//! its default keystroke, its localized label, and a closure that constructs the
-//! concrete GPUI `KeyBinding` (the closure fixes the concrete `Action` type, so
-//! we never need to reconstruct a `Box<dyn Action>` from a string).
+//! its default keystroke, its localized label, and a `make_action` closure that
+//! constructs the concrete GPUI action (so we never need to reconstruct a
+//! `Box<dyn Action>` from a string). The command palette reuses the same
+//! `make_action` to dispatch a command by id.
 //!
 //! The keymap is rebuilt at runtime from settings via [`rebuild_keymap`], so
 //! edits in the settings window take effect without a restart.
@@ -15,10 +16,10 @@ use gpui::{App, DummyKeyboardMapper, KeyBinding, Keystroke};
 
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
-    ClearScreen, CloseTab, CloseWindow, FindNext, FindPrevious, FontDecrease, FontIncrease,
-    FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow, NextTab,
-    OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown, SplitRight,
-    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
+    ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
+    FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow,
+    NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown,
+    SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
 };
 
 /// One user-configurable action. `ACTION_SPECS` is the single source of truth;
@@ -31,18 +32,18 @@ pub(crate) struct ActionSpec {
     pub default_keystroke: &'static str,
     /// Localized display label.
     pub label: fn(Language) -> &'static str,
-    /// Builds a terminal `KeyBinding` (context = None) for the given keystroke.
-    /// The closure fixes the concrete `Action` type. Returns `None` on parse
-    /// failure so a bad override is skipped rather than panicking.
-    pub build: fn(&str) -> Option<KeyBinding>,
+    /// Constructs the concrete `Action` this command dispatches. Shared by two callers: the keymap
+    /// (wrapped in a `KeyBinding` via `load_binding`) and the command palette (dispatched directly),
+    /// so both draw from this single id -> action source of truth.
+    pub make_action: fn() -> Box<dyn gpui::Action>,
 }
 
 /// Fallibly build a keybinding. Uses `KeyBinding::load` (not `::new`, which
 /// panics on parse error) so malformed keystrokes are skipped.
-fn load_binding<A: gpui::Action>(keystrokes: &str, action: A) -> Option<KeyBinding> {
+fn load_binding(keystrokes: &str, action: Box<dyn gpui::Action>) -> Option<KeyBinding> {
     KeyBinding::load(
         keystrokes,
-        Box::new(action),
+        action,
         None,
         false,
         None,
@@ -57,169 +58,175 @@ pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
         id: "open_settings",
         default_keystroke: "cmd-,",
         label: Language::action_open_settings,
-        build: |ks| load_binding(ks, OpenSettings),
+        make_action: || Box::new(OpenSettings),
     },
     ActionSpec {
         id: "new_window",
         default_keystroke: "cmd-n",
         label: Language::action_new_window,
-        build: |ks| load_binding(ks, NewWindow),
+        make_action: || Box::new(NewWindow),
     },
     ActionSpec {
         id: "quit",
         default_keystroke: "cmd-q",
         label: Language::action_quit,
-        build: |ks| load_binding(ks, Quit),
+        make_action: || Box::new(Quit),
     },
     ActionSpec {
         id: "terminal_copy",
         default_keystroke: "cmd-c",
         label: Language::action_terminal_copy,
-        build: |ks| load_binding(ks, TerminalCopy),
+        make_action: || Box::new(TerminalCopy),
     },
     ActionSpec {
         id: "terminal_paste",
         default_keystroke: "cmd-v",
         label: Language::action_terminal_paste,
-        build: |ks| load_binding(ks, TerminalPaste),
+        make_action: || Box::new(TerminalPaste),
     },
     ActionSpec {
         id: "terminal_select_all",
         default_keystroke: "cmd-a",
         label: Language::action_terminal_select_all,
-        build: |ks| load_binding(ks, TerminalSelectAll),
+        make_action: || Box::new(TerminalSelectAll),
     },
     ActionSpec {
         id: "terminal_find",
         default_keystroke: "cmd-f",
         label: Language::action_terminal_find,
-        build: |ks| load_binding(ks, TerminalFind),
+        make_action: || Box::new(TerminalFind),
     },
     ActionSpec {
         id: "find_next",
         default_keystroke: "cmd-g",
         label: Language::action_find_next,
-        build: |ks| load_binding(ks, FindNext),
+        make_action: || Box::new(FindNext),
     },
     ActionSpec {
         id: "find_previous",
         default_keystroke: "cmd-shift-g",
         label: Language::action_find_previous,
-        build: |ks| load_binding(ks, FindPrevious),
+        make_action: || Box::new(FindPrevious),
     },
     ActionSpec {
         id: "new_tab",
         default_keystroke: "cmd-t",
         label: Language::action_new_tab,
-        build: |ks| load_binding(ks, NewTab),
+        make_action: || Box::new(NewTab),
     },
     ActionSpec {
         id: "close_tab",
         default_keystroke: "cmd-w",
         label: Language::action_close_tab,
-        build: |ks| load_binding(ks, CloseTab),
+        make_action: || Box::new(CloseTab),
     },
     ActionSpec {
         id: "close_window",
         default_keystroke: "cmd-shift-w",
         label: Language::action_close_window,
-        build: |ks| load_binding(ks, CloseWindow),
+        make_action: || Box::new(CloseWindow),
     },
     ActionSpec {
         id: "next_tab",
         default_keystroke: "cmd-shift-]",
         label: Language::action_next_tab,
-        build: |ks| load_binding(ks, NextTab),
+        make_action: || Box::new(NextTab),
     },
     ActionSpec {
         id: "prev_tab",
         default_keystroke: "cmd-shift-[",
         label: Language::action_prev_tab,
-        build: |ks| load_binding(ks, PrevTab),
+        make_action: || Box::new(PrevTab),
     },
     ActionSpec {
         id: "split_right",
         default_keystroke: "cmd-d",
         label: Language::action_split_right,
-        build: |ks| load_binding(ks, SplitRight),
+        make_action: || Box::new(SplitRight),
     },
     ActionSpec {
         id: "split_down",
         default_keystroke: "cmd-shift-d",
         label: Language::action_split_down,
-        build: |ks| load_binding(ks, SplitDown),
+        make_action: || Box::new(SplitDown),
     },
     ActionSpec {
         id: "clear_screen",
         default_keystroke: "cmd-k",
         label: Language::action_clear_screen,
-        build: |ks| load_binding(ks, ClearScreen),
+        make_action: || Box::new(ClearScreen),
     },
     ActionSpec {
         id: "scroll_top",
         default_keystroke: "cmd-home",
         label: Language::action_scroll_top,
-        build: |ks| load_binding(ks, ScrollTop),
+        make_action: || Box::new(ScrollTop),
     },
     ActionSpec {
         id: "scroll_bottom",
         default_keystroke: "cmd-end",
         label: Language::action_scroll_bottom,
-        build: |ks| load_binding(ks, ScrollBottom),
+        make_action: || Box::new(ScrollBottom),
     },
     ActionSpec {
         id: "page_up",
         default_keystroke: "cmd-pageup",
         label: Language::action_page_up,
-        build: |ks| load_binding(ks, PageUp),
+        make_action: || Box::new(PageUp),
     },
     ActionSpec {
         id: "page_down",
         default_keystroke: "cmd-pagedown",
         label: Language::action_page_down,
-        build: |ks| load_binding(ks, PageDown),
+        make_action: || Box::new(PageDown),
     },
     ActionSpec {
         id: "font_increase",
         default_keystroke: "cmd-=",
         label: Language::action_font_increase,
-        build: |ks| load_binding(ks, FontIncrease),
+        make_action: || Box::new(FontIncrease),
     },
     ActionSpec {
         id: "font_decrease",
         default_keystroke: "cmd--",
         label: Language::action_font_decrease,
-        build: |ks| load_binding(ks, FontDecrease),
+        make_action: || Box::new(FontDecrease),
     },
     ActionSpec {
         id: "font_reset",
         default_keystroke: "cmd-0",
         label: Language::action_font_reset,
-        build: |ks| load_binding(ks, FontReset),
+        make_action: || Box::new(FontReset),
     },
     ActionSpec {
         id: "jump_prev_prompt",
         default_keystroke: "cmd-up",
         label: Language::action_jump_prev_prompt,
-        build: |ks| load_binding(ks, JumpPrevPrompt),
+        make_action: || Box::new(JumpPrevPrompt),
     },
     ActionSpec {
         id: "jump_next_prompt",
         default_keystroke: "cmd-down",
         label: Language::action_jump_next_prompt,
-        build: |ks| load_binding(ks, JumpNextPrompt),
+        make_action: || Box::new(JumpNextPrompt),
     },
     ActionSpec {
         id: "minimize_window",
         default_keystroke: "cmd-m",
         label: Language::action_minimize_window,
-        build: |ks| load_binding(ks, MinimizeWindow),
+        make_action: || Box::new(MinimizeWindow),
     },
     ActionSpec {
         id: "toggle_full_screen",
         default_keystroke: "ctrl-cmd-f",
         label: Language::action_toggle_full_screen,
-        build: |ks| load_binding(ks, ToggleFullScreen),
+        make_action: || Box::new(ToggleFullScreen),
+    },
+    ActionSpec {
+        id: "command_palette",
+        default_keystroke: "cmd-shift-p",
+        label: Language::action_command_palette,
+        make_action: || Box::new(CommandPalette),
     },
 ];
 
@@ -365,8 +372,8 @@ pub(crate) fn rebuild_keymap(config: &AppSettings, cx: &mut App) {
             .get(spec.id)
             .map(String::as_str)
             .unwrap_or(spec.default_keystroke);
-        if let Some(binding) =
-            (spec.build)(keystroke).or_else(|| (spec.build)(spec.default_keystroke))
+        if let Some(binding) = load_binding(keystroke, (spec.make_action)())
+            .or_else(|| load_binding(spec.default_keystroke, (spec.make_action)()))
         {
             bindings.push(binding);
         }
@@ -415,7 +422,7 @@ mod tests {
                 spec.default_keystroke
             );
             assert!(
-                (spec.build)(spec.default_keystroke).is_some(),
+                load_binding(spec.default_keystroke, (spec.make_action)()).is_some(),
                 "default keystroke does not build for {}: {:?}",
                 spec.id,
                 spec.default_keystroke

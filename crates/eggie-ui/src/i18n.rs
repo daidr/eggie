@@ -1829,6 +1829,36 @@ impl Language {
         }
     }
 
+    pub(crate) fn action_command_palette(self) -> &'static str {
+        match self {
+            Self::English => "Command Palette",
+            Self::SimplifiedChinese => "命令面板",
+        }
+    }
+
+    // --- Command palette --------------------------------------------------------------------
+
+    pub(crate) fn command_palette_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Command Palette…",
+            Self::SimplifiedChinese => "命令面板…",
+        }
+    }
+
+    pub(crate) fn command_palette_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Search commands…",
+            Self::SimplifiedChinese => "搜索命令…",
+        }
+    }
+
+    pub(crate) fn command_palette_empty(self) -> &'static str {
+        match self {
+            Self::English => "No matching commands",
+            Self::SimplifiedChinese => "无匹配的命令",
+        }
+    }
+
     // --- Bell -------------------------------------------------------------------------------
 
     pub(crate) fn bell_row(self) -> &'static str {

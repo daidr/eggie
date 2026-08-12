@@ -64,7 +64,8 @@ actions!(
         MinimizeWindow,
         ZoomWindow,
         ToggleFullScreen,
-        HelpDocs
+        HelpDocs,
+        CommandPalette
     ]
 );
 
@@ -359,6 +360,8 @@ fn build_menus(language: Language) -> Vec<Menu> {
             MenuItem::action(language.action_find_previous(), FindPrevious).icon("chevron.up"),
         ]),
         Menu::new(language.view_menu()).items([
+            MenuItem::action(language.command_palette_menu_item(), CommandPalette).icon("command"),
+            MenuItem::separator(),
             MenuItem::action(language.action_font_increase(), FontIncrease)
                 .icon("textformat.size.larger"),
             MenuItem::action(language.action_font_decrease(), FontDecrease)
