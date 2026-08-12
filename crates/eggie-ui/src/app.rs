@@ -43,7 +43,7 @@ use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
     DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions,
-    Pixels, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Pixels, Point, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     Stateful, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
     TouchPhase, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, anchored,
     canvas, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
@@ -100,6 +100,12 @@ const SPLIT_DIVIDER_LINE_WIDTH: f32 = 2.;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 8.;
 const SIDEBAR_SCROLLBAR_THUMB_WIDTH: f32 = 4.;
 const SIDEBAR_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 24.;
+// The terminal scrollbar occupies a thin strip on the right edge of each pane. It is always shown
+// while there is scrollback, and darkens slightly on hover/drag. The track is a wider transparent
+// grab/hit area; the visible thumb is narrower.
+const TERMINAL_SCROLLBAR_WIDTH: f32 = 12.;
+const TERMINAL_SCROLLBAR_THUMB_WIDTH: f32 = 6.;
+const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 24.;
 const SESSION_INSPECTION_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_LIST_INTERVAL: Duration = Duration::from_millis(500);
 const SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
@@ -249,6 +255,18 @@ struct TerminalSelectionDrag {
     group_id: GroupId,
     session_id: SessionId,
     dragged: bool,
+}
+
+/// State for an in-progress scrollbar thumb drag. `grab_offset` is the pointer's Y distance from the
+/// thumb's top at grab time, so the thumb doesn't jump under the cursor. `pending_offset` is the
+/// last offset we asked the daemon for; it drives optimistic thumb rendering so the thumb tracks the
+/// pointer instantly rather than waiting for the round-tripped snapshot.
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    group_id: GroupId,
+    session_id: SessionId,
+    grab_offset: f32,
+    pending_offset: u32,
 }
 
 /// State for the in-terminal search bar (⌘F). At most one search is active at a time, targeting the
@@ -562,6 +580,13 @@ pub struct EggieApp {
     // the render-time `.clone()` shares the same map; cloning a bare `RefCell` would copy the map
     // and the listener would write into a throwaway the resize handler never sees.
     split_bounds: Rc<RefCell<HashMap<SplitId, Bounds<Pixels>>>>,
+    /// The scrollbar thumb currently being dragged, if any.
+    dragging_scrollbar: Option<ScrollbarDrag>,
+    // On-screen bounds of each group's scrollbar track, recorded by the track's prepaint listener.
+    // The drag handler maps a pointer Y into an absolute scroll offset against these bounds, and the
+    // renderer sizes/places the thumb from them. Same `Rc<RefCell>` sharing rationale as
+    // `split_bounds`: cloning a bare `RefCell` at render time would detach the listener's writes.
+    scrollbar_bounds: Rc<RefCell<HashMap<GroupId, Bounds<Pixels>>>>,
     moving_window: bool,
     tab_drop_target: Option<TabDropTarget>,
     right_sidebar_scroll_handle: ScrollHandle,
@@ -1205,6 +1230,8 @@ impl EggieApp {
             resizing_sidebar: None,
             resizing_split: None,
             split_bounds: Rc::new(RefCell::new(HashMap::new())),
+            dragging_scrollbar: None,
+            scrollbar_bounds: Rc::new(RefCell::new(HashMap::new())),
             moving_window: false,
             tab_drop_target: None,
             right_sidebar_scroll_handle: ScrollHandle::new(),
@@ -4180,6 +4207,196 @@ impl EggieApp {
         cx.notify();
     }
 
+    /// Send an absolute scroll request for the scrollbar thumb drag / track click.
+    fn scroll_terminal_to_offset(&self, session_id: SessionId, offset: u32) {
+        if let Err(error) = self.client.request(ClientRequest::TerminalScrollToOffset {
+            session_id,
+            offset,
+        }) {
+            eprintln!("failed to scroll terminal to offset: {error:#}");
+        }
+    }
+
+    /// Drive an in-progress scrollbar thumb drag. Mirrors `resize_split`: it reads the cached track
+    /// bounds, maps the pointer Y (minus the grab offset) to an absolute scroll offset, renders the
+    /// thumb optimistically at that offset, and asks the daemon to scroll there.
+    fn drag_scrollbar(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(mut drag) = self.dragging_scrollbar else {
+            return;
+        };
+        if !event.dragging() {
+            self.dragging_scrollbar = None;
+            return;
+        }
+        let Some(bounds) = self.scrollbar_bounds.borrow().get(&drag.group_id).copied() else {
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&drag.session_id) else {
+            return;
+        };
+        let history = snapshot.history_size;
+        let rows = snapshot.size.rows;
+        let track_height = f32::from(bounds.size.height);
+        let thumb_top = f32::from(event.position.y) - f32::from(bounds.top()) - drag.grab_offset;
+        let offset = scrollbar_offset_from_thumb_top(track_height, history, rows, thumb_top);
+        drag.pending_offset = offset;
+        self.dragging_scrollbar = Some(drag);
+        self.scroll_terminal_to_offset(drag.session_id, offset);
+        cx.notify();
+    }
+
+    /// Handle a click on the scrollbar track (outside the thumb): page up if the click is above the
+    /// thumb, page down if below. Reuses the discrete PageUp/PageDown scroll commands.
+    fn scrollbar_track_click(
+        &mut self,
+        group_id: GroupId,
+        session_id: SessionId,
+        position: Point<Pixels>,
+    ) {
+        let Some(bounds) = self.scrollbar_bounds.borrow().get(&group_id).copied() else {
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&session_id) else {
+            return;
+        };
+        let track_height = f32::from(bounds.size.height);
+        let Some(thumb) =
+            scrollbar_thumb_geometry(track_height, snapshot.history_size, snapshot.size.rows, snapshot.display_offset)
+        else {
+            return;
+        };
+        let click_y = f32::from(position.y) - f32::from(bounds.top());
+        let command = if click_y < thumb.top {
+            TerminalScrollCommand::PageUp
+        } else if click_y > thumb.top + thumb.height {
+            TerminalScrollCommand::PageDown
+        } else {
+            return;
+        };
+        if let Err(error) = self.client.request(ClientRequest::TerminalScrollTo {
+            session_id,
+            command,
+        }) {
+            eprintln!("failed to page terminal scrollbar: {error:#}");
+        }
+    }
+
+    /// Render the terminal scrollbar overlay for a pane. Returns `None` when there is no scrollback
+    /// (the scrollbar is hidden) or on the first frame before the track's bounds have been captured.
+    ///
+    /// The whole strip is `.occlude()`d so pointer events over it never fall through to the terminal
+    /// (selection / link-hover) beneath — matching the search-bar overlay precedent. The thumb top
+    /// is rendered from the previous frame's cached track height; while this group's thumb is being
+    /// dragged we substitute the optimistic `pending_offset` so it tracks the pointer immediately.
+    fn render_scrollbar(
+        &self,
+        group_id: GroupId,
+        session_id: SessionId,
+        history: u32,
+        offset: u32,
+        rows: u16,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if history == 0 {
+            return None;
+        }
+        // Optimistic offset during an active drag on this group.
+        let render_offset = match self.dragging_scrollbar {
+            Some(drag) if drag.group_id == group_id => drag.pending_offset,
+            _ => offset,
+        };
+        let track_height = self
+            .scrollbar_bounds
+            .borrow()
+            .get(&group_id)
+            .map(|bounds| f32::from(bounds.size.height));
+        let thumb = track_height
+            .and_then(|height| scrollbar_thumb_geometry(height, history, rows, render_offset));
+
+        let scrollbar_bounds = self.scrollbar_bounds.clone();
+        let dragging_this = self
+            .dragging_scrollbar
+            .is_some_and(|drag| drag.group_id == group_id);
+        let muted = self.colors.muted;
+        // Same hue at every state, only the opacity changes: light at rest, a touch darker on hover,
+        // darkest while dragging. Never the accent color.
+        const THUMB_ALPHA_IDLE: u32 = 0x59;
+        const THUMB_ALPHA_HOVER: u32 = 0x99;
+        const THUMB_ALPHA_DRAG: u32 = 0xcc;
+
+        let mut track = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(TERMINAL_SCROLLBAR_WIDTH))
+            .occlude()
+            // Capture the track's window-space bounds for thumb geometry and drag hit-mapping.
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        scrollbar_bounds.borrow_mut().insert(group_id, bounds);
+                    },
+                    |_, _, _, _| (),
+                )
+                .absolute()
+                .size_full(),
+            )
+            // A click on the track (outside the thumb) pages toward the click.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |app, event: &MouseDownEvent, _, cx| {
+                    app.scrollbar_track_click(group_id, session_id, event.position);
+                    cx.stop_propagation();
+                }),
+            );
+
+        if let Some(thumb) = thumb {
+            let idle_alpha = if dragging_this {
+                THUMB_ALPHA_DRAG
+            } else {
+                THUMB_ALPHA_IDLE
+            };
+            // A stable id lets GPUI track the hover state so the darker hover fill repaints promptly.
+            let thumb_margin = (TERMINAL_SCROLLBAR_WIDTH - TERMINAL_SCROLLBAR_THUMB_WIDTH) / 2.;
+            track = track.child(
+                div()
+                    .id(SharedString::from(format!("scrollbar-thumb-{group_id}")))
+                    .absolute()
+                    .top(px(thumb.top))
+                    .right(px(thumb_margin))
+                    .w(px(TERMINAL_SCROLLBAR_THUMB_WIDTH))
+                    .h(px(thumb.height))
+                    .rounded_full()
+                    .bg(rgba((muted << 8) | idle_alpha))
+                    .when(!dragging_this, |element| {
+                        element.hover(|style| style.bg(rgba((muted << 8) | THUMB_ALPHA_HOVER)))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, event: &MouseDownEvent, _, cx| {
+                            let thumb_top_window = app
+                                .scrollbar_bounds
+                                .borrow()
+                                .get(&group_id)
+                                .map(|bounds| f32::from(bounds.top()) + thumb.top);
+                            if let Some(thumb_top_window) = thumb_top_window {
+                                app.dragging_scrollbar = Some(ScrollbarDrag {
+                                    group_id,
+                                    session_id,
+                                    grab_offset: f32::from(event.position.y) - thumb_top_window,
+                                    pending_offset: render_offset,
+                                });
+                            }
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+
+        Some(track.into_any_element())
+    }
+
     /// Attach the manual window-drag handlers Eggie uses under `app_owns_titlebar_drag`.
     ///
     /// On macOS the `WindowControlArea::Drag` marker is a no-op; dragging is driven entirely by
@@ -5100,7 +5317,7 @@ impl EggieApp {
                             .text_color(rgb(self.colors.muted))
                             .child(icon_sized(
                                 if collapsed {
-                                    IconName::ArrowUp
+                                    IconName::ArrowRight
                                 } else {
                                     IconName::ArrowDown
                                 },
@@ -5824,6 +6041,21 @@ impl EggieApp {
             content_region = content_region.child(search_bar);
         }
 
+        // Overlay the scrollbar on the right edge when the active session has scrollback.
+        if let Some(scrollbar) = active_session_id.and_then(|session_id| {
+            let snapshot = self.snapshots.get(&session_id)?;
+            self.render_scrollbar(
+                group_id,
+                session_id,
+                snapshot.history_size,
+                snapshot.display_offset,
+                snapshot.size.rows,
+                cx,
+            )
+        }) {
+            content_region = content_region.child(scrollbar);
+        }
+
         div()
             .id(format!("terminal-group-{group_id}"))
             .flex()
@@ -6241,6 +6473,7 @@ impl gpui::Render for EggieApp {
             .on_mouse_move(cx.listener(|app, event, window, cx| {
                 app.resize_sidebar(event, window, cx);
                 app.resize_split(event, window, cx);
+                app.drag_scrollbar(event, cx);
                 app.update_terminal_selection_drag(event, cx);
             }))
             .on_mouse_up(
@@ -6248,6 +6481,7 @@ impl gpui::Render for EggieApp {
                 cx.listener(|app, _, _, cx| {
                     app.resizing_sidebar = None;
                     app.resizing_split = None;
+                    app.dragging_scrollbar = None;
                     app.clear_tab_drop_target(cx);
                     app.finish_terminal_selection_drag(cx);
                 }),
@@ -6870,6 +7104,58 @@ fn fixed_terminal_scroll_delta(delta: f32) -> i32 {
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
+/// Thumb geometry for the terminal scrollbar, in pixels relative to the track's top.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarThumb {
+    top: f32,
+    height: f32,
+}
+
+/// Compute the scrollbar thumb's height and top offset.
+///
+/// `H` = history_size (scrollback lines), `R` = visible rows, `D` = display_offset (0 = live bottom,
+/// H = scrolled to the oldest line). The thumb represents the R visible rows out of the (H + R) total
+/// scrollable rows. Viewport-top content index is `H - D`, mapped onto pixel travel `[0, travel]`:
+/// D = 0 → thumb flush bottom, D = H → thumb flush top. Returns `None` when there is no scrollback
+/// (`H == 0`) or the track is too short to be meaningful.
+fn scrollbar_thumb_geometry(track_height: f32, history: u32, rows: u16, offset: u32) -> Option<ScrollbarThumb> {
+    if history == 0 || track_height <= 0. {
+        return None;
+    }
+    let h = history as f32;
+    let r = (rows.max(1)) as f32;
+    let frac = r / (h + r);
+    let thumb_height = (track_height * frac).max(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_height);
+    let travel = (track_height - thumb_height).max(0.);
+    let d = (offset.min(history)) as f32;
+    let top = ((h - d) / h) * travel;
+    Some(ScrollbarThumb {
+        top,
+        height: thumb_height,
+    })
+}
+
+/// Inverse of [`scrollbar_thumb_geometry`]: map a thumb-top pixel position back to a scroll offset D.
+/// `thumb_top` is clamped to `[0, travel]` by the caller's grab math; here we invert the linear map.
+/// Returns the current offset unchanged when there is no travel (thumb fills the track).
+fn scrollbar_offset_from_thumb_top(track_height: f32, history: u32, rows: u16, thumb_top: f32) -> u32 {
+    if history == 0 || track_height <= 0. {
+        return 0;
+    }
+    let h = history as f32;
+    let r = (rows.max(1)) as f32;
+    let frac = r / (h + r);
+    let thumb_height = (track_height * frac).max(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_height);
+    let travel = track_height - thumb_height;
+    if travel <= 0. {
+        return 0;
+    }
+    let clamped = thumb_top.clamp(0., travel);
+    // top = ((H - D) / H) * travel  ⇒  D = H * (1 - top/travel)
+    let d = (h * (1. - clamped / travel)).round();
+    (d.max(0.) as u32).min(history)
+}
+
 fn terminal_size_for_viewport(
     width: f32,
     height: f32,
@@ -7443,6 +7729,57 @@ mod tests {
     use super::*;
     use gpui::{Keystroke, Modifiers};
     use uuid::Uuid;
+
+    #[test]
+    fn scrollbar_thumb_hidden_without_scrollback() {
+        // No history → no thumb (scrollbar is hidden entirely).
+        assert_eq!(scrollbar_thumb_geometry(400., 0, 24, 0), None);
+        // Zero-height track is degenerate.
+        assert_eq!(scrollbar_thumb_geometry(0., 100, 24, 0), None);
+    }
+
+    #[test]
+    fn scrollbar_thumb_sits_at_bottom_and_top_at_the_extremes() {
+        let track = 400.;
+        let (history, rows) = (100u32, 25u16);
+        let thumb = scrollbar_thumb_geometry(track, history, rows, 0).unwrap();
+        let travel = track - thumb.height;
+        // D = 0 (live bottom) → thumb flush bottom.
+        assert!((thumb.top - travel).abs() < 0.01, "bottom: {thumb:?}");
+        // D = H (scrolled to top) → thumb flush top.
+        let top = scrollbar_thumb_geometry(track, history, rows, history).unwrap();
+        assert!(top.top.abs() < 0.01, "top: {top:?}");
+        // Thumb represents R/(H+R) of the track: 25/125 = 0.2 → 80px.
+        assert!((thumb.height - 80.).abs() < 0.01, "height: {thumb:?}");
+    }
+
+    #[test]
+    fn scrollbar_thumb_respects_minimum_height() {
+        // Huge history would give a sub-pixel thumb; clamp to the minimum.
+        let thumb = scrollbar_thumb_geometry(400., 1_000_000, 24, 0).unwrap();
+        assert!((thumb.height - TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrollbar_offset_inverts_thumb_top() {
+        let track = 400.;
+        let (history, rows) = (100u32, 25u16);
+        // Round-trip a few offsets through geometry → thumb top → offset.
+        for offset in [0u32, 25, 50, 75, 100] {
+            let thumb = scrollbar_thumb_geometry(track, history, rows, offset).unwrap();
+            let recovered = scrollbar_offset_from_thumb_top(track, history, rows, thumb.top);
+            assert_eq!(recovered, offset, "offset {offset} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn scrollbar_offset_clamps_out_of_range_positions() {
+        let track = 400.;
+        let (history, rows) = (100u32, 25u16);
+        // Above the track → oldest line (full history). Below → live bottom (0).
+        assert_eq!(scrollbar_offset_from_thumb_top(track, history, rows, -50.), history);
+        assert_eq!(scrollbar_offset_from_thumb_top(track, history, rows, 10_000.), 0);
+    }
 
     fn process(pid: u32, parent_pid: Option<u32>, name: &str) -> ProcessInfo {
         ProcessInfo {
