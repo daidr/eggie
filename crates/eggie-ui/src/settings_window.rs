@@ -65,7 +65,9 @@ actions!(
         ZoomWindow,
         ToggleFullScreen,
         HelpDocs,
-        CommandPalette
+        CommandPalette,
+        ToggleLeftSidebar,
+        ToggleRightSidebar
     ]
 );
 
@@ -361,6 +363,11 @@ fn build_menus(language: Language) -> Vec<Menu> {
         ]),
         Menu::new(language.view_menu()).items([
             MenuItem::action(language.command_palette_menu_item(), CommandPalette).icon("command"),
+            MenuItem::separator(),
+            MenuItem::action(language.action_toggle_left_sidebar(), ToggleLeftSidebar)
+                .icon("sidebar.left"),
+            MenuItem::action(language.action_toggle_right_sidebar(), ToggleRightSidebar)
+                .icon("sidebar.right"),
             MenuItem::separator(),
             MenuItem::action(language.action_font_increase(), FontIncrease)
                 .icon("textformat.size.larger"),
