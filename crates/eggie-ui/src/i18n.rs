@@ -1836,6 +1836,20 @@ impl Language {
         }
     }
 
+    pub(crate) fn action_toggle_left_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "Toggle Left Sidebar",
+            Self::SimplifiedChinese => "切换左侧边栏",
+        }
+    }
+
+    pub(crate) fn action_toggle_right_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "Toggle Right Sidebar",
+            Self::SimplifiedChinese => "切换右侧边栏",
+        }
+    }
+
     // --- Command palette --------------------------------------------------------------------
 
     pub(crate) fn command_palette_menu_item(self) -> &'static str {

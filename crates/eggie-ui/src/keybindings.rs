@@ -20,6 +20,7 @@ use crate::settings_window::{
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow,
     NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown,
     SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 
 /// One user-configurable action. `ACTION_SPECS` is the single source of truth;
@@ -227,6 +228,18 @@ pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
         default_keystroke: "cmd-shift-p",
         label: Language::action_command_palette,
         make_action: || Box::new(CommandPalette),
+    },
+    ActionSpec {
+        id: "toggle_left_sidebar",
+        default_keystroke: "cmd-b",
+        label: Language::action_toggle_left_sidebar,
+        make_action: || Box::new(ToggleLeftSidebar),
+    },
+    ActionSpec {
+        id: "toggle_right_sidebar",
+        default_keystroke: "cmd-shift-b",
+        label: Language::action_toggle_right_sidebar,
+        make_action: || Box::new(ToggleRightSidebar),
     },
 ];
 

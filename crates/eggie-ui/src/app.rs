@@ -14,8 +14,8 @@ use crate::settings_window::{
     ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NextTab,
     PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitLeft, SplitRight, SplitUp,
-    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen, ZoomWindow,
-    is_dark_appearance,
+    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
+    ToggleLeftSidebar, ToggleRightSidebar, ZoomWindow, is_dark_appearance,
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
@@ -6822,6 +6822,14 @@ impl gpui::Render for EggieApp {
             }))
             .on_action(cx.listener(|app, _: &CommandPalette, window, cx| {
                 app.toggle_command_palette(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &ToggleLeftSidebar, _, cx| {
+                app.toggle_left_sidebar(cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &ToggleRightSidebar, _, cx| {
+                app.toggle_right_sidebar(cx);
                 cx.stop_propagation();
             }))
             .on_mouse_move(cx.listener(|app, event, window, cx| {
