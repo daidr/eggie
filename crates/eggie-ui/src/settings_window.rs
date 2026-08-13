@@ -73,7 +73,7 @@ actions!(
 
 /// Destination for the Help menu's documentation item.
 // TODO: point at the real Eggie docs/repo once one exists (Cargo.toml has no `repository`).
-const EGGIE_HELP_URL: &str = "https://github.com/eggie-terminal/eggie";
+const EGGIE_HELP_URL: &str = "https://github.com/daidr/eggie";
 
 const SETTINGS_WIDTH: f32 = 680.;const SETTINGS_HEIGHT: f32 = 540.;
 const SETTINGS_MIN_WIDTH: f32 = 640.;
