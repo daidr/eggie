@@ -5835,7 +5835,10 @@ impl DaemonInputSender {
     }
 }
 
-fn terminate_daemon_at(socket_path: &Path) {
+/// Terminate the daemon listening on `socket_path` (SIGTERM via the socket
+/// peer PID) and remove the socket file. Used by the app on shutdown paths
+/// and by the standalone updater when an update changes the daemon protocol.
+pub fn terminate_daemon_at(socket_path: &Path) {
     if let Ok(stream) = UnixStream::connect(socket_path)
         && let Some(pid) = unix_peer_pid(&stream)
         && pid > 1
@@ -5851,6 +5854,27 @@ fn terminate_daemon_at(socket_path: &Path) {
     if socket_path.exists() {
         let _ = fs::remove_file(socket_path);
     }
+}
+
+/// Whether a daemon's handshake response is acceptable to this client.
+///
+/// The protocol version must always match. In debug builds the build id must
+/// also match, so any recompile swaps in a fresh daemon. In release builds
+/// only the protocol version matters, allowing an in-place update to keep a
+/// compatible daemon running (terminal sessions stay alive across updates).
+pub fn handshake_accepted(
+    daemon_protocol: u32,
+    daemon_build_id: &str,
+    self_protocol: u32,
+    self_build_id: &str,
+) -> bool {
+    if daemon_protocol != self_protocol {
+        return false;
+    }
+    if cfg!(debug_assertions) && daemon_build_id != self_build_id {
+        return false;
+    }
+    true
 }
 
 impl DaemonClient {
@@ -5930,7 +5954,23 @@ impl DaemonClient {
             DaemonResponse::HandshakeAccepted {
                 protocol_version,
                 build_id,
-            } if protocol_version == PROTOCOL_VERSION && build_id == self.build_id.as_ref() => {
+            } => {
+                if !handshake_accepted(
+                    protocol_version,
+                    &build_id,
+                    PROTOCOL_VERSION,
+                    &self.build_id,
+                ) {
+                    bail!("unexpected handshake response: protocol={protocol_version}, build_id={build_id}");
+                }
+                if build_id != self.build_id.as_ref() {
+                    // Release builds accept a daemon from a different build as long as the
+                    // protocol version matches (in-place updates keep the daemon alive).
+                    eprintln!(
+                        "connected to daemon with a different build id: daemon {build_id}, app {}",
+                        self.build_id
+                    );
+                }
                 Ok(())
             }
             response => bail!("unexpected handshake response: {response:?}"),
@@ -9938,5 +9978,22 @@ mod tests {
             PathBuf::from("fallback")
         );
         fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn handshake_acceptance_rules() {
+        // Protocol mismatch is always rejected.
+        assert!(!handshake_accepted(2, "any", 1, "any"));
+
+        // Same protocol, same build id is always accepted.
+        assert!(handshake_accepted(1, "build-a", 1, "build-a"));
+
+        // Same protocol but different build id: rejected in debug builds
+        // (so a recompile swaps the daemon), accepted in release builds
+        // (so in-place updates keep a compatible daemon).
+        assert_eq!(
+            handshake_accepted(1, "build-a", 1, "build-b"),
+            !cfg!(debug_assertions)
+        );
     }
 }

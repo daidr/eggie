@@ -49,7 +49,17 @@ fn main() {
             }),
         );
     }
-    println!("cargo:rustc-env=EGGIE_BUILD_ID=dev-{hash:016x}");
+    // Debug builds identify themselves by a content hash so any recompile swaps
+    // in a fresh daemon (see handshake_accepted). Release builds use a stable,
+    // version-derived id so in-place updates with the same protocol version can
+    // keep the existing daemon alive.
+    let profile = env::var("PROFILE").unwrap_or_default();
+    let build_id = if profile == "release" {
+        format!("release-{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("dev-{hash:016x}")
+    };
+    println!("cargo:rustc-env=EGGIE_BUILD_ID={build_id}");
 }
 
 fn generate_ghostty_theme_sources(manifest: &Path) {

@@ -14,6 +14,7 @@ use crate::{
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
 use eggie_daemon::DaemonClient;
+use eggie_update::UpdateState;
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Entity, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
@@ -54,6 +55,7 @@ actions!(
         JumpPrevPrompt,
         JumpNextPrompt,
         About,
+        CheckForUpdates,
         ToggleSecureKeyboardEntry,
         CloseWindow,
         CloseAllWindows,
@@ -248,6 +250,7 @@ pub(crate) fn install(
     project_store: Entity<ProjectStore>,
     client: DaemonClient,
     notification_routes: NotificationRoutes,
+    updates: Entity<crate::update_controller::UpdateController>,
     cx: &mut App,
 ) {
     let settings_for_action = settings.clone();
@@ -255,6 +258,7 @@ pub(crate) fn install(
     // New Window is an app-level action (like OpenSettings): it works even when no Eggie window is
     // focused, and opens a fresh main window sharing the same settings/project-store entities.
     let settings_for_new_window = settings.clone();
+    let updates_for_new_window = updates.clone();
     let project_store_for_new_window = project_store.clone();
     let client_for_new_window = client.clone();
     let routes_for_new_window = notification_routes.clone();
@@ -263,10 +267,31 @@ pub(crate) fn install(
             cx,
             client_for_new_window.clone(),
             settings_for_new_window.clone(),
+            updates_for_new_window.clone(),
             project_store_for_new_window.clone(),
             routes_for_new_window.clone(),
             NewWindowInit::Empty,
         );
+    });
+    // Manual update check: surface the update window (which shows the live state) and kick off
+    // a check when idle.
+    let updates_for_check = updates.clone();
+    let settings_for_check = settings.clone();
+    cx.on_action(move |_: &CheckForUpdates, cx| {
+        let should_check = updates_for_check.update(cx, |controller, cx| {
+            let idle = matches!(controller.state(), UpdateState::Idle);
+            if idle {
+                controller.check(false, cx);
+            }
+            idle
+        });
+        if should_check {
+            crate::update_window::open_update_window(
+                updates_for_check.clone(),
+                settings_for_check.clone(),
+                cx,
+            );
+        }
     });
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
@@ -402,8 +427,13 @@ fn build_menus(language: Language) -> Vec<Menu> {
         ]),
         Menu::new(language.help_menu())
             .help()
-            .items([MenuItem::action(language.help_docs_menu_item(), HelpDocs)
-                .icon("questionmark.circle")]),
+            .items([
+                MenuItem::action(language.help_docs_menu_item(), HelpDocs)
+                    .icon("questionmark.circle"),
+                MenuItem::separator(),
+                MenuItem::action(language.check_for_updates_menu_item(), CheckForUpdates)
+                    .icon("arrow.down.circle"),
+            ]),
     ]
 }
 
@@ -798,6 +828,12 @@ impl SettingsWindow {
     fn set_copy_on_select(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.copy_on_select = enabled, cx)
+        });
+    }
+
+    fn set_auto_check_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.auto_check_updates = enabled, cx)
         });
     }
 
@@ -1258,6 +1294,48 @@ impl SettingsWindow {
                             })
                             .on_click(cx.listener(move |settings, _, _, cx| {
                                 settings.set_detect_urls(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_auto_check_updates_control(
+        &self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        [(false, language.disabled()), (true, language.enabled())]
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, (value, label)| {
+                    control.child(
+                        div()
+                            .id(format!("auto-check-updates-{label}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(enabled == value, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_auto_check_updates(value, cx)
                             }))
                             .child(label),
                     )
@@ -3086,6 +3164,8 @@ impl gpui::Render for SettingsWindow {
         let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
         let copy_on_select_control =
             self.render_copy_on_select_control(config.copy_on_select, cx);
+        let auto_check_updates_control =
+            self.render_auto_check_updates_control(config.auto_check_updates, cx);
         let scrollback_control = self.render_scrollback_control(config.scrollback_lines, cx);
         let shell_program_control =
             self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
@@ -3474,6 +3554,16 @@ impl gpui::Render for SettingsWindow {
                                                                     language.osc_clipboard_read_row(),
                                                                     language.osc_clipboard_read_description(),
                                                                     osc_clipboard_read_control,
+                                                                    self.colors,
+                                                                )],
+                                                                self.colors,
+                                                            ),
+                                                            settings_section(
+                                                                language.updates_section(),
+                                                                vec![settings_row(
+                                                                    language.auto_check_updates_row(),
+                                                                    language.auto_check_updates_description(),
+                                                                    auto_check_updates_control,
                                                                     self.colors,
                                                                 )],
                                                                 self.colors,

@@ -667,6 +667,150 @@ impl Language {
         }
     }
 
+    pub(crate) fn check_for_updates_menu_item(self) -> &'static str {
+        match self {
+            Self::English => "Check for Updates…",
+            Self::SimplifiedChinese => "检查更新…",
+        }
+    }
+
+    pub(crate) fn update_window_title(self) -> &'static str {
+        match self {
+            Self::English => "Eggie Has an Update",
+            Self::SimplifiedChinese => "Eggie 有新版本",
+        }
+    }
+
+    pub(crate) fn update_checking(self) -> &'static str {
+        match self {
+            Self::English => "Checking for updates…",
+            Self::SimplifiedChinese => "正在检查更新…",
+        }
+    }
+
+    pub(crate) fn update_up_to_date(self) -> &'static str {
+        match self {
+            Self::English => "Eggie is up to date.",
+            Self::SimplifiedChinese => "当前已是最新版本。",
+        }
+    }
+
+    pub(crate) fn update_no_pending(self) -> &'static str {
+        match self {
+            Self::English => "No update in progress.",
+            Self::SimplifiedChinese => "暂无进行中的更新。",
+        }
+    }
+
+    pub(crate) fn update_downloading(self) -> &'static str {
+        match self {
+            Self::English => "Downloading update…",
+            Self::SimplifiedChinese => "正在下载更新…",
+        }
+    }
+
+    pub(crate) fn update_download_and_install(self) -> &'static str {
+        match self {
+            Self::English => "Download and Install",
+            Self::SimplifiedChinese => "下载并安装",
+        }
+    }
+
+    pub(crate) fn update_later(self) -> &'static str {
+        match self {
+            Self::English => "Later",
+            Self::SimplifiedChinese => "稍后",
+        }
+    }
+
+    pub(crate) fn update_restart(self) -> &'static str {
+        match self {
+            Self::English => "Restart",
+            Self::SimplifiedChinese => "重启",
+        }
+    }
+
+    pub(crate) fn update_restart_with_daemon(self) -> &'static str {
+        match self {
+            Self::English => "Restart and Update Daemon",
+            Self::SimplifiedChinese => "重启并更新 daemon",
+        }
+    }
+
+    pub(crate) fn update_ready_restart(self) -> &'static str {
+        match self {
+            Self::English => "The update is ready. Restart Eggie to apply it.",
+            Self::SimplifiedChinese => "更新已就绪,重启 Eggie 后生效。",
+        }
+    }
+
+    pub(crate) fn update_ready_restart_with_daemon(self) -> &'static str {
+        match self {
+            Self::English => {
+                "The update is ready. Restarting will also replace the background service."
+            }
+            Self::SimplifiedChinese => "更新已就绪,重启将同时替换后台服务。",
+        }
+    }
+
+    pub(crate) fn update_daemon_warning(self) -> &'static str {
+        match self {
+            Self::English => {
+                "This update requires restarting the background service. All terminal sessions will be closed."
+            }
+            Self::SimplifiedChinese => "本次更新需要重启后台服务,当前所有终端会话将被关闭。",
+        }
+    }
+
+    pub(crate) fn update_error_title(self) -> &'static str {
+        match self {
+            Self::English => "Update failed",
+            Self::SimplifiedChinese => "更新失败",
+        }
+    }
+
+    pub(crate) fn update_retry(self) -> &'static str {
+        match self {
+            Self::English => "Retry",
+            Self::SimplifiedChinese => "重试",
+        }
+    }
+
+    pub(crate) fn update_available_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Update available",
+            Self::SimplifiedChinese => "有可用更新",
+        }
+    }
+
+    pub(crate) fn update_ready_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Update ready — restart to apply",
+            Self::SimplifiedChinese => "更新已就绪,重启后生效",
+        }
+    }
+
+    pub(crate) fn auto_check_updates_row(self) -> &'static str {
+        match self {
+            Self::English => "Automatically check for updates",
+            Self::SimplifiedChinese => "自动检查更新",
+        }
+    }
+
+    pub(crate) fn auto_check_updates_description(self) -> &'static str {
+        match self {
+            Self::English => "Check for new versions on launch and notify in the sidebar.",
+            Self::SimplifiedChinese => "启动时检查新版本,并在侧边栏提示。",
+        }
+    }
+
+    pub(crate) fn updates_section(self) -> &'static str {
+        match self {
+            Self::English => "Updates",
+            Self::SimplifiedChinese => "更新",
+        }
+    }
+
     pub(crate) fn cut(self) -> &'static str {
         match self {
             Self::English => "Cut",

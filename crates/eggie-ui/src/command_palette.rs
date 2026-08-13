@@ -16,8 +16,8 @@ use gpui::Action;
 use crate::keybindings::{ACTION_SPECS, display_keystroke, effective_keystroke};
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
-    About, CloseAllWindows, HelpDocs, Hide, HideOthers, ShowAll, SplitLeft, SplitUp,
-    ToggleSecureKeyboardEntry, ZoomWindow,
+    About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, ShowAll, SplitLeft,
+    SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
 };
 
 /// A command that exists only in the menu bar (no configurable keybinding), surfaced in the palette
@@ -70,6 +70,10 @@ const MENU_ONLY_COMMANDS: &[MenuCommand] = &[
     MenuCommand {
         label: Language::help_docs_menu_item,
         make_action: || Box::new(HelpDocs),
+    },
+    MenuCommand {
+        label: Language::check_for_updates_menu_item,
+        make_action: || Box::new(CheckForUpdates),
     },
 ];
 
