@@ -23,13 +23,14 @@ BUNDLE="$CARGO_TARGET_DIR/app/$APP_NAME.app"
 ICNS_SRC="$ROOT/images/AppIcon.icns"
 
 echo "==> cargo build ($PROFILE)"
-cargo build -p eggie-ui $( [[ "$PROFILE" == "release" ]] && echo "--release" )
+cargo build -p eggie-ui -p eggie-updater $( [[ "$PROFILE" == "release" ]] && echo "--release" )
 
 echo "==> 组装 $BUNDLE"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 
 cp "$BINARY" "$BUNDLE/Contents/MacOS/eggie"
+cp "$CARGO_TARGET_DIR/$PROFILE/eggie-updater" "$BUNDLE/Contents/MacOS/eggie-updater"
 cp "$ROOT/packaging/Info.plist" "$BUNDLE/Contents/Info.plist"
 
 if [[ -f "$ICNS_SRC" ]]; then

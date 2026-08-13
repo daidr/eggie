@@ -12,6 +12,7 @@ crossterm.workspace = true
 eggie-daemon.workspace = true
 eggie-domain.workspace = true
 eggie-protocol.workspace = true
+eggie-update.workspace = true
 futures = "0.3"
 gpui.workspace = true
 gpui_platform.workspace = true

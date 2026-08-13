@@ -502,6 +502,7 @@ pub struct EggieApp {
     input_sender: DaemonInputSender,
     input_latency: InputLatencyTracker,
     settings: Entity<SettingsStore>,
+    updates: Entity<crate::update_controller::UpdateController>,
     colors: UiColors,
     terminal_theme: &'static TerminalTheme,
     terminal_appearance: TerminalAppearance,
@@ -565,6 +566,10 @@ pub struct EggieApp {
     /// On-screen bounds of the detached-sessions toggle button, captured at paint so the popover can
     /// anchor just below it (like the settings dropdowns) instead of snapping to the window corner.
     detached_toggle_bounds: Option<Bounds<Pixels>>,
+    /// Whether the update popover (download progress / ready-to-restart) is open.
+    update_popover_open: bool,
+    /// On-screen bounds of the update indicator button, for popover anchoring.
+    update_toggle_bounds: Option<Bounds<Pixels>>,
     /// Which directory field's "open with" dropdown is currently open (right sidebar), if any.
     open_with_dropdown: Option<DirectoryField>,
     /// On-screen bounds of each directory field's split-button, captured at paint so its dropdown can
@@ -771,17 +776,20 @@ impl EggieApp {
                 .expect("failed to register the embedded Hugeicons font");
             let settings = cx.new(|_| settings_store);
             let project_store = cx.new(|_| project_store);
+            let updates = cx.new(|_| crate::update_controller::UpdateController::new());
             crate::settings_window::install(
                 settings.clone(),
                 project_store.clone(),
                 client.clone(),
                 notification_routes.clone(),
+                updates.clone(),
                 cx,
             );
             Self::open_new_window(
                 cx,
                 client.clone(),
                 settings.clone(),
+                updates.clone(),
                 project_store.clone(),
                 notification_routes.clone(),
                 NewWindowInit::ColdStart {
@@ -794,9 +802,26 @@ impl EggieApp {
                 cx,
                 client.clone(),
                 settings.clone(),
+                updates.clone(),
                 project_store.clone(),
                 notification_routes.clone(),
             );
+            // Automatic update check, shortly after launch (staggered to avoid the startup
+            // scramble). Silent: failures stay in the log, successes light up the sidebar.
+            {
+                let updates = updates.clone();
+                let settings = settings.clone();
+                let executor = cx.background_executor().clone();
+                cx.spawn(async move |cx| {
+                    executor.timer(Duration::from_secs(3)).await;
+                    let _ = cx.update(|cx| {
+                        if settings.read(cx).config().auto_check_updates {
+                            updates.update(cx, |controller, cx| controller.check(true, cx));
+                        }
+                    });
+                })
+                .detach();
+            }
             // D9: quitting when the last main window closes. The daemon and its sessions live on
             // independently; the next `eggie` invocation reopens a window and reclaims them. The
             // settings window alone must not keep the process alive, so only count `EggieApp` windows.
@@ -821,6 +846,7 @@ impl EggieApp {
         cx: &mut App,
         client: DaemonClient,
         settings: Entity<SettingsStore>,
+        updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
         notification_routes: NotificationRoutes,
     ) {
@@ -851,6 +877,7 @@ impl EggieApp {
             while let Some(cwd) = rx.next().await {
                 let client = client.clone();
                 let settings = settings.clone();
+                let updates = updates.clone();
                 let project_store = project_store.clone();
                 let notification_routes = notification_routes.clone();
                 cx.update(|cx| {
@@ -862,6 +889,7 @@ impl EggieApp {
                         cx,
                         client,
                         settings,
+                        updates,
                         project_store.clone(),
                         notification_routes,
                         NewWindowInit::OpenDir { project_id },
@@ -880,6 +908,7 @@ impl EggieApp {
         cx: &mut App,
         client: DaemonClient,
         settings: Entity<SettingsStore>,
+        updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
         notification_routes: NotificationRoutes,
         init: NewWindowInit,
@@ -906,6 +935,7 @@ impl EggieApp {
                         WindowId::new_v4(),
                         client,
                         settings,
+                        updates,
                         project_store,
                         notification_routes,
                         init,
@@ -1064,6 +1094,7 @@ impl EggieApp {
         window_id: WindowId,
         client: DaemonClient,
         settings: Entity<SettingsStore>,
+        updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
         notification_routes: NotificationRoutes,
         init: NewWindowInit,
@@ -1160,6 +1191,8 @@ impl EggieApp {
             })
             .collect::<HashMap<_, _>>();
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        // Update state changes (found/downloading/ready) re-render the sidebar indicator.
+        cx.observe(&updates, |_, _, cx| cx.notify()).detach();
         // Cross-window project sync: when any window mutates the shared store, reconcile this
         // window's per-project views (add/drop) and re-render.
         cx.observe(&project_store, |app, _, cx| {
@@ -1183,6 +1216,7 @@ impl EggieApp {
             input_latency: InputLatencyTracker::from_environment(),
             client,
             settings,
+            updates,
             colors,
             terminal_theme,
             terminal_appearance,
@@ -1225,6 +1259,8 @@ impl EggieApp {
             detached_sessions: Vec::new(),
             detached_popover_open: false,
             detached_toggle_bounds: None,
+            update_popover_open: false,
+            update_toggle_bounds: None,
             open_with_dropdown: None,
             open_with_dropdown_bounds: HashMap::new(),
             snapshots,
@@ -4750,6 +4786,9 @@ impl EggieApp {
             cx,
         );
         if !self.left_sidebar_collapsed {
+            if let Some(indicator) = self.render_update_indicator(cx) {
+                titlebar = titlebar.child(indicator);
+            }
             titlebar = titlebar.child(icon_button(
                 IconName::PanelLeftOpen,
                 "collapse-left-sidebar",
@@ -4762,6 +4801,318 @@ impl EggieApp {
             ));
         }
         titlebar.into_any_element()
+    }
+
+    /// The update indicator in the title bar (left of the collapse-sidebar button): an icon for
+    /// the current update state, plus a mini progress bar while downloading. Hidden when idle.
+    fn render_update_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use eggie_update::UpdateState;
+
+        let state = self.updates.read(cx).state().clone();
+        let (icon_name, tooltip, tinted): (IconName, SharedString, bool) = match &state {
+            UpdateState::Available(_) => (
+                IconName::Download,
+                self.language.update_available_tooltip().into(),
+                true,
+            ),
+            UpdateState::Downloading { .. } => (
+                IconName::Download,
+                self.language.update_downloading().into(),
+                false,
+            ),
+            UpdateState::Ready { .. } => (
+                IconName::CheckmarkCircle,
+                self.language.update_ready_tooltip().into(),
+                true,
+            ),
+            UpdateState::Error(_) | UpdateState::UpToDate => (
+                IconName::AlertCircle,
+                self.language.update_error_title().into(),
+                false,
+            ),
+            _ => return None,
+        };
+        let colors = self.colors;
+        let opens_window = matches!(state, UpdateState::Available(_));
+        let control = cx.entity().downgrade();
+
+        let mut indicator = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .px_1()
+            .h_full()
+            // Capture on-screen bounds so the popover can anchor just below the icon.
+            .on_children_prepainted(move |children, _, cx| {
+                let Some(bounds) = children.first().copied() else {
+                    return;
+                };
+                let control = control.clone();
+                cx.defer(move |cx| {
+                    control
+                        .update(cx, |app, cx| {
+                            if app.update_toggle_bounds != Some(bounds) {
+                                app.update_toggle_bounds = Some(bounds);
+                                if app.update_popover_open {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                });
+            })
+            .child(
+                div()
+                    .id("update-indicator-toggle")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(24.))
+                    .rounded_lg()
+                    .when(tinted, |this| this.text_color(rgb(colors.accent)))
+                    .when(!tinted, |this| this.text_color(rgb(colors.muted)))
+                    .hover(move |element| {
+                        element
+                            .bg(rgb(colors.panel_alt))
+                            .text_color(rgb(colors.text))
+                    })
+                    .tooltip(tooltip_text(tooltip, colors))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        if opens_window {
+                            crate::update_window::open_update_window(
+                                app.updates.clone(),
+                                app.settings.clone(),
+                                cx,
+                            );
+                        } else {
+                            app.update_popover_open = !app.update_popover_open;
+                            cx.notify();
+                        }
+                        let _ = window;
+                    }))
+                    .child(icon(icon_name)),
+            );
+
+        // Mini progress bar under the icon while downloading.
+        if let UpdateState::Downloading { progress, .. } = &state {
+            let total = progress.total.unwrap_or(0).max(1);
+            let fraction = (progress.downloaded as f32 / total as f32).clamp(0., 1.);
+            indicator = indicator.child(
+                div()
+                    .w(px(20.))
+                    .h(px(2.))
+                    .rounded_full()
+                    .bg(rgb(colors.panel_alt))
+                    .child(
+                        div()
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(rgb(colors.accent))
+                            .w(px(20. * fraction)),
+                    ),
+            );
+        }
+
+        Some(indicator.into_any_element())
+    }
+
+    /// Popover for the download / ready / error states, anchored under the update indicator.
+    fn render_update_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use eggie_update::UpdateState;
+
+        if !self.update_popover_open {
+            return None;
+        }
+        let state = self.updates.read(cx).state().clone();
+        if matches!(state, UpdateState::Idle | UpdateState::Checking | UpdateState::Available(_)) {
+            return None;
+        }
+        let colors = self.colors;
+        let language = self.language;
+
+        let body: AnyElement = match &state {
+            UpdateState::Downloading { progress, .. } => {
+                let total = progress.total.unwrap_or(0).max(1);
+                let fraction = (progress.downloaded as f32 / total as f32).clamp(0., 1.);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(colors.text))
+                            .child(language.update_downloading()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(5.))
+                            .rounded_full()
+                            .bg(rgb(colors.panel_alt))
+                            .child(
+                                div()
+                                    .h(px(5.))
+                                    .rounded_full()
+                                    .bg(rgb(colors.accent))
+                                    .w(relative(fraction)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.muted))
+                            .child(div().child(format!(
+                                "{}/s",
+                                format_update_speed(progress.bytes_per_sec)
+                            )))
+                            .child(div().child(format!("{:.0}%", fraction * 100.))),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::Ready { release, .. } => {
+                let compatible = release.daemon_compatible();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(colors.text))
+                            .child(if compatible {
+                                language.update_ready_restart()
+                            } else {
+                                language.update_ready_restart_with_daemon()
+                            }),
+                    )
+                    .when(!compatible, |this| {
+                        this.child(
+                            div()
+                                .p_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(0xd08700))
+                                .bg(rgba(0xd0870022))
+                                .text_size(px(11.))
+                                .text_color(rgb(0xb87400))
+                                .child(language.update_daemon_warning()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                popover_button(
+                                    language.update_later(),
+                                    false,
+                                    colors,
+                                    cx.listener(|app, _, _, cx| {
+                                        app.update_popover_open = false;
+                                        app.updates
+                                            .update(cx, |controller, cx| controller.dismiss(cx));
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(popover_button(
+                                if compatible {
+                                    language.update_restart()
+                                } else {
+                                    language.update_restart_with_daemon()
+                                },
+                                true,
+                                colors,
+                                cx.listener(|app, _, _, cx| {
+                                    app.updates.update(cx, |controller, cx| {
+                                        if let Err(error) =
+                                            controller.install_and_restart(cx)
+                                        {
+                                            controller.report_error(format!("{error:#}"), cx);
+                                        }
+                                    });
+                                }),
+                            )),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::Error(message) => {
+                let message = message.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0xff6b6b))
+                            .child(format!("{}: {message}", language.update_error_title())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .child(popover_button(
+                                language.update_retry(),
+                                true,
+                                colors,
+                                cx.listener(|app, _, _, cx| {
+                                    app.update_popover_open = false;
+                                    app.updates
+                                        .update(cx, |controller, cx| controller.check(false, cx));
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::UpToDate => div()
+                .text_size(px(13.))
+                .text_color(rgb(colors.text))
+                .child(language.update_up_to_date())
+                .into_any_element(),
+            _ => div().into_any_element(),
+        };
+
+        let popover = div()
+            .flex()
+            .flex_col()
+            .w(px(260.))
+            .p_3()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_lg()
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(move |app, _, _, cx| {
+                if app.update_popover_open {
+                    app.update_popover_open = false;
+                    cx.notify();
+                }
+            }))
+            .child(body);
+
+        let anchored = match self.update_toggle_bounds {
+            Some(bounds) => anchored()
+                .anchor(Anchor::TopRight)
+                .position(point(bounds.right(), bounds.bottom() + px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+            None => anchored()
+                .anchor(Anchor::TopRight)
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+        };
+        Some(deferred(anchored).priority(2).into_any_element())
     }
 
     fn render_sidebar_resize_handle(
@@ -5565,7 +5916,8 @@ impl EggieApp {
                                     }),
                                 )),
                         )
-                        .children(self.render_detached_sessions_popover(cx)),
+                        .children(self.render_detached_sessions_popover(cx))
+                        .children(self.render_update_popover(cx)),
                 ),
             );
         for (index, project) in self.projects.iter().enumerate() {
@@ -8018,6 +8370,61 @@ fn icon_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(listener)
         .child(icon(icon_name))
+}
+
+/// Small button used inside the update popover.
+fn popover_button(
+    label: &str,
+    primary: bool,
+    colors: UiColors,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(format!("update-popover-{label}"))
+        .flex_none()
+        .h(px(28.))
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .when(primary, |this| {
+            this.bg(rgb(colors.accent))
+                .text_color(rgb(0xffffff))
+                .hover(move |element| element.bg(mix_toward_black(colors.accent, 0.12)))
+        })
+        .when(!primary, |this| {
+            this.bg(rgb(colors.panel_alt))
+                .text_color(rgb(colors.text))
+                .border_1()
+                .border_color(rgb(colors.border))
+                .hover(move |element| element.bg(rgb(colors.hover)))
+        })
+        .on_click(on_click)
+        .child(label.to_string())
+        .into_any_element()
+}
+
+/// Darken a packed 0xRRGGBB color toward black by `amount` (0..1), for button hover states.
+fn mix_toward_black(color: u32, amount: f32) -> gpui::Rgba {
+    let channel = |shift: u32| {
+        let value = ((color >> shift) & 0xff) as f32;
+        (value * (1. - amount)).round().clamp(0., 255.) as u32
+    };
+    rgb((channel(16) << 16) | (channel(8) << 8) | channel(0))
+}
+
+fn format_update_speed(bytes_per_sec: u64) -> String {
+    if bytes_per_sec >= 1_000_000 {
+        format!("{:.1} MB/s", bytes_per_sec as f64 / 1_000_000.)
+    } else if bytes_per_sec >= 1_000 {
+        format!("{:.0} KB/s", bytes_per_sec as f64 / 1_000.)
+    } else {
+        format!("{bytes_per_sec} B/s")
+    }
 }
 
 fn top_bar_icon_button(

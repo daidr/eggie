@@ -612,6 +612,10 @@ pub(crate) struct AppSettings {
     pub(crate) allow_osc_clipboard_read: bool,
     pub(crate) detect_urls: bool,
     pub(crate) copy_on_select: bool,
+    /// Whether to check for app updates on launch. The check is silent; results
+    /// surface as a sidebar indicator.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) auto_check_updates: bool,
     pub(crate) cursor_shape: CursorShapeSetting,
     pub(crate) cursor_blink: CursorBlink,
     pub(crate) bell_mode: BellMode,
@@ -730,6 +734,7 @@ impl Default for AppSettings {
             allow_osc_clipboard_read: false,
             detect_urls: true,
             copy_on_select: true,
+            auto_check_updates: true,
             cursor_shape: CursorShapeSetting::default(),
             cursor_blink: CursorBlink::default(),
             bell_mode: BellMode::default(),
@@ -1351,6 +1356,7 @@ mod tests {
             allow_osc_clipboard_read: true,
             detect_urls: false,
             copy_on_select: false,
+            auto_check_updates: true,
             cursor_shape: CursorShapeSetting::Bar,
             cursor_blink: CursorBlink::On,
             bell_mode: BellMode::Sound,

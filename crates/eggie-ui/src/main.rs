@@ -17,6 +17,8 @@ mod system_menu;
 mod terminal_renderer;
 mod terminal_sprites;
 mod text_input;
+mod update_controller;
+mod update_window;
 
 use anyhow::{Context, Result};
 use eggie_daemon::{DaemonClient, is_daemon_invocation, run_daemon};
