@@ -1,4 +1,4 @@
 target/
 /.tui-test/
-/.DS_Store
+.DS_Store
 *.log

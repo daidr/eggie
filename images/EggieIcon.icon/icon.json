@@ -1,0 +1,53 @@
+{
+  "features" : [
+    "refractivity"
+  ],
+  "fill" : {
+    "automatic-gradient" : "extended-gray:1.00000,1.00000"
+  },
+  "groups" : [
+    {
+      "blend-mode" : "normal",
+      "blur-material" : null,
+      "hidden" : false,
+      "layers" : [
+        {
+          "fill" : "automatic",
+          "glass" : true,
+          "image-name" : "33a33e87-2ad5-45fd-8826-5a64d98e2572.png",
+          "name" : "33a33e87-2ad5-45fd-8826-5a64d98e2572",
+          "opacity" : 1,
+          "position" : {
+            "scale" : 0.64,
+            "translation-in-points" : [
+              0,
+              -19
+            ]
+          }
+        }
+      ],
+      "lighting" : "individual",
+      "opacity" : 1,
+      "refractivity" : {
+        "depth" : 0.11921875,
+        "enabled" : true,
+        "strength" : 0.0741015625
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.42
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
