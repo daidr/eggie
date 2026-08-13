@@ -6031,7 +6031,7 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let current = directory.join(format!("daemon-v{PROTOCOL_VERSION}.sock"));
-        let obsolete = directory.join("daemon-v1.sock");
+        let obsolete = directory.join("daemon-v999.sock");
         let unrelated = directory.join("keep-me.sock");
         fs::write(&current, []).unwrap();
         fs::write(&obsolete, []).unwrap();
