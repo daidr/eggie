@@ -16,6 +16,7 @@ pub(crate) fn run(_flags: &[String]) -> i32 {
     println!();
     println!("Version");
     println!("  - version : {VERSION}");
+    println!("  - protocol: {}", eggie_protocol::PROTOCOL_VERSION);
     println!("  - build id: {BUILD_ID}");
     println!("  - build   : {build_mode}");
 

@@ -1,0 +1,45 @@
+# git-cliff 配置 —— 从 conventional commits 生成分类更新日志。
+# 用于 release workflow:既作 GitHub release 正文,也作 feed 的 release_notes。
+# 约定前缀:feat / fix / perf / refactor / docs / chore(与项目历史一致)。
+
+[changelog]
+# 不输出全局 header(每个 release 的日志是独立片段,直接进 release body)。
+header = ""
+# tera 模板:按分组渲染,组内逐条。
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+# 解析 conventional commits。
+conventional_commits = true
+# 非 conventional 的提交直接丢弃,不污染日志。
+filter_unconventional = true
+# 不做 commit 拆分。
+split_commits = false
+# 提交分组:正则匹配 type,归入带 emoji 的中文分组;顺序即展示顺序。
+commit_parsers = [
+    { message = "^feat", group = "✨ 新功能" },
+    { message = "^fix", group = "🐛 修复" },
+    { message = "^perf", group = "⚡ 性能" },
+    { message = "^refactor", group = "♻️ 重构" },
+    { message = "^docs", group = "📝 文档" },
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^test", skip = true },
+    { message = "^style", skip = true },
+    { body = ".*", group = "其他" },
+]
+# 过滤掉合并提交等噪音。
+filter_commits = false
+# tag 匹配 v 开头的语义化版本(含 prerelease)。
+tag_pattern = "v[0-9]*"
+# 按时间排序,最新在前。
+sort_commits = "newest"
