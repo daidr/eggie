@@ -1,0 +1,56 @@
+# 独立重建 feed 并部署到 GitHub Pages。
+#
+# 手动触发(workflow_dispatch),用于:
+#   - 手工修改了某个 release 的 manifest.json 后刷新 feed
+#   - release workflow 的 feed 步骤失败后单独补跑(不必重新公证发版)
+#   - 任何需要强制刷新 stable.json / beta.json 的场景
+#
+# 与 release.yml 的 feed job 逻辑一致,但作为完整独立 run 存在,
+# 因此不会撞上"单个 job rerun 导致同名 Pages artifact 冲突"的问题。
+name: rebuild-feed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  PAGES_DOMAIN: eggie-pages.daidr.me
+
+# 同一时刻只允许一个 Pages 部署,避免并发部署互相取消。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 全量重建 feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site
+          scripts/build-feed.sh _site
+          # 自定义域名:Pages 需要 CNAME 文件。
+          echo "$PAGES_DOMAIN" > _site/CNAME
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+
+      - name: 上传 Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: 部署到 Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
