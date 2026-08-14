@@ -282,20 +282,24 @@ pub(crate) fn install(
     let settings_for_check = settings.clone();
     cx.on_action(move |_: &CheckForUpdates, cx| {
         let channel = settings_for_check.read(cx).config().update_channel.slug();
-        let should_check = updates_for_check.update(cx, |controller, cx| {
-            let idle = matches!(controller.state(), UpdateState::Idle);
-            if idle {
+        updates_for_check.update(cx, |controller, cx| {
+            // Re-check from any settled state (idle / up-to-date / error);
+            // leave in-flight or pending work (checking / available /
+            // downloading / ready) untouched — the window shows its progress.
+            if matches!(
+                controller.state(),
+                UpdateState::Idle | UpdateState::UpToDate | UpdateState::Error(_)
+            ) {
                 controller.check(false, channel, cx);
             }
-            idle
         });
-        if should_check {
-            crate::update_window::open_update_window(
-                updates_for_check.clone(),
-                settings_for_check.clone(),
-                cx,
-            );
-        }
+        // Always surface the window so the user sees the current state,
+        // whether that's a fresh check, a pending download, or an error.
+        crate::update_window::open_update_window(
+            updates_for_check.clone(),
+            settings_for_check.clone(),
+            cx,
+        );
     });
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
