@@ -4827,11 +4827,13 @@ impl EggieApp {
                 self.language.update_ready_tooltip().into(),
                 true,
             ),
-            UpdateState::Error(_) | UpdateState::UpToDate => (
+            UpdateState::Error(_) => (
                 IconName::AlertCircle,
                 self.language.update_error_title().into(),
                 false,
             ),
+            // `UpToDate` is a manual-check result shown in the update window,
+            // not a persistent sidebar state — leave the sidebar clean.
             _ => return None,
         };
         let colors = self.colors;

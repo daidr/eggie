@@ -676,8 +676,8 @@ impl Language {
 
     pub(crate) fn update_window_title(self) -> &'static str {
         match self {
-            Self::English => "Eggie Has an Update",
-            Self::SimplifiedChinese => "Eggie 有新版本",
+            Self::English => "Eggie Update",
+            Self::SimplifiedChinese => "Eggie 更新",
         }
     }
 
