@@ -9,7 +9,7 @@ use crate::{
         MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING,
         MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
         MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme, ThemeMode,
-        UiColors, minimum_contrast_rgb, theme_catalog,
+        UiColors, UpdateChannel, minimum_contrast_rgb, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
@@ -254,7 +254,10 @@ pub(crate) fn install(
     cx: &mut App,
 ) {
     let settings_for_action = settings.clone();
-    cx.on_action(move |_: &OpenSettings, cx| open_settings_window(settings_for_action.clone(), cx));
+    let updates_for_action = updates.clone();
+    cx.on_action(move |_: &OpenSettings, cx| {
+        open_settings_window(settings_for_action.clone(), updates_for_action.clone(), cx)
+    });
     // New Window is an app-level action (like OpenSettings): it works even when no Eggie window is
     // focused, and opens a fresh main window sharing the same settings/project-store entities.
     let settings_for_new_window = settings.clone();
@@ -278,10 +281,11 @@ pub(crate) fn install(
     let updates_for_check = updates.clone();
     let settings_for_check = settings.clone();
     cx.on_action(move |_: &CheckForUpdates, cx| {
+        let channel = settings_for_check.read(cx).config().update_channel.slug();
         let should_check = updates_for_check.update(cx, |controller, cx| {
             let idle = matches!(controller.state(), UpdateState::Idle);
             if idle {
-                controller.check(false, cx);
+                controller.check(false, channel, cx);
             }
             idle
         });
@@ -437,7 +441,11 @@ fn build_menus(language: Language) -> Vec<Menu> {
     ]
 }
 
-fn open_settings_window(settings: Entity<SettingsStore>, cx: &mut App) {
+fn open_settings_window(
+    settings: Entity<SettingsStore>,
+    updates: Entity<crate::update_controller::UpdateController>,
+    cx: &mut App,
+) {
     if let Some(existing) = cx
         .windows()
         .into_iter()
@@ -470,7 +478,9 @@ fn open_settings_window(settings: Entity<SettingsStore>, cx: &mut App) {
             focus: true,
             ..Default::default()
         },
-        move |window, cx| cx.new(|cx| SettingsWindow::new(settings.clone(), fonts, window, cx)),
+        move |window, cx| {
+            cx.new(|cx| SettingsWindow::new(settings.clone(), updates.clone(), fonts, window, cx))
+        },
     )
     .expect("failed to open Eggie settings window");
 }
@@ -555,6 +565,7 @@ fn monospace_font_names_uncached(cx: &App) -> Vec<String> {
 
 struct SettingsWindow {
     settings: Entity<SettingsStore>,
+    updates: Entity<crate::update_controller::UpdateController>,
     dark_theme_names: Vec<String>,
     light_theme_names: Vec<String>,
     font_names: Vec<String>,
@@ -585,6 +596,7 @@ struct SettingsWindow {
 impl SettingsWindow {
     fn new(
         settings: Entity<SettingsStore>,
+        updates: Entity<crate::update_controller::UpdateController>,
         font_names: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -647,6 +659,7 @@ impl SettingsWindow {
         .detach();
         Self {
             settings,
+            updates,
             dark_theme_names: theme_catalog().dark_names(),
             light_theme_names: theme_catalog().light_names(),
             font_names,
@@ -835,6 +848,16 @@ impl SettingsWindow {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.auto_check_updates = enabled, cx)
         });
+    }
+
+    fn set_update_channel(&mut self, channel: UpdateChannel, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|settings| settings.update_channel = channel, cx)
+        });
+        // Re-check against the newly selected channel's feed so a switch is
+        // reflected immediately (silent: a failure just stays quiet).
+        self.updates
+            .update(cx, |controller, cx| controller.check(true, channel.slug(), cx));
     }
 
     fn set_ligatures(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1336,6 +1359,49 @@ impl SettingsWindow {
                             })
                             .on_click(cx.listener(move |settings, _, _, cx| {
                                 settings.set_auto_check_updates(value, cx)
+                            }))
+                            .child(label),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_update_channel_control(
+        &self,
+        selected: UpdateChannel,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        UpdateChannel::ALL
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .rounded_lg()
+                    .bg(rgb(self.colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(self.colors.border)),
+                |control, channel| {
+                    let label = language.update_channel_label(channel);
+                    control.child(
+                        div()
+                            .id(format!("update-channel-{}", channel.slug()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.))
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(selected == channel, |element| {
+                                element
+                                    .bg(rgb(self.colors.background))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .on_click(cx.listener(move |settings, _, _, cx| {
+                                settings.set_update_channel(channel, cx)
                             }))
                             .child(label),
                     )
@@ -3166,6 +3232,8 @@ impl gpui::Render for SettingsWindow {
             self.render_copy_on_select_control(config.copy_on_select, cx);
         let auto_check_updates_control =
             self.render_auto_check_updates_control(config.auto_check_updates, cx);
+        let update_channel_control =
+            self.render_update_channel_control(config.update_channel, cx);
         let scrollback_control = self.render_scrollback_control(config.scrollback_lines, cx);
         let shell_program_control =
             self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
@@ -3560,12 +3628,20 @@ impl gpui::Render for SettingsWindow {
                                                             ),
                                                             settings_section(
                                                                 language.updates_section(),
-                                                                vec![settings_row(
-                                                                    language.auto_check_updates_row(),
-                                                                    language.auto_check_updates_description(),
-                                                                    auto_check_updates_control,
-                                                                    self.colors,
-                                                                )],
+                                                                vec![
+                                                                    settings_row(
+                                                                        language.auto_check_updates_row(),
+                                                                        language.auto_check_updates_description(),
+                                                                        auto_check_updates_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                    settings_row(
+                                                                        language.update_channel_row(),
+                                                                        language.update_channel_description(),
+                                                                        update_channel_control,
+                                                                        self.colors,
+                                                                    ),
+                                                                ],
                                                                 self.colors,
                                                             ),
                                                             settings_section(

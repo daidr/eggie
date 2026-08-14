@@ -2,3 +2,4 @@ target/
 /.tui-test/
 .DS_Store
 *.log
+CAPABILITIES_TODO.md

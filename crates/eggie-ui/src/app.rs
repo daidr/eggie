@@ -815,8 +815,10 @@ impl EggieApp {
                 cx.spawn(async move |cx| {
                     executor.timer(Duration::from_secs(3)).await;
                     let _ = cx.update(|cx| {
-                        if settings.read(cx).config().auto_check_updates {
-                            updates.update(cx, |controller, cx| controller.check(true, cx));
+                        let config = settings.read(cx).config();
+                        if config.auto_check_updates {
+                            let channel = config.update_channel.slug();
+                            updates.update(cx, |controller, cx| controller.check(true, channel, cx));
                         }
                     });
                 })
@@ -5065,8 +5067,11 @@ impl EggieApp {
                                 colors,
                                 cx.listener(|app, _, _, cx| {
                                     app.update_popover_open = false;
-                                    app.updates
-                                        .update(cx, |controller, cx| controller.check(false, cx));
+                                    let channel =
+                                        app.settings.read(cx).config().update_channel.slug();
+                                    app.updates.update(cx, |controller, cx| {
+                                        controller.check(false, channel, cx)
+                                    });
                                     cx.notify();
                                 }),
                             )),

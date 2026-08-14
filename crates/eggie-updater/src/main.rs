@@ -29,7 +29,6 @@ enum Phase {
     Extract,
     Verify,
     Swap,
-    Sign,
     Register,
     Relaunch,
     Cleanup,
@@ -40,7 +39,7 @@ fn rollback_for(phase: Phase) -> Rollback {
     match phase {
         Phase::WaitForAppExit | Phase::TerminateDaemon => Rollback::NothingYet,
         Phase::Backup | Phase::Extract | Phase::Verify => Rollback::RemoveNew,
-        Phase::Swap | Phase::Sign | Phase::Register | Phase::Relaunch | Phase::Cleanup => {
+        Phase::Swap | Phase::Register | Phase::Relaunch | Phase::Cleanup => {
             Rollback::RestoreBackup
         }
     }
@@ -208,19 +207,15 @@ fn run_phases(args: &Args, phase: &mut Phase) -> Result<()> {
         .with_context(|| format!("swapping in {}", args.app_path.display()))?;
     log_line("swapped in new app");
 
-    *phase = Phase::Sign;
-    let output = Command::new("codesign")
-        .args(["--force", "--deep", "--sign", "-"])
-        .arg(&args.app_path)
-        .output()
-        .context("spawning codesign")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        log_line(&format!("codesign stderr: {}", stderr.trim()));
-        log_line(&format!("codesign stdout: {}", stdout.trim()));
-        bail!("codesign failed with {}", output.status);
-    }
+    // Deliberately no re-signing here. The downloaded package is a whole-bundle
+    // replacement whose signature (and, for released builds, its stapled
+    // notarization ticket) is embedded in the binary and
+    // `_CodeSignature/CodeResources`. `extract_zip` restores every file
+    // faithfully, so the seal survives intact. Re-signing ad-hoc (`--sign -`)
+    // here would strip the Developer ID signature and staple, leaving a
+    // notarized app "de-notarized" after its first self-update. Neither ureq's
+    // download nor the zip extraction sets `com.apple.quarantine`, so Gatekeeper
+    // does not block the relaunch.
 
     *phase = Phase::Register;
     let _ = Command::new("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
@@ -393,7 +388,7 @@ mod tests {
         assert_eq!(rollback_for(Phase::Extract), Rollback::RemoveNew);
         assert_eq!(rollback_for(Phase::Verify), Rollback::RemoveNew);
         assert_eq!(rollback_for(Phase::Swap), Rollback::RestoreBackup);
-        assert_eq!(rollback_for(Phase::Sign), Rollback::RestoreBackup);
+        assert_eq!(rollback_for(Phase::Register), Rollback::RestoreBackup);
         assert_eq!(rollback_for(Phase::Relaunch), Rollback::RestoreBackup);
     }
 

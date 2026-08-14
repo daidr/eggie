@@ -1,9 +1,22 @@
 //! Update feed abstraction and its implementations.
 //!
-//! A feed describes where to look for the latest release. The mock
-//! implementation reads a local JSON file ([`FileFeed`]); once the GitHub
-//! repository exists, an HTTP implementation can be added behind the same
-//! [`UpdateFeed`] trait without touching any UI code.
+//! A feed lists the releases available upstream. The mock implementation reads
+//! a local JSON document ([`FileFeed`]); once the GitHub repository exists an
+//! HTTP implementation can be added behind the same [`UpdateFeed`] trait
+//! without touching the controller or UI.
+//!
+//! The feed document is `{ "releases": [ ReleaseInfo, ... ] }`. Modeling the
+//! feed as a *list* (rather than just "the latest") lets the controller
+//! aggregate the notes of every release between the user's version and the
+//! newest one — a user several versions behind sees the full changelog.
+//!
+//! Terminology, for the future GitHub backend: the release *list* and each
+//! version's notes come from GitHub's `/releases` endpoint (the `body` field);
+//! a per-release `manifest.json` *asset* carries only that one release's install
+//! metadata (`protocol_version`, `sha256`, package name). `GitHubFeed` will
+//! assemble those two sources into the `Vec<ReleaseInfo>` this trait returns —
+//! so a "manifest.json" asset is per-release, while a "feed document" (this
+//! struct / the mock file) is the assembled list.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +35,7 @@ pub struct ReleaseInfo {
     /// The daemon protocol version this release speaks. Used to decide
     /// whether an update can keep the running daemon.
     pub protocol_version: u32,
-    /// Human-readable release notes, shown in the update window.
+    /// Human-readable release notes (Markdown), shown in the update window.
     pub release_notes: String,
     /// RFC3339 publish timestamp, display only.
     pub published_at: String,
@@ -31,6 +44,12 @@ pub struct ReleaseInfo {
     pub download_url: Url,
     /// Lowercase hex SHA-256 of the download, verified before install.
     pub sha256: String,
+}
+
+/// The top-level feed document: the assembled list of published releases.
+#[derive(Clone, Debug, Deserialize)]
+struct FeedDocument {
+    releases: Vec<ReleaseInfo>,
 }
 
 impl ReleaseInfo {
@@ -43,13 +62,24 @@ impl ReleaseInfo {
 
 /// A source of release information.
 pub trait UpdateFeed: Send + Sync {
-    /// Fetch the latest release. Errors are surfaced to the UI (manual
-    /// check) or swallowed (automatic background check).
-    fn fetch_latest(&self) -> Result<ReleaseInfo>;
+    /// Fetch all published releases. Order is not assumed; the controller
+    /// sorts. Errors are surfaced to the UI (manual check) or swallowed
+    /// (automatic background check).
+    fn fetch_releases(&self) -> Result<Vec<ReleaseInfo>>;
 }
 
-/// Mock feed backed by a local JSON file. The file layout matches
-/// [`ReleaseInfo`]'s serde representation; see `packaging/update-feed.example.json`.
+/// Parse and validate a feed document.
+fn parse_feed(bytes: &str, source: &str) -> Result<Vec<ReleaseInfo>> {
+    let document: FeedDocument = serde_json::from_str(bytes)
+        .with_context(|| format!("failed to parse update feed {source}"))?;
+    for release in &document.releases {
+        release.validate()?;
+    }
+    Ok(document.releases)
+}
+
+/// Mock feed backed by a local JSON document. The file layout matches
+/// [`FeedDocument`]; see `packaging/update-feed.example.json`.
 pub struct FileFeed {
     path: PathBuf,
 }
@@ -61,32 +91,27 @@ impl FileFeed {
 }
 
 impl UpdateFeed for FileFeed {
-    fn fetch_latest(&self) -> Result<ReleaseInfo> {
+    fn fetch_releases(&self) -> Result<Vec<ReleaseInfo>> {
         let contents = std::fs::read_to_string(&self.path)
             .with_context(|| format!("failed to read update feed {}", self.path.display()))?;
-        let release: ReleaseInfo = serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse update feed {}", self.path.display()))?;
-        release.validate()?;
-        Ok(release)
+        parse_feed(&contents, &self.path.display().to_string())
     }
 }
 
-/// Feed that fetches JSON over HTTP(S). Reserved for the real GitHub
-/// Releases backend; the parsing is shared with [`FileFeed`].
+/// Feed that fetches a JSON document over HTTP(S). Reserved for the real
+/// GitHub Releases backend; parsing is shared with [`FileFeed`].
 pub struct HttpFeed {
     url: Url,
 }
 
 impl UpdateFeed for HttpFeed {
-    fn fetch_latest(&self) -> Result<ReleaseInfo> {
-        let response = ureq::get(self.url.as_str())
+    fn fetch_releases(&self) -> Result<Vec<ReleaseInfo>> {
+        let body = ureq::get(self.url.as_str())
             .call()
-            .with_context(|| format!("failed to fetch update feed {}", self.url))?;
-        let release: ReleaseInfo = response
-            .into_json()
-            .with_context(|| format!("failed to parse update feed {}", self.url))?;
-        release.validate()?;
-        Ok(release)
+            .with_context(|| format!("failed to fetch update feed {}", self.url))?
+            .into_string()
+            .with_context(|| format!("failed to read update feed {}", self.url))?;
+        parse_feed(&body, &self.url.to_string())
     }
 }
 
@@ -94,11 +119,14 @@ impl ReleaseInfo {
     /// Cross-check fields that serde can't enforce on its own.
     fn validate(&self) -> Result<()> {
         if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bail!("feed has invalid sha256: {:?}", self.sha256);
+            bail!("release {} has invalid sha256: {:?}", self.version, self.sha256);
         }
         match self.download_url.scheme() {
             "file" | "http" | "https" => Ok(()),
-            other => bail!("feed has unsupported download URL scheme: {other}"),
+            other => bail!(
+                "release {} has unsupported download URL scheme: {other}",
+                self.version
+            ),
         }
     }
 }
@@ -176,25 +204,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("eggie-feed-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("feed.json");
-        std::fs::write(&path, release_json(json!({}))).unwrap();
+        let doc = format!("{{\"releases\":[{}]}}", release_json(json!({})));
+        std::fs::write(&path, doc).unwrap();
 
         let feed = FileFeed::new(path.clone());
-        let release = feed.fetch_latest().unwrap();
-        assert_eq!(release.version, Version::new(0, 0, 2));
+        let releases = feed.fetch_releases().unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, Version::new(0, 0, 2));
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_feed_rejects_invalid_release_in_document() {
+        let dir = std::env::temp_dir().join(format!("eggie-feed-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feed.json");
+        let doc = format!(
+            "{{\"releases\":[{}]}}",
+            release_json(json!({ "sha256": "nope" }))
+        );
+        std::fs::write(&path, doc).unwrap();
+        assert!(FileFeed::new(path).fetch_releases().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn file_feed_missing_file_errors() {
         let feed = FileFeed::new(PathBuf::from("/nonexistent/eggie-feed.json"));
-        assert!(feed.fetch_latest().is_err());
+        assert!(feed.fetch_releases().is_err());
     }
 
     #[test]
     fn feed_from_url_dispatches_on_scheme() {
         let file = Url::parse("file:///tmp/feed.json").unwrap();
-        assert!(feed_from_url(&file).fetch_latest().is_err()); // missing file, but it is a FileFeed
+        assert!(feed_from_url(&file).fetch_releases().is_err()); // missing file, but it is a FileFeed
         let http = Url::parse("https://example.com/feed.json").unwrap();
         let _ = feed_from_url(&http); // HttpFeed construction must not panic
     }
