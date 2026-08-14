@@ -1,0 +1,271 @@
+# 发版流水线:push 一个 `v*` tag 触发。
+#
+# 三段:
+#   build   —— macOS runner:签名(Developer ID + hardened runtime)、公证、
+#              staple、打 zip(自更新包)+ dmg(首次安装包)、生成 manifest.json,
+#              上传为 workflow artifact。
+#   release —— git-cliff 生成本版更新日志 → 创建 GitHub Release(prerelease
+#              tag 自动标记),附 zip + dmg + manifest.json。
+#   feed    —— 从所有 release 的 manifest 全量重建 stable.json / beta.json,
+#              部署到 GitHub Pages(自定义域名 eggie-pages.daidr.me)。
+#
+# 版本号真相源 = tag。build job 从 tag 反写 Info.plist 的 ShortVersion;
+# CFBundleVersion 用 run_number 保证单调递增。
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 允许 feed job 部署 Pages,以及 release job 写 release。
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+env:
+  APP_NAME: Eggie
+  TEAM_ID: HG2R6352FW
+  SIGN_IDENTITY: "Developer ID Application: Xuezhou Dai (HG2R6352FW)"
+  # feed 里 download_url 指向的域名(Pages 自定义域名)。
+  PAGES_DOMAIN: eggie-pages.daidr.me
+
+jobs:
+  build:
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本元数据
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"                       # 去掉前缀 v
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # semver prerelease:含 '-' 即预发布(alpha/beta/rc)。
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 校验 tag 版本与 Cargo.toml 一致
+        run: |
+          # env!(CARGO_PKG_VERSION) 的真相源是 eggie-ui crate 的 Cargo.toml
+          # (workspace 根没有 package version)。
+          CARGO_VERSION=$(grep -m1 '^version' crates/eggie-ui/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [[ "$CARGO_VERSION" != "${{ steps.meta.outputs.version }}" ]]; then
+            echo "::error::tag 版本 ${{ steps.meta.outputs.version }} 与 crates/eggie-ui/Cargo.toml 的 $CARGO_VERSION 不一致"
+            echo "先把 crates/eggie-ui/Cargo.toml 的 version 改成 ${{ steps.meta.outputs.version }} 并提交,再打 tag。"
+            exit 1
+          fi
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: 导入签名证书到临时 keychain
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          # keychain 密码只在本次 job 内有效,随手生成。
+          KEYCHAIN_PWD=$(openssl rand -base64 24)
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          echo -n "$CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list \
+            -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          # 让工具链看到这个 keychain(保留 login.keychain 以防其他步骤需要)。
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$CERT_PATH"
+
+      - name: 打包并签名 .app
+        env:
+          EGGIE_VERSION: ${{ steps.meta.outputs.version }}
+          EGGIE_BUILD_NUMBER: ${{ github.run_number }}
+          EGGIE_SIGN_IDENTITY: ${{ env.SIGN_IDENTITY }}
+        run: scripts/make-app.sh
+
+      - name: 公证 .app
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          APP="target/app/$APP_NAME.app"
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo -n "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$KEY_PATH"
+
+          # 公证要提交一个容器;.app 先临时 zip(ticket 钉进 .app,不是这个 zip)。
+          NOTARY_ZIP="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+
+          echo "==> 提交公证(阻塞至完成)"
+          xcrun notarytool submit "$NOTARY_ZIP" \
+            --key "$KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+
+          echo "==> staple ticket 到 .app"
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f "$KEY_PATH" "$NOTARY_ZIP"
+
+      - name: 造自更新 zip(从已 staple 的 .app)
+        run: scripts/make-update-zip.sh
+
+      - name: 造首次安装 dmg 并公证
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          scripts/make-dmg.sh
+          VERSION="${{ steps.meta.outputs.version }}"
+          DMG="target/app/$APP_NAME-$VERSION.dmg"
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo -n "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$KEY_PATH"
+
+          echo "==> 公证 dmg(阻塞至完成)"
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          echo "==> staple ticket 到 dmg"
+          xcrun stapler staple "$DMG"
+          rm -f "$KEY_PATH"
+
+      - name: 生成 manifest.json
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          ZIP="target/app/$APP_NAME-$VERSION.zip"
+          SHA=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+          # protocol_version 从二进制权威读取(+version 输出)。
+          PROTOCOL=$(target/release/eggie +version | awk -F': ' '/- protocol/{print $2}')
+          PUBLISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # download_url 指向本 tag 的 GitHub Release 资产。
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$APP_NAME-$VERSION.zip"
+
+          # release_notes 由 release job 用 git-cliff 生成后再覆盖;这里先占位。
+          jq -n \
+            --arg version "$VERSION" \
+            --argjson protocol_version "$PROTOCOL" \
+            --arg published_at "$PUBLISHED" \
+            --arg download_url "$DOWNLOAD_URL" \
+            --arg sha256 "$SHA" \
+            '{version: $version, protocol_version: $protocol_version, release_notes: "", published_at: $published_at, download_url: $download_url, sha256: $sha256}' \
+            > target/app/manifest.json
+          echo "生成的 manifest.json:"
+          cat target/app/manifest.json
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            target/app/${{ env.APP_NAME }}-${{ steps.meta.outputs.version }}.zip
+            target/app/${{ env.APP_NAME }}-${{ steps.meta.outputs.version }}.dmg
+            target/app/manifest.json
+
+      - name: 清理 keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # git-cliff 需要完整历史 + tags
+
+      - name: 下载 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: 生成本版更新日志
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG_LATEST.md
+
+      - name: 把更新日志写入 manifest.json 的 release_notes
+        run: |
+          NOTES=$(cat CHANGELOG_LATEST.md)
+          jq --arg notes "$NOTES" '.release_notes = $notes' \
+            dist/manifest.json > dist/manifest.tmp.json
+          mv dist/manifest.tmp.json dist/manifest.json
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          PRERELEASE_FLAG=""
+          if [[ "${{ needs.build.outputs.is_prerelease }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$APP_NAME $VERSION" \
+            --notes-file CHANGELOG_LATEST.md \
+            $PRERELEASE_FLAG \
+            "dist/$APP_NAME-$VERSION.zip" \
+            "dist/$APP_NAME-$VERSION.dmg" \
+            "dist/manifest.json"
+
+  feed:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 全量重建 feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site
+          scripts/build-feed.sh _site
+          # 自定义域名:Pages 需要 CNAME 文件。
+          echo "$PAGES_DOMAIN" > _site/CNAME
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+
+      - name: 上传 Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: 部署到 Pages
+        uses: actions/deploy-pages@v4
