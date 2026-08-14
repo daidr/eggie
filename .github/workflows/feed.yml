@@ -5,6 +5,9 @@
 #   - release workflow 的 feed 步骤失败后单独补跑(不必重新公证发版)
 #   - 任何需要强制刷新 stable.json / beta.json 的场景
 #
+# 触发命令(注意用文件名而非 workflow 的 name):
+#   gh workflow run feed.yml --repo daidr/eggie
+#
 # 与 release.yml 的 feed job 逻辑一致,但作为完整独立 run 存在,
 # 因此不会撞上"单个 job rerun 导致同名 Pages artifact 冲突"的问题。
 name: rebuild-feed
