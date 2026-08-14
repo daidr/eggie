@@ -5,7 +5,10 @@ use crate::native_menu::{
     NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand,
     prepare_process_menu, prepare_project_menu, prepare_tab_menu,
 };
+use crate::command_history::{CommandStatus, format_relative_time};
+use crate::notes_store::NotesStore;
 use crate::project_store::ProjectStore;
+use crate::snippet_store::{Snippet, SnippetStore};
 use crate::settings::{
     CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, OpenWith, SettingsStore,
     TerminalTheme, UiColors,
@@ -40,7 +43,7 @@ use eggie_protocol::{
     TerminalScrollDelta, TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit,
     TerminalSearchDirection,
     TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind, TerminalSelectionSide,
-    TerminalSize, TerminalSnapshot,
+    TerminalShellIntegrationState, TerminalSize, TerminalSnapshot,
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
@@ -220,8 +223,29 @@ pub(crate) type NotificationRoutes = Rc<RefCell<HashMap<String, NotificationRout
 enum RightTab {
     #[default]
     Info,
-    Files,
-    Git,
+    Commands,
+    Notes,
+}
+
+/// State for the snippet editor popover (add or edit). `editing` is `Some(id)` when editing an
+/// existing snippet, `None` when adding a new one. `name` and `content` are live `TextInput`
+/// entities (single-line name, multi-line content).
+struct SnippetEditor {
+    editing: Option<uuid::Uuid>,
+    name: Entity<TextInput>,
+    content: Entity<TextInput>,
+    _name_subscription: Subscription,
+    _content_subscription: Subscription,
+}
+
+/// State for the Notes tab's multi-line editor: the input entity, its change subscription, and the
+/// debounce epoch used to coalesce autosaves (only the latest scheduled save writes to disk).
+struct NotesEditor {
+    input: Entity<TextInput>,
+    _subscription: Subscription,
+    /// Incremented on every change; a scheduled debounce save only persists if the epoch it
+    /// captured still matches, so bursts of keystrokes collapse into one write.
+    save_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,6 +570,10 @@ pub struct EggieApp {
     /// Shared, cross-window project list (name/root/order). Cloned handle of the one `Entity` all
     /// windows observe; mutating it re-renders every window and re-syncs their `project_views`.
     project_store: Entity<ProjectStore>,
+    /// Shared snippet store (cross-window), mirrors the ProjectStore pattern.
+    snippet_store: Entity<SnippetStore>,
+    /// Shared global-notes store (cross-window).
+    notes_store: Entity<NotesStore>,
     /// Local ordered mirror of `project_store.projects()`, refreshed by `reconcile_project_views`.
     /// Kept so render/iteration can read projects without holding a `cx` borrow on the entity.
     projects: Vec<Project>,
@@ -593,6 +621,18 @@ pub struct EggieApp {
     session_inspection_errors: HashMap<SessionId, String>,
     process_metrics_system: System,
     right_tab: RightTab,
+    /// Cached OSC 133 shell-integration state per session, refreshed while the Commands tab is
+    /// visible (see `start_shell_integration_polling`). UI-only mirror; source of truth is the daemon.
+    shell_integration: HashMap<SessionId, TerminalShellIntegrationState>,
+    /// Whether the command-history sub-section of the Commands tab is collapsed.
+    command_history_collapsed: bool,
+    /// Whether the snippets sub-section of the Commands tab is collapsed.
+    snippets_collapsed: bool,
+    /// The open snippet editor popover, if any (add or edit).
+    snippet_editor: Option<SnippetEditor>,
+    /// The Notes tab's multi-line editor + its change subscription. Lazily created on first render
+    /// of the Notes tab so it can seed from the shared store.
+    notes_editor: Option<NotesEditor>,
     left_sidebar_width: f32,
     right_sidebar_width: f32,
     left_sidebar_collapsed: bool,
@@ -745,6 +785,8 @@ impl EggieApp {
     pub fn launch(project_root: PathBuf, client: DaemonClient) {
         let settings_store = SettingsStore::load();
         let project_store = ProjectStore::load();
+        let snippet_store = SnippetStore::load();
+        let notes_store = NotesStore::load();
 
         gpui_platform::application().run(move |cx: &mut App| {
             cx.set_app_identity("me.daidr.eggie", "Eggie");
@@ -776,10 +818,14 @@ impl EggieApp {
                 .expect("failed to register the embedded Hugeicons font");
             let settings = cx.new(|_| settings_store);
             let project_store = cx.new(|_| project_store);
+            let snippet_store = cx.new(|_| snippet_store);
+            let notes_store = cx.new(|_| notes_store);
             let updates = cx.new(|_| crate::update_controller::UpdateController::new());
             crate::settings_window::install(
                 settings.clone(),
                 project_store.clone(),
+                snippet_store.clone(),
+                notes_store.clone(),
                 client.clone(),
                 notification_routes.clone(),
                 updates.clone(),
@@ -791,6 +837,8 @@ impl EggieApp {
                 settings.clone(),
                 updates.clone(),
                 project_store.clone(),
+                snippet_store.clone(),
+                notes_store.clone(),
                 notification_routes.clone(),
                 NewWindowInit::ColdStart {
                     project_root: project_root.clone(),
@@ -804,6 +852,8 @@ impl EggieApp {
                 settings.clone(),
                 updates.clone(),
                 project_store.clone(),
+                snippet_store.clone(),
+                notes_store.clone(),
                 notification_routes.clone(),
             );
             // Automatic update check, shortly after launch (staggered to avoid the startup
@@ -850,6 +900,8 @@ impl EggieApp {
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
+        snippet_store: Entity<SnippetStore>,
+        notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
     ) {
         crate::gui_ipc::reap_stale_gui_sockets();
@@ -881,6 +933,8 @@ impl EggieApp {
                 let settings = settings.clone();
                 let updates = updates.clone();
                 let project_store = project_store.clone();
+                let snippet_store = snippet_store.clone();
+                let notes_store = notes_store.clone();
                 let notification_routes = notification_routes.clone();
                 cx.update(|cx| {
                     // D4: reuse a project with the same root, otherwise add one, then open a window
@@ -893,6 +947,8 @@ impl EggieApp {
                         settings,
                         updates,
                         project_store.clone(),
+                        snippet_store,
+                        notes_store,
                         notification_routes,
                         NewWindowInit::OpenDir { project_id },
                     );
@@ -912,6 +968,8 @@ impl EggieApp {
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
+        snippet_store: Entity<SnippetStore>,
+        notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
         init: NewWindowInit,
     ) {
@@ -939,6 +997,8 @@ impl EggieApp {
                         settings,
                         updates,
                         project_store,
+                        snippet_store,
+                        notes_store,
                         notification_routes,
                         init,
                         window,
@@ -1098,6 +1158,8 @@ impl EggieApp {
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
+        snippet_store: Entity<SnippetStore>,
+        notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
         init: NewWindowInit,
         window: &mut Window,
@@ -1202,6 +1264,21 @@ impl EggieApp {
             cx.notify();
         })
         .detach();
+        // Snippet edits from any window re-render the Commands tab here.
+        cx.observe(&snippet_store, |_, _, cx| cx.notify()).detach();
+        // Notes edits from another window: reseed our editor so it mirrors the shared text (unless
+        // this window is the one actively editing — guarded in the observer body).
+        cx.observe(&notes_store, |app, store, cx| {
+            let shared = store.read(cx).text().to_owned();
+            if let Some(editor) = app.notes_editor.as_ref() {
+                let local = editor.input.read(cx).content().to_owned();
+                if local != shared {
+                    editor.input.update(cx, |input, cx| input.set_content(shared, cx));
+                }
+            }
+            cx.notify();
+        })
+        .detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         let terminal_font_families = config.resolved_font_families();
@@ -1211,6 +1288,34 @@ impl EggieApp {
             config.resolved_font_variations().into();
         let terminal_font_codepoint_map: std::sync::Arc<[crate::settings::CodepointMapEntry]> =
             config.resolved_codepoint_map().into();
+        // The Notes tab's multi-line editor: created upfront (rendering is `&self` and cannot lazily
+        // build a TextInput, which needs `window`). Seeds from the shared store; a subscription drives
+        // debounced autosave.
+        let notes_editor = {
+            let text_style = TextInputStyle {
+                text_color: (colors.text << 8) | 0xff,
+                placeholder_color: (colors.muted << 8) | 0xff,
+                cursor_color: (colors.accent << 8) | 0xff,
+                selection_color: (colors.accent << 8) | 0x55,
+            };
+            let seed = notes_store.read(cx).text().to_owned();
+            let language = config.language;
+            let input = cx.new(|cx| {
+                let mut input = TextInput::new(window, cx, text_style).multiline();
+                input.set_placeholder(language.notes_placeholder());
+                input.set_language(language);
+                if !seed.is_empty() {
+                    input.set_content(seed, cx);
+                }
+                input
+            });
+            let subscription = cx.subscribe_in(&input, window, Self::on_notes_input_event);
+            NotesEditor {
+                input,
+                _subscription: subscription,
+                save_epoch: 0,
+            }
+        };
         let mut app = Self {
             input_sender: client
                 .input_sender()
@@ -1253,6 +1358,8 @@ impl EggieApp {
             pending_progress_updates: HashMap::new(),
             window_id,
             project_store,
+            snippet_store,
+            notes_store,
             projects,
             project_views,
             active_project,
@@ -1281,6 +1388,11 @@ impl EggieApp {
             session_inspection_errors: HashMap::new(),
             process_metrics_system: System::new(),
             right_tab: RightTab::Info,
+            shell_integration: HashMap::new(),
+            command_history_collapsed: false,
+            snippets_collapsed: false,
+            snippet_editor: None,
+            notes_editor: Some(notes_editor),
             left_sidebar_width: LEFT_SIDEBAR_DEFAULT_WIDTH,
             right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
             left_sidebar_collapsed: false,
@@ -1316,6 +1428,7 @@ impl EggieApp {
         }
         app.start_polling(cx);
         app.start_inspection_polling(cx);
+        app.start_shell_integration_polling(cx);
         app.start_latency_reporting(cx);
         app.install_close_confirmation(window, cx);
         cx.on_focus_in(&app.focus_handle, window, |app, _, cx| {
@@ -2372,6 +2485,57 @@ impl EggieApp {
                     });
                     if update.is_err() {
                         eprintln!("session-inspection update lost its window");
+                        break;
+                    }
+                }
+                executor.timer(SESSION_INSPECTION_INTERVAL).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Poll the daemon's OSC 133 shell-integration state for the active session, but only while the
+    /// Commands tab is visible (the sidebar could be collapsed or on another tab). Mirrors the
+    /// `start_inspection_polling` template; caches into `shell_integration`.
+    fn start_shell_integration_polling(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let target = this
+                    .update(cx, |app, _| {
+                        if app.right_sidebar_collapsed || app.right_tab != RightTab::Commands {
+                            None
+                        } else {
+                            app.active_session_id()
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(session_id) = target {
+                    let request_client = client.clone();
+                    let result = executor
+                        .spawn(async move {
+                            request_client
+                                .request(ClientRequest::GetShellIntegrationState { session_id })
+                        })
+                        .await;
+                    let update = this.update(cx, |app, cx| match result {
+                        Ok(DaemonResponse::ShellIntegrationState { state, .. }) => {
+                            let changed = app.shell_integration.get(&session_id) != Some(&state);
+                            if changed {
+                                app.shell_integration.insert(session_id, state);
+                                cx.notify();
+                            }
+                        }
+                        Ok(response) => {
+                            eprintln!("unexpected shell-integration response: {response:?}");
+                        }
+                        Err(error) => {
+                            eprintln!("shell-integration request failed: {error:#}");
+                        }
+                    });
+                    if update.is_err() {
                         break;
                     }
                 }
@@ -6743,8 +6907,8 @@ impl EggieApp {
         let language = self.language;
         let tabs = [
             (RightTab::Info, language.info_tab(), IconName::Info),
-            (RightTab::Files, language.files_tab(), IconName::Folder),
-            (RightTab::Git, language.git_tab(), IconName::GitBranch),
+            (RightTab::Commands, language.commands_tab(), IconName::Terminal),
+            (RightTab::Notes, language.notes_tab(), IconName::StickyNote),
         ]
         .into_iter()
         .fold(
@@ -6931,27 +7095,528 @@ impl EggieApp {
                 }
                 content.into_any_element()
             }
-            RightTab::Files => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(section_label(self.language.current_directory_label(), self.colors))
-                .child(placeholder(
-                    self.language.file_tree_scaffold_note(),
-                    self.colors,
-                ))
-                .into_any_element(),
-            RightTab::Git => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(section_label(self.language.source_control_label(), self.colors))
-                .child(placeholder(
-                    self.language.git_scaffold_note(),
-                    self.colors,
-                ))
-                .into_any_element(),
+            RightTab::Commands => self.render_commands_tab(cx),
+            RightTab::Notes => self.render_notes_tab(cx),
         }
+    }
+
+    // ===== Commands tab (command history + snippets) =========================================
+
+    fn text_input_style(&self) -> TextInputStyle {
+        TextInputStyle {
+            text_color: (self.colors.text << 8) | 0xff,
+            placeholder_color: (self.colors.muted << 8) | 0xff,
+            cursor_color: (self.colors.accent << 8) | 0xff,
+            selection_color: (self.colors.accent << 8) | 0x55,
+        }
+    }
+
+    fn render_commands_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.render_command_history_section(cx))
+            .child(self.render_snippets_section(cx))
+            .children(self.snippet_editor.as_ref().map(|_| self.render_snippet_editor(cx)))
+            .into_any_element()
+    }
+
+    /// A clickable collapsible section header: caret + label. Toggling flips the given predicate via
+    /// the click listener the caller wires through \`on_toggle\`.
+    fn collapsible_header(
+        &self,
+        id: SharedString,
+        label: &'static str,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+        on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .text_color(rgb(self.colors.muted))
+            .child(icon_sized(
+                if collapsed { IconName::ArrowRight } else { IconName::ArrowDown },
+                12.,
+            ))
+            .child(section_label(label, self.colors))
+            .on_click(cx.listener(move |app, _, _, cx| {
+                on_toggle(app, cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_command_history_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut section = div().flex().flex_col().gap_2().child(self.collapsible_header(
+            "command-history-header".into(),
+            self.language.command_history_label(),
+            self.command_history_collapsed,
+            cx,
+            |app, _| app.command_history_collapsed = !app.command_history_collapsed,
+        ));
+        if self.command_history_collapsed {
+            return section.into_any_element();
+        }
+
+        let session_id = self.active_session_id();
+        let state = session_id.and_then(|id| self.shell_integration.get(&id));
+        match state {
+            None => {
+                section = section.child(placeholder(
+                    self.language.shell_integration_unavailable(),
+                    self.colors,
+                ));
+            }
+            Some(state) => {
+                // Newest first: current (running) command, then history reversed.
+                let now_ms = unix_now_ms();
+                let mut list = div().flex().flex_col().gap_1();
+                let mut any = false;
+                if let Some(current) = &state.current_command {
+                    any = true;
+                    list = list.child(self.render_command_row(
+                        session_id,
+                        "cmd-current".into(),
+                        current.command_line.clone(),
+                        current.exit_code,
+                        current.started_at_unix_ms,
+                        now_ms,
+                        cx,
+                    ));
+                }
+                for record in state.history.iter().rev() {
+                    any = true;
+                    list = list.child(self.render_command_row(
+                        session_id,
+                        { let s: SharedString = format!("cmd-{}", record.id).into(); s },
+                        record.command_line.clone(),
+                        record.exit_code,
+                        record.started_at_unix_ms,
+                        now_ms,
+                        cx,
+                    ));
+                }
+                if any {
+                    section = section.child(list);
+                } else {
+                    section =
+                        section.child(placeholder(self.language.command_history_empty(), self.colors));
+                }
+            }
+        }
+        section.into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_command_row(
+        &self,
+        session_id: Option<SessionId>,
+        id: SharedString,
+        command_line: Option<String>,
+        exit_code: Option<i32>,
+        started_at_unix_ms: u64,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let status = CommandStatus::from_exit_code(exit_code);
+        let (dot_color, trailing): (u32, Option<String>) = match status {
+            CommandStatus::Running => (self.colors.muted, Some(self.language.command_running().to_owned())),
+            CommandStatus::Success => (0x3fb950, None),
+            CommandStatus::Failure(code) => (0xf85149, Some(code.to_string())),
+        };
+        let command_text = command_line.unwrap_or_default();
+        let paste_text = command_text.clone();
+        let relative = format_relative_time(started_at_unix_ms, now_ms);
+        let colors = self.colors;
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|element| element.bg(rgb(colors.panel_alt)))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(rgb(dot_color)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family("monospace")
+                    .child(command_text),
+            )
+            .children(trailing.map(|t| {
+                div()
+                    .flex_none()
+                    .text_size(px(10.))
+                    .text_color(rgb(dot_color))
+                    .child(t)
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.))
+                    .text_color(rgb(colors.muted))
+                    .child(relative),
+            )
+            .on_click(cx.listener(move |app, _, _, _| {
+                // Refill only (no trailing newline appended): the command is re-entered, not run.
+                if let Some(session_id) = session_id {
+                    app.enqueue_terminal_paste(session_id, paste_text.clone());
+                }
+            }))
+            .into_any_element()
+    }
+
+    // ----- Snippets --------------------------------------------------------------------------
+
+    fn render_snippets_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(self.collapsible_header(
+                "snippets-header".into(),
+                self.language.snippets_label(),
+                self.snippets_collapsed,
+                cx,
+                |app, _| app.snippets_collapsed = !app.snippets_collapsed,
+            ))
+            .child(icon_button(
+                IconName::Add,
+                "snippet-add",
+                self.colors,
+                Some(self.language.add_snippet().into()),
+                cx.listener(|app, _, window, cx| app.open_snippet_editor(None, window, cx)),
+            ));
+        let mut section = div().flex().flex_col().gap_2().child(header);
+        if self.snippets_collapsed {
+            return section.into_any_element();
+        }
+        let snippets = self.snippet_store.read(cx).snippets().to_vec();
+        if snippets.is_empty() {
+            section = section.child(placeholder(self.language.snippets_empty(), self.colors));
+        } else {
+            let mut list = div().flex().flex_col().gap_1();
+            for snippet in snippets {
+                list = list.child(self.render_snippet_row(&snippet, cx));
+            }
+            section = section.child(list);
+        }
+        section.into_any_element()
+    }
+
+    fn render_snippet_row(&self, snippet: &Snippet, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.colors;
+        let id = snippet.id;
+        let content = snippet.content.clone();
+        let name = if snippet.name.trim().is_empty() {
+            snippet.content.lines().next().unwrap_or_default().to_owned()
+        } else {
+            snippet.name.clone()
+        };
+        div()
+            .id(Box::leak(format!("snippet-{id}").into_boxed_str()) as &str)
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .hover(|element| element.bg(rgb(colors.panel_alt)))
+            .child(
+                div()
+                    .id(Box::leak(format!("snippet-run-{id}").into_boxed_str()) as &str)
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .child(name)
+                    .on_click(cx.listener(move |app, _, _, _| {
+                        // Execute intent lives in the content: a trailing '\n' auto-runs.
+                        if let Some(session_id) = app.active_session_id() {
+                            app.enqueue_terminal_paste(session_id, content.clone());
+                        }
+                    })),
+            )
+            .child(icon_button(
+                IconName::Settings,
+                Box::leak(format!("snippet-edit-{id}").into_boxed_str()) as &str,
+                colors,
+                Some(self.language.edit_snippet().into()),
+                cx.listener(move |app, _, window, cx| app.open_snippet_editor(Some(id), window, cx)),
+            ))
+            .child(icon_button(
+                IconName::Close,
+                Box::leak(format!("snippet-del-{id}").into_boxed_str()) as &str,
+                colors,
+                Some(self.language.delete_snippet().into()),
+                cx.listener(move |app, _, window, cx| app.confirm_delete_snippet(id, window, cx)),
+            ))
+            .into_any_element()
+    }
+
+    fn open_snippet_editor(
+        &mut self,
+        editing: Option<uuid::Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let style = self.text_input_style();
+        let language = self.language;
+        let existing = editing.and_then(|id| {
+            self.snippet_store
+                .read(cx)
+                .snippets()
+                .iter()
+                .find(|s| s.id == id)
+                .cloned()
+        });
+        let name_seed = existing.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+        let content_seed = existing.as_ref().map(|s| s.content.clone()).unwrap_or_default();
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx, style);
+            input.set_placeholder(language.snippet_name_placeholder());
+            input.set_language(language);
+            if !name_seed.is_empty() {
+                input.set_content(name_seed, cx);
+            }
+            input
+        });
+        let content = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx, style).multiline();
+            input.set_placeholder(language.snippet_content_placeholder());
+            input.set_language(language);
+            if !content_seed.is_empty() {
+                input.set_content(content_seed, cx);
+            }
+            input
+        });
+        let name_subscription = cx.subscribe_in(&name, window, Self::on_snippet_editor_event);
+        let content_subscription = cx.subscribe_in(&content, window, Self::on_snippet_editor_event);
+        window.focus(&name.read(cx).focus_handle(), cx);
+        self.snippet_editor = Some(SnippetEditor {
+            editing,
+            name,
+            content,
+            _name_subscription: name_subscription,
+            _content_subscription: content_subscription,
+        });
+        cx.notify();
+    }
+
+    fn on_snippet_editor_event(
+        &mut self,
+        _input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // Cmd+Enter (multi-line submit) or Enter on the single-line name field saves.
+            TextInputEvent::Confirm => self.save_snippet_editor(cx),
+            TextInputEvent::Cancel => {
+                self.snippet_editor = None;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn save_snippet_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.snippet_editor.take() else {
+            return;
+        };
+        let name = editor.name.read(cx).content().to_owned();
+        let content = editor.content.read(cx).content().to_owned();
+        if name.trim().is_empty() && content.trim().is_empty() {
+            cx.notify();
+            return;
+        }
+        match editor.editing {
+            Some(id) => self
+                .snippet_store
+                .update(cx, |store, cx| store.update(id, name, content, cx)),
+            None => self
+                .snippet_store
+                .update(cx, |store, cx| store.add(Snippet::new(name, content), cx)),
+        }
+        cx.notify();
+    }
+
+    fn confirm_delete_snippet(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            language.delete_snippet_confirm_title(),
+            Some(language.delete_snippet_confirm_message()),
+            &[language.delete(), language.cancel()],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(choice) = prompt.await else {
+                return;
+            };
+            if choice != 0 {
+                return;
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.snippet_store.update(cx, |store, cx| store.remove(id, cx));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_snippet_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.snippet_editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let colors = self.colors;
+        let title = if editor.editing.is_some() {
+            self.language.edit_snippet()
+        } else {
+            self.language.add_snippet()
+        };
+        // A modal-ish overlay anchored inside the sidebar. \`.occlude()\` stops click-through.
+        anchored()
+            .child(
+                div()
+                    .occlude()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(colors.panel_alt))
+                    .border_1()
+                    .border_color(rgb(colors.muted))
+                    .child(section_label(title, colors))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(colors.panel))
+                            .child(editor.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .min_h(px(60.))
+                            .bg(rgb(colors.panel))
+                            .child(editor.content.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("snippet-editor-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(colors.muted))
+                                    .hover(|e| e.bg(rgb(colors.panel)))
+                                    .child(self.language.cancel())
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.snippet_editor = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("snippet-editor-save")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(colors.accent))
+                                    .text_color(rgb(colors.background))
+                                    .child(self.language.save())
+                                    .on_click(cx.listener(|app, _, _, cx| app.save_snippet_editor(cx))),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    // ===== Notes tab =========================================================================
+
+    fn render_notes_tab(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.colors;
+        let Some(editor) = self.notes_editor.as_ref() else {
+            return div().into_any_element();
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_h(px(120.))
+            .child(
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(colors.panel_alt))
+                    .child(editor.input.clone()),
+            )
+            .into_any_element()
+    }
+
+    fn on_notes_input_event(
+        &mut self,
+        _input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, TextInputEvent::Changed) {
+            return;
+        }
+        let Some(editor) = self.notes_editor.as_mut() else {
+            return;
+        };
+        editor.save_epoch = editor.save_epoch.wrapping_add(1);
+        let epoch = editor.save_epoch;
+        // Debounce: only the last keystroke in a ~500ms burst writes to disk.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                let Some(editor) = app.notes_editor.as_ref() else {
+                    return;
+                };
+                if editor.save_epoch != epoch {
+                    return; // Superseded by a newer keystroke.
+                }
+                let text = editor.input.read(cx).content().to_owned();
+                app.notes_store.update(cx, |store, cx| store.set_text(text, cx));
+            });
+        })
+        .detach();
     }
 }
 
@@ -7904,6 +8569,13 @@ fn terminal_size_for_viewport(
             .round()
             .clamp(1., u16::MAX as f32) as u16,
     }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn section_label(label: &'static str, colors: UiColors) -> impl IntoElement {

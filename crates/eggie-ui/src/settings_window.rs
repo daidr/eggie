@@ -248,6 +248,8 @@ impl SettingsSection {
 pub(crate) fn install(
     settings: Entity<SettingsStore>,
     project_store: Entity<ProjectStore>,
+    snippet_store: Entity<crate::snippet_store::SnippetStore>,
+    notes_store: Entity<crate::notes_store::NotesStore>,
     client: DaemonClient,
     notification_routes: NotificationRoutes,
     updates: Entity<crate::update_controller::UpdateController>,
@@ -263,6 +265,8 @@ pub(crate) fn install(
     let settings_for_new_window = settings.clone();
     let updates_for_new_window = updates.clone();
     let project_store_for_new_window = project_store.clone();
+    let snippet_store_for_new_window = snippet_store.clone();
+    let notes_store_for_new_window = notes_store.clone();
     let client_for_new_window = client.clone();
     let routes_for_new_window = notification_routes.clone();
     cx.on_action(move |_: &NewWindow, cx| {
@@ -272,6 +276,8 @@ pub(crate) fn install(
             settings_for_new_window.clone(),
             updates_for_new_window.clone(),
             project_store_for_new_window.clone(),
+            snippet_store_for_new_window.clone(),
+            notes_store_for_new_window.clone(),
             routes_for_new_window.clone(),
             NewWindowInit::Empty,
         );
