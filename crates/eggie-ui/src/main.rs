@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod command_history;
 mod command_palette;
 mod gui_ipc;
 mod i18n;
@@ -10,7 +11,9 @@ mod markdown;
 #[cfg(target_os = "macos")]
 mod metal_terminal;
 mod native_menu;
+mod notes_store;
 mod project_store;
+mod snippet_store;
 pub mod services;
 mod settings;
 mod settings_window;

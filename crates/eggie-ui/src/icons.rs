@@ -23,7 +23,6 @@ pub(crate) enum IconName {
     Finder,
     Folder,
     FolderOpen,
-    GitBranch,
     Info,
     Keyboard,
     PanelLeftClose,
@@ -33,6 +32,7 @@ pub(crate) enum IconName {
     Refresh,
     Search,
     Settings,
+    StickyNote,
     Terminal,
     VsCode,
 }
@@ -57,7 +57,6 @@ impl IconName {
             Self::Finder => '\u{F15D1}',
             Self::Folder => '\u{F1D01}',
             Self::FolderOpen => '\u{F1D02}',
-            Self::GitBranch => '\u{F1D6B}',
             Self::Info => '\u{F1E70}',
             Self::Keyboard => '\u{F1F02}',
             Self::PanelLeftClose => '\u{F22AE}',
@@ -67,6 +66,7 @@ impl IconName {
             Self::Refresh => '\u{F2449}',
             Self::Search => '\u{F2546}',
             Self::Settings => '\u{F257F}',
+            Self::StickyNote => '\u{F26E5}',
             Self::Terminal => '\u{F1836}',
             Self::VsCode => '\u{F297B}',
         }

@@ -220,20 +220,6 @@ impl Language {
         }
     }
 
-    pub(crate) fn current_directory_label(self) -> &'static str {
-        match self {
-            Self::English => "CURRENT DIRECTORY",
-            Self::SimplifiedChinese => "当前目录",
-        }
-    }
-
-    pub(crate) fn source_control_label(self) -> &'static str {
-        match self {
-            Self::English => "SOURCE CONTROL",
-            Self::SimplifiedChinese => "源代码管理",
-        }
-    }
-
     pub(crate) fn processes_label(self) -> &'static str {
         match self {
             Self::English => "PROCESSES",
@@ -250,17 +236,17 @@ impl Language {
         }
     }
 
-    pub(crate) fn files_tab(self) -> &'static str {
+    pub(crate) fn commands_tab(self) -> &'static str {
         match self {
-            Self::English => "Files",
-            Self::SimplifiedChinese => "文件",
+            Self::English => "Commands",
+            Self::SimplifiedChinese => "命令",
         }
     }
 
-    pub(crate) fn git_tab(self) -> &'static str {
+    pub(crate) fn notes_tab(self) -> &'static str {
         match self {
-            Self::English => "Git",
-            Self::SimplifiedChinese => "Git",
+            Self::English => "Notes",
+            Self::SimplifiedChinese => "便签",
         }
     }
 
@@ -315,21 +301,123 @@ impl Language {
         }
     }
 
-    pub(crate) fn file_tree_scaffold_note(self) -> &'static str {
+    // --- Commands tab: history + snippets ----------------------------------------------------
+
+    pub(crate) fn command_history_label(self) -> &'static str {
         match self {
-            Self::English => {
-                "File-tree service is scaffolded for current, initial, and locked roots."
-            }
-            Self::SimplifiedChinese => "文件树服务已为当前、初始和锁定根目录搭建。",
+            Self::English => "COMMAND HISTORY",
+            Self::SimplifiedChinese => "命令历史",
         }
     }
 
-    pub(crate) fn git_scaffold_note(self) -> &'static str {
+    pub(crate) fn snippets_label(self) -> &'static str {
+        match self {
+            Self::English => "SNIPPETS",
+            Self::SimplifiedChinese => "代码片段",
+        }
+    }
+
+    pub(crate) fn command_history_empty(self) -> &'static str {
+        match self {
+            Self::English => "No commands yet.",
+            Self::SimplifiedChinese => "暂无命令。",
+        }
+    }
+
+    pub(crate) fn shell_integration_unavailable(self) -> &'static str {
         match self {
             Self::English => {
-                "Git status, diff, staging, commit, branch, pull, and push services are scaffolded."
+                "Shell integration is not active. Command history appears once your shell reports OSC 133 prompts."
             }
-            Self::SimplifiedChinese => "Git 状态、差异、暂存、提交、分支、拉取和推送服务已搭建。",
+            Self::SimplifiedChinese => {
+                "Shell 集成尚未启用。当你的 shell 上报 OSC 133 提示符后,命令历史才会出现。"
+            }
+        }
+    }
+
+    pub(crate) fn command_running(self) -> &'static str {
+        match self {
+            Self::English => "running",
+            Self::SimplifiedChinese => "运行中",
+        }
+    }
+
+    pub(crate) fn snippets_empty(self) -> &'static str {
+        match self {
+            Self::English => "No snippets yet. Add one to reuse commands.",
+            Self::SimplifiedChinese => "暂无片段。添加一个以复用命令。",
+        }
+    }
+
+    pub(crate) fn add_snippet(self) -> &'static str {
+        match self {
+            Self::English => "Add snippet",
+            Self::SimplifiedChinese => "新增片段",
+        }
+    }
+
+    pub(crate) fn edit_snippet(self) -> &'static str {
+        match self {
+            Self::English => "Edit snippet",
+            Self::SimplifiedChinese => "编辑片段",
+        }
+    }
+
+    pub(crate) fn delete_snippet(self) -> &'static str {
+        match self {
+            Self::English => "Delete snippet",
+            Self::SimplifiedChinese => "删除片段",
+        }
+    }
+
+    pub(crate) fn snippet_name_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Name",
+            Self::SimplifiedChinese => "名称",
+        }
+    }
+
+    pub(crate) fn snippet_content_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Command… (trailing newline auto-runs)",
+            Self::SimplifiedChinese => "命令…(末尾换行则自动执行)",
+        }
+    }
+
+    pub(crate) fn save(self) -> &'static str {
+        match self {
+            Self::English => "Save",
+            Self::SimplifiedChinese => "保存",
+        }
+    }
+
+    pub(crate) fn delete_snippet_confirm_title(self) -> &'static str {
+        match self {
+            Self::English => "Delete snippet?",
+            Self::SimplifiedChinese => "删除片段?",
+        }
+    }
+
+    pub(crate) fn delete_snippet_confirm_message(self) -> &'static str {
+        match self {
+            Self::English => "This snippet will be permanently removed.",
+            Self::SimplifiedChinese => "该片段将被永久删除。",
+        }
+    }
+
+    pub(crate) fn delete(self) -> &'static str {
+        match self {
+            Self::English => "Delete",
+            Self::SimplifiedChinese => "删除",
+        }
+    }
+
+    // --- Notes tab ---------------------------------------------------------------------------
+
+    pub(crate) fn notes_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Jot anything here — it is saved automatically and shared across windows.",
+            Self::SimplifiedChinese => "在此随手记录 —— 自动保存并跨窗口共享。",
         }
     }
 
