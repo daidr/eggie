@@ -26,16 +26,16 @@ filter_unconventional = true
 split_commits = false
 # 提交分组:正则匹配 type,归入带 emoji 的中文分组;顺序即展示顺序。
 commit_parsers = [
-    { message = "^feat", group = "✨ 新功能" },
-    { message = "^fix", group = "🐛 修复" },
-    { message = "^perf", group = "⚡ 性能" },
-    { message = "^refactor", group = "♻️ 重构" },
-    { message = "^docs", group = "📝 文档" },
+    { message = "^feat", group = "✨ Features" },
+    { message = "^fix", group = "🐛 Bug Fixes" },
+    { message = "^perf", group = "⚡ Performance" },
+    { message = "^refactor", group = "♻️ Refactor" },
+    { message = "^docs", group = "📝 Documentation" },
     { message = "^chore", skip = true },
     { message = "^ci", skip = true },
     { message = "^test", skip = true },
     { message = "^style", skip = true },
-    { body = ".*", group = "其他" },
+    { body = ".*", group = "Other" },
 ]
 # 过滤掉合并提交等噪音。
 filter_commits = false
