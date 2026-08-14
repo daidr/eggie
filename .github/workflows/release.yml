@@ -247,6 +247,13 @@ jobs:
   feed:
     needs: release
     runs-on: ubuntu-latest
+    # 同一时刻只允许一个 Pages 部署(与 rebuild-feed.yml 共享同一分组)。
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -268,4 +275,5 @@ jobs:
           path: _site
 
       - name: 部署到 Pages
+        id: deployment
         uses: actions/deploy-pages@v4
