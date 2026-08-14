@@ -3321,10 +3321,12 @@ impl EggieApp {
         }
         self.terminal_resize_in_flight.remove(&session_id);
         if let Err(error) = result {
+            // A resize can fail because the PTY has already closed (the process exited but the
+            // tab still renders its last snapshot). Keep the last-sent size recorded instead of
+            // clearing it: resize_terminal's "same size" early-return then suppresses the
+            // identical resend the per-frame prepaint would otherwise issue, so a dead session
+            // no longer spins the resize path every frame. A different viewport size still retries.
             eprintln!("failed to resize terminal {session_id}: {error}");
-            if self.terminal_sizes.get(&session_id) == Some(&sent_size) {
-                self.terminal_sizes.remove(&session_id);
-            }
             return;
         }
         if self.terminal_sizes.get(&session_id) != Some(&sent_size) {
