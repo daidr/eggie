@@ -19,6 +19,7 @@ gpui_platform.workspace = true
 libc.workspace = true
 memmap2.workspace = true
 parking_lot.workspace = true
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 rmp-serde.workspace = true
 rustc-hash.workspace = true

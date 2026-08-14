@@ -1,4 +1,4 @@
-use crate::settings::Language;
+use crate::settings::{Language, UpdateChannel};
 
 impl Language {
     // --- Common dialog buttons ---------------------------------------------------------------
@@ -808,6 +808,31 @@ impl Language {
         match self {
             Self::English => "Updates",
             Self::SimplifiedChinese => "更新",
+        }
+    }
+
+    pub(crate) fn update_channel_row(self) -> &'static str {
+        match self {
+            Self::English => "Update channel",
+            Self::SimplifiedChinese => "更新渠道",
+        }
+    }
+
+    pub(crate) fn update_channel_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Stable receives final releases only; Beta also receives prereleases."
+            }
+            Self::SimplifiedChinese => "稳定版仅接收正式版本;测试版还会接收预发布版本。",
+        }
+    }
+
+    pub(crate) fn update_channel_label(self, channel: UpdateChannel) -> &'static str {
+        match (self, channel) {
+            (Self::English, UpdateChannel::Stable) => "Stable",
+            (Self::English, UpdateChannel::Beta) => "Beta",
+            (Self::SimplifiedChinese, UpdateChannel::Stable) => "稳定版",
+            (Self::SimplifiedChinese, UpdateChannel::Beta) => "测试版",
         }
     }
 

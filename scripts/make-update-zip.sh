@@ -33,11 +33,15 @@ echo
 echo "把下面内容写入 ~/Library/Application Support/Eggie/dev/update-feed.json 即可模拟更新:"
 cat <<EOF
 {
-  "version": "$VERSION",
-  "protocol_version": 1,
-  "release_notes": "- 在此填写更新内容",
-  "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "download_url": "file://$OUT",
-  "sha256": "$SHA"
+  "releases": [
+    {
+      "version": "$VERSION",
+      "protocol_version": 1,
+      "release_notes": "- 在此填写更新内容",
+      "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+      "download_url": "file://$OUT",
+      "sha256": "$SHA"
+    }
+  ]
 }
 EOF

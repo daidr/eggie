@@ -5,18 +5,14 @@
 //! handle so the sidebar indicator stays in sync across windows.
 
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use anyhow::Context as _;
 use gpui::{Context, Task};
-use eggie_update::{
-    UpdateState, feed_from_url, is_update_available, updates_dir,
-};
+use eggie_update::{UpdateState, feed_from_url, select_update, updates_dir};
 
 pub(crate) struct UpdateController {
     state: UpdateState,
-    feed: Arc<dyn eggie_update::UpdateFeed>,
     current_version: String,
     /// Set while a check or download is in flight so repeated triggers
     /// don't pile up.
@@ -26,16 +22,8 @@ pub(crate) struct UpdateController {
 
 impl UpdateController {
     pub(crate) fn new() -> Self {
-        let feed = match eggie_update::default_feed_url() {
-            Ok(url) => feed_from_url(&url),
-            Err(error) => {
-                eprintln!("invalid update feed URL: {error:#}");
-                Arc::new(eggie_update::FileFeed::new(Default::default()))
-            }
-        };
         Self {
             state: UpdateState::Idle,
-            feed,
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
             check_task: None,
             download_task: None,
@@ -46,33 +34,51 @@ impl UpdateController {
         &self.state
     }
 
-    /// Check the feed for a newer release. `silent` checks (automatic, on
-    /// launch) stay quiet on failure; manual checks surface errors.
-    pub(crate) fn check(&mut self, silent: bool, cx: &mut Context<Self>) {
+    /// Check the feed for a newer release on the given `channel`
+    /// (`UpdateChannel::slug()`). Building the feed per-check means a runtime
+    /// channel change is picked up on the next check with no extra plumbing.
+    /// `silent` checks (automatic, on launch) stay quiet on failure; manual
+    /// checks surface errors.
+    pub(crate) fn check(&mut self, silent: bool, channel: &str, cx: &mut Context<Self>) {
         if self.check_task.is_some() || matches!(self.state, UpdateState::Downloading { .. }) {
             return;
         }
+        let feed = match eggie_update::default_feed_url(channel) {
+            Ok(url) => feed_from_url(&url),
+            Err(error) => {
+                let message = format!("invalid update feed URL: {error:#}");
+                if silent {
+                    eprintln!("{message}");
+                    self.state = UpdateState::Idle;
+                } else {
+                    self.state = UpdateState::Error(message);
+                }
+                cx.notify();
+                return;
+            }
+        };
         self.state = UpdateState::Checking;
         cx.notify();
 
         let executor = cx.background_executor().clone();
-        let feed = self.feed.clone();
         let current_version = self.current_version.clone();
         let task = cx.spawn(async move |this, cx| {
-            let result = executor.spawn(async move { feed.fetch_latest() }).await;
+            let result = executor.spawn(async move { feed.fetch_releases() }).await;
             this.update(cx, |controller, cx| {
                 controller.check_task = None;
                 match result {
-                    Ok(release) if is_update_available(&current_version, &release) => {
-                        controller.state = UpdateState::Available(release);
-                    }
-                    Ok(_) => {
-                        if !silent {
-                            controller.state = UpdateState::UpToDate;
-                        } else {
-                            controller.state = UpdateState::Idle;
+                    Ok(releases) => match select_update(&current_version, &releases) {
+                        Some(release) => {
+                            controller.state = UpdateState::Available(release);
                         }
-                    }
+                        None => {
+                            controller.state = if silent {
+                                UpdateState::Idle
+                            } else {
+                                UpdateState::UpToDate
+                            };
+                        }
+                    },
                     Err(error) => {
                         if !silent {
                             controller.state = UpdateState::Error(format!("{error:#}"));
@@ -89,8 +95,10 @@ impl UpdateController {
         self.check_task = Some(task);
     }
 
-    /// Start downloading the currently available release.
-    pub(crate) fn start_download(&mut self, cx: &mut Context<Self>) {
+    /// Start downloading the currently available release. `channel`
+    /// (`UpdateChannel::slug()`) is only used by the error-retry path, which
+    /// re-checks the feed.
+    pub(crate) fn start_download(&mut self, channel: &str, cx: &mut Context<Self>) {
         if self.download_task.is_some() {
             return;
         }
@@ -98,7 +106,7 @@ impl UpdateController {
             UpdateState::Available(release) => release.clone(),
             UpdateState::Error(_) | UpdateState::UpToDate => {
                 // Retry from an error: re-check first.
-                self.check(false, cx);
+                self.check(false, channel, cx);
                 return;
             }
             _ => return,

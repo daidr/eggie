@@ -1,8 +1,20 @@
 {
-  "version": "0.0.2",
-  "protocol_version": 1,
-  "release_notes": "- 新增应用内自动更新\n- 修复若干问题",
-  "published_at": "2026-08-13T10:00:00Z",
-  "download_url": "file:///absolute/path/to/Eggie-0.0.2.zip",
-  "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  "releases": [
+    {
+      "version": "0.0.2",
+      "protocol_version": 1,
+      "release_notes": "- 新增应用内自动更新\n- 修复若干问题",
+      "published_at": "2026-08-14T00:00:00Z",
+      "download_url": "file:///absolute/path/to/Eggie-0.0.2.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "version": "0.0.1",
+      "protocol_version": 1,
+      "release_notes": "- 首个预览版本",
+      "published_at": "2026-08-13T00:00:00Z",
+      "download_url": "file:///absolute/path/to/Eggie-0.0.1.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
 }

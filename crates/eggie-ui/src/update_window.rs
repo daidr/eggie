@@ -197,8 +197,11 @@ impl Render for UpdateWindow {
                                 true,
                                 colors,
                                 cx.listener(|this, _, _, cx| {
-                                    this.updates
-                                        .update(cx, |controller, cx| controller.check(false, cx));
+                                    let channel =
+                                        this.settings.read(cx).config().update_channel.slug();
+                                    this.updates.update(cx, |controller, cx| {
+                                        controller.check(false, channel, cx)
+                                    });
                                 }),
                             )),
                     )
@@ -241,8 +244,11 @@ impl Render for UpdateWindow {
                                 true,
                                 colors,
                                 cx.listener(|this, _, _, cx| {
-                                    this.updates
-                                        .update(cx, |controller, cx| controller.start_download(cx));
+                                    let channel =
+                                        this.settings.read(cx).config().update_channel.slug();
+                                    this.updates.update(cx, |controller, cx| {
+                                        controller.start_download(channel, cx)
+                                    });
                                 }),
                             )),
                     )
@@ -586,9 +592,13 @@ fn release_notes_view(notes: &str, colors: UiColors) -> AnyElement {
                 .border_1()
                 .border_color(rgb(colors.border))
                 .bg(rgb(colors.panel))
-                .text_size(px(13.))
-                .text_color(rgb(colors.text))
-                .child(notes.to_string()),
+                .child(crate::markdown::markdown_element(
+                    notes,
+                    crate::markdown::MarkdownStyle {
+                        colors,
+                        base_size: 13.,
+                    },
+                )),
         )
         .into_any_element()
 }

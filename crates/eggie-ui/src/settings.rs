@@ -422,6 +422,33 @@ impl OpenWith {
     }
 }
 
+/// Which release channel the updater follows. `Stable` sees only final releases;
+/// `Beta` additionally sees prereleases (alpha/beta/rc). Maps to the feed file
+/// the client fetches (`stable.json` vs `beta.json`); see `default_feed_url`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub(crate) const ALL: [Self; 2] = [Self::Stable, Self::Beta];
+
+    /// A stable ascii slug for element ids, i18n lookup, and the feed filename.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Stable)
+    }
+}
+
 /// The default cursor shape. A running program can still override this at runtime via DECSCUSR
 /// (`CSI Ps SP q`); this only sets the shape used when the program hasn't requested one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,6 +643,9 @@ pub(crate) struct AppSettings {
     /// surface as a sidebar indicator.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) auto_check_updates: bool,
+    /// Which release channel the updater follows. Default `Stable`.
+    #[serde(default, skip_serializing_if = "UpdateChannel::is_default")]
+    pub(crate) update_channel: UpdateChannel,
     pub(crate) cursor_shape: CursorShapeSetting,
     pub(crate) cursor_blink: CursorBlink,
     pub(crate) bell_mode: BellMode,
@@ -735,6 +765,7 @@ impl Default for AppSettings {
             detect_urls: true,
             copy_on_select: true,
             auto_check_updates: true,
+            update_channel: UpdateChannel::default(),
             cursor_shape: CursorShapeSetting::default(),
             cursor_blink: CursorBlink::default(),
             bell_mode: BellMode::default(),
@@ -1357,6 +1388,7 @@ mod tests {
             detect_urls: false,
             copy_on_select: false,
             auto_check_updates: true,
+            update_channel: UpdateChannel::Beta,
             cursor_shape: CursorShapeSetting::Bar,
             cursor_blink: CursorBlink::On,
             bell_mode: BellMode::Sound,
