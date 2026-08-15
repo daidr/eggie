@@ -67,9 +67,18 @@ eggie-integration() {
 
     eggie_preexec() {
         builtin emulate -L zsh -o no_warn_create_global -o no_aliases
-        # Mark the start of command output and remember that a command is running
-        # so the next precmd can close it with the exit status.
-        builtin print -nu $_eggie_fd '\e]133;C\a'
+        # Mark the start of command output and remember that a command is running so the next
+        # precmd can close it with the exit status. Attach the command line as base64
+        # (cmdline_b64) so Eggie can show real command text in its history panel; base64 is
+        # robust for UTF-8 (CJK), semicolons, newlines, and control bytes that would otherwise
+        # break the OSC 133 sequence. $1 is the command zsh is about to run.
+        builtin local encoded
+        encoded="$(builtin print -rn -- "$1" | command base64 | command tr -d '\n')"
+        if [[ -n "$encoded" ]]; then
+            builtin print -nu $_eggie_fd '\e]133;C;cmdline_b64='"$encoded"'\a'
+        else
+            builtin print -nu $_eggie_fd '\e]133;C\a'
+        fi
         builtin typeset -gi _eggie_running=1
     }
 

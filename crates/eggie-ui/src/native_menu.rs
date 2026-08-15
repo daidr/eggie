@@ -24,6 +24,13 @@ pub(crate) enum NativeProcessMenuCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeSnippetMenuCommand {
+    Use,
+    Edit,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeEditMenuCommand {
     Cut,
     Copy,
@@ -32,7 +39,9 @@ pub(crate) enum NativeEditMenuCommand {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{NativeEditMenu, NativeProcessMenu, NativeProjectMenu, NativeTabMenu};
+pub(crate) use macos::{
+    NativeEditMenu, NativeProcessMenu, NativeProjectMenu, NativeSnippetMenu, NativeTabMenu,
+};
 
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_tab_menu(
@@ -58,6 +67,14 @@ pub(crate) fn prepare_process_menu(
     language: crate::settings::Language,
 ) -> Option<NativeProcessMenu> {
     macos::NativeProcessMenu::prepare(window, language)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_snippet_menu(
+    window: &Window,
+    language: crate::settings::Language,
+) -> Option<NativeSnippetMenu> {
+    macos::NativeSnippetMenu::prepare(window, language)
 }
 
 #[cfg(target_os = "macos")]
@@ -123,6 +140,21 @@ pub(crate) fn prepare_process_menu(_: &Window, _: crate::settings::Language) -> 
 }
 
 #[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeSnippetMenu;
+
+#[cfg(not(target_os = "macos"))]
+impl NativeSnippetMenu {
+    pub(crate) fn show(self) -> Option<NativeSnippetMenuCommand> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_snippet_menu(_: &Window, _: crate::settings::Language) -> Option<NativeSnippetMenu> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) struct NativeEditMenu;
 
 #[cfg(not(target_os = "macos"))]
@@ -145,7 +177,7 @@ pub(crate) fn prepare_edit_menu(
 mod macos {
     use super::{
         NativeEditMenuCommand, NativeProcessMenuCommand, NativeProjectMenuCommand,
-        NativeTabMenuCommand,
+        NativeSnippetMenuCommand, NativeTabMenuCommand,
     };
     use cocoa::{
         appkit::{NSApp, NSMenu, NSMenuItem},
@@ -524,6 +556,85 @@ mod macos {
         }
     }
 
+
+    // --- Snippet context menu ---------------------------------------------------------------
+
+    pub(crate) struct NativeSnippetMenu {
+        view: id,
+        event: id,
+        language: crate::settings::Language,
+    }
+
+    impl NativeSnippetMenu {
+        pub(super) fn prepare(
+            window: &Window,
+            language: crate::settings::Language,
+        ) -> Option<Self> {
+            let window_handle = HasWindowHandle::window_handle(window).ok()?;
+            let RawWindowHandle::AppKit(appkit_handle) = window_handle.as_raw() else {
+                return None;
+            };
+            let view = appkit_handle.ns_view.as_ptr() as id;
+            let event: id = unsafe { msg_send![NSApp(), currentEvent] };
+            if view == nil || event == nil {
+                return None;
+            }
+            unsafe {
+                let _: id = msg_send![view, retain];
+                let _: id = msg_send![event, retain];
+            }
+            Some(Self { view, event, language })
+        }
+
+        pub(crate) fn show(self) -> Option<NativeSnippetMenuCommand> {
+            show_snippet_menu(self.view, self.event, self.language)
+        }
+    }
+
+    impl Drop for NativeSnippetMenu {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.event, release];
+                let _: () = msg_send![self.view, release];
+            }
+        }
+    }
+
+    fn show_snippet_menu(
+        view: id,
+        event: id,
+        language: crate::settings::Language,
+    ) -> Option<NativeSnippetMenuCommand> {
+        let selected = unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let target: id = msg_send![menu_target_class(), new];
+            (*target).set_ivar(SELECTED_COMMAND_IVAR, NO_SELECTION);
+            let menu = NSMenu::new(nil).autorelease();
+            menu.setAutoenablesItems(NO);
+
+            menu.addItem_(menu_item(language.use_snippet(), 0, true, target));
+            menu.addItem_(menu_item(language.edit_snippet(), 1, true, target));
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            menu.addItem_(menu_item(language.delete_snippet(), 2, true, target));
+
+            pop_up_menu(menu, event, view);
+            let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
+            let _: () = msg_send![target, release];
+            pool.drain();
+            selected
+        };
+
+        snippet_command_from_tag(selected)
+    }
+
+    fn snippet_command_from_tag(tag: isize) -> Option<NativeSnippetMenuCommand> {
+        match tag {
+            0 => Some(NativeSnippetMenuCommand::Use),
+            1 => Some(NativeSnippetMenuCommand::Edit),
+            2 => Some(NativeSnippetMenuCommand::Delete),
+            _ => None,
+        }
+    }
     // --- Edit context menu ------------------------------------------------------------------
 
     pub(crate) struct NativeEditMenu {

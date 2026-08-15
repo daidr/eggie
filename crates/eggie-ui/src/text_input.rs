@@ -19,6 +19,7 @@ use std::time::Instant;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    ScrollHandle,
     InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style,
     TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
@@ -164,6 +165,17 @@ pub(crate) struct TextInput {
     undo_stack: Vec<EditSnapshot>,
     redo_stack: Vec<EditSnapshot>,
     last_edit_kind: Option<EditKind>,
+    /// Optional parent scroll handle: when set (multi-line notes), dragging a selection to the
+    /// top/bottom edge auto-scrolls the container so text outside the viewport can be selected.
+    scroll_handle: Option<ScrollHandle>,
+    /// Last pointer position seen while selecting, so the timer-driven edge auto-scroll can keep
+    /// extending the selection toward newly-revealed text even when the mouse stops moving or leaves
+    /// the window.
+    last_mouse_pos: Option<Point<Pixels>>,
+    /// Current edge auto-scroll direction while selecting: -1 up, 0 none, 1 down.
+    autoscroll_dir: i32,
+    /// Whether the auto-scroll timer loop is running (avoids stacking loops).
+    autoscroll_scheduled: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -206,11 +218,20 @@ impl TextInput {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_kind: None,
+            scroll_handle: None,
+            last_mouse_pos: None,
+            autoscroll_dir: 0,
+            autoscroll_scheduled: false,
         }
     }
 
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// Attach the parent scroll handle so edge-drag auto-scroll works (multi-line editors).
+    pub(crate) fn set_scroll_handle(&mut self, handle: ScrollHandle) {
+        self.scroll_handle = Some(handle);
     }
 
     /// Enable multi-line editing. Builder-style so existing single-line call sites
@@ -518,21 +539,109 @@ impl TextInput {
         window.focus(&self.focus_handle, cx);
         cx.stop_propagation();
         self.is_selecting = true;
+        self.last_mouse_pos = Some(event.position);
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         } else {
             self.move_to(self.index_for_mouse_position(event.position), cx);
         }
+        self.ensure_autoscroll(cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.autoscroll_dir = 0;
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+        if !self.is_selecting {
+            return;
         }
+        self.last_mouse_pos = Some(event.position);
+        self.update_autoscroll_dir(event.position.y);
+        self.select_to(self.index_for_mouse_position(event.position), cx);
+        cx.notify();
+    }
+
+    /// Set the edge auto-scroll direction from the pointer's y vs the scroll viewport edges.
+    /// -1 = scroll up, +1 = scroll down, 0 = none / no scrollable parent.
+    fn update_autoscroll_dir(&mut self, y: Pixels) {
+        let Some(handle) = self.scroll_handle.as_ref() else {
+            self.autoscroll_dir = 0;
+            return;
+        };
+        let viewport = handle.bounds();
+        let margin = px(24.);
+        self.autoscroll_dir = if y < viewport.top() + margin {
+            -1
+        } else if y > viewport.bottom() - margin {
+            1
+        } else {
+            0
+        };
+    }
+
+    /// Start the auto-scroll timer loop (once) while selecting. Each tick, if the pointer is in an
+    /// edge zone, scroll one step and re-extend the selection toward the newly-revealed text — even
+    /// if the mouse stopped moving or left the window (no more move events would fire otherwise).
+    fn ensure_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscroll_scheduled {
+            return;
+        }
+        self.autoscroll_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let keep = this
+                    .update(cx, |input, cx| input.autoscroll_step(cx))
+                    .unwrap_or(false);
+                if !keep {
+                    let _ = this.update(cx, |input, _| input.autoscroll_scheduled = false);
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(30))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// One auto-scroll tick. Returns whether the loop should continue (still selecting).
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_selecting {
+            return false;
+        }
+        if self.autoscroll_dir == 0 {
+            return true; // keep looping; direction may change as the pointer moves.
+        }
+        let Some(handle) = self.scroll_handle.as_ref() else {
+            return true;
+        };
+        let step = px(16.);
+        let offset = handle.offset();
+        // GPUI stores max_offset as a POSITIVE magnitude; the live offset ranges from
+        // -max_offset.y (fully scrolled down) up to 0 (top). Scroll up = toward 0, scroll down =
+        // toward -max_offset.y.
+        let bottom_limit = -handle.max_offset().y;
+        let new_y = if self.autoscroll_dir < 0 {
+            (offset.y + step).min(px(0.))
+        } else {
+            (offset.y - step).max(bottom_limit)
+        };
+        if new_y != offset.y {
+            handle.set_offset(point(offset.x, new_y));
+            // Re-extend the selection to the last pointer position clamped into the viewport, so the
+            // selection follows the revealed text. As content scrolls under a fixed viewport y, the
+            // hit-test maps to newly-visible lines.
+            if let (Some(pos), Some(_bounds)) = (self.last_mouse_pos, self.last_bounds) {
+                let viewport = handle.bounds();
+                let clamped_y = pos.y.max(viewport.top()).min(viewport.bottom());
+                let target = self.index_for_mouse_position(point(pos.x, clamped_y));
+                self.select_to(target, cx);
+            }
+            cx.notify();
+        }
+        true
     }
 
     /// Right-click: pop up the native macOS edit menu (Cut / Copy / Paste / Select All).
@@ -1109,11 +1218,12 @@ impl EntityInputHandler for TextInput {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let multiline = self.multiline;
         div()
             .flex()
             .flex_1()
             .min_w_0()
-            .h_full()
+            .when(!multiline, |element| element.h_full())
             .key_context("EggieTextInput")
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
@@ -1226,6 +1336,53 @@ impl TextElement {
     /// Multi-line prepaint: shape each line independently, stack them top-to-bottom, and compute a
     /// caret plus one selection rectangle per covered line. `top` values are relative to the paint
     /// bounds' top edge (which the parent scroll container translates for overflow).
+    /// Break one logical line into visual wrap segments that each fit within `wrap_width`.
+    /// Returns byte offsets (relative to the line start) marking the START of each visual row;
+    /// the first is always 0. Word-wraps at the last space before the overflow, falling back to a
+    /// hard char-boundary break for a single word longer than the width. `wrap_width <= 0` (or an
+    /// empty line) yields a single segment `[0]` (no wrapping).
+    fn wrap_segments(shaped: &ShapedLine, line_text: &str, wrap_width: Pixels) -> Vec<usize> {
+        let mut starts = vec![0usize];
+        if f32::from(wrap_width) <= 0. || line_text.is_empty() {
+            return starts;
+        }
+        if f32::from(shaped.x_for_index(line_text.len())) <= f32::from(wrap_width) {
+            return starts;
+        }
+        let mut seg_start = 0usize;
+        loop {
+            let base_x = f32::from(shaped.x_for_index(seg_start));
+            let mut break_at = seg_start;
+            let mut last_space: Option<usize> = None;
+            let mut idx = seg_start;
+            while idx < line_text.len() {
+                let next = idx + line_text[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                let right = f32::from(shaped.x_for_index(next)) - base_x;
+                if right > f32::from(wrap_width) {
+                    break;
+                }
+                if line_text[idx..next].chars().next() == Some(' ') {
+                    last_space = Some(next);
+                }
+                break_at = next;
+                idx = next;
+            }
+            if break_at == seg_start {
+                break_at = seg_start
+                    + line_text[seg_start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            } else if let Some(space_end) = last_space {
+                if space_end > seg_start && space_end < break_at {
+                    break_at = space_end;
+                }
+            }
+            if break_at >= line_text.len() {
+                break;
+            }
+            starts.push(break_at);
+            seg_start = break_at;
+        }
+        starts
+    }
     fn prepaint_multiline(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1291,9 +1448,14 @@ impl TextElement {
 
         let text_color = rgba(style.text_color);
         let starts = TextInput::line_starts(&content);
-        let mut lines: Vec<RenderedLine> = Vec::with_capacity(starts.len());
+        let mut lines: Vec<RenderedLine> = Vec::new();
         let mut selections: Vec<PaintQuad> = Vec::new();
         let mut cursor_quad: Option<PaintQuad> = None;
+        // Soft-wrap width = the element's content width. Each logical line is broken into visual
+        // rows that fit; every visual row becomes its own RenderedLine/line_layout entry, so the
+        // existing row-based navigation, hit-testing, and selection keep working unchanged.
+        let wrap_width = bounds.size.width;
+        let mut visual_top = px(0.);
 
         for (row, &line_start) in starts.iter().enumerate() {
             let line_end = if row + 1 < starts.len() {
@@ -1301,98 +1463,141 @@ impl TextElement {
             } else {
                 content.len()
             };
-            let line_text: SharedString = content[line_start..line_end].to_string().into();
-            let byte_len = line_end - line_start;
-            let top = line_height * (row as f32);
+            let _logical_is_last = row + 1 >= starts.len();
+            let line_text_full: SharedString = content[line_start..line_end].to_string().into();
 
-            // Base run for the whole line, splitting out any marked (IME) sub-range for underline.
-            let base = TextRun {
-                len: byte_len,
+            // Shape the whole logical line once to find wrap boundaries by x position.
+            let full_run = TextRun {
+                len: line_text_full.len(),
                 font: font.clone(),
                 color: text_color.into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            let runs: Vec<TextRun> = match marked_range.as_ref().and_then(|m| {
-                // Intersection of the marked range with this line, in line-local offsets.
-                let s = m.start.max(line_start);
-                let e = m.end.min(line_end);
-                (s < e).then(|| (s - line_start, e - line_start))
-            }) {
-                Some((ms, me)) => [
-                    TextRun { len: ms, ..base.clone() },
-                    TextRun {
-                        len: me - ms,
-                        underline: Some(UnderlineStyle {
-                            color: Some(base.color),
-                            thickness: px(1.0),
-                            wavy: false,
-                        }),
-                        ..base.clone()
-                    },
-                    TextRun { len: byte_len - me, ..base.clone() },
-                ]
-                .into_iter()
-                .filter(|r| r.len > 0)
-                .collect(),
-                None => {
-                    if byte_len > 0 {
-                        vec![base]
-                    } else {
-                        Vec::new()
+            let full_runs: Vec<TextRun> = if line_text_full.is_empty() {
+                Vec::new()
+            } else {
+                vec![full_run]
+            };
+            let full_shaped = window
+                .text_system()
+                .shape_line(line_text_full.clone(), font_size, &full_runs, None);
+            let seg_starts = Self::wrap_segments(&full_shaped, &line_text_full, wrap_width);
+
+            for (seg_idx, &seg_off) in seg_starts.iter().enumerate() {
+                let seg_end_off = if seg_idx + 1 < seg_starts.len() {
+                    seg_starts[seg_idx + 1]
+                } else {
+                    line_text_full.len()
+                };
+                let seg_abs_start = line_start + seg_off;
+                let seg_abs_end = line_start + seg_end_off; // excludes the '\n'
+                let _is_last_segment = seg_idx + 1 >= seg_starts.len();
+                let seg_text: SharedString =
+                    line_text_full[seg_off..seg_end_off].to_string().into();
+                let byte_len = seg_end_off - seg_off;
+                let top = visual_top;
+
+                // Base run for this visual row, splitting out any marked (IME) sub-range.
+                let base = TextRun {
+                    len: byte_len,
+                    font: font.clone(),
+                    color: text_color.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let runs: Vec<TextRun> = match marked_range.as_ref().and_then(|m| {
+                    let s = m.start.max(seg_abs_start);
+                    let e = m.end.min(seg_abs_end);
+                    (s < e).then(|| (s - seg_abs_start, e - seg_abs_start))
+                }) {
+                    Some((ms, me)) => [
+                        TextRun { len: ms, ..base.clone() },
+                        TextRun {
+                            len: me - ms,
+                            underline: Some(UnderlineStyle {
+                                color: Some(base.color),
+                                thickness: px(1.0),
+                                wavy: false,
+                            }),
+                            ..base.clone()
+                        },
+                        TextRun { len: byte_len - me, ..base.clone() },
+                    ]
+                    .into_iter()
+                    .filter(|r| r.len > 0)
+                    .collect(),
+                    None => {
+                        if byte_len > 0 {
+                            vec![base]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(seg_text, font_size, &runs, None);
+
+                // Selection rectangle for the part of this visual row inside the selection range.
+                // A selection that continues past this row (into its trailing newline / next row)
+                // draws a small sliver even when the row is empty, so a blank / newline-only line
+                // still shows as selected.
+                if !selected_range.is_empty()
+                    && selected_range.start <= seg_abs_end
+                    && selected_range.end >= seg_abs_start
+                {
+                    let s = selected_range.start.max(seg_abs_start);
+                    let e = selected_range.end.min(seg_abs_end);
+                    let x0 = line.x_for_index(s - seg_abs_start);
+                    let mut x1 = line.x_for_index(e - seg_abs_start);
+                    // Selection extends beyond this row's visible end: pad a sliver to show it.
+                    if selected_range.end > seg_abs_end {
+                        x1 = x1.max(x0 + px(4.));
+                    }
+                    if x1 > x0 {
+                        selections.push(fill(
+                            Bounds::from_corners(
+                                point(bounds.left() + x0, bounds.top() + top),
+                                point(bounds.left() + x1, bounds.top() + top + line_height),
+                            ),
+                            rgba(style.selection_color),
+                        ));
                     }
                 }
-            };
-            let line = window
-                .text_system()
-                .shape_line(line_text, font_size, &runs, None);
 
-            // Selection rectangle for the part of this line inside the selection range.
-            if !selected_range.is_empty() {
-                let s = selected_range.start.max(line_start);
-                // A selection that spans past this line's end (into the newline) should visually
-                // extend to the line end; cap the highlight at byte_len.
-                let e = selected_range.end.min(line_end);
-                if s <= e && selected_range.start <= line_end && selected_range.end >= line_start {
-                    let x0 = line.x_for_index(s - line_start);
-                    let x1 = line.x_for_index(e - line_start);
-                    selections.push(fill(
-                        Bounds::from_corners(
-                            point(bounds.left() + x0, bounds.top() + top),
-                            point(bounds.left() + x1, bounds.top() + top + line_height),
-                        ),
-                        rgba(style.selection_color),
-                    ));
-                }
+
+                lines.push(RenderedLine {
+                    line,
+                    byte_start: seg_abs_start,
+                    byte_len,
+                    top,
+                });
+                visual_top += line_height;
             }
+        }
 
-            // Caret on the line that contains it. The cursor sits at a line's end offset on that
-            // line (not the next line's start), except the very last line owns content.len().
-            let on_this_line = if row + 1 < starts.len() {
-                cursor >= line_start && cursor < starts[row + 1]
-            } else {
-                cursor >= line_start && cursor <= line_end
-            };
-            if caret_visible && cursor_quad.is_none() && on_this_line {
-                let cx_x = line.x_for_index(cursor.saturating_sub(line_start).min(byte_len));
+
+        // Caret placement (after all rows are laid out): the caret sits on the LAST visual row whose
+        // byte_start <= cursor. This mirrors line_layout_index_for_offset, guarantees exactly one
+        // owning row (so a boundary/end-of-content cursor is never lost), and keeps the caret on the
+        // row the click/paste actually landed in.
+        if caret_visible {
+            if let Some(row) = lines.iter().rposition(|r| r.byte_start <= cursor) {
+                let rl = &lines[row];
+                let local = cursor.saturating_sub(rl.byte_start).min(rl.byte_len);
+                let cx_x = rl.line.x_for_index(local);
                 cursor_quad = Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cx_x, bounds.top() + top),
+                        point(bounds.left() + cx_x, bounds.top() + rl.top),
                         size(px(1.5), line_height),
                     ),
                     rgba(style.cursor_color),
                 ));
             }
-
-            lines.push(RenderedLine {
-                line,
-                byte_start: line_start,
-                byte_len,
-                top,
-            });
         }
-
         TextElementPrepaint {
             line: None,
             lines,
@@ -1428,19 +1633,60 @@ impl Element for TextElement {
         let line_height = window.line_height();
 
         if self.input.read(cx).multiline {
-            // Multi-line: grow to fit all lines so the parent's scroll container can overflow. Don't
-            // stretch to the parent height (that would vertically center a single line).
-            let lines = TextInput::line_count(&self.input.read(cx).content).max(1);
-            let content_height = line_height * (lines as f32);
-            style.size.height = content_height.into();
-            style.min_size.height = content_height.into();
+            // Multi-line: height grows to fit all VISUAL rows (after soft-wrapping to the available
+            // width), measured lazily once the width is known, so the parent scroll container can
+            // overflow. A measured layout gives us the wrap width that a plain request_layout cannot.
+            let content = self.input.read(cx).content.clone();
+            let style_snapshot = self.input.read(cx).style;
+            let _ = style_snapshot;
+            let text_style = window.text_style();
+            let font = text_style.font();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let measure_line_height = line_height;
+            // Do NOT cap height to relative(1.): inside a scroll parent that equals the viewport and
+            // the element could never overflow. Leave height auto so the measured content height wins
+            // and the parent overflow_y_scroll engages when content exceeds the viewport.
+            let layout_id = window.request_measured_layout(style, move |known, available, window, _cx| {
+                // Resolve the content width from known dimensions, else the available width.
+                let width = known.width.unwrap_or(match available.width {
+                    gpui::AvailableSpace::Definite(w) => w,
+                    _ => px(0.),
+                });
+                let starts = TextInput::line_starts(&content);
+                let mut visual_rows = 0usize;
+                for (row, &line_start) in starts.iter().enumerate() {
+                    let line_end = if row + 1 < starts.len() {
+                        starts[row + 1] - 1
+                    } else {
+                        content.len()
+                    };
+                    let line_text: SharedString = content[line_start..line_end].to_string().into();
+                    let run = TextRun {
+                        len: line_text.len(),
+                        font: font.clone(),
+                        color: gpui::Hsla::default(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let runs: Vec<TextRun> = if line_text.is_empty() { Vec::new() } else { vec![run] };
+                    let shaped = window
+                        .text_system()
+                        .shape_line(line_text.clone(), font_size, &runs, None);
+                    visual_rows += TextElement::wrap_segments(&shaped, &line_text, width).len();
+                }
+                let visual_rows = visual_rows.max(1);
+                let height = measure_line_height * (visual_rows as f32);
+                size(width, height)
+            });
+            (layout_id, ())
         } else {
             // Single-line: fill the parent's height (so text can be centered within it), but never
             // collapse below one line when the parent doesn't constrain height.
             style.size.height = relative(1.).into();
             style.min_size.height = line_height.into();
+            (window.request_layout(style, [], cx), ())
         }
-        (window.request_layout(style, [], cx), ())
     }
 
     fn prepaint(

@@ -2,8 +2,9 @@ use crate::icons::{IconName, icon, icon_sized};
 use crate::command_palette::{PaletteEntry, command_matches, palette_entries};
 use crate::input_latency::InputLatencyTracker;
 use crate::native_menu::{
-    NativeProcessMenuCommand, NativeProjectMenuCommand, NativeTabMenuCommand,
-    prepare_process_menu, prepare_project_menu, prepare_tab_menu,
+    NativeProcessMenuCommand, NativeProjectMenuCommand, NativeSnippetMenuCommand,
+    NativeTabMenuCommand, prepare_process_menu, prepare_project_menu, prepare_snippet_menu,
+    prepare_tab_menu,
 };
 use crate::command_history::{CommandStatus, format_relative_time};
 use crate::notes_store::NotesStore;
@@ -33,7 +34,8 @@ use eggie_domain::{
     SplitId, TabGroup, TabItem, WindowId,
 };
 use eggie_protocol::{
-    ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionSummary,
+    ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionStatus,
+    SessionSummary,
     TERMINAL_SCROLL_DELTA_SCALE, TerminalAppearance, TerminalAttentionRequest,
     TerminalClipboardContent, TerminalClipboardSelection, TerminalCursorShape,
     TerminalImageDescriptor,
@@ -227,22 +229,14 @@ enum RightTab {
     Notes,
 }
 
-/// State for the snippet editor popover (add or edit). `editing` is `Some(id)` when editing an
-/// existing snippet, `None` when adding a new one. `name` and `content` are live `TextInput`
-/// entities (single-line name, multi-line content).
-struct SnippetEditor {
-    editing: Option<uuid::Uuid>,
-    name: Entity<TextInput>,
-    content: Entity<TextInput>,
-    _name_subscription: Subscription,
-    _content_subscription: Subscription,
-}
-
 /// State for the Notes tab's multi-line editor: the input entity, its change subscription, and the
 /// debounce epoch used to coalesce autosaves (only the latest scheduled save writes to disk).
 struct NotesEditor {
     input: Entity<TextInput>,
     _subscription: Subscription,
+    /// The textarea's own vertical scroll handle, so the scrollbar sits on the notes editor
+    /// (which grows by line count) instead of the whole sidebar.
+    scroll_handle: ScrollHandle,
     /// Incremented on every change; a scheduled debounce save only persists if the epoch it
     /// captured still matches, so bursts of keystrokes collapse into one write.
     save_epoch: u64,
@@ -628,8 +622,6 @@ pub struct EggieApp {
     command_history_collapsed: bool,
     /// Whether the snippets sub-section of the Commands tab is collapsed.
     snippets_collapsed: bool,
-    /// The open snippet editor popover, if any (add or edit).
-    snippet_editor: Option<SnippetEditor>,
     /// The Notes tab's multi-line editor + its change subscription. Lazily created on first render
     /// of the Notes tab so it can seed from the shared store.
     notes_editor: Option<NotesEditor>,
@@ -776,6 +768,195 @@ fn prompt_for_text(
     _ok_label: &str,
     _cancel_label: &str,
 ) -> futures::channel::oneshot::Receiver<Option<String>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let _ = tx.send(None);
+    rx
+}
+
+/// A native snippet editor prompt: a single-line name field, a multi-line content editor, and an
+/// "auto-run" checkbox (when checked, Eggie sends a real Enter after injecting so the command runs;
+/// unchecked just types it in). A native dialog gives multi-line editing real space and avoids
+/// squeezing the narrow right sidebar. Resolves Some((name, content, auto_run)) on OK, None otherwise.
+#[cfg(target_os = "macos")]
+fn prompt_for_snippet(
+    window: &Window,
+    title: &str,
+    name_seed: &str,
+    content_seed: &str,
+    auto_run_seed: bool,
+    name_placeholder: &str,
+    content_placeholder: &str,
+    auto_run_label: &str,
+    ok_label: &str,
+    cancel_label: &str,
+) -> futures::channel::oneshot::Receiver<Option<(String, String, bool)>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+
+    unsafe {
+        let alert: id = msg_send![class!(NSAlert), alloc];
+        let alert: id = msg_send![alert, init];
+        let _: () = msg_send![alert, setMessageText: NSString::alloc(nil).init_str(title)];
+
+        const WIDTH: f64 = 320.;
+        const NAME_H: f64 = 24.;
+        const CONTENT_H: f64 = 120.;
+        const CHECK_H: f64 = 20.;
+        const GAP: f64 = 8.;
+        let total_h = NAME_H + GAP + CONTENT_H + GAP + CHECK_H;
+        let container: id = msg_send![class!(NSView), alloc];
+        let container: id = msg_send![
+            container,
+            initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(WIDTH, total_h))
+        ];
+
+        // Layout is bottom-up (AppKit y grows upward): checkbox at the bottom, then content, then name.
+        let check_y = 0.;
+        let content_y = CHECK_H + GAP;
+        let name_y = content_y + CONTENT_H + GAP;
+
+        // Name field (single line) at the top.
+        let name_field: id = msg_send![class!(NSTextField), alloc];
+        let name_field: id = msg_send![
+            name_field,
+            initWithFrame: NSRect::new(NSPoint::new(0., name_y), NSSize::new(WIDTH, NAME_H))
+        ];
+        let _: () = msg_send![name_field, setStringValue: NSString::alloc(nil).init_str(name_seed)];
+        let _: () = msg_send![
+            name_field,
+            setPlaceholderString: NSString::alloc(nil).init_str(name_placeholder)
+        ];
+        let _: () = msg_send![container, addSubview: name_field];
+
+        // Content editor: NSTextView inside an NSScrollView.
+        let scroll: id = msg_send![class!(NSScrollView), alloc];
+        let scroll: id = msg_send![
+            scroll,
+            initWithFrame: NSRect::new(NSPoint::new(0., content_y), NSSize::new(WIDTH, CONTENT_H))
+        ];
+        let _: () = msg_send![scroll, setHasVerticalScroller: true];
+        // Rounded, hairline-bordered container to match modern macOS text fields. NSScrollView
+        // border types have no rounded option, so drop the built-in border and round the layer.
+        let _: () = msg_send![scroll, setBorderType: 0 as NSInteger]; // NSNoBorder
+        let _: () = msg_send![scroll, setWantsLayer: true];
+        let scroll_layer: id = msg_send![scroll, layer];
+        if scroll_layer != nil {
+            let _: () = msg_send![scroll_layer, setCornerRadius: 6.0f64];
+            let _: () = msg_send![scroll_layer, setMasksToBounds: true];
+            let _: () = msg_send![scroll_layer, setBorderWidth: 1.0f64];
+            let separator: id = msg_send![class!(NSColor), separatorColor];
+            let border_cg: id = msg_send![separator, CGColor];
+            let _: () = msg_send![scroll_layer, setBorderColor: border_cg];
+        }
+        let text_view: id = msg_send![class!(NSTextView), alloc];
+        let text_view: id = msg_send![
+            text_view,
+            initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(WIDTH, CONTENT_H))
+        ];
+        let _: () = msg_send![text_view, setRichText: false];
+        let _: () = msg_send![text_view, setString: NSString::alloc(nil).init_str(content_seed)];
+        let _: () = msg_send![scroll, setDocumentView: text_view];
+        let _: () = msg_send![container, addSubview: scroll];
+
+        // Auto-run checkbox at the bottom. NSButton checkbox = buttonWithTitle then setButtonType:switch.
+        let checkbox: id = msg_send![class!(NSButton), alloc];
+        let checkbox: id = msg_send![
+            checkbox,
+            initWithFrame: NSRect::new(NSPoint::new(0., check_y), NSSize::new(WIDTH, CHECK_H))
+        ];
+        let _: () = msg_send![checkbox, setButtonType: 3 as NSInteger]; // NSButtonTypeSwitch
+        let _: () = msg_send![checkbox, setTitle: NSString::alloc(nil).init_str(auto_run_label)];
+        let _: () = msg_send![checkbox, setState: (if auto_run_seed { 1 } else { 0 }) as NSInteger];
+        let _: () = msg_send![container, addSubview: checkbox];
+
+        // NSTextView has no native placeholder; surface the content hint as the dialog body only
+        // when creating a new snippet (empty content), so an editing dialog is not cluttered.
+        if content_seed.is_empty() {
+            let _: () = msg_send![
+                alert,
+                setInformativeText: NSString::alloc(nil).init_str(content_placeholder)
+            ];
+        }
+        let _: () = msg_send![alert, setAccessoryView: container];
+
+        let _: id = msg_send![alert, addButtonWithTitle: NSString::alloc(nil).init_str(ok_label)];
+        let cancel_button: id =
+            msg_send![alert, addButtonWithTitle: NSString::alloc(nil).init_str(cancel_label)];
+        let _: () = msg_send![
+            cancel_button,
+            setKeyEquivalent: NSString::alloc(nil).init_str("\u{1b}")
+        ];
+
+        let native_window = match HasWindowHandle::window_handle(window) {
+            Ok(handle) => match handle.as_raw() {
+                RawWindowHandle::AppKit(appkit) => {
+                    let ns_view = appkit.ns_view.as_ptr() as id;
+                    if ns_view == nil {
+                        nil
+                    } else {
+                        msg_send![ns_view, window]
+                    }
+                }
+                _ => nil,
+            },
+            Err(_) => nil,
+        };
+
+        if native_window == nil {
+            let _ = tx.send(None);
+            return rx;
+        }
+
+        let tx = std::cell::Cell::new(Some(tx));
+        let block = ConcreteBlock::new(move |response: NSInteger| {
+            let result = if response == 1000 {
+                let name_value: id = msg_send![name_field, stringValue];
+                let name_bytes: *const std::os::raw::c_char = msg_send![name_value, UTF8String];
+                let name = if name_bytes.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(name_bytes).to_string_lossy().into_owned()
+                };
+                let content_value: id = msg_send![text_view, string];
+                let content_bytes: *const std::os::raw::c_char = msg_send![content_value, UTF8String];
+                let content = if content_bytes.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(content_bytes).to_string_lossy().into_owned()
+                };
+                let state: NSInteger = msg_send![checkbox, state];
+                Some((name, content, state != 0))
+            } else {
+                None
+            };
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(result);
+            }
+        });
+        let block = block.copy();
+
+        let _: () = msg_send![
+            alert,
+            beginSheetModalForWindow: native_window
+            completionHandler: block
+        ];
+    }
+
+    rx
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prompt_for_snippet(
+    _window: &Window,
+    _title: &str,
+    _name_seed: &str,
+    _content_seed: &str,
+    _auto_run_seed: bool,
+    _name_placeholder: &str,
+    _content_placeholder: &str,
+    _auto_run_label: &str,
+    _ok_label: &str,
+    _cancel_label: &str,
+) -> futures::channel::oneshot::Receiver<Option<(String, String, bool)>> {
     let (tx, rx) = futures::channel::oneshot::channel();
     let _ = tx.send(None);
     rx
@@ -1310,10 +1491,14 @@ impl EggieApp {
                 input
             });
             let subscription = cx.subscribe_in(&input, window, Self::on_notes_input_event);
+            let scroll_handle = ScrollHandle::new();
+            // Let the textarea drive this same scroll handle for edge-drag auto-scroll.
+            input.update(cx, |input, _| input.set_scroll_handle(scroll_handle.clone()));
             NotesEditor {
                 input,
                 _subscription: subscription,
                 save_epoch: 0,
+                scroll_handle,
             }
         };
         let mut app = Self {
@@ -1391,7 +1576,6 @@ impl EggieApp {
             shell_integration: HashMap::new(),
             command_history_collapsed: false,
             snippets_collapsed: false,
-            snippet_editor: None,
             notes_editor: Some(notes_editor),
             left_sidebar_width: LEFT_SIDEBAR_DEFAULT_WIDTH,
             right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
@@ -2686,6 +2870,21 @@ impl EggieApp {
             .session_id
     }
 
+    /// Whether the right sidebar should force the Notes tab and disable Info/Commands: true when
+    /// the active terminal has exited (e.g. the shell ran `exit`) or there is no active session at
+    /// all. Info/Commands are meaningless without a live shell, so we steer the user to Notes.
+    fn notes_forced(&self) -> bool {
+        match self.active_session_id() {
+            None => true,
+            Some(id) => self
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| matches!(session.status, SessionStatus::Exited { .. }))
+                .unwrap_or(true),
+        }
+    }
+
     /// Returns the active terminal tab in every visible split group. This is intentionally
     /// independent from `active_group_id`: that field selects the keyboard input target, while
     /// every session returned here must keep receiving snapshots and rendering frames.
@@ -3797,6 +3996,20 @@ impl EggieApp {
         true
     }
 
+    /// Inject a snippet into the terminal. The content is pasted verbatim (bracketed-paste safe,
+    /// newlines kept as written). When `auto_run` is set, a real carriage return (`\r`) key is sent
+    /// AFTER the paste to execute it — inside a bracketed paste the shell would otherwise insert a
+    /// newline literally instead of running. Whether to run is an explicit per-snippet flag
+    /// (the editor's auto-run checkbox), not inferred from a trailing newline.
+    fn run_snippet_content(&self, session_id: SessionId, content: &str, auto_run: bool) -> bool {
+        if !content.is_empty() && !self.enqueue_terminal_paste(session_id, content.to_owned()) {
+            return false;
+        }
+        if auto_run {
+            return self.enqueue_terminal_input(session_id, b"\r".to_vec());
+        }
+        true
+    }
     fn enqueue_terminal_clipboard_paste(
         &self,
         session_id: SessionId,
@@ -6907,6 +7120,11 @@ impl EggieApp {
 
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let language = self.language;
+        // When the active shell has exited (or there is no session), Info/Commands are disabled and
+        // the content is forced to Notes; the user's right_tab choice is preserved and restored once a
+        // live session is active again.
+        let forced = self.notes_forced();
+        let active_tab = if forced { RightTab::Notes } else { self.right_tab };
         let tabs = [
             (RightTab::Info, language.info_tab(), IconName::Info),
             (RightTab::Commands, language.commands_tab(), IconName::Terminal),
@@ -6922,6 +7140,8 @@ impl EggieApp {
                 .p(px(TAB_BAR_PADDING))
                 .gap(px(TAB_GAP)),
             |tabs, (tab, title, tab_icon)| {
+                // Info/Commands are disabled while notes are forced (no live shell).
+                let disabled = forced && tab != RightTab::Notes;
                 tabs.child(
                     div()
                         .id(format!("right-tab-{title}"))
@@ -6932,16 +7152,20 @@ impl EggieApp {
                         .justify_center()
                         .gap_1()
                         .rounded_lg()
-                        .cursor_pointer()
-                        .when(self.right_tab == tab, |element| {
+                        .when(disabled, |element| element.text_color(rgb(self.colors.muted)).opacity(0.5))
+                        .when(!disabled, |element| {
                             element
-                                .bg(rgb(self.colors.panel_alt))
-                                .text_color(rgb(self.colors.accent))
+                                .cursor_pointer()
+                                .when(active_tab == tab, |element| {
+                                    element
+                                        .bg(rgb(self.colors.panel_alt))
+                                        .text_color(rgb(self.colors.accent))
+                                })
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.right_tab = tab;
+                                    cx.notify();
+                                }))
                         })
-                        .on_click(cx.listener(move |app, _, _, cx| {
-                            app.right_tab = tab;
-                            cx.notify();
-                        }))
                         .child(icon(tab_icon))
                         .child(title),
                 )
@@ -6955,7 +7179,16 @@ impl EggieApp {
             .h_full()
             .bg(rgb(self.colors.panel))
             .child(tabs)
-            .child(
+            .child(if active_tab == RightTab::Notes {
+                // Notes fills the bounded region directly (NOT inside the sidebar's outer scroll),
+                // so its textarea can own a real height and scroll internally.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_2()
+                    .text_size(px(12.))
+                    .child(self.render_right_content(cx))
+            } else {
                 div()
                     .relative()
                     .flex_1()
@@ -6972,8 +7205,8 @@ impl EggieApp {
                             .text_size(px(12.))
                             .child(self.render_right_content(cx)),
                     )
-                    .child(self.render_right_sidebar_scrollbar()),
-            )
+                    .child(self.render_right_sidebar_scrollbar())
+            })
             .into_any_element()
     }
 
@@ -7020,7 +7253,9 @@ impl EggieApp {
     }
 
     fn render_right_content(&self, cx: &mut Context<Self>) -> AnyElement {
-        match self.right_tab {
+        // Forced Notes (exited / no session) overrides the selected tab's content.
+        let tab = if self.notes_forced() { RightTab::Notes } else { self.right_tab };
+        match tab {
             RightTab::Info => {
                 let session = self
                     .active_session_id()
@@ -7104,15 +7339,6 @@ impl EggieApp {
 
     // ===== Commands tab (command history + snippets) =========================================
 
-    fn text_input_style(&self) -> TextInputStyle {
-        TextInputStyle {
-            text_color: (self.colors.text << 8) | 0xff,
-            placeholder_color: (self.colors.muted << 8) | 0xff,
-            cursor_color: (self.colors.accent << 8) | 0xff,
-            selection_color: (self.colors.accent << 8) | 0x55,
-        }
-    }
-
     fn render_commands_tab(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
@@ -7120,7 +7346,6 @@ impl EggieApp {
             .gap_4()
             .child(self.render_command_history_section(cx))
             .child(self.render_snippets_section(cx))
-            .children(self.snippet_editor.as_ref().map(|_| self.render_snippet_editor(cx)))
             .into_any_element()
     }
 
@@ -7231,8 +7456,18 @@ impl EggieApp {
             CommandStatus::Success => (0x3fb950, None),
             CommandStatus::Failure(code) => (0xf85149, Some(code.to_string())),
         };
-        let command_text = command_line.unwrap_or_default();
-        let paste_text = command_text.clone();
+        let raw = command_line.unwrap_or_default();
+        // The paste refill uses the real command (empty if the shell never reported one);
+        // the display falls back to a muted placeholder so a text-less record is not a blank row.
+        let paste_text = raw.clone();
+        let has_text = !raw.trim().is_empty();
+        // Command history rows are single-line: collapse any embedded newlines (multi-line
+        // commands) to spaces so the row keeps its flex layout and truncates cleanly.
+        let command_text = if has_text {
+            raw.split(['\n', '\r']).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+        } else {
+            self.language.command_no_text().to_owned()
+        };
         let relative = format_relative_time(started_at_unix_ms, now_ms);
         let colors = self.colors;
         div()
@@ -7258,6 +7493,7 @@ impl EggieApp {
                     .min_w_0()
                     .truncate()
                     .font_family("monospace")
+                    .when(!has_text, |element| element.text_color(rgb(colors.muted)))
                     .child(command_text),
             )
             .children(trailing.map(|t| {
@@ -7325,50 +7561,82 @@ impl EggieApp {
         let colors = self.colors;
         let id = snippet.id;
         let content = snippet.content.clone();
+        let auto_run = snippet.auto_run;
+        let short = id.simple().to_string();
+        let row_id: SharedString = format!("snippet-{short}").into();
         let name = if snippet.name.trim().is_empty() {
             snippet.content.lines().next().unwrap_or_default().to_owned()
         } else {
             snippet.name.clone()
         };
+        // Left click uses (injects/runs) the snippet; right click opens a native menu
+        // (Use / Edit / — / Delete). No inline buttons — the row itself is the target.
         div()
-            .id(Box::leak(format!("snippet-{id}").into_boxed_str()) as &str)
+            .id(row_id)
             .flex()
             .items_center()
             .gap_2()
             .px_2()
             .py_1()
             .rounded_md()
+            .cursor_pointer()
             .hover(|element| element.bg(rgb(colors.panel_alt)))
-            .child(
-                div()
-                    .id(Box::leak(format!("snippet-run-{id}").into_boxed_str()) as &str)
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .cursor_pointer()
-                    .child(name)
-                    .on_click(cx.listener(move |app, _, _, _| {
-                        // Execute intent lives in the content: a trailing '\n' auto-runs.
-                        if let Some(session_id) = app.active_session_id() {
-                            app.enqueue_terminal_paste(session_id, content.clone());
-                        }
-                    })),
+            .child(div().flex_1().min_w_0().truncate().child(name))
+            .on_click(cx.listener(move |app, _, _, _| {
+                if let Some(session_id) = app.active_session_id() {
+                    app.run_snippet_content(session_id, &content, auto_run);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |app, _, window, cx| {
+                    app.show_snippet_context_menu(id, window, cx);
+                }),
             )
-            .child(icon_button(
-                IconName::Settings,
-                Box::leak(format!("snippet-edit-{id}").into_boxed_str()) as &str,
-                colors,
-                Some(self.language.edit_snippet().into()),
-                cx.listener(move |app, _, window, cx| app.open_snippet_editor(Some(id), window, cx)),
-            ))
-            .child(icon_button(
-                IconName::Close,
-                Box::leak(format!("snippet-del-{id}").into_boxed_str()) as &str,
-                colors,
-                Some(self.language.delete_snippet().into()),
-                cx.listener(move |app, _, window, cx| app.confirm_delete_snippet(id, window, cx)),
-            ))
             .into_any_element()
+    }
+
+    fn show_snippet_context_menu(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        let Some(menu) = prepare_snippet_menu(window, self.language) else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(command) = menu.show() else {
+                return;
+            };
+            let _ = cx.update(|window, cx| {
+                let _ = this.update(cx, |app, cx| {
+                    app.handle_snippet_menu_command(command, id, window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn handle_snippet_menu_command(
+        &mut self,
+        command: NativeSnippetMenuCommand,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            NativeSnippetMenuCommand::Use => {
+                let snippet = self
+                    .snippet_store
+                    .read(cx)
+                    .snippets()
+                    .iter()
+                    .find(|s| s.id == id)
+                    .cloned();
+                if let (Some(snippet), Some(session_id)) = (snippet, self.active_session_id()) {
+                    self.run_snippet_content(session_id, &snippet.content, snippet.auto_run);
+                }
+            }
+            NativeSnippetMenuCommand::Edit => self.open_snippet_editor(Some(id), window, cx),
+            NativeSnippetMenuCommand::Delete => self.confirm_delete_snippet(id, window, cx),
+        }
     }
 
     fn open_snippet_editor(
@@ -7377,7 +7645,6 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let style = self.text_input_style();
         let language = self.language;
         let existing = editing.and_then(|id| {
             self.snippet_store
@@ -7389,74 +7656,44 @@ impl EggieApp {
         });
         let name_seed = existing.as_ref().map(|s| s.name.clone()).unwrap_or_default();
         let content_seed = existing.as_ref().map(|s| s.content.clone()).unwrap_or_default();
-        let name = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx, style);
-            input.set_placeholder(language.snippet_name_placeholder());
-            input.set_language(language);
-            if !name_seed.is_empty() {
-                input.set_content(name_seed, cx);
-            }
-            input
-        });
-        let content = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx, style).multiline();
-            input.set_placeholder(language.snippet_content_placeholder());
-            input.set_language(language);
-            if !content_seed.is_empty() {
-                input.set_content(content_seed, cx);
-            }
-            input
-        });
-        let name_subscription = cx.subscribe_in(&name, window, Self::on_snippet_editor_event);
-        let content_subscription = cx.subscribe_in(&content, window, Self::on_snippet_editor_event);
-        window.focus(&name.read(cx).focus_handle(), cx);
-        self.snippet_editor = Some(SnippetEditor {
-            editing,
-            name,
-            content,
-            _name_subscription: name_subscription,
-            _content_subscription: content_subscription,
-        });
-        cx.notify();
-    }
-
-    fn on_snippet_editor_event(
-        &mut self,
-        _input: &Entity<TextInput>,
-        event: &TextInputEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            // Cmd+Enter (multi-line submit) or Enter on the single-line name field saves.
-            TextInputEvent::Confirm => self.save_snippet_editor(cx),
-            TextInputEvent::Cancel => {
-                self.snippet_editor = None;
-                cx.notify();
-            }
-            _ => {}
-        }
-    }
-
-    fn save_snippet_editor(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.snippet_editor.take() else {
-            return;
+        let auto_run_seed = existing.as_ref().map(|s| s.auto_run).unwrap_or(false);
+        let title = if editing.is_some() {
+            language.edit_snippet()
+        } else {
+            language.add_snippet()
         };
-        let name = editor.name.read(cx).content().to_owned();
-        let content = editor.content.read(cx).content().to_owned();
-        if name.trim().is_empty() && content.trim().is_empty() {
-            cx.notify();
-            return;
-        }
-        match editor.editing {
-            Some(id) => self
-                .snippet_store
-                .update(cx, |store, cx| store.update(id, name, content, cx)),
-            None => self
-                .snippet_store
-                .update(cx, |store, cx| store.add(Snippet::new(name, content), cx)),
-        }
-        cx.notify();
+        let prompt = prompt_for_snippet(
+            window,
+            title,
+            &name_seed,
+            &content_seed,
+            auto_run_seed,
+            language.snippet_name_placeholder(),
+            language.snippet_content_placeholder(),
+            language.auto_run_label(),
+            language.save(),
+            language.cancel(),
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some((name, content, auto_run))) = prompt.await else {
+                return;
+            };
+            if name.trim().is_empty() && content.trim().is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |app, cx| {
+                match editing {
+                    Some(id) => app
+                        .snippet_store
+                        .update(cx, |store, cx| store.update(id, name, content, auto_run, cx)),
+                    None => app
+                        .snippet_store
+                        .update(cx, |store, cx| store.add(Snippet::new(name, content, auto_run), cx)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn confirm_delete_snippet(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -7483,88 +7720,6 @@ impl EggieApp {
         .detach();
     }
 
-    fn render_snippet_editor(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(editor) = self.snippet_editor.as_ref() else {
-            return div().into_any_element();
-        };
-        let colors = self.colors;
-        let title = if editor.editing.is_some() {
-            self.language.edit_snippet()
-        } else {
-            self.language.add_snippet()
-        };
-        // A modal-ish overlay anchored inside the sidebar. \`.occlude()\` stops click-through.
-        anchored()
-            .child(
-                div()
-                    .occlude()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(colors.muted))
-                    .child(section_label(title, colors))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(colors.panel))
-                            .child(editor.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .min_h(px(60.))
-                            .bg(rgb(colors.panel))
-                            .child(editor.content.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("snippet-editor-cancel")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_color(rgb(colors.muted))
-                                    .hover(|e| e.bg(rgb(colors.panel)))
-                                    .child(self.language.cancel())
-                                    .on_click(cx.listener(|app, _, _, cx| {
-                                        app.snippet_editor = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("snippet-editor-save")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(rgb(colors.accent))
-                                    .text_color(rgb(colors.background))
-                                    .child(self.language.save())
-                                    .on_click(cx.listener(|app, _, _, cx| app.save_snippet_editor(cx))),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
     // ===== Notes tab =========================================================================
 
     fn render_notes_tab(&self, _cx: &mut Context<Self>) -> AnyElement {
@@ -7572,17 +7727,64 @@ impl EggieApp {
         let Some(editor) = self.notes_editor.as_ref() else {
             return div().into_any_element();
         };
+        // The notes tab lives in the sidebar's bounded region (not its outer scroll), so this scroll
+        // container has a real height: the multi-line TextInput grows by (wrapped) line count and
+        // scrolls INSIDE here. A self-drawn scrollbar (GPUI's overflow_y_scroll paints none) sits on
+        // the textarea itself.
+        let scroll_handle = editor.scroll_handle.clone();
+        let muted = colors.muted;
         div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .min_h(px(120.))
+            .relative()
+            .size_full()
+            .min_h_0()
             .child(
                 div()
+                    .id("notes-scroll")
+                    .size_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&editor.scroll_handle)
                     .p_2()
                     .rounded_md()
                     .bg(rgb(colors.panel_alt))
                     .child(editor.input.clone()),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |track_bounds, _, window, _| {
+                        let max_offset = f32::from(scroll_handle.max_offset().y);
+                        if max_offset <= 0. {
+                            return;
+                        }
+                        let viewport_height = f32::from(scroll_handle.bounds().size.height);
+                        let track_height = f32::from(track_bounds.size.height);
+                        let content_height = viewport_height + max_offset;
+                        let thumb_height = (track_height * viewport_height / content_height)
+                            .max(SIDEBAR_SCROLLBAR_MIN_THUMB_HEIGHT)
+                            .min(track_height);
+                        let progress = (-f32::from(scroll_handle.offset().y) / max_offset).clamp(0., 1.);
+                        let thumb_top =
+                            f32::from(track_bounds.origin.y) + (track_height - thumb_height) * progress;
+                        let thumb_bounds = Bounds::new(
+                            point(track_bounds.origin.x, px(thumb_top)),
+                            size(track_bounds.size.width, px(thumb_height)),
+                        );
+                        window.paint_quad(quad(
+                            thumb_bounds,
+                            px(SIDEBAR_SCROLLBAR_THUMB_WIDTH / 2.),
+                            rgba((muted << 8) | 0x99),
+                            px(0.),
+                            rgba(0x00000000),
+                            Default::default(),
+                        ));
+                    },
+                )
+                .absolute()
+                .top(px(4.))
+                .right(px(2.))
+                .bottom(px(4.))
+                .w(px(SIDEBAR_SCROLLBAR_THUMB_WIDTH)),
             )
             .into_any_element()
     }

@@ -439,7 +439,7 @@ impl ShellIntegrationTracker {
             SemanticPromptAction::InputStart
             | SemanticPromptAction::InputStartAndTerminatePrompt => {
                 if self.current_command.is_none() {
-                    self.begin_command(now, option_value(&prompt.options, "cmdline"));
+                    self.begin_command(now, command_line_from_options(&prompt.options));
                 }
                 // Entering input directly (no preceding A) still means the cursor is on a prompt;
                 // record the start if we don't have one yet.
@@ -449,8 +449,7 @@ impl ShellIntegrationTracker {
                 self.phase = TerminalSemanticPhase::Input;
             }
             SemanticPromptAction::OutputStart => {
-                let command_line = option_value(&prompt.options, "cmdline")
-                    .or_else(|| option_value(&prompt.options, "cmdline_url").map(percent_decode));
+                let command_line = command_line_from_options(&prompt.options);
                 if self.current_command.is_none() {
                     self.begin_command(now, command_line);
                 } else if let Some(command_line) = command_line
@@ -2387,6 +2386,17 @@ fn unix_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Resolve a command line from an OSC 133 prompt's options, accepting three encodings in
+/// priority order: `cmdline_b64` (base64, robust for CJK/newlines/control bytes and what the
+/// zsh integration emits), `cmdline_url` (percent-encoded), then raw `cmdline`.
+fn command_line_from_options(options: &str) -> Option<String> {
+    option_value(options, "cmdline_b64")
+        .and_then(|value| decode_base64_text(&value))
+        .or_else(|| option_value(options, "cmdline_url").map(percent_decode))
+        .or_else(|| option_value(options, "cmdline"))
+        .filter(|line| !line.is_empty())
 }
 
 fn option_value(options: &str, key: &str) -> Option<String> {
@@ -6052,6 +6062,30 @@ mod tests {
     use super::*;
 
     static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn command_line_from_options_prefers_base64_then_url_then_raw() {
+        // base64 wins and round-trips UTF-8 (CJK) that would break a raw OSC payload.
+        let b64 = BASE64.encode("echo 你好;ls".as_bytes());
+        let opts = format!("cmdline_b64={b64};cmdline_url=echo%20x;cmdline=raw");
+        assert_eq!(
+            command_line_from_options(&opts).as_deref(),
+            Some("echo 你好;ls")
+        );
+        // Falls back to percent-decoded cmdline_url when no b64.
+        assert_eq!(
+            command_line_from_options("cmdline_url=echo%20hi").as_deref(),
+            Some("echo hi")
+        );
+        // Then raw cmdline.
+        assert_eq!(
+            command_line_from_options("cmdline=plain").as_deref(),
+            Some("plain")
+        );
+        // Empty / absent yields None (no blank rows in the UI).
+        assert_eq!(command_line_from_options(""), None);
+        assert_eq!(command_line_from_options("cmdline="), None);
+    }
 
     #[test]
     fn default_socket_is_scoped_by_user_and_protocol() {

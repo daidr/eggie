@@ -342,6 +342,13 @@ impl Language {
         }
     }
 
+    pub(crate) fn command_no_text(self) -> &'static str {
+        match self {
+            Self::English => "(command output)",
+            Self::SimplifiedChinese => "(命令输出)",
+        }
+    }
+
     pub(crate) fn snippets_empty(self) -> &'static str {
         match self {
             Self::English => "No snippets yet. Add one to reuse commands.",
@@ -353,6 +360,13 @@ impl Language {
         match self {
             Self::English => "Add snippet",
             Self::SimplifiedChinese => "新增片段",
+        }
+    }
+
+    pub(crate) fn use_snippet(self) -> &'static str {
+        match self {
+            Self::English => "Use",
+            Self::SimplifiedChinese => "使用",
         }
     }
 
@@ -379,8 +393,15 @@ impl Language {
 
     pub(crate) fn snippet_content_placeholder(self) -> &'static str {
         match self {
-            Self::English => "Command… (trailing newline auto-runs)",
-            Self::SimplifiedChinese => "命令…(末尾换行则自动执行)",
+            Self::English => "Command to inject when this snippet runs",
+            Self::SimplifiedChinese => "运行该片段时注入的命令",
+        }
+    }
+
+    pub(crate) fn auto_run_label(self) -> &'static str {
+        match self {
+            Self::English => "Run automatically (send Enter)",
+            Self::SimplifiedChinese => "自动执行(发送回车)",
         }
     }
 
