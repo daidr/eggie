@@ -109,11 +109,16 @@ fn download_inner(
     part: &Path,
     on_progress: &mut dyn FnMut(DownloadProgress),
 ) -> Result<()> {
+    // `total` is the expected content length: local file size for `file://`, or the HTTP
+    // `Content-Length` header for `http(s)://`. It drives the progress bar, so leaving it `None`
+    // for HTTP (as before) made the bar jump straight to 100% on the first chunk.
+    let mut total: Option<u64> = None;
     let mut reader: Box<dyn Read> = match url.scheme() {
         "file" => {
             let path = url
                 .to_file_path()
                 .map_err(|_| anyhow::anyhow!("invalid file URL: {url}"))?;
+            total = std::fs::metadata(&path).ok().map(|m| m.len());
             Box::new(
                 File::open(&path).with_context(|| format!("failed to open {}", path.display()))?,
             )
@@ -122,19 +127,13 @@ fn download_inner(
             let response = ureq::get(url.as_str())
                 .call()
                 .with_context(|| format!("failed to download {url}"))?;
+            total = response
+                .header("Content-Length")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|&length| length > 0);
             Box::new(response.into_reader())
         }
         other => bail!("unsupported download URL scheme: {other}"),
-    };
-
-    // Total size is only known up front for local files.
-    let total = match url.scheme() {
-        "file" => url
-            .to_file_path()
-            .ok()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len()),
-        _ => None,
     };
 
     let mut output = File::create(part)
@@ -224,7 +223,11 @@ mod tests {
         download(&url, &dest, &sha256_hex(contents), |p| last = Some(p)).unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), contents);
-        assert_eq!(last.unwrap().downloaded, contents.len() as u64);
+        let last = last.unwrap();
+        assert_eq!(last.downloaded, contents.len() as u64);
+        // A local file's total is known up front (its size), so the progress bar has a real
+        // denominator instead of falling back to a fake 100%.
+        assert_eq!(last.total, Some(contents.len() as u64));
         assert!(!part_path(&dest).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }

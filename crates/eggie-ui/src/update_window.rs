@@ -437,8 +437,20 @@ fn set_window_height(window: &mut Window, width: f32, height: f32) {
 }
 
 fn render_progress_bar(colors: UiColors, progress: eggie_update::DownloadProgress) -> AnyElement {
-    let total = progress.total.unwrap_or(0).max(1);
-    let fraction = (progress.downloaded as f32 / total as f32).clamp(0., 1.);
+    // Only compute a fraction when the total size is actually known. A missing/zero total means
+    // the fill width and percentage would be meaningless, so we leave the bar in an indeterminate
+    // state rather than pinning it to a false 100%.
+    let fraction = progress
+        .total
+        .filter(|&total| total > 0)
+        .map(|total| (progress.downloaded as f32 / total as f32).clamp(0., 1.));
+    let mut fill = div().h(px(6.)).rounded_full().bg(rgb(colors.accent));
+    match fraction {
+        // Known total: fill to the exact fraction.
+        Some(fraction) => fill = fill.w(relative(fraction)),
+        // Unknown total: a slim moving-less sliver signals activity without claiming a percentage.
+        None => fill = fill.w(relative(0.15)),
+    }
     div()
         .flex()
         .flex_col()
@@ -449,13 +461,7 @@ fn render_progress_bar(colors: UiColors, progress: eggie_update::DownloadProgres
                 .h(px(6.))
                 .rounded_full()
                 .bg(rgb(colors.panel_alt))
-                .child(
-                    div()
-                        .h(px(6.))
-                        .rounded_full()
-                        .bg(rgb(colors.accent))
-                        .w(relative(fraction)),
-                ),
+                .child(fill),
         )
         .child(
             div()
@@ -463,8 +469,11 @@ fn render_progress_bar(colors: UiColors, progress: eggie_update::DownloadProgres
                 .justify_between()
                 .text_size(px(12.))
                 .text_color(rgb(colors.muted))
-                .child(div().child(format!("{}/s", format_speed(progress.bytes_per_sec))))
-                .child(div().child(format!("{:.0}%", fraction * 100.))),
+                .child(div().child(format_speed(progress.bytes_per_sec)))
+                .child(div().child(match fraction {
+                    Some(fraction) => format!("{:.0}%", fraction * 100.),
+                    None => String::new(),
+                })),
         )
         .into_any_element()
 }
