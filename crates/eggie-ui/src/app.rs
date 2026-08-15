@@ -672,6 +672,7 @@ fn prompt_for_text(
     title: &str,
     message: &str,
     placeholder: Option<&str>,
+    initial: Option<&str>,
     ok_label: &str,
     cancel_label: &str,
 ) -> futures::channel::oneshot::Receiver<Option<String>> {
@@ -698,6 +699,12 @@ fn prompt_for_text(
             let _: () = msg_send![
                 text_field,
                 setPlaceholderString: NSString::alloc(nil).init_str(placeholder)
+            ];
+        }
+        if let Some(initial) = initial {
+            let _: () = msg_send![
+                text_field,
+                setStringValue: NSString::alloc(nil).init_str(initial)
             ];
         }
         let _: () = msg_send![alert, setAccessoryView: text_field];
@@ -765,6 +772,7 @@ fn prompt_for_text(
     _title: &str,
     _message: &str,
     _placeholder: Option<&str>,
+    _initial: Option<&str>,
     _ok_label: &str,
     _cancel_label: &str,
 ) -> futures::channel::oneshot::Receiver<Option<String>> {
@@ -3110,6 +3118,7 @@ impl EggieApp {
             language.new_project_title(),
             language.new_project_message(),
             Some(language.project_name_placeholder()),
+            None,
             language.ok(),
             language.cancel(),
         );
@@ -3289,6 +3298,7 @@ impl EggieApp {
                     window,
                     language.rename_project_title(),
                     language.rename_project_message(),
+                    None,
                     Some(&current_name),
                     language.ok(),
                     language.cancel(),
@@ -5618,7 +5628,14 @@ impl EggieApp {
                 .neighbor_group_id(group_id, direction)
                 .is_some()
         });
-        let Some(menu) = prepare_tab_menu(window, move_enabled, self.language) else {
+        let clear_title_enabled = self
+            .workspace()
+            .layout
+            .find_group(group_id)
+            .and_then(|group| group.items.iter().find(|item| item.id == item_id))
+            .is_some_and(|item| item.custom_title.is_some());
+        let Some(menu) = prepare_tab_menu(window, move_enabled, clear_title_enabled, self.language)
+        else {
             return;
         };
         // AppKit menus are modal and run a nested event loop. Start the menu from a foreground
@@ -5643,6 +5660,12 @@ impl EggieApp {
                     }
                     NativeTabMenuCommand::Move(direction) => {
                         app.move_tab_in_direction(group_id, item_id, direction, cx);
+                    }
+                    NativeTabMenuCommand::SetCustomTitle => {
+                        app.prompt_custom_title(group_id, item_id, cx);
+                    }
+                    NativeTabMenuCommand::ClearCustomTitle => {
+                        app.set_custom_title(group_id, item_id, None, cx);
                     }
                 }
             })
@@ -5673,6 +5696,76 @@ impl EggieApp {
         self.ensure_snapshot_watchers(cx);
         self.sync_terminal_focus();
         cx.notify();
+    }
+
+    /// Set (or clear, with `None`) a tab's custom title override, then repaint. The custom title is
+    /// per-tab layout metadata; it wins over the process/OSC title without ever mutating it, so
+    /// clearing restores the live process title.
+    fn set_custom_title(
+        &mut self,
+        group_id: GroupId,
+        item_id: ItemId,
+        custom_title: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .workspace_mut()
+            .layout
+            .set_custom_title(group_id, item_id, custom_title)
+        {
+            cx.notify();
+        }
+    }
+
+    /// Open a native prompt to set or edit a tab's custom title. The field is prefilled with the
+    /// tab's current display title (custom title if set, otherwise the process title). An empty
+    /// result clears the override so the process title takes over again.
+    fn prompt_custom_title(
+        &mut self,
+        group_id: GroupId,
+        item_id: ItemId,
+        cx: &mut Context<Self>,
+    ) {
+        let language = self.language;
+        let current = self
+            .workspace()
+            .layout
+            .find_group(group_id)
+            .and_then(|group| group.items.iter().find(|item| item.id == item_id))
+            .map(|item| item.display_title().to_owned())
+            .unwrap_or_default();
+        let Some(window) = cx.active_window() else {
+            return;
+        };
+        let app = cx.entity().downgrade();
+        window
+            .update(cx, |_, window, cx| {
+                let receiver = prompt_for_text(
+                    window,
+                    language.custom_title_prompt_title(),
+                    language.custom_title_prompt_message(),
+                    Some(language.custom_title_placeholder()),
+                    Some(&current),
+                    language.ok(),
+                    language.cancel(),
+                );
+                cx.spawn(async move |cx| {
+                    let value = receiver.await.ok()??;
+                    let trimmed = value.trim();
+                    let custom_title = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_owned())
+                    };
+                    app.update(cx, move |app, cx| {
+                        app.set_custom_title(group_id, item_id, custom_title, cx);
+                    })
+                    .ok()?;
+                    Some(())
+                })
+                .detach();
+            })
+            .ok();
     }
 
     fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
@@ -6375,6 +6468,14 @@ impl EggieApp {
                     let active = is_active_project
                         && self.active_session_id() == Some(session.id);
                     let session_id = session.id;
+                    // Prefer the tab's custom title (if any) so the sidebar stays consistent with
+                    // the tab bar; fall back to the session's process title.
+                    let session_title: SharedString = view
+                        .layout
+                        .terminal_display_title(session_id)
+                        .unwrap_or(session.title.as_str())
+                        .to_owned()
+                        .into();
                     panel = panel.child(
                         div()
                             .id(format!("sidebar-session-{session_id}"))
@@ -6419,7 +6520,7 @@ impl EggieApp {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .child(session.title.clone()),
+                                .child(session_title.clone()),
                         ),
                 );
             }
@@ -6592,7 +6693,7 @@ impl EggieApp {
                 source_group_id: group_id,
                 item_id,
                 item_kind: item.kind,
-                title: item.title.clone().into(),
+                title: item.display_title().to_owned().into(),
                 active,
                 colors: self.colors,
             };
@@ -6651,7 +6752,7 @@ impl EggieApp {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(item.title.clone()),
+                            .child(SharedString::from(item.display_title().to_owned())),
                     )
                     .child(
                         div()

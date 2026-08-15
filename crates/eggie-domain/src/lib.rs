@@ -75,7 +75,13 @@ pub enum ItemKind {
 pub struct TabItem {
     pub id: ItemId,
     pub kind: ItemKind,
+    /// The process/OSC-derived title. Kept updated by the running shell and never reflects a
+    /// user override, so removing a custom title falls back to the live process title.
     pub title: String,
+    /// A user-assigned override that wins over `title` when set. Independent metadata: OSC title
+    /// updates leave it untouched, and clearing it (`None`) restores the process title.
+    #[serde(default)]
+    pub custom_title: Option<String>,
     pub session_id: Option<SessionId>,
 }
 
@@ -85,8 +91,14 @@ impl TabItem {
             id: Uuid::new_v4(),
             kind: ItemKind::Terminal,
             title: title.into(),
+            custom_title: None,
             session_id: Some(session_id),
         }
+    }
+
+    /// The title to render: the user's custom title if set, otherwise the process title.
+    pub fn display_title(&self) -> &str {
+        self.custom_title.as_deref().unwrap_or(&self.title)
     }
 }
 
@@ -259,6 +271,48 @@ impl LayoutNode {
                 first_changed || second_changed
             }
         }
+    }
+
+    /// The title to display for the tab backed by `session_id`: the tab's custom title if set,
+    /// otherwise its process title. Returns `None` when no tab is backed by that session.
+    ///
+    /// Used by surfaces outside the tab bar (e.g. the sidebar session list) that key off a session
+    /// id rather than a tab, so a user's custom tab title stays consistent everywhere.
+    pub fn terminal_display_title(&self, session_id: SessionId) -> Option<&str> {
+        match self {
+            Self::Group { group } => group
+                .items
+                .iter()
+                .find(|item| item.session_id == Some(session_id))
+                .map(|item| item.display_title()),
+            Self::Split { first, second, .. } => first
+                .terminal_display_title(session_id)
+                .or_else(|| second.terminal_display_title(session_id)),
+        }
+    }
+
+    /// Sets (or clears, with `None`) the user's custom title override for a single tab, identified
+    /// by its group and item id. Returns `true` if the override actually changed.
+    ///
+    /// Unlike [`Self::update_terminal_title`], this targets one specific item rather than every tab
+    /// backed by a session: a custom title is per-tab metadata, not a process property.
+    pub fn set_custom_title(
+        &mut self,
+        group_id: GroupId,
+        item_id: ItemId,
+        custom_title: Option<String>,
+    ) -> bool {
+        let Some(group) = self.find_group_mut(group_id) else {
+            return false;
+        };
+        let Some(item) = group.items.iter_mut().find(|item| item.id == item_id) else {
+            return false;
+        };
+        if item.custom_title == custom_title {
+            return false;
+        }
+        item.custom_title = custom_title;
+        true
     }
 
     pub fn first_group_id(&self) -> GroupId {
@@ -780,6 +834,64 @@ mod tests {
             layout.find_group(second_group_id).unwrap().items[0].title,
             "OSC title"
         );
+    }
+
+    #[test]
+    fn custom_title_overrides_process_title_and_survives_osc_updates() {
+        let session_id = Uuid::new_v4();
+        let item = TabItem::terminal(session_id, "process title");
+        let item_id = item.id;
+        let mut layout = LayoutNode::group(item);
+        let group_id = layout.first_group_id();
+
+        // No override yet: display falls back to the process title.
+        assert_eq!(
+            layout.find_group(group_id).unwrap().items[0].display_title(),
+            "process title"
+        );
+
+        // Setting a custom title wins over the process title.
+        assert!(layout.set_custom_title(group_id, item_id, Some("My Tab".to_owned())));
+        assert!(!layout.set_custom_title(group_id, item_id, Some("My Tab".to_owned())));
+        assert_eq!(
+            layout.find_group(group_id).unwrap().items[0].display_title(),
+            "My Tab"
+        );
+
+        // An OSC title update changes the process title but never the custom override.
+        assert!(layout.update_terminal_title(session_id, "new process title"));
+        let item = &layout.find_group(group_id).unwrap().items[0];
+        assert_eq!(item.title, "new process title");
+        assert_eq!(item.custom_title.as_deref(), Some("My Tab"));
+        assert_eq!(item.display_title(), "My Tab");
+
+        // Clearing the override restores the (now-updated) process title.
+        assert!(layout.set_custom_title(group_id, item_id, None));
+        assert_eq!(
+            layout.find_group(group_id).unwrap().items[0].display_title(),
+            "new process title"
+        );
+    }
+
+    #[test]
+    fn terminal_display_title_reflects_custom_title_by_session_id() {
+        let session_id = Uuid::new_v4();
+        let item = TabItem::terminal(session_id, "process title");
+        let item_id = item.id;
+        let mut layout = LayoutNode::group(item);
+        let group_id = layout.first_group_id();
+
+        // Falls back to the process title when no override is set.
+        assert_eq!(
+            layout.terminal_display_title(session_id),
+            Some("process title")
+        );
+        // An unknown session id has no tab.
+        assert_eq!(layout.terminal_display_title(Uuid::new_v4()), None);
+
+        // A custom title wins, keyed off the session id (what the sidebar uses).
+        layout.set_custom_title(group_id, item_id, Some("Custom".to_owned()));
+        assert_eq!(layout.terminal_display_title(session_id), Some("Custom"));
     }
 
     #[test]
