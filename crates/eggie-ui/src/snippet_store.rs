@@ -18,21 +18,25 @@ use uuid::Uuid;
 /// 持久化信封的当前版本。放在最外层,便于未来在不破坏旧文件的前提下演进磁盘格式。
 const PERSIST_VERSION: u32 = 1;
 
-/// 单条 snippet。`id` 稳定标识;`name` 是列表里展示的短名;`content` 是注入终端的正文
-/// (末尾 `\n` 决定是否自动执行)。
+/// 单条 snippet。`id` 稳定标识;`name` 是列表里展示的短名;`content` 是注入终端的正文;
+/// `auto_run` 为真时,注入后额外发一个回车执行(编辑对话框里的复选框显式控制,默认关闭)。
+/// `#[serde(default)]` 让旧的 snippets.json(无该字段)按 false 读入,保持向后兼容。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Snippet {
     pub(crate) id: Uuid,
     pub(crate) name: String,
     pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) auto_run: bool,
 }
 
 impl Snippet {
-    pub(crate) fn new(name: String, content: String) -> Self {
+    pub(crate) fn new(name: String, content: String, auto_run: bool) -> Self {
         Self {
             id: Uuid::new_v4(),
             name,
             content,
+            auto_run,
         }
     }
 }
@@ -90,11 +94,13 @@ impl SnippetStore {
         id: Uuid,
         name: String,
         content: String,
+        auto_run: bool,
         cx: &mut Context<Self>,
     ) {
         if let Some(snippet) = self.snippets.iter_mut().find(|snippet| snippet.id == id) {
             snippet.name = name;
             snippet.content = content;
+            snippet.auto_run = auto_run;
             self.persist(cx);
         }
     }
@@ -155,7 +161,7 @@ mod tests {
         let mut store = SnippetStore::load_from(path.clone());
         assert!(store.snippets().is_empty());
 
-        let snippet = Snippet::new("list".to_owned(), "ls -la\n".to_owned());
+        let snippet = Snippet::new("list".to_owned(), "ls -la".to_owned(), true);
         let id = snippet.id;
         // 手动模拟 add 的落盘(测试环境无 Context,直接调 save 验证序列化往返)。
         store.snippets.push(snippet);
@@ -165,7 +171,8 @@ mod tests {
         assert_eq!(reloaded.snippets().len(), 1);
         assert_eq!(reloaded.snippets()[0].id, id);
         assert_eq!(reloaded.snippets()[0].name, "list");
-        assert_eq!(reloaded.snippets()[0].content, "ls -la\n");
+        assert_eq!(reloaded.snippets()[0].content, "ls -la");
+        assert!(reloaded.snippets()[0].auto_run);
 
         let _ = fs::remove_file(&path);
     }
