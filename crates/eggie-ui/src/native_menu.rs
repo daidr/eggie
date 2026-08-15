@@ -5,6 +5,8 @@ use gpui::Window;
 pub(crate) enum NativeTabMenuCommand {
     Split(Direction),
     Move(Direction),
+    SetCustomTitle,
+    ClearCustomTitle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,9 +49,10 @@ pub(crate) use macos::{
 pub(crate) fn prepare_tab_menu(
     window: &Window,
     move_enabled: [bool; 4],
+    clear_title_enabled: bool,
     language: crate::settings::Language,
 ) -> Option<NativeTabMenu> {
-    macos::NativeTabMenu::prepare(window, move_enabled, language)
+    macos::NativeTabMenu::prepare(window, move_enabled, clear_title_enabled, language)
 }
 
 #[cfg(target_os = "macos")]
@@ -100,6 +103,7 @@ impl NativeTabMenu {
 pub(crate) fn prepare_tab_menu(
     _: &Window,
     _: [bool; 4],
+    _: bool,
     _: crate::settings::Language,
 ) -> Option<NativeTabMenu> {
     None
@@ -204,6 +208,7 @@ mod macos {
         view: id,
         event: id,
         move_enabled: [bool; 4],
+        clear_title_enabled: bool,
         language: crate::settings::Language,
     }
 
@@ -211,6 +216,7 @@ mod macos {
         pub(super) fn prepare(
             window: &Window,
             move_enabled: [bool; 4],
+            clear_title_enabled: bool,
             language: crate::settings::Language,
         ) -> Option<Self> {
             let window_handle = HasWindowHandle::window_handle(window).ok()?;
@@ -230,6 +236,7 @@ mod macos {
                 view,
                 event,
                 move_enabled,
+                clear_title_enabled,
                 language,
             })
         }
@@ -239,7 +246,13 @@ mod macos {
         /// `NSMenu` runs a nested event loop. Calling this from a GPUI listener lets unrelated
         /// foreground tasks re-enter GPUI while its `RefCell` is already mutably borrowed.
         pub(crate) fn show(self) -> Option<NativeTabMenuCommand> {
-            show_tab_menu(self.view, self.event, self.move_enabled, self.language)
+            show_tab_menu(
+                self.view,
+                self.event,
+                self.move_enabled,
+                self.clear_title_enabled,
+                self.language,
+            )
         }
     }
 
@@ -289,6 +302,7 @@ mod macos {
         view: id,
         event: id,
         move_enabled: [bool; 4],
+        clear_title_enabled: bool,
         language: crate::settings::Language,
     ) -> Option<NativeTabMenuCommand> {
         let selected = unsafe {
@@ -325,6 +339,17 @@ mod macos {
             let _: () = msg_send![title, release];
             parent.setSubmenu_(submenu);
             menu.addItem_(parent);
+
+            // A separator then the custom-title actions. Tag 8 sets/edits the title; tag 9 removes
+            // it and is disabled when the tab has no custom title.
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            menu.addItem_(menu_item(language.set_custom_title(), 8, true, target));
+            menu.addItem_(menu_item(
+                language.remove_custom_title(),
+                9,
+                clear_title_enabled,
+                target,
+            ));
 
             pop_up_menu(menu, event, view);
             let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
@@ -370,6 +395,11 @@ mod macos {
     }
 
     fn command_from_tag(tag: isize) -> Option<NativeTabMenuCommand> {
+        match tag {
+            8 => return Some(NativeTabMenuCommand::SetCustomTitle),
+            9 => return Some(NativeTabMenuCommand::ClearCustomTitle),
+            _ => {}
+        }
         let direction = match tag.rem_euclid(4) {
             0 => Direction::Up,
             1 => Direction::Down,
@@ -736,7 +766,29 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use super::{edit_command_from_tag, NativeEditMenuCommand};
+        use super::{command_from_tag, edit_command_from_tag, NativeEditMenuCommand};
+        use crate::native_menu::NativeTabMenuCommand;
+        use eggie_domain::Direction;
+
+        #[test]
+        fn tab_command_from_tag_decodes_splits_moves_and_title_actions() {
+            assert_eq!(
+                command_from_tag(0),
+                Some(NativeTabMenuCommand::Split(Direction::Up))
+            );
+            assert_eq!(
+                command_from_tag(4),
+                Some(NativeTabMenuCommand::Move(Direction::Up))
+            );
+            assert_eq!(command_from_tag(8), Some(NativeTabMenuCommand::SetCustomTitle));
+            assert_eq!(
+                command_from_tag(9),
+                Some(NativeTabMenuCommand::ClearCustomTitle)
+            );
+            // NO_SELECTION(-1) and out-of-range tags decode to None.
+            assert_eq!(command_from_tag(-1), None);
+            assert_eq!(command_from_tag(10), None);
+        }
 
         #[test]
         fn edit_command_from_tag_decodes_each_item() {

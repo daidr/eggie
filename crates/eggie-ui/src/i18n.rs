@@ -140,6 +140,45 @@ impl Language {
         }
     }
 
+    // --- Tab custom title --------------------------------------------------------------------
+
+    /// Tab context-menu item that opens the custom-title prompt.
+    pub(crate) fn set_custom_title(self) -> &'static str {
+        match self {
+            Self::English => "Rename Tab…",
+            Self::SimplifiedChinese => "自定义标题…",
+        }
+    }
+
+    /// Tab context-menu item that clears the custom title (disabled when none is set).
+    pub(crate) fn remove_custom_title(self) -> &'static str {
+        match self {
+            Self::English => "Remove Custom Title",
+            Self::SimplifiedChinese => "移除自定义标题",
+        }
+    }
+
+    pub(crate) fn custom_title_prompt_title(self) -> &'static str {
+        match self {
+            Self::English => "Rename Tab",
+            Self::SimplifiedChinese => "自定义标签标题",
+        }
+    }
+
+    pub(crate) fn custom_title_prompt_message(self) -> &'static str {
+        match self {
+            Self::English => "Enter a custom title for this tab. Leave empty to use the process title.",
+            Self::SimplifiedChinese => "为该标签输入自定义标题。留空则使用进程标题。",
+        }
+    }
+
+    pub(crate) fn custom_title_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Custom tab title",
+            Self::SimplifiedChinese => "自定义标签标题",
+        }
+    }
+
     // --- Section labels ----------------------------------------------------------------------
 
     pub(crate) fn projects_label(self) -> &'static str {
