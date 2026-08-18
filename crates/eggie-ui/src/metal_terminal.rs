@@ -32,10 +32,10 @@ use core_text::{
 use gpui::MetalRenderContext;
 use memmap2::Mmap;
 use metal::{
-    CompileOptions, Device, DeviceRef, MTLBlendFactor, MTLBlendOperation, MTLPixelFormat,
-    MTLPrimitiveType, MTLRegion, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLStorageMode,
-    MTLTextureUsage, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
-    SamplerState, Texture, TextureDescriptor,
+    Buffer, CompileOptions, Device, DeviceRef, MTLBlendFactor, MTLBlendOperation, MTLPixelFormat,
+    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter,
+    MTLStorageMode, MTLTextureUsage, NSUInteger, RenderPipelineDescriptor, RenderPipelineState,
+    SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -54,9 +54,7 @@ use std::{
 };
 
 #[cfg(test)]
-use metal::{
-    MTLClearColor, MTLLoadAction, MTLResourceOptions, MTLStoreAction, RenderPassDescriptor,
-};
+use metal::{MTLClearColor, MTLLoadAction, MTLStoreAction, RenderPassDescriptor};
 
 const MASK_ATLAS_SIZE: usize = 4096;
 const COLOR_ATLAS_SIZE: usize = 2048;
@@ -720,12 +718,41 @@ struct CachedTerminalImage {
     texture: Texture,
     bytes: usize,
     last_used: u64,
+    /// When present, `texture` is a zero-copy view over shared memory: the `MTLBuffer` wraps the
+    /// mmap pages directly (`new_buffer_with_bytes_no_copy`), so the mmap and buffer must outlive
+    /// the texture. Such textures alias a specific shm segment and must never be recycled for a
+    /// different image.
+    #[cfg(unix)]
+    zero_copy: Option<ZeroCopyBacking>,
+}
+
+/// Keeps a zero-copy image texture's backing memory alive. The `MTLBuffer` was created with
+/// `new_buffer_with_bytes_no_copy` pointing at the mmap pages (deallocator `None`), so dropping the
+/// mmap while the GPU could still sample it is a use-after-free — both are held until the cache
+/// entry is evicted.
+#[cfg(unix)]
+struct ZeroCopyBacking {
+    _buffer: Buffer,
+    _mmap: Arc<memmap2::Mmap>,
 }
 
 struct RecycledTerminalImage {
     texture: Texture,
     width: u32,
     height: u32,
+}
+
+/// Whether to attempt zero-copy image upload (`new_buffer_with_bytes_no_copy` over the shm mmap,
+/// skipping `replace_region`). Off by default: the alignment and cross-process lifetime assumptions
+/// need validation on real hardware before it becomes the default. Set `EGGIE_IMAGE_ZERO_COPY=1`.
+#[cfg(unix)]
+fn image_zero_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("EGGIE_IMAGE_ZERO_COPY")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
 }
 
 impl MetalBackend {
@@ -806,6 +833,13 @@ impl MetalBackend {
         for key in stale {
             if let Some(cached) = self.images.remove(&key) {
                 self.image_bytes = self.image_bytes.saturating_sub(cached.bytes);
+                // Only plain (copy-uploaded) textures may be recycled. A zero-copy texture is a view
+                // over a specific shm mmap; reusing it for another image would alias freed pages or
+                // write into shared memory via replace_region. Drop it (and its backing) instead.
+                #[cfg(unix)]
+                if cached.zero_copy.is_some() {
+                    continue;
+                }
                 if self.recycled_images.len() < 4 {
                     self.recycled_images.push(RecycledTerminalImage {
                         width: cached.texture.width() as u32,
@@ -1023,6 +1057,32 @@ impl MetalBackend {
                 self.image_bytes = self.image_bytes.saturating_sub(removed.bytes);
             }
         }
+
+        // Zero-copy fast path (opt-in): wrap the shm mmap pages in an MTLBuffer and build a texture
+        // view over it, skipping the replace_region CPU copy entirely. Falls back to the copy path
+        // if disabled, if the image is not shm-mapped, or if the row stride is not aligned to the
+        // device's linear-texture requirement.
+        #[cfg(unix)]
+        if image_zero_copy_enabled()
+            && let Some(mmap) = image.pixels.mapped()
+            && let Some((texture, buffer)) = self.zero_copy_image_texture(image, &mmap, width)
+        {
+            self.image_bytes = self.image_bytes.saturating_add(expected);
+            self.images.insert(
+                image.key,
+                CachedTerminalImage {
+                    texture: texture.to_owned(),
+                    bytes: expected,
+                    last_used: self.image_clock,
+                    zero_copy: Some(ZeroCopyBacking {
+                        _buffer: buffer,
+                        _mmap: mmap,
+                    }),
+                },
+            );
+            return Ok((texture, 0, started.elapsed()));
+        }
+
         let texture = self
             .recycled_images
             .iter()
@@ -1050,9 +1110,52 @@ impl MetalBackend {
                 texture: texture.to_owned(),
                 bytes: expected,
                 last_used: self.image_clock,
+                #[cfg(unix)]
+                zero_copy: None,
             },
         );
         Ok((texture, expected, started.elapsed()))
+    }
+
+    /// Build a texture that samples the shm mmap directly, with no CPU copy. Returns `None` (so the
+    /// caller falls back to `replace_region`) when the row stride does not meet the device's
+    /// `minimumLinearTextureAlignmentForPixelFormat`, since an unaligned buffer-backed texture is
+    /// invalid. The mmap base from POSIX shm is page-aligned, satisfying the buffer's own alignment.
+    #[cfg(unix)]
+    fn zero_copy_image_texture(
+        &self,
+        image: &TerminalImageData,
+        mmap: &Arc<memmap2::Mmap>,
+        width: usize,
+    ) -> Option<(Texture, Buffer)> {
+        let bytes_per_row = (width * 4) as u64;
+        let alignment = self
+            .device
+            .minimum_linear_texture_alignment_for_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        if alignment == 0 || bytes_per_row % alignment != 0 {
+            return None;
+        }
+        let expected = (width * image.height as usize * 4) as NSUInteger;
+        if (mmap.len() as NSUInteger) < expected {
+            return None;
+        }
+        // SAFETY: the mmap is a read-only, page-aligned POSIX shm mapping that outlives the buffer
+        // (kept alive via ZeroCopyBacking); the daemon writes it once before sending the name and
+        // never mutates it afterward. deallocator `None` — we own the mmap's lifetime ourselves.
+        let buffer = self.device.new_buffer_with_bytes_no_copy(
+            mmap.as_ptr().cast(),
+            expected,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_width(image.width as u64);
+        descriptor.set_height(image.height as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_usage(MTLTextureUsage::ShaderRead);
+        let texture = buffer.new_texture_with_descriptor(&descriptor, 0, bytes_per_row);
+        Some((texture, buffer))
     }
 
     fn build_instance(
@@ -3188,5 +3291,75 @@ mod tests {
             }
             return;
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_copy_texture_samples_the_mapped_shm_pixels() {
+        use std::io::Write;
+
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let backend = MetalBackend::new(&device).expect("backend must build");
+
+        // A 64x4 RGBA image: 64*4 = 256 bytes/row, aligned enough for RGBA8Unorm on Apple GPUs. Back
+        // it with a page-sized mmap (POSIX shm is page-rounded) so the buffer's base is page-aligned.
+        let width = 64u32;
+        let height = 4u32;
+        let logical = (width * height * 4) as usize;
+        let page = 16 * 1024usize;
+        let mut backing = vec![0u8; page];
+        for (index, byte) in backing.iter_mut().enumerate().take(logical) {
+            *byte = (index % 251) as u8;
+        }
+        let path = std::env::temp_dir().join(format!("eggie-zerocopy-test-{}", std::process::id()));
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&backing).unwrap();
+            file.flush().unwrap();
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+        let _ = std::fs::remove_file(&path);
+
+        let image = TerminalImageData {
+            key: TerminalTextureKey {
+                session_id: eggie_domain::SessionId::new_v4(),
+                image: eggie_protocol::TerminalImageKey {
+                    id: 1,
+                    generation: 1,
+                },
+            },
+            width,
+            height,
+            pixels: crate::terminal_renderer::PixelStore::Mapped {
+                mmap: Arc::clone(&mmap),
+                len: logical,
+            },
+        };
+
+        let Some((texture, _buffer)) =
+            backend.zero_copy_image_texture(&image, &mmap, width as usize)
+        else {
+            // Device declined the alignment; nothing to assert beyond graceful fallback.
+            return;
+        };
+        assert_eq!(texture.width(), width as u64);
+        assert_eq!(texture.height(), height as u64);
+
+        // Read the texture back and confirm it samples the mmap bytes without any copy step.
+        let mut readback = vec![0u8; logical];
+        texture.get_bytes(
+            readback.as_mut_ptr().cast(),
+            (width * 4) as u64,
+            MTLRegion::new_2d(0, 0, width as u64, height as u64),
+            0,
+        );
+        assert_eq!(
+            readback,
+            &backing[..logical],
+            "zero-copy texture must present the mapped shm pixels verbatim"
+        );
     }
 }

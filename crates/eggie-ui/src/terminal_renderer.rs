@@ -482,6 +482,18 @@ impl PixelStore {
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.as_bytes().as_ptr()
     }
+
+    /// The mmap backing this store, if it is shared-memory mapped. Zero-copy Metal upload
+    /// (`new_buffer_with_bytes_no_copy`) needs the page-aligned mmap base and a clone that keeps the
+    /// mapping alive for the texture's lifetime. `Owned` pixels return `None` — their `Vec`
+    /// allocation is not page-aligned and is not shared with the GPU.
+    #[cfg(unix)]
+    pub(crate) fn mapped(&self) -> Option<Arc<memmap2::Mmap>> {
+        match self {
+            PixelStore::Owned(_) => None,
+            PixelStore::Mapped { mmap, .. } => Some(Arc::clone(mmap)),
+        }
+    }
 }
 
 struct TerminalMetalPrimitive {
