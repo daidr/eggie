@@ -1100,6 +1100,87 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    /// A bordered −/value/+ stepper. The caller pre-formats the current value into `display`,
+    /// picks the box width, and supplies `on_step`, which receives the direction (-1 or +1) and
+    /// applies the control's own delta before invoking the matching change setter.
+    fn render_stepper(
+        &self,
+        dec_id: &str,
+        inc_id: &str,
+        display: String,
+        can_dec: bool,
+        can_inc: bool,
+        value_box_width: f32,
+        on_step: impl Fn(&mut Self, i8, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let on_step = std::rc::Rc::new(on_step);
+        let button = |id: SharedString,
+                      label: &'static str,
+                      enabled: bool,
+                      dir: i8,
+                      on_step: std::rc::Rc<dyn Fn(&mut Self, i8, &mut Context<Self>)>,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(30.))
+                .text_size(px(16.))
+                .cursor_pointer()
+                .text_color(rgb(if enabled {
+                    self.colors.text
+                } else {
+                    self.colors.muted
+                }))
+                .when(enabled, |element| {
+                    element
+                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            on_step(settings, dir, cx)
+                        }))
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .overflow_hidden()
+            .child(button(
+                SharedString::from(dec_id.to_owned()),
+                "−",
+                can_dec,
+                -1,
+                on_step.clone(),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(value_box_width))
+                    .h(px(30.))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(self.colors.border))
+                    .child(display),
+            )
+            .child(button(
+                SharedString::from(inc_id.to_owned()),
+                "+",
+                can_inc,
+                1,
+                on_step,
+                cx,
+            ))
+            .into_any_element()
+    }
+
     fn render_mode_control(&self, selected: ThemeMode, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
         let options = ThemeMode::ALL
@@ -1496,67 +1577,16 @@ impl SettingsWindow {
         strength: u8,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_font_thicken_strength(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-font-thicken-strength",
-                "−",
-                strength > 0,
-                -16,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{strength}")),
-            )
-            .child(button(
-                "increase-font-thicken-strength",
-                "+",
-                strength < 255,
-                16,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-font-thicken-strength",
+            "increase-font-thicken-strength",
+            format!("{strength}"),
+            strength > 0,
+            strength < 255,
+            54.,
+            |settings, dir, cx| settings.change_font_thicken_strength(i32::from(dir) * 16, cx),
+            cx,
+        )
     }
 
     fn render_copy_on_select_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -2396,67 +2426,16 @@ impl SettingsWindow {
     }
 
     fn render_font_size_control(&self, font_size: f32, cx: &mut Context<Self>) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: f32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_font_size(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-font-size",
-                "−",
-                font_size > MIN_FONT_SIZE,
-                -1.,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{font_size:.0}")),
-            )
-            .child(button(
-                "increase-font-size",
-                "+",
-                font_size < MAX_FONT_SIZE,
-                1.,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-font-size",
+            "increase-font-size",
+            format!("{font_size:.0}"),
+            font_size > MIN_FONT_SIZE,
+            font_size < MAX_FONT_SIZE,
+            54.,
+            |settings, dir, cx| settings.change_font_size(f32::from(dir), cx),
+            cx,
+        )
     }
 
     fn render_minimum_contrast_control(
@@ -2464,67 +2443,16 @@ impl SettingsWindow {
         minimum_contrast: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: f32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_minimum_contrast(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-minimum-contrast",
-                "−",
-                minimum_contrast > MIN_MINIMUM_CONTRAST,
-                -0.1,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{minimum_contrast:.1}")),
-            )
-            .child(button(
-                "increase-minimum-contrast",
-                "+",
-                minimum_contrast < MAX_MINIMUM_CONTRAST,
-                0.1,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-minimum-contrast",
+            "increase-minimum-contrast",
+            format!("{minimum_contrast:.1}"),
+            minimum_contrast > MIN_MINIMUM_CONTRAST,
+            minimum_contrast < MAX_MINIMUM_CONTRAST,
+            54.,
+            |settings, dir, cx| settings.change_minimum_contrast(f32::from(dir) * 0.1, cx),
+            cx,
+        )
     }
 
     fn render_terminal_padding_control(
@@ -2543,67 +2471,16 @@ impl SettingsWindow {
                 "increase-vertical-terminal-padding",
             ),
         };
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: f32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_terminal_padding(axis, delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                decrease_id,
-                "−",
-                value > MIN_TERMINAL_PADDING,
-                -1.,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{value:.0}")),
-            )
-            .child(button(
-                increase_id,
-                "+",
-                value < MAX_TERMINAL_PADDING,
-                1.,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            decrease_id,
+            increase_id,
+            format!("{value:.0}"),
+            value > MIN_TERMINAL_PADDING,
+            value < MAX_TERMINAL_PADDING,
+            54.,
+            move |settings, dir, cx| settings.change_terminal_padding(axis, f32::from(dir), cx),
+            cx,
+        )
     }
 
     fn render_metric_adjustment_control(
@@ -2626,57 +2503,18 @@ impl SettingsWindow {
             (None, _) => "0".to_owned(),
         };
         let current = numeric.unwrap_or(0);
-        let decrease_id = SharedString::from(format!("decrease-adjust-{}", kind.slug()));
-        let increase_id = SharedString::from(format!("increase-adjust-{}", kind.slug()));
-        let button = |id: SharedString,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_metric_adjustment(kind, delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(decrease_id, "−", current > -64, -1, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(display),
-            )
-            .child(button(increase_id, "+", current < 64, 1, cx))
-            .into_any_element()
+        let decrease_id = format!("decrease-adjust-{}", kind.slug());
+        let increase_id = format!("increase-adjust-{}", kind.slug());
+        self.render_stepper(
+            &decrease_id,
+            &increase_id,
+            display,
+            current > -64,
+            current < 64,
+            54.,
+            move |settings, dir, cx| settings.change_metric_adjustment(kind, i32::from(dir), cx),
+            cx,
+        )
     }
 
     fn render_progress_timeout_control(
@@ -2696,131 +2534,33 @@ impl SettingsWindow {
                 "increase-progress-stale-timeout",
             ),
         };
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_progress_timeout(kind, delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                decrease_id,
-                "−",
-                value > MIN_PROGRESS_TIMEOUT_SECS,
-                -step,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(62.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{value}s")),
-            )
-            .child(button(
-                increase_id,
-                "+",
-                value < MAX_PROGRESS_TIMEOUT_SECS,
-                step,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            decrease_id,
+            increase_id,
+            format!("{value}s"),
+            value > MIN_PROGRESS_TIMEOUT_SECS,
+            value < MAX_PROGRESS_TIMEOUT_SECS,
+            62.,
+            move |settings, dir, cx| {
+                settings.change_progress_timeout(kind, i32::from(dir) * step, cx)
+            },
+            cx,
+        )
     }
 
     fn render_scrollback_control(&self, value: usize, cx: &mut Context<Self>) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i64,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_scrollback_lines(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-scrollback-lines",
-                "−",
-                value > MIN_SCROLLBACK_LINES,
-                -SCROLLBACK_LINES_STEP,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(72.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(value.to_string()),
-            )
-            .child(button(
-                "increase-scrollback-lines",
-                "+",
-                value < MAX_SCROLLBACK_LINES,
-                SCROLLBACK_LINES_STEP,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-scrollback-lines",
+            "increase-scrollback-lines",
+            value.to_string(),
+            value > MIN_SCROLLBACK_LINES,
+            value < MAX_SCROLLBACK_LINES,
+            72.,
+            |settings, dir, cx| {
+                settings.change_scrollback_lines(i64::from(dir) * SCROLLBACK_LINES_STEP, cx)
+            },
+            cx,
+        )
     }
 
     /// Wrap a persistent shell `TextInput` entity in a bordered, fixed-width control box for a
