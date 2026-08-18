@@ -726,10 +726,11 @@ struct CachedTerminalImage {
     zero_copy: Option<ZeroCopyBacking>,
 }
 
-/// Keeps a zero-copy image texture's backing memory alive. The `MTLBuffer` was created with
-/// `new_buffer_with_bytes_no_copy` pointing at the mmap pages (deallocator `None`), so dropping the
-/// mmap while the GPU could still sample it is a use-after-free — both are held until the cache
-/// entry is evicted.
+/// Keeps a zero-copy image texture's Rust-side handles together with the cache entry. GPU-safe
+/// lifetime of the mmap is guaranteed by the buffer's deallocator block (which owns its own
+/// `Arc<Mmap>` clone and runs `munmap` only when Metal finally releases the buffer, i.e. after all
+/// in-flight command buffers complete). This struct just parks the `Buffer` handle and a mmap
+/// reference alongside the texture so they are not dropped earlier than the cache entry.
 #[cfg(unix)]
 struct ZeroCopyBacking {
     _buffer: Buffer,
@@ -1139,14 +1140,29 @@ impl MetalBackend {
         if (mmap.len() as NSUInteger) < expected {
             return None;
         }
-        // SAFETY: the mmap is a read-only, page-aligned POSIX shm mapping that outlives the buffer
-        // (kept alive via ZeroCopyBacking); the daemon writes it once before sending the name and
-        // never mutates it afterward. deallocator `None` — we own the mmap's lifetime ourselves.
+        // Bind the mmap's lifetime to the MTLBuffer via a deallocator block that owns a clone of the
+        // Arc<Mmap>. Metal calls (and releases) the deallocator only when the buffer's refcount hits
+        // zero — which is after our own drop AND after every command buffer that referenced a
+        // texture over this buffer has completed (command buffers retain their resources). So the
+        // pages stay mapped until the GPU is truly done, closing the use-after-free window that a
+        // cache eviction on the CPU side would otherwise open mid-frame. The closure body is empty:
+        // dropping the captured Arc runs memmap2's munmap when the last reference goes away.
+        let backing = Arc::clone(mmap);
+        let deallocator = block::ConcreteBlock::new(
+            move |_ptr: *const std::ffi::c_void, _len: NSUInteger| {
+                // Hold the mapping alive until Metal releases this block; drop does the munmap.
+                let _keep_alive = &backing;
+            },
+        )
+        .copy();
+        // SAFETY: the mmap is a read-only, page-aligned POSIX shm mapping. The deallocator block
+        // above keeps it mapped for as long as Metal (and thus the GPU) can reference the buffer;
+        // the daemon writes the segment once before sending its name and never mutates it after.
         let buffer = self.device.new_buffer_with_bytes_no_copy(
             mmap.as_ptr().cast(),
             expected,
             MTLResourceOptions::StorageModeShared,
-            None,
+            Some(&deallocator),
         );
         let descriptor = TextureDescriptor::new();
         descriptor.set_width(image.width as u64);

@@ -156,49 +156,45 @@ fn fetch_terminal_image_chunked(
         .ok_or_else(|| anyhow::anyhow!("terminal image dimensions overflow"))?;
 
     // Whole-image fast path: the daemon delivers the image either as an shm segment (mapped
-    // zero-copy here) or as a single complete inline frame. Only an inline image larger than one
-    // wire chunk falls through to the chunked loop below.
-    match connection.fetch_terminal_image(session_id, descriptor.key, expected_length) {
-        Ok(frame) => {
-            let pixels = match frame {
-                TerminalImageFrame::Shm {
-                    metadata,
-                    segment_name,
-                } => {
-                    verify_image_metadata(&metadata, descriptor, expected_length)?;
-                    PixelStore::Mapped {
-                        mmap: Arc::new(map_image_shm_segment(
-                            &segment_name,
-                            expected_length as usize,
-                        )?),
-                        len: expected_length as usize,
-                    }
-                }
-                TerminalImageFrame::Inline { metadata, pixels } => {
-                    verify_image_metadata(&metadata, descriptor, expected_length)?;
-                    if pixels.len() != expected_length as usize {
-                        anyhow::bail!("inline terminal image length mismatch");
-                    }
-                    PixelStore::Owned(Arc::new(pixels))
-                }
-            };
-            return Ok(TerminalImageData {
-                key: TerminalTextureKey {
-                    session_id,
-                    image: descriptor.key,
-                },
-                width: descriptor.width,
-                height: descriptor.height,
-                pixels,
-            });
+    // zero-copy here) or as a single complete inline frame. An image larger than one wire chunk
+    // comes back as InlineTooLarge and falls through to the chunked loop below.
+    let frame = connection.fetch_terminal_image(session_id, descriptor.key, expected_length)?;
+    let pixels = match frame {
+        TerminalImageFrame::Shm {
+            metadata,
+            segment_name,
+        } => {
+            // Map (and immediately unlink) the segment BEFORE validating metadata: otherwise a
+            // metadata mismatch would return before we ever open the segment, leaking it (the
+            // daemon has already handed off the unlink). Mapping first means any early return drops
+            // the mapping and reclaims the object.
+            let mmap = map_image_shm_segment(&segment_name, expected_length as usize)?;
+            verify_image_metadata(&metadata, descriptor, expected_length)?;
+            Some(PixelStore::Mapped {
+                mmap: Arc::new(mmap),
+                len: expected_length as usize,
+            })
         }
-        Err(error) => {
-            // The daemon signals a multi-chunk inline image by refusing the whole-image fetch; fall
-            // back to the chunk loop. Any other error propagates.
-            if !error.to_string().contains("append_terminal_image_chunk") {
-                return Err(error);
+        TerminalImageFrame::Inline { metadata, pixels } => {
+            verify_image_metadata(&metadata, descriptor, expected_length)?;
+            if pixels.len() != expected_length as usize {
+                anyhow::bail!("inline terminal image length mismatch");
             }
+            Some(PixelStore::Owned(Arc::new(pixels)))
         }
+        // Image spans multiple wire chunks; fall through to the chunked loop.
+        TerminalImageFrame::InlineTooLarge { .. } => None,
+    };
+    if let Some(pixels) = pixels {
+        return Ok(TerminalImageData {
+            key: TerminalTextureKey {
+                session_id,
+                image: descriptor.key,
+            },
+            width: descriptor.width,
+            height: descriptor.height,
+            pixels,
+        });
     }
 
     let mut pixels = Vec::with_capacity(expected_length as usize);
