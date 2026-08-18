@@ -152,6 +152,43 @@ fn classify_wire_header(header: u32) -> (WireFrameKind, usize) {
     (kind, length)
 }
 
+/// Pack the 28-byte image-chunk metadata header shared by the inline and shm wire framings. The
+/// layout (all little-endian) is: id[0..4], generation[4..12], width[12..16], height[16..20],
+/// total_length[20..24], offset[24..28]. `#[inline]` keeps this a zero-cost stack fill on the
+/// image-publish hot path.
+#[inline]
+fn pack_image_metadata(
+    key: TerminalImageKey,
+    width: u32,
+    height: u32,
+    total_length: u32,
+    offset: u32,
+) -> [u8; RAW_TERMINAL_IMAGE_METADATA_SIZE] {
+    let mut header = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
+    header[0..4].copy_from_slice(&key.id.to_le_bytes());
+    header[4..12].copy_from_slice(&key.generation.to_le_bytes());
+    header[12..16].copy_from_slice(&width.to_le_bytes());
+    header[16..20].copy_from_slice(&height.to_le_bytes());
+    header[20..24].copy_from_slice(&total_length.to_le_bytes());
+    header[24..28].copy_from_slice(&offset.to_le_bytes());
+    header
+}
+
+/// Unpack the 28-byte header written by [`pack_image_metadata`]. Returns `(key, width, height,
+/// total_length, offset)`; `chunk_length` is framing-specific and stays with the caller.
+#[inline]
+fn unpack_image_metadata(
+    header: &[u8; RAW_TERMINAL_IMAGE_METADATA_SIZE],
+) -> (TerminalImageKey, u32, u32, u32, u32) {
+    let read_u32 =
+        |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().expect("four bytes"));
+    let key = TerminalImageKey {
+        id: read_u32(0),
+        generation: u64::from_le_bytes(header[4..12].try_into().expect("eight bytes")),
+    };
+    (key, read_u32(12), read_u32(16), read_u32(20), read_u32(24))
+}
+
 #[derive(Clone, Copy)]
 struct GridSize(TerminalSize);
 
@@ -5449,13 +5486,13 @@ fn write_terminal_image_wire(
     }
     let payload_length =
         u32::try_from(payload_length).context("terminal image chunk is too large")?;
-    let mut metadata = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
-    metadata[0..4].copy_from_slice(&chunk.key.id.to_le_bytes());
-    metadata[4..12].copy_from_slice(&chunk.key.generation.to_le_bytes());
-    metadata[12..16].copy_from_slice(&chunk.width.to_le_bytes());
-    metadata[16..20].copy_from_slice(&chunk.height.to_le_bytes());
-    metadata[20..24].copy_from_slice(&chunk.total_length.to_le_bytes());
-    metadata[24..28].copy_from_slice(&chunk.offset.to_le_bytes());
+    let metadata = pack_image_metadata(
+        chunk.key,
+        chunk.width,
+        chunk.height,
+        chunk.total_length,
+        chunk.offset,
+    );
     writer.write_all(&(payload_length | RAW_TERMINAL_IMAGE_WIRE_FLAG).to_le_bytes())?;
     writer.write_all(&metadata)?;
     writer.write_all(bytes)?;
@@ -5472,10 +5509,7 @@ fn read_terminal_image_wire_into(
     }
     let mut metadata = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
     reader.read_exact(&mut metadata)?;
-    let read_u32 = |offset: usize| {
-        u32::from_le_bytes(metadata[offset..offset + 4].try_into().expect("four bytes"))
-    };
-    let generation = u64::from_le_bytes(metadata[4..12].try_into().expect("eight bytes"));
+    let (key, width, height, total_length, offset) = unpack_image_metadata(&metadata);
     let chunk_length = payload_length - RAW_TERMINAL_IMAGE_METADATA_SIZE;
     let chunk_length = u32::try_from(chunk_length).context("terminal image chunk is too large")?;
     let original_length = destination.len();
@@ -5485,14 +5519,11 @@ fn read_terminal_image_wire_into(
         return Err(error.into());
     }
     Ok(TerminalImageChunkMetadata {
-        key: TerminalImageKey {
-            id: read_u32(0),
-            generation,
-        },
-        width: read_u32(12),
-        height: read_u32(16),
-        total_length: read_u32(20),
-        offset: read_u32(24),
+        key,
+        width,
+        height,
+        total_length,
+        offset,
         chunk_length,
     })
 }
@@ -5620,13 +5651,13 @@ fn write_terminal_image_shm_wire(
         u32::try_from(payload_length).context("shm terminal image name is too large")?;
     let name_length =
         u32::try_from(segment_name.len()).context("shm terminal image name is too large")?;
-    let mut header = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
-    header[0..4].copy_from_slice(&metadata.key.id.to_le_bytes());
-    header[4..12].copy_from_slice(&metadata.key.generation.to_le_bytes());
-    header[12..16].copy_from_slice(&metadata.width.to_le_bytes());
-    header[16..20].copy_from_slice(&metadata.height.to_le_bytes());
-    header[20..24].copy_from_slice(&metadata.total_length.to_le_bytes());
-    header[24..28].copy_from_slice(&metadata.offset.to_le_bytes());
+    let header = pack_image_metadata(
+        metadata.key,
+        metadata.width,
+        metadata.height,
+        metadata.total_length,
+        metadata.offset,
+    );
     writer.write_all(&(payload_length | SHM_TERMINAL_IMAGE_WIRE_FLAG).to_le_bytes())?;
     writer.write_all(&header)?;
     writer.write_all(&name_length.to_le_bytes())?;
@@ -5648,10 +5679,7 @@ fn read_terminal_image_shm_wire_header(
     }
     let mut metadata = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
     reader.read_exact(&mut metadata)?;
-    let read_u32 = |offset: usize| {
-        u32::from_le_bytes(metadata[offset..offset + 4].try_into().expect("four bytes"))
-    };
-    let generation = u64::from_le_bytes(metadata[4..12].try_into().expect("eight bytes"));
+    let (key, width, height, total_length, offset) = unpack_image_metadata(&metadata);
     let mut name_length = [0_u8; 4];
     reader.read_exact(&mut name_length)?;
     let name_length = u32::from_le_bytes(name_length) as usize;
@@ -5661,15 +5689,13 @@ fn read_terminal_image_shm_wire_header(
     let mut name = vec![0_u8; name_length];
     reader.read_exact(&mut name)?;
     let metadata = TerminalImageChunkMetadata {
-        key: TerminalImageKey {
-            id: read_u32(0),
-            generation,
-        },
-        width: read_u32(12),
-        height: read_u32(16),
-        total_length: read_u32(20),
-        offset: read_u32(24),
-        chunk_length: read_u32(20),
+        key,
+        width,
+        height,
+        total_length,
+        offset,
+        // A shm frame always carries the whole image, so the chunk spans the full length.
+        chunk_length: total_length,
     };
     Ok((metadata, name))
 }
@@ -6200,24 +6226,28 @@ impl DaemonConnection {
 }
 
 impl DaemonInputSender {
-    pub fn send_input(&self, session_id: SessionId, bytes: Vec<u8>, sequence: u64) -> Result<()> {
+    /// Hand a queued input to the worker thread, mapping a closed channel to a uniform error. All
+    /// the typed `send_*` methods funnel through here so the "worker stopped" context lives once.
+    fn enqueue(&self, input: QueuedTerminalInput) -> Result<()> {
         self.sender
-            .send(QueuedTerminalInput::Input {
-                session_id,
-                bytes,
-                sequence,
-            })
+            .send(input)
             .context("terminal input worker stopped")
     }
 
+    pub fn send_input(&self, session_id: SessionId, bytes: Vec<u8>, sequence: u64) -> Result<()> {
+        self.enqueue(QueuedTerminalInput::Input {
+            session_id,
+            bytes,
+            sequence,
+        })
+    }
+
     pub fn send_paste(&self, session_id: SessionId, text: String, sequence: u64) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::Paste {
-                session_id,
-                text,
-                sequence,
-            })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::Paste {
+            session_id,
+            text,
+            sequence,
+        })
     }
 
     pub fn send_paste_clipboard(
@@ -6227,35 +6257,27 @@ impl DaemonInputSender {
         contents: Vec<TerminalClipboardContent>,
         sequence: u64,
     ) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::PasteClipboard {
-                session_id,
-                selection,
-                contents,
-                sequence,
-            })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::PasteClipboard {
+            session_id,
+            selection,
+            contents,
+            sequence,
+        })
     }
 
     pub fn send_mouse(&self, session_id: SessionId, event: TerminalMouseEvent) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::Mouse { session_id, event })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::Mouse { session_id, event })
     }
 
     pub fn send_scroll(&self, session_id: SessionId, event: TerminalScrollEvent) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::Scroll { session_id, event })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::Scroll { session_id, event })
     }
 
     pub fn send_focus(&self, session_id: SessionId, focused: bool) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::Focus {
-                session_id,
-                focused,
-            })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::Focus {
+            session_id,
+            focused,
+        })
     }
 
     pub fn send_selection_start(
@@ -6265,14 +6287,12 @@ impl DaemonInputSender {
         side: TerminalSelectionSide,
         kind: TerminalSelectionKind,
     ) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::SelectionStart {
-                session_id,
-                point,
-                side,
-                kind,
-            })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::SelectionStart {
+            session_id,
+            point,
+            side,
+            kind,
+        })
     }
 
     pub fn send_selection_update(
@@ -6281,19 +6301,15 @@ impl DaemonInputSender {
         point: TerminalCellPosition,
         side: TerminalSelectionSide,
     ) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::SelectionUpdate {
-                session_id,
-                point,
-                side,
-            })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::SelectionUpdate {
+            session_id,
+            point,
+            side,
+        })
     }
 
     pub fn send_selection_clear(&self, session_id: SessionId) -> Result<()> {
-        self.sender
-            .send(QueuedTerminalInput::SelectionClear { session_id })
-            .context("terminal input worker stopped")
+        self.enqueue(QueuedTerminalInput::SelectionClear { session_id })
     }
 }
 
