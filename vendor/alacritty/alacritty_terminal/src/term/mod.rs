@@ -65,8 +65,17 @@ const GRAPHEME_CLUSTER_MODE: u16 = 2027;
 const SGR_PIXEL_MOUSE_MODE: u16 = 1016;
 /// DEC private mode for Kitty OSC 5522 paste-event notifications.
 const PASTE_EVENTS_MODE: u16 = 5522;
-/// Eggie's identity returned for XTVERSION queries.
-const XTVERSION_RESPONSE: &str = "\x1bP>|Eggie 0.1.0\x1b\\";
+/// Identity returned for XTVERSION queries.
+///
+/// The `kitty(<version>)` shape is exactly what notcurses parses to classify the terminal
+/// (`kitty(` prefix, `)` suffix — see notcurses `src/lib/in.c`). Reporting it makes notcurses run
+/// its Kitty heuristics, which grant Unicode-13 **sextant** (3x2) and quadrant (2x2) blitters —
+/// Eggie's own reply (`Eggie 0.1.0`) matched no prefix and fell back to Alacritty, the one profile
+/// notcurses explicitly denies sextants. The version sits in [0.20.0, 0.23.1]: notcurses enables
+/// its `NCPIXEL_KITTY_ANIMATED` bitmap backend at ≥0.20.0 (Eggie implements Kitty animation/frame
+/// composition), while staying ≤0.23.1 avoids the extra XTPUSHCOLORS escapes it only adds above
+/// that version.
+const XTVERSION_RESPONSE: &str = "\x1bP>|kitty(0.21.0)\x1b\\";
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
