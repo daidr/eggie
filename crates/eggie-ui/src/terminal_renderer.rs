@@ -455,8 +455,15 @@ pub(crate) struct TerminalImageData {
 #[derive(Clone, Debug)]
 pub(crate) enum PixelStore {
     Owned(Arc<Vec<u8>>),
+    /// A read-only mmap plus the image's *logical* byte length. POSIX shm objects are rounded up to
+    /// a page boundary, so the mmap is often larger than the pixels; `len` clips it back to the
+    /// image so `as_bytes()` never exposes the page padding (which would fail the Metal upload's
+    /// exact-length check and blank every image).
     #[cfg(unix)]
-    Mapped(Arc<memmap2::Mmap>),
+    Mapped {
+        mmap: Arc<memmap2::Mmap>,
+        len: usize,
+    },
 }
 
 impl PixelStore {
@@ -464,7 +471,7 @@ impl PixelStore {
         match self {
             PixelStore::Owned(bytes) => bytes,
             #[cfg(unix)]
-            PixelStore::Mapped(mmap) => mmap,
+            PixelStore::Mapped { mmap, len } => &mmap[..*len],
         }
     }
 
@@ -2164,6 +2171,48 @@ mod tests {
     use crate::settings::{AppSettings, ThemeMode, theme_catalog};
     use eggie_protocol::{TerminalCellPosition, TerminalColorOverride, TerminalSize};
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_pixel_store_clips_page_rounded_mmap_to_logical_length() {
+        // Regression: POSIX shm objects (and any mmap) are rounded up to a page boundary, so a
+        // 17-byte image maps to a page-sized region. PixelStore::Mapped must expose only the logical
+        // bytes — otherwise image_texture's exact-length check (pixels.len() == width*height*4)
+        // fails and every image blanks. Back the mmap with a temp file larger than the logical image.
+        use std::io::Write;
+
+        let logical_len = 17usize;
+        let page = 16 * 1024usize;
+        let mut backing = vec![0u8; page];
+        for (index, byte) in backing.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "eggie-pixelstore-test-{}",
+            std::process::id()
+        ));
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&backing).unwrap();
+            file.flush().unwrap();
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let _ = std::fs::remove_file(&path);
+        assert!(mmap.len() >= page, "mmap should span the whole backing file");
+
+        let store = PixelStore::Mapped {
+            mmap: Arc::new(mmap),
+            len: logical_len,
+        };
+        assert_eq!(store.len(), logical_len);
+        assert_eq!(store.as_bytes().len(), logical_len);
+        assert_eq!(
+            store.as_bytes(),
+            &backing[..logical_len],
+            "clipped bytes must be the leading logical pixels"
+        );
+    }
 
     fn menlo_family() -> Arc<str> {
         Arc::from("Menlo")
