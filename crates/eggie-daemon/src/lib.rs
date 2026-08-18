@@ -96,6 +96,12 @@ const TERMINAL_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 const PROGRESS_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 const MAX_WIRE_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMAGE_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+/// Upper bound for a shared-memory image segment. Because shm pixels never cross the socket, this
+/// must track the decoder's image limit (`kitty_graphics::MAX_IMAGE_BYTES`, 400 MiB =
+/// 10000×10000×4), NOT the 64 MiB wire-frame limit — an image up to 4096×4096 is exactly 64 MiB, so
+/// bounding shm by the wire limit would blank every larger image the terminal can legitimately
+/// decode.
+const MAX_SHM_IMAGE_BYTES: usize = 400 * 1024 * 1024;
 const PUBLISHED_SNAPSHOT_HISTORY: usize = 16;
 const OSC_EVENT_HISTORY: usize = 256;
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
@@ -832,6 +838,13 @@ pub enum TerminalImageFrame {
     Shm {
         metadata: TerminalImageChunkMetadata,
         segment_name: Vec<u8>,
+    },
+    /// The image is larger than one inline wire chunk, so the whole-image fetch only saw its first
+    /// chunk. The caller must fall back to [`DaemonConnection::append_terminal_image_chunk`] to walk
+    /// the remaining chunks. A typed variant (rather than a stringly-matched error) makes the
+    /// fallback contract explicit and compiler-checked.
+    InlineTooLarge {
+        metadata: TerminalImageChunkMetadata,
     },
 }
 
@@ -5543,16 +5556,24 @@ fn create_image_shm_segment(pixels: &[u8]) -> Result<ShmImageSegment> {
     let serial = SHM_SEGMENT_SERIAL.fetch_add(1, Ordering::Relaxed);
     let name = std::ffi::CString::new(format!("/eggie-img-{}-{serial}", process::id()))
         .context("shm segment name contained a nul byte")?;
-    let fd = unsafe {
-        libc::shm_open(
-            name.as_ptr(),
-            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-            0o600,
-        )
-    };
+    let flags = libc::O_CREAT | libc::O_RDWR | libc::O_EXCL;
+    let mut fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("shm_open failed to create image segment");
+        let error = std::io::Error::last_os_error();
+        // EEXIST means a prior daemon instance crashed (Drop never ran) and the OS reused its pid,
+        // so this exact name is an orphaned, linked segment. It belongs to our pid namespace and no
+        // live instance references it, so reclaim it and retry once rather than tearing down the
+        // connection.
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            unsafe {
+                libc::shm_unlink(name.as_ptr());
+            }
+            fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600) };
+        }
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("shm_open failed to create image segment");
+        }
     }
     // Arm the guard as soon as the object exists so every later error path unlinks it.
     let guard = ShmImageSegment { name, armed: true };
@@ -5699,8 +5720,8 @@ fn read_image_shm_segment(
         libc::shm_unlink(name.as_ptr());
     }
     let file = unsafe { File::from_raw_fd(fd) };
-    if total_length > MAX_WIRE_MESSAGE_SIZE {
-        bail!("image segment exceeds {MAX_WIRE_MESSAGE_SIZE} bytes: {total_length}");
+    if total_length > MAX_SHM_IMAGE_BYTES {
+        bail!("image segment exceeds {MAX_SHM_IMAGE_BYTES} bytes: {total_length}");
     }
     if total_length == 0 {
         return Ok(0);
@@ -6138,11 +6159,9 @@ impl DaemonConnection {
                     &mut pixels,
                 )?;
                 if metadata.chunk_length != metadata.total_length {
-                    bail!(
-                        "inline image frame delivered {} of {} bytes; use append_terminal_image_chunk for images larger than one chunk",
-                        metadata.chunk_length,
-                        metadata.total_length
-                    );
+                    // Only the first chunk arrived; the caller must walk the rest with
+                    // append_terminal_image_chunk. Signal that with a typed variant, not an error.
+                    return Ok(TerminalImageFrame::InlineTooLarge { metadata });
                 }
                 Ok(TerminalImageFrame::Inline { metadata, pixels })
             }
@@ -6644,6 +6663,50 @@ mod tests {
         assert_eq!(decoded.chunk_length as usize, expected.len());
         assert_eq!(&destination[..2], &[9, 9]);
         assert_eq!(&destination[2..], &expected[..]);
+    }
+
+    #[test]
+    fn shm_transport_carries_images_larger_than_the_wire_frame_limit() {
+        // Regression: shm pixels never cross the socket, so the segment must be bounded by the
+        // decoder's image limit (400 MiB), not MAX_WIRE_MESSAGE_SIZE (64 MiB). An image just over
+        // 64 MiB (e.g. 4097x4096x4) must round-trip; the earlier code bailed at the wire limit and
+        // blanked every image larger than 4096x4096.
+        let total = 64 * 1024 * 1024 + 4096; // just past the old 64 MiB cap
+        let expected: Vec<u8> = (0..=255u8).cycle().take(total).collect();
+        let segment = create_image_shm_segment(&expected).unwrap();
+        let metadata = TerminalImageChunkMetadata {
+            key: TerminalImageKey {
+                id: 3,
+                generation: 1,
+            },
+            width: 4097,
+            height: 4096,
+            total_length: expected.len() as u32,
+            offset: 0,
+            chunk_length: expected.len() as u32,
+        };
+
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let name = segment.name_bytes().to_vec();
+        let writer_thread = thread::spawn(move || {
+            let mut segment = segment;
+            let result = write_terminal_image_shm_wire(&mut writer, &metadata, &name);
+            segment.disarm();
+            result
+        });
+
+        let mut reader = BufReader::new(reader);
+        let header = read_wire_header(&mut reader).unwrap().unwrap();
+        let (kind, length) = classify_wire_header(header);
+        assert_eq!(kind, WireFrameKind::ShmImage);
+        let mut destination = Vec::new();
+        let decoded =
+            read_terminal_image_shm_wire_into(&mut reader, length, &mut destination).unwrap();
+
+        writer_thread.join().unwrap().unwrap();
+        assert_eq!(decoded.total_length as usize, total);
+        assert_eq!(destination.len(), total);
+        assert_eq!(destination, expected);
     }
 
     #[test]
