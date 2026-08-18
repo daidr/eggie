@@ -6329,18 +6329,25 @@ mod tests {
             let lines = snapshot.plain_lines();
             let identified = lines
                 .iter()
-                .any(|line| line.contains("notcurses") && line.contains(" on Alacritty "));
+                .any(|line| line.contains("notcurses") && line.contains(" on Kitty "));
+            // Reporting a `kitty(...)` XTVERSION makes notcurses run its Kitty heuristics, which
+            // grant both quadrant (2x2) and Unicode-13 sextant (3x2) blitters. The Alacritty
+            // profile Eggie used to match is the one notcurses explicitly denies sextants.
             let quadrants = lines.iter().any(|line| line.contains("2x2+"));
+            let sextants = lines.iter().any(|line| line.contains("3x2+"));
             let terminal_capabilities = lines
                 .iter()
                 .any(|line| line.contains("uline+") && line.contains("rgb+"));
             let graphics_and_input = lines.iter().any(|line| line.contains("kbd+"))
                 && lines.iter().any(|line| line.contains("pmouse+"))
+                // Kitty heuristics enable notcurses' animated pixel backend, so the banner reads
+                // "rgba pixel animation support" rather than the "…graphics support" wording seen
+                // under the old Alacritty profile. Match the substring common to both.
                 && lines
                     .iter()
-                    .any(|line| line.contains("rgba pixel graphics support"));
+                    .any(|line| line.contains("rgba pixel") && line.contains("support"));
             let finished = lines.iter().any(|line| line.contains("renders,"));
-            if identified && quadrants && terminal_capabilities && graphics_and_input && finished {
+            if identified && quadrants && sextants && terminal_capabilities && graphics_and_input && finished {
                 let placement = snapshot
                     .image_placements
                     .first()
