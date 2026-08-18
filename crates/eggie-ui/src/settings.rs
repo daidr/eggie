@@ -1,6 +1,6 @@
 use gpui::Context;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, process::Command, sync::OnceLock};
+use std::{path::PathBuf, process::Command, sync::OnceLock};
 
 include!(concat!(env!("OUT_DIR"), "/ghostty_themes.rs"));
 
@@ -1001,14 +1001,11 @@ pub(crate) struct SettingsStore {
 
 impl SettingsStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(settings_path())
+        Self::load_from(crate::persist::data_file_path("settings.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let mut config = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<AppSettings>(&bytes).ok())
-            .unwrap_or_default();
+        let mut config = crate::persist::load_json::<AppSettings>(&path).unwrap_or_default();
         config.normalize();
         Self {
             config,
@@ -1063,28 +1060,8 @@ impl SettingsStore {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let encoded = serde_json::to_vec_pretty(&self.config)?;
-        let temporary_path = self.path.with_extension("json.tmp");
-        fs::write(&temporary_path, encoded)?;
-        fs::rename(temporary_path, &self.path)
+        crate::persist::save_json_atomic(&self.path, &self.config)
     }
-}
-
-fn settings_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    return home
-        .join("Library")
-        .join("Application Support")
-        .join("Eggie")
-        .join("settings.json");
-    #[cfg(not(target_os = "macos"))]
-    return home.join(".config").join("eggie").join("settings.json");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1300,6 +1277,7 @@ fn mix(base: u32, overlay: u32, amount: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn bundled_catalog_contains_dark_and_light_ghostty_themes() {

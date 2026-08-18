@@ -8,7 +8,6 @@
 //! 执行语义(见 handoff 决策):snippet 的 `content` 末尾带 `\n` → 注入后由内容本身触发执行,
 //! 不带则只键入。**不额外存储「是否自动执行」标志位** —— 执行意图完全由 `content` 决定。
 
-use std::fs;
 use std::path::PathBuf;
 
 use gpui::Context;
@@ -57,13 +56,11 @@ pub(crate) struct SnippetStore {
 
 impl SnippetStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(snippets_path())
+        Self::load_from(crate::persist::data_file_path("snippets.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let snippets = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistedSnippets>(&bytes).ok())
+        let snippets = crate::persist::load_json::<PersistedSnippets>(&path)
             .map(|persisted| persisted.snippets)
             .unwrap_or_default();
         Self { snippets, path }
@@ -113,39 +110,18 @@ impl SnippetStore {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let persisted = PersistedSnippets {
             version: PERSIST_VERSION,
             snippets: self.snippets.clone(),
         };
-        let encoded = serde_json::to_vec_pretty(&persisted)?;
-        let temporary_path = self.path.with_extension("json.tmp");
-        fs::write(&temporary_path, encoded)?;
-        fs::rename(temporary_path, &self.path)
+        crate::persist::save_json_atomic(&self.path, &persisted)
     }
-}
-
-/// 与 `projects_path()` 同目录:macOS `~/Library/Application Support/Eggie/snippets.json`,
-/// 其它平台 `~/.config/eggie/snippets.json`。
-fn snippets_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    return home
-        .join("Library")
-        .join("Application Support")
-        .join("Eggie")
-        .join("snippets.json");
-    #[cfg(not(target_os = "macos"))]
-    return home.join(".config").join("eggie").join("snippets.json");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp_path() -> PathBuf {
         let dir =
