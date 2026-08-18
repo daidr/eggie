@@ -28,7 +28,7 @@ use crate::terminal_renderer::{
     TerminalTextureKey,
     terminal_background, terminal_cell_metrics,
 };
-use eggie_daemon::{DaemonClient, DaemonInputSender};
+use eggie_daemon::{DaemonClient, DaemonConnection, DaemonInputSender};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
     SplitId, TabGroup, TabItem, WindowId,
@@ -137,35 +137,23 @@ struct TerminalImageStreamKey {
     image_id: u32,
 }
 
-fn fetch_terminal_image(
-    client: DaemonClient,
+/// Pull one terminal image over an already-open, reusable daemon connection.
+///
+/// The caller owns the [`DaemonConnection`] and keeps it across generations, so an animated image
+/// no longer pays a fresh `connect()` per frame. Retries/backoff are the caller's responsibility
+/// (the image-stream worker reconnects and paces itself), which is why this takes `&mut` rather
+/// than owning the connection: on success the caller keeps reusing it, on error the caller drops
+/// it and reconnects next round.
+fn fetch_terminal_image_chunked(
+    connection: &mut DaemonConnection,
     session_id: SessionId,
-    descriptor: TerminalImageDescriptor,
-) -> anyhow::Result<TerminalImageData> {
-    let mut last_error = None;
-    for attempt in 0..3 {
-        match fetch_terminal_image_once(client.clone(), session_id, descriptor.clone()) {
-            Ok(image) => return Ok(image),
-            Err(error) => last_error = Some(error),
-        }
-        if attempt < 2 {
-            std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
-        }
-    }
-    Err(last_error.expect("terminal image transfer attempted at least once"))
-}
-
-fn fetch_terminal_image_once(
-    client: DaemonClient,
-    session_id: SessionId,
-    descriptor: TerminalImageDescriptor,
+    descriptor: &TerminalImageDescriptor,
 ) -> anyhow::Result<TerminalImageData> {
     let expected_length = descriptor
         .width
         .checked_mul(descriptor.height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| anyhow::anyhow!("terminal image dimensions overflow"))?;
-    let mut connection = client.connect()?;
     let mut pixels = Vec::with_capacity(expected_length as usize);
     while pixels.len() < expected_length as usize {
         let offset = pixels.len() as u32;
@@ -2245,10 +2233,6 @@ impl EggieApp {
     fn schedule_terminal_images(&mut self, snapshot: &TerminalSnapshot, cx: &mut Context<Self>) {
         self.terminal_renderer.retain_snapshot_images(snapshot);
         for descriptor in &snapshot.images {
-            let key = TerminalTextureKey {
-                session_id: snapshot.session_id,
-                image: descriptor.key,
-            };
             let stream_key = TerminalImageStreamKey {
                 session_id: snapshot.session_id,
                 image_id: descriptor.key.id,
@@ -2260,51 +2244,125 @@ impl EggieApp {
             {
                 continue;
             }
-            let client = self.client.clone();
-            let descriptor = descriptor.clone();
-            let executor = cx.background_executor().clone();
-            cx.spawn(async move |this, cx| {
-                let result = executor
-                    .spawn(async move { fetch_terminal_image(client, key.session_id, descriptor) })
-                    .await;
-                let _ = this.update_in(cx, |app, window, cx| {
-                    app.terminal_images_in_flight.remove(&stream_key);
-                    match result {
-                        Ok(image) => {
-                            let still_live =
-                                app.snapshots.get(&key.session_id).is_some_and(|snapshot| {
-                                    snapshot
-                                        .images
-                                        .iter()
-                                        .any(|descriptor| descriptor.key == key.image)
-                                });
-                            if still_live {
-                                app.terminal_renderer.install_image(image);
-                            }
-                            // Start the newest generation immediately after this stream becomes
-                            // available. Waiting for the next platform frame here adds a full vsync
-                            // of idle time per transfer and caps image animations below the PTY's
-                            // production rate even when the raw Unix-socket copy finished early.
-                            if let Some(snapshot) = app.snapshots.get(&key.session_id).cloned() {
-                                app.schedule_terminal_images(&snapshot, cx);
-                            }
-                            // Even when this transfer was superseded, present the newest complete
-                            // snapshot so a fast animation cannot leave the renderer waiting on an
-                            // image generation which will never be presented.
-                            app.schedule_terminal_frame(window, cx);
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "failed to fetch terminal image {} generation {}: {error:#}",
-                                key.image.id, key.image.generation
-                            );
-                        }
-                    }
-                });
-            })
-            .detach();
+            // A persistent worker now owns this image stream: it holds one reusable daemon
+            // connection and keeps pulling the newest un-cached generation of `image_id` until the
+            // image disappears or the session hides. `terminal_images_in_flight` marks the worker
+            // as alive; the worker clears it atomically on exit, and the next snapshot re-arms it
+            // through the frame path if a fresh generation appears afterward.
+            self.start_terminal_image_stream(snapshot.session_id, descriptor.key.id, cx);
         }
     }
+
+    /// Own one `(session_id, image_id)` image stream for its whole animated lifetime.
+    ///
+    /// Replaces the old "spawn a one-shot fetch per generation" scheme, which paid a fresh
+    /// `connect()` every frame and only started the next generation after a main-thread round-trip.
+    /// This worker mirrors [`Self::start_snapshot_watching`]: it keeps a reusable
+    /// [`DaemonConnection`] across generations, and each round pulls whatever generation of
+    /// `image_id` the current snapshot references — so intermediate generations produced while a
+    /// transfer was in flight are skipped automatically rather than fetched in order.
+    ///
+    /// Exit and the `terminal_images_in_flight` removal happen inside the same `update` (one app
+    /// lock), so a generation arriving after the worker exits is never lost: the snapshot's frame
+    /// path re-runs [`Self::schedule_terminal_images`], finds the stream key absent, and re-spawns.
+    fn start_terminal_image_stream(
+        &self,
+        session_id: SessionId,
+        image_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let stream_key = TerminalImageStreamKey {
+            session_id,
+            image_id,
+        };
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let mut connection: Option<DaemonConnection> = None;
+            // Read the newest un-cached descriptor for this stream. Returns `None` (and clears the
+            // alive marker under the same lock) when there is nothing left to fetch, ending the
+            // worker.
+            while let Some(descriptor) = this
+                .update(cx, |app, _| {
+                    let descriptor = app
+                        .is_visible_active_session(session_id)
+                        .then(|| {
+                            app.snapshots.get(&session_id).and_then(|snapshot| {
+                                snapshot
+                                    .images
+                                    .iter()
+                                    .find(|descriptor| descriptor.key.id == image_id)
+                                    .cloned()
+                            })
+                        })
+                        .flatten()
+                        .filter(|descriptor| {
+                            !app.terminal_renderer.has_image(session_id, descriptor.key)
+                        });
+                    if descriptor.is_none() {
+                        app.terminal_images_in_flight.remove(&stream_key);
+                    }
+                    descriptor
+                })
+                .ok()
+                .flatten()
+            {
+                let request_client = client.clone();
+                let (next_connection, result) = executor
+                    .spawn(async move {
+                        let mut connected = match connection.take() {
+                            Some(connected) => connected,
+                            None => match request_client.connect() {
+                                Ok(connected) => connected,
+                                Err(error) => return (None, Err(error)),
+                            },
+                        };
+                        let result =
+                            fetch_terminal_image_chunked(&mut connected, session_id, &descriptor);
+                        if result.is_ok() {
+                            (Some(connected), result)
+                        } else {
+                            (None, result)
+                        }
+                    })
+                    .await;
+                connection = next_connection;
+                let request_failed = result.is_err();
+                let update = this.update_in(cx, |app, window, cx| match result {
+                    Ok(image) => {
+                        // The descriptor can vanish between the fetch and now (fast animation).
+                        // Only install pixels the current snapshot still references.
+                        let still_live = app.snapshots.get(&session_id).is_some_and(|snapshot| {
+                            snapshot
+                                .images
+                                .iter()
+                                .any(|descriptor| descriptor.key == image.key.image)
+                        });
+                        if still_live {
+                            app.terminal_renderer.install_image(image);
+                        }
+                        app.schedule_terminal_frame(window, cx);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "failed to fetch terminal image {image_id} of session {session_id}: {error:#}"
+                        );
+                    }
+                });
+                if update.is_err() {
+                    eprintln!("terminal image update lost its window");
+                    break;
+                }
+                if request_failed {
+                    // Connection was dropped above; back off before reconnecting. If the image is
+                    // simply gone, the next loop head reads no descriptor and exits cleanly.
+                    executor.timer(Duration::from_millis(25)).await;
+                }
+            }
+        })
+        .detach();
+    }
+
 
     /// Coalesce terminal revisions and image arrivals onto the platform frame boundary.
     ///
