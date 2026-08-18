@@ -829,6 +829,27 @@ impl Language {
         }
     }
 
+    pub(crate) fn update_current_version(self) -> &'static str {
+        match self {
+            Self::English => "Current version",
+            Self::SimplifiedChinese => "当前版本",
+        }
+    }
+
+    pub(crate) fn update_new_version(self) -> &'static str {
+        match self {
+            Self::English => "New version",
+            Self::SimplifiedChinese => "新版本",
+        }
+    }
+
+    pub(crate) fn update_release_notes(self) -> &'static str {
+        match self {
+            Self::English => "What's new",
+            Self::SimplifiedChinese => "更新内容",
+        }
+    }
+
     pub(crate) fn update_checking(self) -> &'static str {
         match self {
             Self::English => "Checking for updates…",

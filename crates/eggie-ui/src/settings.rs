@@ -309,10 +309,7 @@ impl FontMetricAdjustments {
     }
 }
 
-const DEFAULT_PALETTE: [u32; 16] = [
-    0x1d2027, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370,
-    0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
-];
+use eggie_protocol::DEFAULT_PALETTE;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
