@@ -744,15 +744,16 @@ struct RecycledTerminalImage {
 }
 
 /// Whether to attempt zero-copy image upload (`new_buffer_with_bytes_no_copy` over the shm mmap,
-/// skipping `replace_region`). Off by default: the alignment and cross-process lifetime assumptions
-/// need validation on real hardware before it becomes the default. Set `EGGIE_IMAGE_ZERO_COPY=1`.
+/// skipping `replace_region`). On by default; the path degrades safely (falls back to
+/// `replace_region` when the row stride is unaligned or the image is not shm-mapped) and the mmap's
+/// GPU lifetime is bound to the buffer's deallocator. Set `EGGIE_IMAGE_ZERO_COPY=0` to force the
+/// copy path.
 #[cfg(unix)]
 fn image_zero_copy_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("EGGIE_IMAGE_ZERO_COPY")
-            .is_some_and(|value| !value.is_empty() && value != "0")
+        std::env::var_os("EGGIE_IMAGE_ZERO_COPY").is_none_or(|value| value != "0")
     })
 }
 
