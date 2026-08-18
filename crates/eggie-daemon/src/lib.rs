@@ -6835,6 +6835,252 @@ mod tests {
         assert!(p95 < Duration::from_millis(50));
     }
 
+    // Dimensions of the synthetic image the two per-generation image benchmarks below transmit.
+    // A retina-ish full-screen frame at ~20 MiB reproduces the notcurses `xray` workload where
+    // every frame bumps a new image generation, defeating the `{id, generation}`-keyed caches and
+    // forcing a full re-transfer. RGBA (4 bytes/px): 2560 * 2048 * 4 = 20 MiB exactly. Both are
+    // well under `MAX_IMAGE_DIMENSION` (10_000) and `MAX_IMAGE_BYTES` (400 MiB).
+    const BENCH_IMAGE_WIDTH: u32 = 2560;
+    const BENCH_IMAGE_HEIGHT: u32 = 2048;
+    const BENCH_IMAGE_ID: u32 = 42;
+
+    /// Build the base64 payload once (the ~27 MiB encode is the expensive part and must stay out of
+    /// the timed region — `xray`'s cache misses come from generation bumps, not pixel changes, so a
+    /// constant image is representative for a *transport* benchmark). A single Kitty APC command is
+    /// capped at `MAX_COMMAND_BYTES` (16 MiB), so the payload is split into `m=1` continuation
+    /// chunks with the metadata carried on the first, mirroring `chunked_transmission_keeps_metadata_from_first_chunk`.
+    fn bench_transmit_commands() -> Vec<Vec<u8>> {
+        let expected = (BENCH_IMAGE_WIDTH as usize) * (BENCH_IMAGE_HEIGHT as usize) * 4;
+        // Content is irrelevant to a transport benchmark; a fixed byte keeps the encode deterministic.
+        let encoded = BASE64.encode(vec![0x7f_u8; expected]);
+        // Stay comfortably below the 16 MiB per-command ceiling; base64 must not split mid-quantum.
+        const CHUNK: usize = 8 * 1024 * 1024;
+        let chunk = CHUNK - (CHUNK % 4);
+        let bytes = encoded.as_bytes();
+        let mut commands = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + chunk).min(bytes.len());
+            let more = if end < bytes.len() { 1 } else { 0 };
+            let segment = &bytes[offset..end];
+            let command = if offset == 0 {
+                format!(
+                    "a=T,f=32,s={},v={},i={},m={};",
+                    BENCH_IMAGE_WIDTH, BENCH_IMAGE_HEIGHT, BENCH_IMAGE_ID, more
+                )
+            } else {
+                format!("m={more};")
+            };
+            let mut payload = command.into_bytes();
+            payload.extend_from_slice(segment);
+            commands.push(payload);
+            offset = end;
+        }
+        commands
+    }
+
+    /// Delete the previous image and re-transmit it, minting a fresh `{id, generation}` (see
+    /// `transmit`, which does `generation = wrapping_add(1).max(1)`), then publish. Returns the new
+    /// key the daemon now serves. Mirrors the delete+retransmit dance in
+    /// `kitty_graphics_crosses_the_real_pty_snapshot_and_resource_paths`.
+    fn bench_bump_image_generation(
+        session: &TerminalSession,
+        commands: &[Vec<u8>],
+    ) -> TerminalImageKey {
+        {
+            let mut terminal = session.terminal.lock();
+            terminal.kitty_graphics_command(format!("a=d,d=I,i={BENCH_IMAGE_ID},q=2;").as_bytes());
+            for command in commands {
+                terminal.kitty_graphics_command(command);
+            }
+            session.events.publish_terminal(&terminal);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            if let Some(descriptor) = snapshot
+                .images
+                .iter()
+                .find(|image| image.key.id == BENCH_IMAGE_ID)
+            {
+                assert_eq!(
+                    (descriptor.width, descriptor.height),
+                    (BENCH_IMAGE_WIDTH, BENCH_IMAGE_HEIGHT),
+                    "published image geometry drifted from the transmitted APC"
+                );
+                return descriptor.key;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "re-transmitted benchmark image never reached the published snapshot"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "performance benchmark: full-screen per-generation Kitty image transport over the wire"]
+    fn image_generation_wire_transport_benchmark() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = Arc::new(
+            TerminalSession::spawn_default(
+                ProjectId::new_v4(),
+                std::env::current_dir().unwrap(),
+                TerminalSize {
+                    columns: 229,
+                    rows: 74,
+                    cell_width: 8,
+                    cell_height: 18,
+                },
+                TerminalAppearance::default(),
+            )
+            .unwrap(),
+        );
+        let session_id = session.id;
+        let state = Arc::new(DaemonState {
+            sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
+            build_id: Arc::from("benchmark"),
+        });
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_state = state.clone();
+        let server = thread::spawn(move || serve_connection(server_stream, &server_state));
+        let mut connection = DaemonConnection {
+            stream: BufReader::new(client_stream),
+            request: Vec::with_capacity(512),
+            response: Vec::with_capacity(1024 * 1024),
+        };
+
+        thread::sleep(Duration::from_millis(100));
+        let commands = bench_transmit_commands();
+        let expected_length = (BENCH_IMAGE_WIDTH as usize) * (BENCH_IMAGE_HEIGHT as usize) * 4;
+
+        let iterations = 60;
+        let mut samples = Vec::with_capacity(iterations);
+        let mut pixels = Vec::with_capacity(expected_length);
+        let mut chunks_per_frame = 0;
+        for _ in 0..iterations {
+            // Minting the new generation, injecting the APC and publishing are all excluded from the
+            // timed region — only the wire fetch of one complete generation is measured.
+            let key = bench_bump_image_generation(&session, &commands);
+            pixels.clear();
+            let started = Instant::now();
+            let mut chunks = 0;
+            while pixels.len() < expected_length {
+                let offset = pixels.len() as u32;
+                let metadata = connection
+                    .append_terminal_image_chunk(
+                        session_id,
+                        key,
+                        offset,
+                        16 * 1024 * 1024,
+                        &mut pixels,
+                    )
+                    .unwrap();
+                chunks += 1;
+                assert_eq!(metadata.key, key);
+                assert_eq!(metadata.total_length as usize, expected_length);
+                assert_eq!(metadata.offset, offset);
+                assert!(metadata.chunk_length > 0, "wire transfer stalled mid-frame");
+            }
+            samples.push(started.elapsed());
+            chunks_per_frame = chunks;
+            assert_eq!(pixels.len(), expected_length, "frame arrived incomplete");
+        }
+
+        samples.sort_unstable();
+        let p50 = samples[(samples.len() - 1) * 50 / 100];
+        let p95 = samples[(samples.len() - 1) * 95 / 100];
+        let wire_bytes_per_frame =
+            expected_length + chunks_per_frame * RAW_TERMINAL_IMAGE_METADATA_SIZE;
+        // Each frame is copied at least twice on the wire path: the daemon's `write_all` of the Arc
+        // slice into the socket (`write_terminal_image_wire`) and the client's `read_exact` into the
+        // destination Vec (`read_terminal_image_wire_into`). These two copies are exactly what Route
+        // A's shared-memory transport is meant to eliminate.
+        let total_memcpy = 2 * expected_length * iterations;
+        eprintln!(
+            "{}x{} image over wire: bytes/frame={:.2}MiB chunks={} p50={:.2}ms p95={:.2}ms ({:.1} fps) total_memcpy={:.0}MiB",
+            BENCH_IMAGE_WIDTH,
+            BENCH_IMAGE_HEIGHT,
+            wire_bytes_per_frame as f64 / (1024. * 1024.),
+            chunks_per_frame,
+            p50.as_secs_f64() * 1_000.,
+            p95.as_secs_f64() * 1_000.,
+            1. / p50.as_secs_f64(),
+            total_memcpy as f64 / (1024. * 1024.),
+        );
+
+        session.terminate();
+        drop(connection);
+        server.join().unwrap().unwrap();
+        // Loose smoke guard only: absolute latency is memcpy-bandwidth and scheduler dependent, so a
+        // tight threshold would flap across machines. The value of this benchmark is the printed
+        // numbers, compared before/after Route A.
+        assert!(p95 < Duration::from_millis(500));
+    }
+
+    #[test]
+    #[ignore = "performance benchmark: daemon-side per-generation chunk borrow stays zero-copy"]
+    fn image_generation_chunk_ref_stays_zero_copy() {
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = TerminalSession::spawn_default(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 229,
+                rows: 74,
+                cell_width: 8,
+                cell_height: 18,
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+        let commands = bench_transmit_commands();
+        let expected_length = (BENCH_IMAGE_WIDTH as usize) * (BENCH_IMAGE_HEIGHT as usize) * 4;
+
+        let iterations = 60;
+        let mut samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let key = bench_bump_image_generation(&session, &commands);
+            // `image_chunk_ref` only clones the immutable `Arc<PixelBuffer>` and computes slice
+            // bounds — no pixel bytes are copied. A single call is capped at `MAX_IMAGE_CHUNK_SIZE`
+            // (16 MiB), so walk the whole generation in chunks exactly as the wire path does, but
+            // daemon-side only. Timing this confirms the daemon fetch stays O(1) per chunk
+            // regardless of image size, and guards that property against regressions.
+            let started = Instant::now();
+            let mut fetched = 0usize;
+            while fetched < expected_length {
+                let chunk = session
+                    .image_chunk_ref(key, fetched as u32, expected_length as u32)
+                    .unwrap();
+                assert_eq!(chunk.total_length as usize, expected_length);
+                let chunk_len = chunk.bytes().len();
+                assert!(chunk_len > 0, "chunk borrow stalled mid-frame");
+                fetched += chunk_len;
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(fetched, expected_length, "chunk borrows did not cover the frame");
+            samples.push(elapsed);
+        }
+
+        samples.sort_unstable();
+        let p50 = samples[(samples.len() - 1) * 50 / 100];
+        let p95 = samples[(samples.len() - 1) * 95 / 100];
+        eprintln!(
+            "{}x{} daemon chunk_ref borrow: p50={:.1}us p95={:.1}us (zero-copy Arc clone)",
+            BENCH_IMAGE_WIDTH,
+            BENCH_IMAGE_HEIGHT,
+            p50.as_secs_f64() * 1_000_000.,
+            p95.as_secs_f64() * 1_000_000.,
+        );
+
+        session.terminate();
+        // A zero-copy Arc clone + bounds math must stay far below a millisecond even for a 20 MiB
+        // image; a regression to per-fetch copying would blow past this.
+        assert!(p95 < Duration::from_millis(5));
+    }
+
     #[test]
     fn adjacent_input_messages_are_coalesced_without_losing_order() {
         let session_id = SessionId::new_v4();
