@@ -2224,7 +2224,7 @@ mod tests {
             key,
             width: 1,
             height: 1,
-            pixels: Arc::new(vec![255; 4]),
+            pixels: crate::terminal_renderer::PixelStore::Owned(Arc::new(vec![255; 4])),
         });
         let mut commands = (0..2048)
             .map(|column| MetalCommand::Image {

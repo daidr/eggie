@@ -445,7 +445,36 @@ pub(crate) struct TerminalImageData {
     pub(crate) key: TerminalTextureKey,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) pixels: Arc<Vec<u8>>,
+    pub(crate) pixels: PixelStore,
+}
+
+/// Backing store for a decoded image's pixels. `Owned` holds a `Vec` reconstructed from the wire;
+/// `Mapped` holds a read-only mmap of a daemon shm segment, so the pixels are never copied into a
+/// `Vec` — the UI reads them straight from shared memory (Route A). Both deref to `&[u8]`, so the
+/// Metal upload path (`.as_ptr()` + `.len()`) is agnostic to which one it holds.
+#[derive(Clone, Debug)]
+pub(crate) enum PixelStore {
+    Owned(Arc<Vec<u8>>),
+    #[cfg(unix)]
+    Mapped(Arc<memmap2::Mmap>),
+}
+
+impl PixelStore {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        match self {
+            PixelStore::Owned(bytes) => bytes,
+            #[cfg(unix)]
+            PixelStore::Mapped(mmap) => mmap,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.as_bytes().as_ptr()
+    }
 }
 
 struct TerminalMetalPrimitive {
@@ -2630,7 +2659,7 @@ mod tests {
             key: texture_key,
             width: 4,
             height: 4,
-            pixels: Arc::clone(&pixels),
+            pixels: PixelStore::Owned(Arc::clone(&pixels)),
         });
         let mut image_cache = FxHashMap::default();
         image_cache.insert(texture_key, Arc::clone(&image));
@@ -2668,7 +2697,7 @@ mod tests {
             panic!("image placement must stay on the dedicated Metal image path")
         };
         assert!(Arc::ptr_eq(prepared, &image));
-        assert!(Arc::ptr_eq(&prepared.pixels, &pixels));
+        assert!(std::ptr::eq(prepared.pixels.as_ptr(), pixels.as_ptr()));
         assert_eq!(*rect, [26., 39., 14., 15.]);
         assert_eq!(*source, [0.25, 0.25, 0.5, 0.5]);
     }
@@ -2691,7 +2720,7 @@ mod tests {
                     key: texture_key,
                     width: 1,
                     height: 1,
-                    pixels: Arc::new(vec![255; 4]),
+                    pixels: PixelStore::Owned(Arc::new(vec![255; 4])),
                 }),
             );
             snapshot
@@ -2795,7 +2824,7 @@ mod tests {
                 key: texture_key,
                 width: 4,
                 height: 4,
-                pixels: Arc::new(vec![255; 64]),
+                pixels: PixelStore::Owned(Arc::new(vec![255; 64])),
             }),
         );
         snapshot
@@ -2842,7 +2871,7 @@ mod tests {
                 key: texture_key,
                 width: 32,
                 height: 32,
-                pixels: Arc::new(vec![255; 32 * 32 * 4]),
+                pixels: PixelStore::Owned(Arc::new(vec![255; 32 * 32 * 4])),
             }),
         );
         snapshot
