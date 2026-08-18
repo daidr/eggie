@@ -3733,6 +3733,10 @@ impl TerminalSession {
         self.events.snapshot()
     }
 
+    /// Copy a chunk of a published image into an owned `Vec`. The production transfer path uses the
+    /// zero-copy [`image_chunk_ref`](Self::image_chunk_ref) instead; this allocating variant exists
+    /// only for tests that want to assert on the pixel bytes directly.
+    #[cfg(test)]
     fn image_chunk(
         &self,
         key: TerminalImageKey,
@@ -4869,22 +4873,13 @@ impl DaemonState {
                     .complete_file_transfer(request_id, destination)?;
                 Ok(DaemonResponse::Ok)
             }
-            ClientRequest::TerminalImage {
-                session_id,
-                key,
-                offset,
-                length,
-            } => {
-                let (width, height, total_length, bytes) =
-                    self.session(session_id)?.image_chunk(key, offset, length)?;
-                Ok(DaemonResponse::TerminalImage {
-                    key,
-                    width,
-                    height,
-                    total_length,
-                    offset,
-                    bytes,
-                })
+            ClientRequest::TerminalImage { .. } => {
+                // `serve_connection` intercepts `TerminalImage` before dispatching to `handle`,
+                // serving it through the zero-copy `image_chunk_ref` + `send_terminal_image_chunk`
+                // path. This arm is therefore never reached in production; keep it explicit so a
+                // future caller that bypasses `serve_connection` fails loudly instead of silently
+                // taking the allocating `image_chunk` path.
+                unreachable!("TerminalImage is served by serve_connection's zero-copy path")
             }
             ClientRequest::Input {
                 session_id,
