@@ -428,6 +428,10 @@ pub(crate) struct PreparedMetalTerminal {
     pub(crate) font_thicken: Option<u8>,
     /// Per-codepoint-range family overrides (`font-codepoint-map`). Empty = none.
     pub(crate) font_codepoint_map: Arc<[crate::settings::CodepointMapEntry]>,
+    /// False when a Kitty image placement in this snapshot references pixels not yet fetched into
+    /// the texture cache. Presentation gates on this to keep the last complete frame visible rather
+    /// than painting a blank where the image belongs.
+    pub(crate) images_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -927,9 +931,14 @@ impl Element for MetalTerminalElement {
             family,
             font_size_bits: font_size.to_bits(),
         };
+        // A frame is presentable only when both its glyph rasters and its image textures are
+        // ready. Gating on images here (not just in the App's frame scheduler) covers every
+        // present path — cursor blink, progress animation, hover — so an un-fetched image
+        // generation can never blank the image for a tick regardless of what triggered the draw.
+        let frame_ready = glyphs.ready && prepared.images_ready;
         let selected = {
             let mut cache = self.renderer.preparation_cache.lock();
-            if glyphs.ready {
+            if frame_ready {
                 cache.last_ready.insert(
                     self.snapshot.session_id,
                     ReadyPreparation {
@@ -947,10 +956,11 @@ impl Element for MetalTerminalElement {
                     .unwrap_or(prepared)
             }
         };
-        if !glyphs.ready {
+        if !frame_ready {
             // Worker completion is intentionally not coupled to App/Window lifetimes. A bounded
             // animation-frame retry keeps the last coherent terminal visible and notices newly
-            // ready raster results without posting cross-thread GPUI callbacks.
+            // ready raster results (or freshly fetched image textures) without posting cross-thread
+            // GPUI callbacks.
             window.request_animation_frame();
         }
         self.input_latency
@@ -1091,7 +1101,7 @@ fn prepare_terminal(
     // Hovered auto-detected URL: underline it in the accent color so it reads as clickable.
     let mut url_hover_commands =
         prepare_url_hover(url_hover, snapshot, cell_width, line_height, (accent << 8) | 0xff);
-    let (mut images_below_background, mut images_below_text, mut images_above_text) =
+    let (mut images_below_background, mut images_below_text, mut images_above_text, images_ready) =
         prepare_images(snapshot, cell_width, line_height, scale_factor, image_cache);
     let mut commands = Vec::with_capacity(
         1 + images_below_background.len()
@@ -1143,6 +1153,7 @@ fn prepare_terminal(
         font_variations,
         font_thicken,
         font_codepoint_map,
+        images_ready,
     }
 }
 
@@ -1152,11 +1163,16 @@ fn prepare_images(
     line_height: f32,
     scale_factor: f32,
     image_cache: &FxHashMap<TerminalTextureKey, Arc<TerminalImageData>>,
-) -> (Vec<MetalCommand>, Vec<MetalCommand>, Vec<MetalCommand>) {
+) -> (Vec<MetalCommand>, Vec<MetalCommand>, Vec<MetalCommand>, bool) {
     const BELOW_BACKGROUND_LIMIT: i32 = i32::MIN / 2;
     let mut below_background = Vec::new();
     let mut below_text = Vec::new();
     let mut above_text = Vec::new();
+    // False as soon as any placement references a texture that has not been fetched into the cache
+    // yet. Callers gate presentation on this so a snapshot whose pixels are still in flight keeps
+    // the last complete frame on screen instead of dropping the image for a blank tick — the cause
+    // of visible flashing in fast Kitty animations (notcurses xray, intro pans).
+    let mut images_ready = true;
     let pixel_scale = scale_factor.max(1.);
     // The terminal core already emits Kitty's (z-index, internal image id, internal ref id)
     // order. Client-provided image and placement IDs are not ordering keys.
@@ -1166,6 +1182,9 @@ fn prepare_images(
             image: placement.image,
         };
         let Some(image) = image_cache.get(&key) else {
+            // Pixels not fetched yet: this frame is incomplete. A degenerate (0-sized) image below
+            // is a permanently unusable placement, not an in-flight one, so it does not block.
+            images_ready = false;
             continue;
         };
         if image.width == 0 || image.height == 0 {
@@ -1202,7 +1221,7 @@ fn prepare_images(
             above_text.push(command);
         }
     }
-    (below_background, below_text, above_text)
+    (below_background, below_text, above_text, images_ready)
 }
 
 struct TerminalGrid<'a> {
@@ -2634,7 +2653,7 @@ mod tests {
         };
         snapshot.image_placements = vec![placement(i32::MIN), placement(-1), placement(0)];
 
-        let (below_background, below_text, above_text) =
+        let (below_background, below_text, above_text, _images_ready) =
             prepare_images(&snapshot, 8., 18., 1., &image_cache);
         assert_eq!(
             (below_background.len(), below_text.len(), above_text.len()),
@@ -2798,7 +2817,7 @@ mod tests {
                 destination_height: 30,
                 z: 0,
             });
-        let (_, _, above) = prepare_images(&snapshot, 8.5, 18., 2., &image_cache);
+        let (_, _, above, _) = prepare_images(&snapshot, 8.5, 18., 2., &image_cache);
         let MetalCommand::Image { rect, .. } = &above[0] else {
             panic!("image command expected")
         };
@@ -2848,7 +2867,7 @@ mod tests {
                 z: -1,
             });
 
-        let (_, below_text, _) = prepare_images(&snapshot, 8., 18., 1., &image_cache);
+        let (_, below_text, _, _) = prepare_images(&snapshot, 8., 18., 1., &image_cache);
         let MetalCommand::Image { rect, .. } = &below_text[0] else {
             panic!("image command expected")
         };

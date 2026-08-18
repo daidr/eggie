@@ -2979,6 +2979,7 @@ mod tests {
             font_variations: Arc::from(&[][..]),
             font_thicken: None,
             font_codepoint_map: Arc::from(&[][..]),
+            images_ready: true,
         }
     }
 
