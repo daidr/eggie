@@ -166,10 +166,13 @@ fn fetch_terminal_image_chunked(
                     segment_name,
                 } => {
                     verify_image_metadata(&metadata, descriptor, expected_length)?;
-                    PixelStore::Mapped(Arc::new(map_image_shm_segment(
-                        &segment_name,
-                        expected_length as usize,
-                    )?))
+                    PixelStore::Mapped {
+                        mmap: Arc::new(map_image_shm_segment(
+                            &segment_name,
+                            expected_length as usize,
+                        )?),
+                        len: expected_length as usize,
+                    }
                 }
                 TerminalImageFrame::Inline { metadata, pixels } => {
                     verify_image_metadata(&metadata, descriptor, expected_length)?;
