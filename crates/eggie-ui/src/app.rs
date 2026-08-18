@@ -23,12 +23,12 @@ use crate::settings_window::{
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
-    MetalTerminalRenderer, TerminalImageData, TerminalImeState, TerminalInputContext,
+    MetalTerminalRenderer, PixelStore, TerminalImageData, TerminalImeState, TerminalInputContext,
     TerminalPoint, TerminalRenderOptions, TerminalSearchHighlights, TerminalSelection,
     TerminalTextureKey,
     terminal_background, terminal_cell_metrics,
 };
-use eggie_daemon::{DaemonClient, DaemonConnection, DaemonInputSender};
+use eggie_daemon::{DaemonClient, DaemonConnection, DaemonInputSender, TerminalImageFrame};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
     SplitId, TabGroup, TabItem, WindowId,
@@ -154,6 +154,50 @@ fn fetch_terminal_image_chunked(
         .checked_mul(descriptor.height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| anyhow::anyhow!("terminal image dimensions overflow"))?;
+
+    // Whole-image fast path: the daemon delivers the image either as an shm segment (mapped
+    // zero-copy here) or as a single complete inline frame. Only an inline image larger than one
+    // wire chunk falls through to the chunked loop below.
+    match connection.fetch_terminal_image(session_id, descriptor.key, expected_length) {
+        Ok(frame) => {
+            let pixels = match frame {
+                TerminalImageFrame::Shm {
+                    metadata,
+                    segment_name,
+                } => {
+                    verify_image_metadata(&metadata, descriptor, expected_length)?;
+                    PixelStore::Mapped(Arc::new(map_image_shm_segment(
+                        &segment_name,
+                        expected_length as usize,
+                    )?))
+                }
+                TerminalImageFrame::Inline { metadata, pixels } => {
+                    verify_image_metadata(&metadata, descriptor, expected_length)?;
+                    if pixels.len() != expected_length as usize {
+                        anyhow::bail!("inline terminal image length mismatch");
+                    }
+                    PixelStore::Owned(Arc::new(pixels))
+                }
+            };
+            return Ok(TerminalImageData {
+                key: TerminalTextureKey {
+                    session_id,
+                    image: descriptor.key,
+                },
+                width: descriptor.width,
+                height: descriptor.height,
+                pixels,
+            });
+        }
+        Err(error) => {
+            // The daemon signals a multi-chunk inline image by refusing the whole-image fetch; fall
+            // back to the chunk loop. Any other error propagates.
+            if !error.to_string().contains("append_terminal_image_chunk") {
+                return Err(error);
+            }
+        }
+    }
+
     let mut pixels = Vec::with_capacity(expected_length as usize);
     while pixels.len() < expected_length as usize {
         let offset = pixels.len() as u32;
@@ -186,9 +230,72 @@ fn fetch_terminal_image_chunked(
         },
         width: descriptor.width,
         height: descriptor.height,
-        pixels: Arc::new(pixels),
+        pixels: PixelStore::Owned(Arc::new(pixels)),
     })
 }
+
+/// Validate a fetched image's metadata against the descriptor the UI requested, guarding against a
+/// generation swap racing the transfer.
+fn verify_image_metadata(
+    metadata: &eggie_daemon::TerminalImageChunkMetadata,
+    descriptor: &TerminalImageDescriptor,
+    expected_length: u32,
+) -> anyhow::Result<()> {
+    if metadata.key != descriptor.key
+        || metadata.width != descriptor.width
+        || metadata.height != descriptor.height
+        || metadata.total_length != expected_length
+    {
+        anyhow::bail!("terminal image metadata changed during transfer");
+    }
+    Ok(())
+}
+
+/// Open the daemon-created POSIX shm segment read-only, unlink it immediately (the kernel keeps it
+/// alive until both sides unmap, so this reclaims it once we drop the mapping), and map it. The
+/// returned `Mmap` is the image's pixels read straight from shared memory — never copied into a
+/// `Vec`. `expected_length` is validated against the segment size.
+#[cfg(unix)]
+fn map_image_shm_segment(name: &[u8], expected_length: usize) -> anyhow::Result<memmap2::Mmap> {
+    use std::os::fd::FromRawFd;
+
+    let cname = std::ffi::CString::new(name)
+        .map_err(|_| anyhow::anyhow!("shm segment name contained a nul byte"))?;
+    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return Err(anyhow::anyhow!(
+            "shm_open failed for image segment: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Reclaim the name immediately; the mapping keeps the object alive until it is dropped.
+    unsafe {
+        libc::shm_unlink(cname.as_ptr());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let object_len = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("failed to stat image segment: {error}"))?
+        .len();
+    if (object_len as usize) < expected_length {
+        anyhow::bail!(
+            "image segment holds {object_len} bytes, expected at least {expected_length}"
+        );
+    }
+    // SAFETY: the segment is a fixed-size, read-only POSIX shm object we just opened; no other
+    // process mutates it (the daemon writes once before sending the name).
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .map_err(|error| anyhow::anyhow!("mmap failed for image segment: {error}"))?
+    };
+    Ok(mmap)
+}
+
+#[cfg(not(unix))]
+fn map_image_shm_segment(_name: &[u8], _expected_length: usize) -> anyhow::Result<memmap2::Mmap> {
+    anyhow::bail!("shared-memory image transport is only supported on unix")
+}
+
 const PROCESS_TREE_LEVEL_WIDTH: f32 = 16.;
 const PROCESS_TREE_LINE_X: f32 = 3.;
 const PROCESS_TREE_ARM_LENGTH: f32 = 9.;

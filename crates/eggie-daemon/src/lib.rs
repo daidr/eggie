@@ -817,6 +817,24 @@ pub struct TerminalImageChunkMetadata {
     pub chunk_length: u32,
 }
 
+/// A whole terminal image fetched over the wire, either inline pixels or a reference to a POSIX
+/// shm segment the caller can map directly. Returned by [`DaemonConnection::fetch_terminal_image`]
+/// so a zero-copy consumer (the UI) can `mmap` the segment instead of copying it into a `Vec`.
+#[derive(Debug)]
+pub enum TerminalImageFrame {
+    /// Pixels delivered inline on the socket; already owned by the caller.
+    Inline {
+        metadata: TerminalImageChunkMetadata,
+        pixels: Vec<u8>,
+    },
+    /// A reference to a daemon-created shm segment. The caller owns the unlink: it must
+    /// `shm_open` + `shm_unlink` + `mmap` the name (see [`ShmImageSegment`] for the lifecycle).
+    Shm {
+        metadata: TerminalImageChunkMetadata,
+        segment_name: Vec<u8>,
+    },
+}
+
 impl ListenerState {
     fn new(
         session_id: SessionId,
@@ -5600,14 +5618,14 @@ fn write_terminal_image_shm_wire(
     Ok(())
 }
 
-/// Read an shm image frame, open the referenced segment, and copy its pixels into `destination`.
-/// This is the functional (copy-into-Vec) decode used by the daemon-side read helpers and the
-/// `DaemonConnection` fallback; the UI's zero-copy `mmap` path (A2) will read the segment directly.
-fn read_terminal_image_shm_wire_into(
+/// Read an shm image frame's header + segment name from the wire, without opening the segment.
+/// Returns the frame metadata (with `chunk_length` left as `total_length`, since a shm frame always
+/// carries the whole image) and the raw segment name. The consumer decides whether to copy the
+/// segment into a `Vec` (daemon-side/fallback) or map it directly (the UI's zero-copy path).
+fn read_terminal_image_shm_wire_header(
     reader: &mut impl Read,
     payload_length: usize,
-    destination: &mut Vec<u8>,
-) -> Result<TerminalImageChunkMetadata> {
+) -> Result<(TerminalImageChunkMetadata, Vec<u8>)> {
     let minimum = RAW_TERMINAL_IMAGE_METADATA_SIZE + 4;
     if !(minimum..=MAX_WIRE_MESSAGE_SIZE).contains(&payload_length) {
         bail!("invalid shm terminal image wire length: {payload_length}");
@@ -5626,11 +5644,7 @@ fn read_terminal_image_shm_wire_into(
     }
     let mut name = vec![0_u8; name_length];
     reader.read_exact(&mut name)?;
-    let total_length = read_u32(20) as usize;
-    let chunk_length = read_image_shm_segment(&name, total_length, destination)?;
-    let chunk_length =
-        u32::try_from(chunk_length).context("shm terminal image chunk is too large")?;
-    Ok(TerminalImageChunkMetadata {
+    let metadata = TerminalImageChunkMetadata {
         key: TerminalImageKey {
             id: read_u32(0),
             generation,
@@ -5639,8 +5653,25 @@ fn read_terminal_image_shm_wire_into(
         height: read_u32(16),
         total_length: read_u32(20),
         offset: read_u32(24),
-        chunk_length,
-    })
+        chunk_length: read_u32(20),
+    };
+    Ok((metadata, name))
+}
+
+/// Read an shm image frame, open the referenced segment, and copy its pixels into `destination`.
+/// This is the functional (copy-into-Vec) decode used by the daemon-side read helpers and the
+/// `DaemonConnection` fallback; the UI's zero-copy `mmap` path (A2) maps the segment directly.
+fn read_terminal_image_shm_wire_into(
+    reader: &mut impl Read,
+    payload_length: usize,
+    destination: &mut Vec<u8>,
+) -> Result<TerminalImageChunkMetadata> {
+    let (metadata, name) = read_terminal_image_shm_wire_header(reader, payload_length)?;
+    let copied = read_image_shm_segment(&name, metadata.total_length as usize, destination)?;
+    if copied != metadata.total_length as usize {
+        bail!("shm terminal image segment shorter than declared length");
+    }
+    Ok(metadata)
 }
 
 /// Open the named POSIX shm segment read-only, unlink it (so it is reclaimed once munmapped), map
@@ -6063,6 +6094,93 @@ impl DaemonConnection {
             }
             DaemonResponse::Error { message } => bail!("daemon request failed: {message}"),
             response => bail!("unexpected terminal image response: {response:?}"),
+        }
+    }
+
+    /// Fetch a whole terminal image, returning an shm segment reference when the daemon delivers
+    /// one (so the caller can map it zero-copy) or inline pixels otherwise. Unlike
+    /// [`append_terminal_image_chunk`](Self::append_terminal_image_chunk), the shm case does not
+    /// open or copy the segment — it hands the caller the name and the responsibility to unlink it.
+    pub fn fetch_terminal_image(
+        &mut self,
+        session_id: SessionId,
+        key: TerminalImageKey,
+        length: u32,
+    ) -> Result<TerminalImageFrame> {
+        write_wire_message(
+            self.stream.get_mut(),
+            &mut self.request,
+            &ClientRequest::TerminalImage {
+                session_id,
+                key,
+                offset: 0,
+                length,
+            },
+        )?;
+        let Some(header) = read_wire_header(&mut self.stream)? else {
+            bail!("daemon closed the persistent connection");
+        };
+        let (kind, payload_length) = classify_wire_header(header);
+        match kind {
+            WireFrameKind::ShmImage => {
+                let (metadata, segment_name) =
+                    read_terminal_image_shm_wire_header(&mut self.stream, payload_length)?;
+                Ok(TerminalImageFrame::Shm {
+                    metadata,
+                    segment_name,
+                })
+            }
+            WireFrameKind::RawImage => {
+                let mut pixels = Vec::new();
+                let metadata = read_terminal_image_wire_into(
+                    &mut self.stream,
+                    payload_length,
+                    &mut pixels,
+                )?;
+                if metadata.chunk_length != metadata.total_length {
+                    bail!(
+                        "inline image frame delivered {} of {} bytes; use append_terminal_image_chunk for images larger than one chunk",
+                        metadata.chunk_length,
+                        metadata.total_length
+                    );
+                }
+                Ok(TerminalImageFrame::Inline { metadata, pixels })
+            }
+            WireFrameKind::Message => {
+                let response = read_message_body::<DaemonResponse>(
+                    &mut self.stream,
+                    &mut self.response,
+                    payload_length,
+                )?;
+                match response {
+                    DaemonResponse::TerminalImage {
+                        key,
+                        width,
+                        height,
+                        total_length,
+                        offset,
+                        bytes,
+                    } => {
+                        let chunk_length = u32::try_from(bytes.len())
+                            .context("terminal image fallback chunk is too large")?;
+                        Ok(TerminalImageFrame::Inline {
+                            metadata: TerminalImageChunkMetadata {
+                                key,
+                                width,
+                                height,
+                                total_length,
+                                offset,
+                                chunk_length,
+                            },
+                            pixels: bytes,
+                        })
+                    }
+                    DaemonResponse::Error { message } => {
+                        bail!("daemon request failed: {message}")
+                    }
+                    response => bail!("unexpected terminal image response: {response:?}"),
+                }
+            }
         }
     }
 }
