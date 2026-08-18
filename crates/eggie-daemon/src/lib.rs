@@ -48,7 +48,7 @@ use flate2::write::ZlibDecoder;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
     os::{
         fd::AsRawFd,
@@ -111,7 +111,40 @@ const PASTE_CLIPBOARD_GRANT_TTL: Duration = Duration::from_secs(30);
 /// one, protecting the bounded OSC queue and preventing UI flash thrash.
 const BELL_THROTTLE: Duration = Duration::from_millis(100);
 const RAW_TERMINAL_IMAGE_WIRE_FLAG: u32 = 1 << 31;
+/// A terminal-image frame whose payload is an shm segment *reference* (metadata + segment name)
+/// rather than the pixels themselves. Mutually exclusive with [`RAW_TERMINAL_IMAGE_WIRE_FLAG`]:
+/// payload length never exceeds `MAX_WIRE_MESSAGE_SIZE` (2^26), so bits 30 and 31 are always free.
+const SHM_TERMINAL_IMAGE_WIRE_FLAG: u32 = 1 << 30;
+/// Every flag bit in a wire header. Clearing these bits yields the payload length; testing them
+/// classifies the frame. Kept as one mask so adding a flag can never leave a stale bit that
+/// corrupts an extracted length.
+const WIRE_HEADER_FLAG_MASK: u32 = RAW_TERMINAL_IMAGE_WIRE_FLAG | SHM_TERMINAL_IMAGE_WIRE_FLAG;
 const RAW_TERMINAL_IMAGE_METADATA_SIZE: usize = 28;
+
+/// How a peer should interpret a wire frame, decoded from its 4-byte length-prefix header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireFrameKind {
+    /// No flag bits set — a length-prefixed MessagePack message.
+    Message,
+    /// [`RAW_TERMINAL_IMAGE_WIRE_FLAG`] set — raw image pixels follow inline.
+    RawImage,
+    /// [`SHM_TERMINAL_IMAGE_WIRE_FLAG`] set — an shm segment reference follows (no inline pixels).
+    ShmImage,
+}
+
+/// Split a wire header into its frame kind and payload length. The length is the header with all
+/// flag bits cleared, so it stays correct no matter which (mutually exclusive) flag is set.
+fn classify_wire_header(header: u32) -> (WireFrameKind, usize) {
+    let length = (header & !WIRE_HEADER_FLAG_MASK) as usize;
+    let kind = if header & RAW_TERMINAL_IMAGE_WIRE_FLAG != 0 {
+        WireFrameKind::RawImage
+    } else if header & SHM_TERMINAL_IMAGE_WIRE_FLAG != 0 {
+        WireFrameKind::ShmImage
+    } else {
+        WireFrameKind::Message
+    };
+    (kind, length)
+}
 
 #[derive(Clone, Copy)]
 struct GridSize(TerminalSize);
@@ -5284,10 +5317,11 @@ fn read_wire_message<T: serde::de::DeserializeOwned>(
     let Some(header) = read_wire_header(reader)? else {
         return Ok(None);
     };
-    if header & RAW_TERMINAL_IMAGE_WIRE_FLAG != 0 {
+    let (kind, length) = classify_wire_header(header);
+    if kind != WireFrameKind::Message {
         bail!("unexpected raw terminal image wire response");
     }
-    read_message_body(reader, buffer, header as usize).map(Some)
+    read_message_body(reader, buffer, length).map(Some)
 }
 
 fn read_wire_header(reader: &mut impl Read) -> Result<Option<u32>> {
@@ -5398,6 +5432,256 @@ fn read_terminal_image_wire_into(
     })
 }
 
+/// A daemon-created POSIX shared-memory segment holding image pixels for a single wire response.
+///
+/// Lifecycle (mirrors the consumer half in `kitty_graphics::read_shared_memory`, reversed): the
+/// daemon creates the segment, copies pixels in, and closes its fd *without* unlinking. The
+/// consumer (UI) opens the segment by name, unlinks it immediately, maps/copies the pixels, and
+/// munmaps — the kernel keeps the object alive until both sides munmap. So on the success path the
+/// daemon hands ownership of the unlink to the consumer via [`disarm`](Self::disarm). If the name
+/// is never sent (an error before hand-off), `Drop` unlinks so the segment cannot leak. A consumer
+/// crash after the name is sent but before it opens leaks one bounded segment until reboot — the
+/// accepted cost of avoiding a synchronous ack.
+///
+/// Currently exercised only by the shm round-trip unit test: `serve_connection` still sends inline
+/// frames. The send path is flipped to shm together with the UI's zero-copy `mmap` consumer (A2),
+/// since a shm frame decoded back into a `Vec` copies just as many times as the inline path.
+#[cfg(unix)]
+#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
+struct ShmImageSegment {
+    name: std::ffi::CString,
+    armed: bool,
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
+impl ShmImageSegment {
+    fn name_bytes(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+
+    /// Transfer unlink responsibility to the consumer. Call only after the name is on the wire.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ShmImageSegment {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                libc::shm_unlink(self.name.as_ptr());
+            }
+        }
+    }
+}
+
+/// Create a uniquely-named POSIX shm segment, copy `pixels` in, and return an armed guard. The fd
+/// is closed before returning; the segment stays linked until the consumer opens+unlinks it (or the
+/// guard's `Drop` unlinks it on an error path). The name is unique per daemon process and segment.
+#[cfg(unix)]
+#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
+fn create_image_shm_segment(pixels: &[u8]) -> Result<ShmImageSegment> {
+    use std::os::fd::FromRawFd;
+
+    static SHM_SEGMENT_SERIAL: AtomicU64 = AtomicU64::new(0);
+    let serial = SHM_SEGMENT_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let name = std::ffi::CString::new(format!("/eggie-img-{}-{serial}", process::id()))
+        .context("shm segment name contained a nul byte")?;
+    let fd = unsafe {
+        libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("shm_open failed to create image segment");
+    }
+    // Arm the guard as soon as the object exists so every later error path unlinks it.
+    let guard = ShmImageSegment { name, armed: true };
+    // RAII close of the fd; the segment outlives the fd once created.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let len = pixels.len();
+    if unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("ftruncate failed to size image segment");
+    }
+    if len > 0 {
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error())
+                .context("mmap failed to write image segment");
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapping.cast::<u8>(), len);
+            libc::munmap(mapping, len);
+        }
+    }
+    Ok(guard)
+}
+
+/// Serialize an shm image frame: the 28-byte metadata header (identical layout to the inline raw
+/// frame) followed by a length-prefixed segment name. The pixels themselves never touch the socket.
+#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
+fn write_terminal_image_shm_wire(
+    writer: &mut impl Write,
+    metadata: &TerminalImageChunkMetadata,
+    segment_name: &[u8],
+) -> Result<()> {
+    let payload_length = RAW_TERMINAL_IMAGE_METADATA_SIZE
+        .checked_add(4)
+        .and_then(|size| size.checked_add(segment_name.len()))
+        .context("shm terminal image wire length overflow")?;
+    if payload_length > MAX_WIRE_MESSAGE_SIZE {
+        bail!("shm terminal image wire message exceeds {MAX_WIRE_MESSAGE_SIZE} bytes: {payload_length}");
+    }
+    let payload_length =
+        u32::try_from(payload_length).context("shm terminal image name is too large")?;
+    let name_length =
+        u32::try_from(segment_name.len()).context("shm terminal image name is too large")?;
+    let mut header = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
+    header[0..4].copy_from_slice(&metadata.key.id.to_le_bytes());
+    header[4..12].copy_from_slice(&metadata.key.generation.to_le_bytes());
+    header[12..16].copy_from_slice(&metadata.width.to_le_bytes());
+    header[16..20].copy_from_slice(&metadata.height.to_le_bytes());
+    header[20..24].copy_from_slice(&metadata.total_length.to_le_bytes());
+    header[24..28].copy_from_slice(&metadata.offset.to_le_bytes());
+    writer.write_all(&(payload_length | SHM_TERMINAL_IMAGE_WIRE_FLAG).to_le_bytes())?;
+    writer.write_all(&header)?;
+    writer.write_all(&name_length.to_le_bytes())?;
+    writer.write_all(segment_name)?;
+    Ok(())
+}
+
+/// Read an shm image frame, open the referenced segment, and copy its pixels into `destination`.
+/// This is the functional (copy-into-Vec) decode used by the daemon-side read helpers and the
+/// `DaemonConnection` fallback; the UI's zero-copy `mmap` path (A2) will read the segment directly.
+fn read_terminal_image_shm_wire_into(
+    reader: &mut impl Read,
+    payload_length: usize,
+    destination: &mut Vec<u8>,
+) -> Result<TerminalImageChunkMetadata> {
+    let minimum = RAW_TERMINAL_IMAGE_METADATA_SIZE + 4;
+    if !(minimum..=MAX_WIRE_MESSAGE_SIZE).contains(&payload_length) {
+        bail!("invalid shm terminal image wire length: {payload_length}");
+    }
+    let mut metadata = [0_u8; RAW_TERMINAL_IMAGE_METADATA_SIZE];
+    reader.read_exact(&mut metadata)?;
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes(metadata[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    let generation = u64::from_le_bytes(metadata[4..12].try_into().expect("eight bytes"));
+    let mut name_length = [0_u8; 4];
+    reader.read_exact(&mut name_length)?;
+    let name_length = u32::from_le_bytes(name_length) as usize;
+    if minimum + name_length != payload_length {
+        bail!("shm terminal image wire name length mismatch");
+    }
+    let mut name = vec![0_u8; name_length];
+    reader.read_exact(&mut name)?;
+    let total_length = read_u32(20) as usize;
+    let chunk_length = read_image_shm_segment(&name, total_length, destination)?;
+    let chunk_length =
+        u32::try_from(chunk_length).context("shm terminal image chunk is too large")?;
+    Ok(TerminalImageChunkMetadata {
+        key: TerminalImageKey {
+            id: read_u32(0),
+            generation,
+        },
+        width: read_u32(12),
+        height: read_u32(16),
+        total_length: read_u32(20),
+        offset: read_u32(24),
+        chunk_length,
+    })
+}
+
+/// Open the named POSIX shm segment read-only, unlink it (so it is reclaimed once munmapped), map
+/// it, append exactly `total_length` bytes to `destination`, and munmap. `total_length` comes from
+/// the wire metadata rather than the segment's `metadata().len()`, because POSIX shm objects are
+/// rounded up to a page boundary (so the object is often larger than the pixel payload). Mirrors
+/// `kitty_graphics::read_shared_memory`; returns the number of bytes appended.
+#[cfg(unix)]
+fn read_image_shm_segment(
+    name: &[u8],
+    total_length: usize,
+    destination: &mut Vec<u8>,
+) -> Result<usize> {
+    use std::os::fd::FromRawFd;
+
+    let name = std::ffi::CString::new(name).context("shm segment name contained a nul byte")?;
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("shm_open failed to read image segment");
+    }
+    // Unlink immediately: the kernel keeps the object alive until we munmap, and this guarantees the
+    // segment is reclaimed even if the rest of this function fails.
+    unsafe {
+        libc::shm_unlink(name.as_ptr());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if total_length > MAX_WIRE_MESSAGE_SIZE {
+        bail!("image segment exceeds {MAX_WIRE_MESSAGE_SIZE} bytes: {total_length}");
+    }
+    if total_length == 0 {
+        return Ok(0);
+    }
+    let object_len = file
+        .metadata()
+        .context("failed to stat image segment")?
+        .len();
+    if (object_len as usize) < total_length {
+        bail!("image segment holds {object_len} bytes, expected at least {total_length}");
+    }
+    let map_len = object_len as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error()).context("mmap failed to read image segment");
+    }
+    let original_length = destination.len();
+    destination.resize(original_length + total_length, 0);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            mapping.cast::<u8>(),
+            destination[original_length..].as_mut_ptr(),
+            total_length,
+        );
+        libc::munmap(mapping, map_len);
+    }
+    Ok(total_length)
+}
+
+#[cfg(not(unix))]
+fn read_image_shm_segment(
+    _name: &[u8],
+    _total_length: usize,
+    _destination: &mut Vec<u8>,
+) -> Result<usize> {
+    bail!("shared-memory image transport is only supported on unix")
+}
+
 fn read_daemon_response(
     reader: &mut impl Read,
     buffer: &mut Vec<u8>,
@@ -5405,15 +5689,13 @@ fn read_daemon_response(
     let Some(header) = read_wire_header(reader)? else {
         return Ok(None);
     };
-    if header & RAW_TERMINAL_IMAGE_WIRE_FLAG == 0 {
-        return read_message_body(reader, buffer, header as usize).map(Some);
-    }
+    let (kind, length) = classify_wire_header(header);
     let mut bytes = Vec::new();
-    let metadata = read_terminal_image_wire_into(
-        reader,
-        (header & !RAW_TERMINAL_IMAGE_WIRE_FLAG) as usize,
-        &mut bytes,
-    )?;
+    let metadata = match kind {
+        WireFrameKind::Message => return read_message_body(reader, buffer, length).map(Some),
+        WireFrameKind::RawImage => read_terminal_image_wire_into(reader, length, &mut bytes)?,
+        WireFrameKind::ShmImage => read_terminal_image_shm_wire_into(reader, length, &mut bytes)?,
+    };
     Ok(Some(DaemonResponse::TerminalImage {
         key: metadata.key,
         width: metadata.width,
@@ -5707,18 +5989,21 @@ impl DaemonConnection {
         let Some(header) = read_wire_header(&mut self.stream)? else {
             bail!("daemon closed the persistent connection");
         };
-        if header & RAW_TERMINAL_IMAGE_WIRE_FLAG != 0 {
-            return read_terminal_image_wire_into(
-                &mut self.stream,
-                (header & !RAW_TERMINAL_IMAGE_WIRE_FLAG) as usize,
-                destination,
-            );
+        let (kind, length) = classify_wire_header(header);
+        match kind {
+            WireFrameKind::RawImage => {
+                return read_terminal_image_wire_into(&mut self.stream, length, destination);
+            }
+            WireFrameKind::ShmImage => {
+                return read_terminal_image_shm_wire_into(&mut self.stream, length, destination);
+            }
+            WireFrameKind::Message => {}
         }
 
         let response = read_message_body::<DaemonResponse>(
             &mut self.stream,
             &mut self.response,
-            header as usize,
+            length,
         )?;
         match response {
             DaemonResponse::TerminalImage {
@@ -6158,6 +6443,65 @@ mod tests {
         assert_eq!(metadata.chunk_length as usize, expected.len());
         assert_eq!(&destination[..3], &[1, 2, 3]);
         assert_eq!(&destination[3..], expected);
+    }
+
+    #[test]
+    fn shm_terminal_image_wire_round_trips_pixels_through_shared_memory() {
+        // Full A1 round-trip: create an shm segment, send only its name + metadata over the wire,
+        // and reconstruct the pixels on the far side by opening the segment. No pixel bytes travel
+        // over the socket.
+        let expected: Vec<u8> = (0..=255).cycle().take(1024 * 1024 + 3).collect();
+        let segment = create_image_shm_segment(&expected).unwrap();
+        let metadata = TerminalImageChunkMetadata {
+            key: TerminalImageKey {
+                id: 7,
+                generation: 99,
+            },
+            width: 256,
+            height: 1024,
+            total_length: expected.len() as u32,
+            offset: 0,
+            chunk_length: expected.len() as u32,
+        };
+
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let name = segment.name_bytes().to_vec();
+        let writer_thread = thread::spawn(move || {
+            let mut segment = segment;
+            let result = write_terminal_image_shm_wire(&mut writer, &metadata, &name);
+            // The name is on the wire; the consumer now owns the unlink.
+            segment.disarm();
+            result
+        });
+
+        let mut reader = BufReader::new(reader);
+        let header = read_wire_header(&mut reader).unwrap().unwrap();
+        let (kind, length) = classify_wire_header(header);
+        assert_eq!(kind, WireFrameKind::ShmImage);
+        // The shm flag must be mutually exclusive with the inline-raw flag.
+        assert_eq!(header & RAW_TERMINAL_IMAGE_WIRE_FLAG, 0);
+        let mut destination = vec![9, 9];
+        let decoded = read_terminal_image_shm_wire_into(&mut reader, length, &mut destination).unwrap();
+
+        writer_thread.join().unwrap().unwrap();
+        assert_eq!(decoded.key.id, 7);
+        assert_eq!(decoded.key.generation, 99);
+        assert_eq!(decoded.width, 256);
+        assert_eq!(decoded.total_length as usize, expected.len());
+        assert_eq!(decoded.chunk_length as usize, expected.len());
+        assert_eq!(&destination[..2], &[9, 9]);
+        assert_eq!(&destination[2..], &expected[..]);
+    }
+
+    #[test]
+    fn image_shm_segment_unlinks_on_drop_when_not_disarmed() {
+        // An armed guard that is never disarmed (name never sent) must reclaim its segment on drop,
+        // so an error before hand-off cannot leak. After drop, opening the name must fail.
+        let segment = create_image_shm_segment(&[1, 2, 3, 4]).unwrap();
+        let name = std::ffi::CString::new(segment.name_bytes()).unwrap();
+        drop(segment);
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd < 0, "dropped-armed segment should have been unlinked");
     }
 
     #[test]
