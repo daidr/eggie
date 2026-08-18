@@ -798,6 +798,13 @@ impl PublishedTerminalImageChunk {
     fn bytes(&self) -> &[u8] {
         &self.pixels[self.offset as usize..self.end]
     }
+
+    /// The whole image's pixels, ignoring the chunk window. The shm transport hands the entire
+    /// image to the consumer in one segment, so it does not use the `offset`/`end` slice.
+    #[cfg(unix)]
+    fn all_bytes(&self) -> &[u8] {
+        &self.pixels[..]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5296,7 +5303,7 @@ fn serve_connection(stream: UnixStream, state: &DaemonState) -> Result<()> {
                 .session(session_id)
                 .and_then(|session| session.image_chunk_ref(key, offset, length))
             {
-                Ok(chunk) => write_terminal_image_wire(stream.get_mut(), &chunk)?,
+                Ok(chunk) => send_terminal_image_chunk(stream.get_mut(), &chunk)?,
                 Err(error) => write_wire_message(
                     stream.get_mut(),
                     &mut response,
@@ -5367,6 +5374,38 @@ fn write_wire_message(
     writer.write_all(&length.to_le_bytes())?;
     writer.write_all(buffer)?;
     Ok(())
+}
+
+/// Send one terminal-image chunk response. On unix, the first chunk of an image (`offset == 0`) is
+/// delivered zero-inline-copy via a shared-memory segment: the whole image is copied into an shm
+/// object and only its name travels the socket. Non-zero offsets (a client re-requesting a tail
+/// after a partial read) and non-unix platforms fall back to the inline wire frame. Because a shm
+/// frame carries the entire image (`chunk_length == total_length`), the client's chunk loop
+/// completes in one iteration and never asks for a non-zero offset in practice.
+fn send_terminal_image_chunk(
+    writer: &mut impl Write,
+    chunk: &PublishedTerminalImageChunk,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if chunk.offset == 0 {
+            let pixels = chunk.all_bytes();
+            let mut segment = create_image_shm_segment(pixels)?;
+            let metadata = TerminalImageChunkMetadata {
+                key: chunk.key,
+                width: chunk.width,
+                height: chunk.height,
+                total_length: chunk.total_length,
+                offset: 0,
+                chunk_length: chunk.total_length,
+            };
+            write_terminal_image_shm_wire(writer, &metadata, segment.name_bytes())?;
+            // The name is on the wire; the consumer now owns the unlink.
+            segment.disarm();
+            return Ok(());
+        }
+    }
+    write_terminal_image_wire(writer, chunk)
 }
 
 fn write_terminal_image_wire(
@@ -5443,18 +5482,16 @@ fn read_terminal_image_wire_into(
 /// crash after the name is sent but before it opens leaks one bounded segment until reboot — the
 /// accepted cost of avoiding a synchronous ack.
 ///
-/// Currently exercised only by the shm round-trip unit test: `serve_connection` still sends inline
-/// frames. The send path is flipped to shm together with the UI's zero-copy `mmap` consumer (A2),
-/// since a shm frame decoded back into a `Vec` copies just as many times as the inline path.
+/// A1 checkpoint: the daemon sends shm frames, but the UI still copies the mapped pixels into a
+/// `Vec` before uploading — so the socket no longer carries pixels, but the total copy count is
+/// unchanged until the UI's zero-copy `mmap`→Metal path (A2) lands.
 #[cfg(unix)]
-#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
 struct ShmImageSegment {
     name: std::ffi::CString,
     armed: bool,
 }
 
 #[cfg(unix)]
-#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
 impl ShmImageSegment {
     fn name_bytes(&self) -> &[u8] {
         self.name.as_bytes()
@@ -5481,7 +5518,6 @@ impl Drop for ShmImageSegment {
 /// is closed before returning; the segment stays linked until the consumer opens+unlinks it (or the
 /// guard's `Drop` unlinks it on an error path). The name is unique per daemon process and segment.
 #[cfg(unix)]
-#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
 fn create_image_shm_segment(pixels: &[u8]) -> Result<ShmImageSegment> {
     use std::os::fd::FromRawFd;
 
@@ -5534,7 +5570,6 @@ fn create_image_shm_segment(pixels: &[u8]) -> Result<ShmImageSegment> {
 
 /// Serialize an shm image frame: the 28-byte metadata header (identical layout to the inline raw
 /// frame) followed by a length-prefixed segment name. The pixels themselves never touch the socket.
-#[allow(dead_code, reason = "send path goes live with the UI zero-copy consumer (Route A / A2)")]
 fn write_terminal_image_shm_wire(
     writer: &mut impl Write,
     metadata: &TerminalImageChunkMetadata,
@@ -6505,6 +6540,81 @@ mod tests {
     }
 
     #[test]
+    fn serve_connection_delivers_images_through_shared_memory() {
+        // End-to-end A1: a real image published by the terminal, fetched over a real socket via
+        // serve_connection, must arrive intact. On unix the daemon now answers offset==0 with an
+        // shm frame, so this exercises the full create→send-name→open→copy path (and, via the
+        // clean shutdown, that the transfer completes without leaking the client connection).
+        let _pty_guard = PTY_TEST_LOCK.lock();
+        let session = Arc::new(
+            TerminalSession::spawn_default(
+                ProjectId::new_v4(),
+                std::env::current_dir().unwrap(),
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                    cell_width: 8,
+                    cell_height: 18,
+                },
+                TerminalAppearance::default(),
+            )
+            .unwrap(),
+        );
+        let session_id = session.id;
+        let state = Arc::new(DaemonState {
+            sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
+            build_id: Arc::from("shm-test"),
+        });
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_state = state.clone();
+        let server = thread::spawn(move || serve_connection(server_stream, &server_state));
+        let mut connection = DaemonConnection {
+            stream: BufReader::new(client_stream),
+            request: Vec::with_capacity(512),
+            response: Vec::with_capacity(1024 * 1024),
+        };
+
+        thread::sleep(Duration::from_millis(100));
+        // A 2x2 RGBA image: bytes 0..16 map to the four pixels. `AQIDBAUGBwgJCgsMDQ4PEA==`
+        // decodes to 1..=16.
+        {
+            let mut terminal = session.terminal.lock();
+            terminal.kitty_graphics_command(
+                b"a=T,f=32,s=2,v=2,i=11,c=1,r=1,C=1;AQIDBAUGBwgJCgsMDQ4PEA==",
+            );
+            session.events.publish_terminal(&terminal);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let key = loop {
+            if let Some(descriptor) = session
+                .snapshot()
+                .images
+                .iter()
+                .find(|image| image.key.id == 11)
+            {
+                assert_eq!((descriptor.width, descriptor.height), (2, 2));
+                break descriptor.key;
+            }
+            assert!(Instant::now() < deadline, "image never reached the snapshot");
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let mut pixels = Vec::new();
+        let metadata = connection
+            .append_terminal_image_chunk(session_id, key, 0, 16 * 1024 * 1024, &mut pixels)
+            .unwrap();
+        assert_eq!(metadata.key, key);
+        assert_eq!((metadata.width, metadata.height), (2, 2));
+        assert_eq!(metadata.total_length, 16);
+        assert_eq!(metadata.chunk_length, 16, "shm frame delivers the whole image at once");
+        assert_eq!(pixels, (1..=16).collect::<Vec<u8>>());
+
+        session.terminate();
+        drop(connection);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn bundled_alacritty_terminfo_is_installed_for_child_sessions() {
         let database = install_bundled_terminfo().unwrap();
         let entry = database.join("61/alacritty");
@@ -7334,23 +7444,22 @@ mod tests {
         samples.sort_unstable();
         let p50 = samples[(samples.len() - 1) * 50 / 100];
         let p95 = samples[(samples.len() - 1) * 95 / 100];
-        let wire_bytes_per_frame =
-            expected_length + chunks_per_frame * RAW_TERMINAL_IMAGE_METADATA_SIZE;
-        // Each frame is copied at least twice on the wire path: the daemon's `write_all` of the Arc
-        // slice into the socket (`write_terminal_image_wire`) and the client's `read_exact` into the
-        // destination Vec (`read_terminal_image_wire_into`). These two copies are exactly what Route
-        // A's shared-memory transport is meant to eliminate.
-        let total_memcpy = 2 * expected_length * iterations;
+        // With the inline wire path each frame crosses the socket as pixels + per-chunk metadata,
+        // and is copied twice (daemon write_all + client read_exact). With the shm transport the
+        // socket carries only metadata + the segment name, and the pixels are copied via shared
+        // memory (daemon page-write + client page-read) instead of the socket. Report both the
+        // pixel payload and the resulting per-frame chunk count so before/after stays legible; the
+        // per-frame latency above is the headline number.
+        let pixel_bytes_per_frame = expected_length;
         eprintln!(
-            "{}x{} image over wire: bytes/frame={:.2}MiB chunks={} p50={:.2}ms p95={:.2}ms ({:.1} fps) total_memcpy={:.0}MiB",
+            "{}x{} image transport: pixels/frame={:.2}MiB chunks/frame={} p50={:.2}ms p95={:.2}ms ({:.1} fps)",
             BENCH_IMAGE_WIDTH,
             BENCH_IMAGE_HEIGHT,
-            wire_bytes_per_frame as f64 / (1024. * 1024.),
+            pixel_bytes_per_frame as f64 / (1024. * 1024.),
             chunks_per_frame,
             p50.as_secs_f64() * 1_000.,
             p95.as_secs_f64() * 1_000.,
             1. / p50.as_secs_f64(),
-            total_memcpy as f64 / (1024. * 1024.),
         );
 
         session.terminate();
