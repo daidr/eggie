@@ -116,6 +116,10 @@ pub(crate) fn rasterize(
 
 const VECTOR_OVERSAMPLE: usize = 4;
 
+/// Fraction of a glyph's shorter side used for a "light" stroke (box-drawing, powerline separators,
+/// math symbols, branch/octant diagonals). Rounded to whole pixels and clamped to ≥ 1.
+const STROKE_RATIO: f32 = 0.11;
+
 fn antialiased(
     width: usize,
     height: usize,
@@ -389,7 +393,7 @@ fn rasterize_box(
 ) -> Option<Vec<u8>> {
     let cp = character as u32;
     let mut mask = Mask::new(width, height);
-    let base_light = (width.min(height) as f32 * 0.11).round().max(1.);
+    let base_light = (width.min(height) as f32 * STROKE_RATIO).round().max(1.);
     // `adjust-box-thickness` scales the light stroke; heavy stays 2×. The modifier is device-px,
     // but this runs in oversampled space (`VECTOR_OVERSAMPLE`), so an absolute delta is scaled up.
     let light = match box_thickness {
@@ -492,7 +496,7 @@ fn rasterize_math_symbol(character: char, width: usize, height: usize) -> Vec<u8
     let left_tip = (max_x * 0.78).round() as isize;
     let center_x = (max_x / 2.).round() as isize;
     let height = height as f32;
-    let thickness = ((width.min(mask.height) as f32 * 0.11).round() as usize).max(1);
+    let thickness = ((width.min(mask.height) as f32 * STROKE_RATIO).round() as usize).max(1);
 
     match cp {
         0x2320..=0x2321 => {
@@ -606,7 +610,7 @@ fn rasterize_math_symbol(character: char, width: usize, height: usize) -> Vec<u8
 fn rasterize_powerline(character: char, width: usize, height: usize) -> Vec<u8> {
     let mut mask = Mask::new(width, height);
     let cp = character as u32;
-    let light = ((width.min(height) as f32 * 0.11).round() as usize).max(1);
+    let light = ((width.min(height) as f32 * STROKE_RATIO).round() as usize).max(1);
     match cp {
         0xe0b0 => mask.triangle(
             (0, 0),
@@ -640,7 +644,7 @@ fn rasterize_powerline(character: char, width: usize, height: usize) -> Vec<u8> 
 fn rasterize_branch(character: char, width: usize, height: usize) -> Vec<u8> {
     let mut mask = Mask::new(width, height);
     let cp = character as u32;
-    let light = ((width.min(height) as f32 * 0.11).round() as usize).max(1);
+    let light = ((width.min(height) as f32 * STROKE_RATIO).round() as usize).max(1);
     match cp {
         0xf5d0 => mask.junction(false, true, false, true, light, light),
         0xf5d1 => mask.junction(true, false, true, false, light, light),
@@ -1466,24 +1470,7 @@ impl Mask {
 
         let pixel_point = |point: (f32, f32)| (point.0.round() as isize, point.1.round() as isize);
         self.line(pixel_point(start), pixel_point(curve_start), thickness);
-        let steps = (self.width.max(self.height) * 2).max(16);
-        let mut previous = curve_start;
-        for step in 1..=steps {
-            let t = step as f32 / steps as f32;
-            let one_minus_t = 1. - t;
-            let point = (
-                one_minus_t.powi(3) * curve_start.0
-                    + 3. * one_minus_t.powi(2) * t * control_1.0
-                    + 3. * one_minus_t * t.powi(2) * control_2.0
-                    + t.powi(3) * curve_end.0,
-                one_minus_t.powi(3) * curve_start.1
-                    + 3. * one_minus_t.powi(2) * t * control_1.1
-                    + 3. * one_minus_t * t.powi(2) * control_2.1
-                    + t.powi(3) * curve_end.1,
-            );
-            self.line(pixel_point(previous), pixel_point(point), thickness);
-            previous = point;
-        }
+        self.cubic_bezier(curve_start, control_1, control_2, curve_end, thickness);
         self.line(pixel_point(curve_end), pixel_point(end), thickness);
 
         let vx0 = self.width.saturating_sub(thickness) / 2;
@@ -2298,7 +2285,7 @@ impl Mask {
         let bits = CORNERS[index.min(CORNERS.len() - 1)];
         let center_x = self.width.div_ceil(2) as isize;
         let center_y = self.height.div_ceil(2) as isize;
-        let thickness = ((self.width.min(self.height) as f32 * 0.11).round() as usize).max(1);
+        let thickness = ((self.width.min(self.height) as f32 * STROKE_RATIO).round() as usize).max(1);
         // These names use *quadrants*, not cell corners. Match Ghostty and Unicode: each arm
         // joins the center of a vertical edge to the center of a horizontal edge.
         let arms = [

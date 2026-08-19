@@ -1047,10 +1047,24 @@ impl SettingsWindow {
         });
     }
 
-    fn render_mode_control(&self, selected: ThemeMode, cx: &mut Context<Self>) -> AnyElement {
-        let language = self.settings.read(cx).config().language;
-        ThemeMode::ALL
+    /// Shared renderer for the settings' segmented button groups (the "pill" control): a rounded
+    /// container holding one clickable pill per option, with the selected pill highlighted.
+    ///
+    /// Each option is `(id_suffix, label, selected)`; the pill's element id is
+    /// `format!("{id_prefix}-{id_suffix}")`, matching the ids each call site built by hand.
+    /// `on_pick` receives the picked option's index (matching `options` order) so the caller can
+    /// map it back to its enum/bool and call the appropriate setter.
+    fn render_segmented(
+        &self,
+        id_prefix: &str,
+        options: Vec<(SharedString, SharedString, bool)>,
+        on_pick: impl Fn(&mut Self, usize, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let on_pick = std::rc::Rc::new(on_pick);
+        options
             .into_iter()
+            .enumerate()
             .fold(
                 div()
                     .flex()
@@ -1059,15 +1073,11 @@ impl SettingsWindow {
                     .bg(rgb(self.colors.panel_alt))
                     .border_1()
                     .border_color(rgb(self.colors.border)),
-                |control, mode| {
-                    let label = match mode {
-                        ThemeMode::Dark => language.theme_mode_dark(),
-                        ThemeMode::Light => language.theme_mode_light(),
-                        ThemeMode::System => language.theme_mode_system(),
-                    };
+                |control, (index, (id_suffix, label, selected))| {
+                    let on_pick = on_pick.clone();
                     control.child(
                         div()
-                            .id(format!("theme-mode-{}", mode.label()))
+                            .id(format!("{id_prefix}-{id_suffix}"))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1075,19 +1085,125 @@ impl SettingsWindow {
                             .px_3()
                             .rounded_md()
                             .cursor_pointer()
-                            .when(selected == mode, |element| {
+                            .when(selected, |element| {
                                 element
                                     .bg(rgb(self.colors.background))
                                     .text_color(rgb(self.colors.accent))
                             })
                             .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_theme_mode(mode, cx)
+                                on_pick(settings, index, cx)
                             }))
                             .child(label),
                     )
                 },
             )
             .into_any_element()
+    }
+
+    /// A bordered −/value/+ stepper. The caller pre-formats the current value into `display`,
+    /// picks the box width, and supplies `on_step`, which receives the direction (-1 or +1) and
+    /// applies the control's own delta before invoking the matching change setter.
+    fn render_stepper(
+        &self,
+        dec_id: &str,
+        inc_id: &str,
+        display: String,
+        can_dec: bool,
+        can_inc: bool,
+        value_box_width: f32,
+        on_step: impl Fn(&mut Self, i8, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let on_step = std::rc::Rc::new(on_step);
+        let button = |id: SharedString,
+                      label: &'static str,
+                      enabled: bool,
+                      dir: i8,
+                      on_step: std::rc::Rc<dyn Fn(&mut Self, i8, &mut Context<Self>)>,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(30.))
+                .text_size(px(16.))
+                .cursor_pointer()
+                .text_color(rgb(if enabled {
+                    self.colors.text
+                } else {
+                    self.colors.muted
+                }))
+                .when(enabled, |element| {
+                    element
+                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            on_step(settings, dir, cx)
+                        }))
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .overflow_hidden()
+            .child(button(
+                SharedString::from(dec_id.to_owned()),
+                "−",
+                can_dec,
+                -1,
+                on_step.clone(),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(value_box_width))
+                    .h(px(30.))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(self.colors.border))
+                    .child(display),
+            )
+            .child(button(
+                SharedString::from(inc_id.to_owned()),
+                "+",
+                can_inc,
+                1,
+                on_step,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_mode_control(&self, selected: ThemeMode, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        let options = ThemeMode::ALL
+            .into_iter()
+            .map(|mode| {
+                let label = match mode {
+                    ThemeMode::Dark => language.theme_mode_dark(),
+                    ThemeMode::Light => language.theme_mode_light(),
+                    ThemeMode::System => language.theme_mode_system(),
+                };
+                (
+                    SharedString::from(mode.label()),
+                    SharedString::from(label),
+                    selected == mode,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "theme-mode",
+            options,
+            |settings, index, cx| settings.set_theme_mode(ThemeMode::ALL[index], cx),
+            cx,
+        )
     }
 
     fn bell_mode_label(language: Language, mode: BellMode) -> &'static str {
@@ -1261,78 +1377,42 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.block()), (true, language.allow())]
+        let options = [(false, language.block()), (true, language.allow())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("osc-clipboard-read-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_osc_clipboard_read(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "osc-clipboard-read",
+            options,
+            |settings, index, cx| settings.set_osc_clipboard_read(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_detect_urls_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("detect-urls-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_detect_urls(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "detect-urls",
+            options,
+            |settings, index, cx| settings.set_detect_urls(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_auto_check_updates_control(
@@ -1341,40 +1421,22 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("auto-check-updates-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_auto_check_updates(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "auto-check-updates",
+            options,
+            |settings, index, cx| settings.set_auto_check_updates(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_update_channel_control(
@@ -1383,41 +1445,22 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        UpdateChannel::ALL
+        let options = UpdateChannel::ALL
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, channel| {
-                    let label = language.update_channel_label(channel);
-                    control.child(
-                        div()
-                            .id(format!("update-channel-{}", channel.slug()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(selected == channel, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_update_channel(channel, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|channel| {
+                (
+                    SharedString::from(channel.slug()),
+                    SharedString::from(language.update_channel_label(channel)),
+                    selected == channel,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "update-channel",
+            options,
+            |settings, index, cx| settings.set_update_channel(UpdateChannel::ALL[index], cx),
+            cx,
+        )
     }
 
     fn render_shell_integration_path_control(
@@ -1426,40 +1469,22 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("shell-integration-path-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_shell_integration_path(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "shell-integration-path",
+            options,
+            |settings, index, cx| settings.set_shell_integration_path(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_synthetic_style_control(
@@ -1469,155 +1494,82 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    let id = SharedString::from(format!("synthetic-{}-{label}", kind.slug()));
-                    control.child(
-                        div()
-                            .id(id)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_synthetic_style(kind, value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            &format!("synthetic-{}", kind.slug()),
+            options,
+            move |settings, index, cx| settings.set_synthetic_style(kind, index == 1, cx),
+            cx,
+        )
     }
 
     fn render_ligatures_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("ligatures-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_ligatures(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "ligatures",
+            options,
+            |settings, index, cx| settings.set_ligatures(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_shaping_break_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("shaping-break-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_shaping_break_cursor(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "shaping-break",
+            options,
+            |settings, index, cx| settings.set_shaping_break_cursor(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_font_thicken_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("font-thicken-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_font_thicken(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "font-thicken",
+            options,
+            |settings, index, cx| settings.set_font_thicken(index == 1, cx),
+            cx,
+        )
     }
 
     fn render_font_thicken_strength_control(
@@ -1625,105 +1577,36 @@ impl SettingsWindow {
         strength: u8,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_font_thicken_strength(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-font-thicken-strength",
-                "−",
-                strength > 0,
-                -16,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{strength}")),
-            )
-            .child(button(
-                "increase-font-thicken-strength",
-                "+",
-                strength < 255,
-                16,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-font-thicken-strength",
+            "increase-font-thicken-strength",
+            format!("{strength}"),
+            strength > 0,
+            strength < 255,
+            54.,
+            |settings, dir, cx| settings.change_font_thicken_strength(i32::from(dir) * 16, cx),
+            cx,
+        )
     }
 
     fn render_copy_on_select_control(&self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        [(false, language.disabled()), (true, language.enabled())]
+        let options = [(false, language.disabled()), (true, language.enabled())]
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, (value, label)| {
-                    control.child(
-                        div()
-                            .id(format!("copy-on-select-{label}"))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(enabled == value, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_copy_on_select(value, cx)
-                            }))
-                            .child(label),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|(value, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    enabled == value,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "copy-on-select",
+            options,
+            |settings, index, cx| settings.set_copy_on_select(index == 1, cx),
+            cx,
+        )
     }
 
     fn metric_adjustment_labels(
@@ -1839,40 +1722,22 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language = self.settings.read(cx).config().language;
-        CursorBlink::ALL
+        let options = CursorBlink::ALL
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, blink| {
-                    control.child(
-                        div()
-                            .id(format!("cursor-blink-{}", blink.slug()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(selected == blink, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_cursor_blink(blink, cx)
-                            }))
-                            .child(Self::cursor_blink_label(language, blink)),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|blink| {
+                (
+                    SharedString::from(blink.slug()),
+                    SharedString::from(Self::cursor_blink_label(language, blink)),
+                    selected == blink,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "cursor-blink",
+            options,
+            |settings, index, cx| settings.set_cursor_blink(CursorBlink::ALL[index], cx),
+            cx,
+        )
     }
 
     fn render_language_control(
@@ -1880,40 +1745,22 @@ impl SettingsWindow {
         selected: Language,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        Language::ALL
+        let options = Language::ALL
             .into_iter()
-            .fold(
-                div()
-                    .flex()
-                    .p(px(2.))
-                    .rounded_lg()
-                    .bg(rgb(self.colors.panel_alt))
-                    .border_1()
-                    .border_color(rgb(self.colors.border)),
-                |control, language| {
-                    control.child(
-                        div()
-                            .id(format!("language-{}", language.label()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.))
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(selected == language, |element| {
-                                element
-                                    .bg(rgb(self.colors.background))
-                                    .text_color(rgb(self.colors.accent))
-                            })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                settings.set_language(language, cx)
-                            }))
-                            .child(language.label()),
-                    )
-                },
-            )
-            .into_any_element()
+            .map(|language| {
+                (
+                    SharedString::from(language.label()),
+                    SharedString::from(language.label()),
+                    selected == language,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "language",
+            options,
+            |settings, index, cx| settings.set_language(Language::ALL[index], cx),
+            cx,
+        )
     }
 
     fn render_selector(
@@ -2579,67 +2426,16 @@ impl SettingsWindow {
     }
 
     fn render_font_size_control(&self, font_size: f32, cx: &mut Context<Self>) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: f32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_font_size(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-font-size",
-                "−",
-                font_size > MIN_FONT_SIZE,
-                -1.,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{font_size:.0}")),
-            )
-            .child(button(
-                "increase-font-size",
-                "+",
-                font_size < MAX_FONT_SIZE,
-                1.,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-font-size",
+            "increase-font-size",
+            format!("{font_size:.0}"),
+            font_size > MIN_FONT_SIZE,
+            font_size < MAX_FONT_SIZE,
+            54.,
+            |settings, dir, cx| settings.change_font_size(f32::from(dir), cx),
+            cx,
+        )
     }
 
     fn render_minimum_contrast_control(
@@ -2647,67 +2443,16 @@ impl SettingsWindow {
         minimum_contrast: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: f32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_minimum_contrast(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-minimum-contrast",
-                "−",
-                minimum_contrast > MIN_MINIMUM_CONTRAST,
-                -0.1,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{minimum_contrast:.1}")),
-            )
-            .child(button(
-                "increase-minimum-contrast",
-                "+",
-                minimum_contrast < MAX_MINIMUM_CONTRAST,
-                0.1,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-minimum-contrast",
+            "increase-minimum-contrast",
+            format!("{minimum_contrast:.1}"),
+            minimum_contrast > MIN_MINIMUM_CONTRAST,
+            minimum_contrast < MAX_MINIMUM_CONTRAST,
+            54.,
+            |settings, dir, cx| settings.change_minimum_contrast(f32::from(dir) * 0.1, cx),
+            cx,
+        )
     }
 
     fn render_terminal_padding_control(
@@ -2726,67 +2471,16 @@ impl SettingsWindow {
                 "increase-vertical-terminal-padding",
             ),
         };
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: f32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_terminal_padding(axis, delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                decrease_id,
-                "−",
-                value > MIN_TERMINAL_PADDING,
-                -1.,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{value:.0}")),
-            )
-            .child(button(
-                increase_id,
-                "+",
-                value < MAX_TERMINAL_PADDING,
-                1.,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            decrease_id,
+            increase_id,
+            format!("{value:.0}"),
+            value > MIN_TERMINAL_PADDING,
+            value < MAX_TERMINAL_PADDING,
+            54.,
+            move |settings, dir, cx| settings.change_terminal_padding(axis, f32::from(dir), cx),
+            cx,
+        )
     }
 
     fn render_metric_adjustment_control(
@@ -2809,57 +2503,18 @@ impl SettingsWindow {
             (None, _) => "0".to_owned(),
         };
         let current = numeric.unwrap_or(0);
-        let decrease_id = SharedString::from(format!("decrease-adjust-{}", kind.slug()));
-        let increase_id = SharedString::from(format!("increase-adjust-{}", kind.slug()));
-        let button = |id: SharedString,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_metric_adjustment(kind, delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(decrease_id, "−", current > -64, -1, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(54.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(display),
-            )
-            .child(button(increase_id, "+", current < 64, 1, cx))
-            .into_any_element()
+        let decrease_id = format!("decrease-adjust-{}", kind.slug());
+        let increase_id = format!("increase-adjust-{}", kind.slug());
+        self.render_stepper(
+            &decrease_id,
+            &increase_id,
+            display,
+            current > -64,
+            current < 64,
+            54.,
+            move |settings, dir, cx| settings.change_metric_adjustment(kind, i32::from(dir), cx),
+            cx,
+        )
     }
 
     fn render_progress_timeout_control(
@@ -2879,131 +2534,33 @@ impl SettingsWindow {
                 "increase-progress-stale-timeout",
             ),
         };
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i32,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_progress_timeout(kind, delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                decrease_id,
-                "−",
-                value > MIN_PROGRESS_TIMEOUT_SECS,
-                -step,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(62.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(format!("{value}s")),
-            )
-            .child(button(
-                increase_id,
-                "+",
-                value < MAX_PROGRESS_TIMEOUT_SECS,
-                step,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            decrease_id,
+            increase_id,
+            format!("{value}s"),
+            value > MIN_PROGRESS_TIMEOUT_SECS,
+            value < MAX_PROGRESS_TIMEOUT_SECS,
+            62.,
+            move |settings, dir, cx| {
+                settings.change_progress_timeout(kind, i32::from(dir) * step, cx)
+            },
+            cx,
+        )
     }
 
     fn render_scrollback_control(&self, value: usize, cx: &mut Context<Self>) -> AnyElement {
-        let button = |id: &'static str,
-                      label: &'static str,
-                      enabled: bool,
-                      delta: i64,
-                      cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(30.))
-                .text_size(px(16.))
-                .cursor_pointer()
-                .text_color(rgb(if enabled {
-                    self.colors.text
-                } else {
-                    self.colors.muted
-                }))
-                .when(enabled, |element| {
-                    element
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            settings.change_scrollback_lines(delta, cx)
-                        }))
-                })
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .overflow_hidden()
-            .child(button(
-                "decrease-scrollback-lines",
-                "−",
-                value > MIN_SCROLLBACK_LINES,
-                -SCROLLBACK_LINES_STEP,
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(72.))
-                    .h(px(30.))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(self.colors.border))
-                    .child(value.to_string()),
-            )
-            .child(button(
-                "increase-scrollback-lines",
-                "+",
-                value < MAX_SCROLLBACK_LINES,
-                SCROLLBACK_LINES_STEP,
-                cx,
-            ))
-            .into_any_element()
+        self.render_stepper(
+            "decrease-scrollback-lines",
+            "increase-scrollback-lines",
+            value.to_string(),
+            value > MIN_SCROLLBACK_LINES,
+            value < MAX_SCROLLBACK_LINES,
+            72.,
+            |settings, dir, cx| {
+                settings.change_scrollback_lines(i64::from(dir) * SCROLLBACK_LINES_STEP, cx)
+            },
+            cx,
+        )
     }
 
     /// Wrap a persistent shell `TextInput` entity in a bordered, fixed-width control box for a
