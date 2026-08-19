@@ -570,6 +570,26 @@ impl LayoutNode {
         groups.into_iter().map(|(group_id, _)| group_id).collect()
     }
 
+    /// The [`SplitId`]s of every split in this layout tree. Mirrors [`group_ids`]; used by the UI to
+    /// retain per-split render caches (divider bounds) against the live layout so closed splits do
+    /// not leak stale entries.
+    pub fn split_ids(&self) -> Vec<SplitId> {
+        let mut splits = Vec::new();
+        self.collect_split_ids(&mut splits);
+        splits
+    }
+
+    fn collect_split_ids(&self, splits: &mut Vec<SplitId>) {
+        if let Self::Split {
+            id, first, second, ..
+        } = self
+        {
+            splits.push(*id);
+            first.collect_split_ids(splits);
+            second.collect_split_ids(splits);
+        }
+    }
+
     /// Total number of tab items across all groups in this layout.
     pub fn item_count(&self) -> usize {
         match self {
