@@ -242,11 +242,6 @@ impl TextInput {
         self
     }
 
-    /// Whether this input is in multi-line mode.
-    pub(crate) fn is_multiline(&self) -> bool {
-        self.multiline
-    }
-
     pub(crate) fn is_focused(&self, window: &Window) -> bool {
         self.focus_handle.is_focused(window)
     }
@@ -964,14 +959,17 @@ impl TextInput {
     }
 
     /// Inverse of [`offset_to_line_col`]. `row`/`col` are clamped into range: `row` to the last
-    /// line, `col` to that line's length. Returns an absolute byte offset.
+    /// line, `col` to that line's length. Returns an absolute byte offset. Retained as the tested
+    /// inverse of the line/column model; only referenced from tests.
+    #[cfg(test)]
     fn line_col_to_offset(text: &str, row: usize, col: usize) -> usize {
         let starts = Self::line_starts(text);
         let range = Self::line_range(text, &starts, row);
         (range.start + col).min(range.end)
     }
 
-    /// Number of lines (≥ 1).
+    /// Number of lines (≥ 1). Only referenced from tests.
+    #[cfg(test)]
     fn line_count(text: &str) -> usize {
         Self::line_starts(text).len()
     }
@@ -1463,7 +1461,6 @@ impl TextElement {
             } else {
                 content.len()
             };
-            let _logical_is_last = row + 1 >= starts.len();
             let line_text_full: SharedString = content[line_start..line_end].to_string().into();
 
             // Shape the whole logical line once to find wrap boundaries by x position.
@@ -1493,7 +1490,6 @@ impl TextElement {
                 };
                 let seg_abs_start = line_start + seg_off;
                 let seg_abs_end = line_start + seg_end_off; // excludes the '\n'
-                let _is_last_segment = seg_idx + 1 >= seg_starts.len();
                 let seg_text: SharedString =
                     line_text_full[seg_off..seg_end_off].to_string().into();
                 let byte_len = seg_end_off - seg_off;
@@ -1637,8 +1633,6 @@ impl Element for TextElement {
             // width), measured lazily once the width is known, so the parent scroll container can
             // overflow. A measured layout gives us the wrap width that a plain request_layout cannot.
             let content = self.input.read(cx).content.clone();
-            let style_snapshot = self.input.read(cx).style;
-            let _ = style_snapshot;
             let text_style = window.text_style();
             let font = text_style.font();
             let font_size = text_style.font_size.to_pixels(window.rem_size());

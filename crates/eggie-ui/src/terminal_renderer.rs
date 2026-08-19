@@ -1618,11 +1618,7 @@ fn prepare_glyphs(
                 column += 1;
                 continue;
             }
-            let span = if flags.contains(Flags::WIDE_CHAR) {
-                2
-            } else {
-                1
-            };
+            let span = cell_span(flags);
             let hidden = flags.contains(Flags::HIDDEN);
             let visible = !hidden
                 && ((cell.character != ' ' && cell.character != '\t')
@@ -1694,7 +1690,7 @@ fn emit_glyph_command(
     glyph_id: Option<u16>,
 ) {
     let flags = Flags::from_bits_retain(cell.flags);
-    let span = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+    let span = cell_span(flags);
     let render_span = UnicodeWidthStr::width(text)
         .clamp(1, 2)
         .min(source_span);
@@ -1954,12 +1950,7 @@ fn prepare_decorations(
                 continue;
             }
             let resolved = palette.resolve_cell(cell, false);
-            let width = cell_width
-                * if flags.contains(Flags::WIDE_CHAR) {
-                    2.
-                } else {
-                    1.
-                };
+            let width = cell_width * cell_span(flags) as f32;
             let x = column as f32 * cell_width;
             let y = row_index as f32 * line_height;
             let underline =

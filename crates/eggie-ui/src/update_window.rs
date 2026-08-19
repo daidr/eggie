@@ -218,11 +218,11 @@ impl Render for UpdateWindow {
                     .flex_col()
                     .size_full()
                     .gap_4()
-                    .child(version_rows(&current_version, &new_version, colors))
+                    .child(version_rows(&current_version, &new_version, colors, language))
                     .when(!compatible, |this| {
                         this.child(daemon_warning(language))
                     })
-                    .child(release_notes_view(&release_notes, colors))
+                    .child(release_notes_view(&release_notes, colors, language))
                     .child(
                         div()
                             .flex()
@@ -277,7 +277,7 @@ impl Render for UpdateWindow {
                     .flex_col()
                     .size_full()
                     .gap_4()
-                    .child(version_rows(&current_version, &new_version, colors))
+                    .child(version_rows(&current_version, &new_version, colors, language))
                     .when(!compatible, |this| {
                         this.child(daemon_warning(language))
                     })
@@ -535,7 +535,12 @@ fn centered_text(text: &str, colors: UiColors, muted: bool) -> AnyElement {
         .into_any_element()
 }
 
-fn version_rows(current: &str, new: &str, colors: UiColors) -> AnyElement {
+fn version_rows(
+    current: &str,
+    new: &str,
+    colors: UiColors,
+    language: crate::settings::Language,
+) -> AnyElement {
     fn row(label: &str, value: &str, colors: UiColors) -> AnyElement {
         div()
             .flex()
@@ -558,8 +563,8 @@ fn version_rows(current: &str, new: &str, colors: UiColors) -> AnyElement {
         .flex()
         .flex_col()
         .gap_1()
-        .child(row("当前版本", current, colors))
-        .child(row("新版本", new, colors))
+        .child(row(language.update_current_version(), current, colors))
+        .child(row(language.update_new_version(), new, colors))
         .into_any_element()
 }
 
@@ -577,7 +582,11 @@ fn daemon_warning(language: crate::settings::Language) -> AnyElement {
         .into_any_element()
 }
 
-fn release_notes_view(notes: &str, colors: UiColors) -> AnyElement {
+fn release_notes_view(
+    notes: &str,
+    colors: UiColors,
+    language: crate::settings::Language,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -588,7 +597,7 @@ fn release_notes_view(notes: &str, colors: UiColors) -> AnyElement {
             div()
                 .text_size(px(12.))
                 .text_color(rgb(colors.muted))
-                .child("更新内容"),
+                .child(language.update_release_notes()),
         )
         .child(
             div()

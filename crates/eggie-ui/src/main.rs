@@ -12,6 +12,7 @@ mod markdown;
 mod metal_terminal;
 mod native_menu;
 mod notes_store;
+mod persist;
 mod project_store;
 mod snippet_store;
 pub mod services;

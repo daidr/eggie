@@ -14,7 +14,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -155,12 +155,6 @@ fn read_message(stream: &mut UnixStream) -> Result<GuiWakeMessage> {
     let mut body = vec![0_u8; length];
     stream.read_exact(&mut body)?;
     rmp_serde::from_slice(&body).context("invalid GUI wake message")
-}
-
-/// 便于 `main.rs` 判断某路径是否是本版本的 GUI socket(调试/日志用)。
-#[allow(dead_code)]
-pub(crate) fn is_gui_socket_path(path: &Path) -> bool {
-    path == gui_socket_path()
 }
 
 #[cfg(test)]

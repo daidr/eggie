@@ -7,7 +7,6 @@
 //! 实现刻意对齐 [`crate::settings::SettingsStore`]:同款 `Entity` + `cx.observe` 跨窗口同步、
 //! 同款 `load` / 原子 `save`(写 `.tmp` 再 rename)、同款「mutating 方法末尾 save + notify」惯用法。
 
-use std::fs;
 use std::path::PathBuf;
 
 use eggie_domain::{Project, ProjectId};
@@ -33,13 +32,11 @@ pub(crate) struct ProjectStore {
 
 impl ProjectStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(projects_path())
+        Self::load_from(crate::persist::data_file_path("projects.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let projects = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistedProjects>(&bytes).ok())
+        let projects = crate::persist::load_json::<PersistedProjects>(&path)
             .map(|persisted| persisted.projects)
             .unwrap_or_default();
         Self { projects, path }
@@ -108,39 +105,18 @@ impl ProjectStore {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let persisted = PersistedProjects {
             version: PERSIST_VERSION,
             projects: self.projects.clone(),
         };
-        let encoded = serde_json::to_vec_pretty(&persisted)?;
-        let temporary_path = self.path.with_extension("json.tmp");
-        fs::write(&temporary_path, encoded)?;
-        fs::rename(temporary_path, &self.path)
+        crate::persist::save_json_atomic(&self.path, &persisted)
     }
-}
-
-/// 与 `settings_path()` 同目录:macOS `~/Library/Application Support/Eggie/projects.json`,
-/// 其它平台 `~/.config/eggie/projects.json`。
-fn projects_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    return home
-        .join("Library")
-        .join("Application Support")
-        .join("Eggie")
-        .join("projects.json");
-    #[cfg(not(target_os = "macos"))]
-    return home.join(".config").join("eggie").join("projects.json");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
 
     fn temp_path() -> PathBuf {

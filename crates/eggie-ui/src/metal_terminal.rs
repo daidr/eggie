@@ -2073,6 +2073,51 @@ struct RasterPlacement {
     baseline: f64,
 }
 
+/// Baseline (in the bottom-origin bitmap context) that vertically centers `ascent + descent`
+/// within a `cell_height`-tall cell, then applies the optional `adjust-font-baseline` modifier
+/// (pre-scaled to device px; positive raises the glyph). Shared by the `CTLine` text path and the
+/// pre-shaped `rasterize_glyph_id` path so both sit on the same line. The float operation order is
+/// load-bearing for bit-identical output and must not change.
+fn resolve_baseline(
+    ascent: f64,
+    descent: f64,
+    cell_height: usize,
+    adjustment: Option<crate::settings::MetricModifier>,
+) -> f64 {
+    let text_height = ascent + descent;
+    let base_baseline = ((cell_height as f64 - text_height) / 2.).max(0.) + descent;
+    match adjustment {
+        Some(modifier) => f64::from(modifier.apply(base_baseline as f32)).max(0.),
+        None => base_baseline,
+    }
+}
+
+/// Bounded per-side ink overhang for an atlas tile. `left_edge`/`right_edge` are the glyph ink's
+/// left and right extents relative to the cell's left edge; each overhang is the amount that ink
+/// spills past the cell, clamped to `max_overhang`. `tile_width` is the resulting tile width and
+/// `offset` is the tile's x placement (negative = shifted left by the left overhang). Shared by the
+/// `CTLine` and pre-shaped glyph paths; the expressions are load-bearing for bit-identical output.
+struct OverhangTile {
+    left: usize,
+    tile_width: usize,
+    offset: [i16; 2],
+}
+
+fn overhang_tile(
+    left_edge: f64,
+    right_edge: f64,
+    cell_width: usize,
+    max_overhang: usize,
+) -> OverhangTile {
+    let left = ((-left_edge).ceil().max(0.) as usize).min(max_overhang);
+    let right = ((right_edge - cell_width as f64).ceil().max(0.) as usize).min(max_overhang);
+    OverhangTile {
+        left,
+        tile_width: cell_width + left + right,
+        offset: [-(left.min(i16::MAX as usize) as i16), 0],
+    }
+}
+
 fn raster_placement(
     line: &CTLine,
     context: &CGContext,
@@ -2082,14 +2127,14 @@ fn raster_placement(
     baseline_adjustment: Option<crate::settings::MetricModifier>,
 ) -> RasterPlacement {
     let metrics = line.get_typographic_bounds();
-    let text_height = metrics.ascent + metrics.descent;
-    let base_baseline = ((cell_height as f64 - text_height) / 2.).max(0.) + metrics.descent;
     // `adjust-font-baseline` shifts the baseline. The modifier is pre-scaled to device px; a
     // positive value raises the glyph (larger baseline y in this bottom-origin bitmap context).
-    let baseline = match baseline_adjustment {
-        Some(modifier) => f64::from(modifier.apply(base_baseline as f32)).max(0.),
-        None => base_baseline,
-    };
+    let baseline = resolve_baseline(
+        metrics.ascent,
+        metrics.descent,
+        cell_height,
+        baseline_adjustment,
+    );
     let ink = line.get_image_bounds(context);
     let has_finite_ink = !ink.is_empty()
         && ink.origin.x.is_finite()
@@ -2121,16 +2166,13 @@ fn raster_placement(
     } else {
         cell_width.max(1)
     };
-    let left_overhang = ((-ink_left).ceil().max(0.) as usize).min(max_overhang);
-    let right_overhang =
-        ((ink_right - cell_width as f64).ceil().max(0.) as usize).min(max_overhang);
-    let width = cell_width + left_overhang + right_overhang;
+    let tile = overhang_tile(ink_left, ink_right, cell_width, max_overhang);
 
     RasterPlacement {
-        width,
+        width: tile.tile_width,
         height: cell_height,
-        offset: [-(left_overhang.min(i16::MAX as usize) as i16), 0],
-        text_x: centered_x + left_overhang as f64,
+        offset: tile.offset,
+        text_x: centered_x + tile.left as f64,
         baseline,
     }
 }
@@ -2201,26 +2243,19 @@ fn rasterize_glyph_id(
 ) -> RasterizedImage {
     let ascent = font.ascent();
     let descent = font.descent();
-    let text_height = ascent + descent;
-    let base_baseline = ((cell_height as f64 - text_height) / 2.).max(0.) + descent;
-    let baseline = match baseline_adjustment {
-        Some(modifier) => f64::from(modifier.apply(base_baseline as f32)).max(0.),
-        None => base_baseline,
-    };
+    let baseline = resolve_baseline(ascent, descent, cell_height, baseline_adjustment);
     // Measure ink so a glyph wider than its cell (a ligature half) keeps a bounded overhang.
     let glyphs = [glyph_id as CGGlyph];
     let bounds = font.get_bounding_rects_for_glyphs(kCTFontOrientationDefault, &glyphs);
     let max_overhang = cell_width.max(1);
-    let left_overhang = ((-bounds.origin.x).ceil().max(0.) as usize).min(max_overhang);
     let right_edge = bounds.origin.x + bounds.size.width;
-    let right_overhang = ((right_edge - cell_width as f64).ceil().max(0.) as usize)
-        .min(max_overhang);
-    let tile_width = cell_width + left_overhang + right_overhang;
+    let tile = overhang_tile(bounds.origin.x, right_edge, cell_width, max_overhang);
+    let tile_width = tile.tile_width;
 
     let mut context = mask_context(tile_width, cell_height, thicken);
     context.data().fill(0);
     context.set_gray_fill_color(1., 1.);
-    let positions = [CGPoint::new(left_overhang as f64, baseline)];
+    let positions = [CGPoint::new(tile.left as f64, baseline)];
     font.draw_glyphs(&glyphs, &positions, context.clone());
     context.flush();
 
@@ -2228,7 +2263,7 @@ fn rasterize_glyph_id(
         pixels: context.data().to_vec(),
         width: tile_width,
         height: cell_height,
-        offset: [-(left_overhang.min(i16::MAX as usize) as i16), 0],
+        offset: tile.offset,
     }
 }
 
@@ -2331,6 +2366,38 @@ pub(crate) fn font_metrics(family: &str, font_size: f32, scale_factor: f32) -> (
 mod tests {
     use super::*;
 
+    /// Builds a `GlyphKey` for ordinary text with every non-dimensional field at its default
+    /// (no bold/italic, not a sprite, no metric modifiers, empty feature/variation sets). Tests
+    /// that need a non-default field layer it on with struct-update syntax
+    /// (`GlyphKey { bold: true, ..text_glyph_key(...) }`).
+    fn text_glyph_key(
+        text: &str,
+        family: &str,
+        font_size_bits: u32,
+        cell_width: u16,
+        width: u16,
+        height: u16,
+    ) -> GlyphKey {
+        GlyphKey {
+            text: Arc::from(text),
+            family: Arc::from(family),
+            font_size_bits,
+            bold: false,
+            italic: false,
+            cell_width,
+            width,
+            height,
+            sprite: false,
+            baseline: None,
+            box_thickness: None,
+            icon_height: None,
+            features: Arc::from(&[][..]),
+            glyph_id: None,
+            variations: Arc::from(&[][..]),
+            thicken: None,
+        }
+    }
+
     #[test]
     fn consecutive_placements_of_one_texture_form_one_metal_batch() {
         let key = TerminalTextureKey {
@@ -2401,24 +2468,7 @@ mod tests {
 
     #[test]
     fn core_text_rasterization_has_exact_cell_dimensions() {
-        let key = GlyphKey {
-            text: Arc::from("M"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 18,
-            width: 18,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
-        };
+        let key = text_glyph_key("M", "Menlo", 28f32.to_bits(), 18, 18, 36);
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("ordinary text must stay on the compact mask path")
         };
@@ -2430,22 +2480,9 @@ mod tests {
     #[test]
     fn unknown_text_uses_one_cell_with_a_one_pixel_hollow_outline() {
         let key = GlyphKey {
-            text: Arc::from("\u{10ffff}\u{10fffe}"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
             bold: true,
             italic: true,
-            cell_width: 17,
-            width: 34,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
+            ..text_glyph_key("\u{10ffff}\u{10fffe}", "Menlo", 28f32.to_bits(), 17, 34, 36)
         };
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("unknown text must stay on the tintable mask path")
@@ -2467,24 +2504,14 @@ mod tests {
     #[test]
     fn precomposed_fractions_stay_inside_their_single_cell_atlas_tiles() {
         for fraction in "¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞⅟↉".chars() {
-            let key = GlyphKey {
-                text: Arc::from(fraction.to_string()),
-                family: Arc::from("Maple Mono NF CN"),
-                font_size_bits: 28f32.to_bits(),
-                bold: false,
-                italic: false,
-                cell_width: 17,
-                width: 17,
-                height: 36,
-                sprite: false,
-                baseline: None,
-                box_thickness: None,
-                icon_height: None,
-                features: Arc::from(&[][..]),
-                glyph_id: None,
-                variations: Arc::from(&[][..]),
-                thicken: None,
-            };
+            let key = text_glyph_key(
+                &fraction.to_string(),
+                "Maple Mono NF CN",
+                28f32.to_bits(),
+                17,
+                17,
+                36,
+            );
             let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
                 panic!("fraction U+{:04X} must use the mask atlas", fraction as u32)
             };
@@ -2599,24 +2626,7 @@ mod tests {
         if !installed.postscript_name().contains("MapleMono-NF-CN") {
             return;
         }
-        let key = GlyphKey {
-            text: Arc::from("\u{f023}"),
-            family: Arc::from("Maple Mono NF CN"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 17,
-            width: 17,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
-        };
+        let key = text_glyph_key("\u{f023}", "Maple Mono NF CN", 28f32.to_bits(), 17, 17, 36);
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("Nerd Font lock must stay on the tintable mask path")
         };
@@ -2667,24 +2677,7 @@ mod tests {
 
     #[test]
     fn core_text_rasterization_preserves_color_emoji_pixels() {
-        let key = GlyphKey {
-            text: Arc::from("🙂"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 18,
-            width: 36,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
-        };
+        let key = text_glyph_key("🙂", "Menlo", 28f32.to_bits(), 18, 36, 36);
         let RasterizedGlyph::Color(image) = rasterize_text(&key) else {
             panic!("Apple Color Emoji fallback must use the color atlas")
         };
@@ -2701,24 +2694,7 @@ mod tests {
     #[test]
     fn core_text_rasterizes_extended_emoji_graphemes_as_single_color_glyphs() {
         for text in ["🇦🇶", "👩‍🔬", "✊🏿", "🏴‍☠️", "🤽🏼‍♀️"] {
-            let key = GlyphKey {
-                text: Arc::from(text),
-                family: Arc::from("Menlo"),
-                font_size_bits: 28f32.to_bits(),
-                bold: false,
-                italic: false,
-                cell_width: 18,
-                width: 36,
-                height: 36,
-                sprite: false,
-                baseline: None,
-                box_thickness: None,
-                icon_height: None,
-                features: Arc::from(&[][..]),
-                glyph_id: None,
-                variations: Arc::from(&[][..]),
-                thicken: None,
-            };
+            let key = text_glyph_key(text, "Menlo", 28f32.to_bits(), 18, 36, 36);
             let RasterizedGlyph::Color(image) = rasterize_text(&key) else {
                 panic!("{text:?} must use the Apple Color Emoji atlas")
             };
@@ -2735,24 +2711,7 @@ mod tests {
     #[test]
     fn text_presentation_and_mixed_preedit_content_stay_tintable() {
         for text in ["☺\u{fe0e}", "你好🙂"] {
-            let key = GlyphKey {
-                text: Arc::from(text),
-                family: Arc::from("Menlo"),
-                font_size_bits: 28f32.to_bits(),
-                bold: false,
-                italic: false,
-                cell_width: 18,
-                width: 96,
-                height: 36,
-                sprite: false,
-                baseline: None,
-                box_thickness: None,
-                icon_height: None,
-                features: Arc::from(&[][..]),
-                glyph_id: None,
-                variations: Arc::from(&[][..]),
-                thicken: None,
-            };
+            let key = text_glyph_key(text, "Menlo", 28f32.to_bits(), 18, 96, 36);
             assert!(
                 matches!(rasterize_text(&key), RasterizedGlyph::Mask(_)),
                 "{text:?} contains text-presentation glyphs and must remain tintable"
@@ -2769,24 +2728,7 @@ mod tests {
         let raster_cache = GlyphRasterCache::default();
         assert!(atlas.color_texture.is_none());
 
-        let text = GlyphKey {
-            text: Arc::from("M"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 18,
-            width: 18,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
-        };
+        let text = text_glyph_key("M", "Menlo", 28f32.to_bits(), 18, 18, 36);
         assert_eq!(
             atlas
                 .get_or_insert(&device, &raster_cache, text)
@@ -2797,24 +2739,7 @@ mod tests {
         );
         assert!(atlas.color_texture.is_none());
 
-        let emoji = GlyphKey {
-            text: Arc::from("🙂"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 18,
-            width: 36,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
-        };
+        let emoji = text_glyph_key("🙂", "Menlo", 28f32.to_bits(), 18, 36, 36);
         assert_eq!(
             atlas
                 .get_or_insert(&device, &raster_cache, emoji)
@@ -2828,24 +2753,7 @@ mod tests {
 
     #[test]
     fn core_text_rasterization_keeps_glyphs_upright() {
-        let key = GlyphKey {
-            text: Arc::from("/"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 18,
-            width: 18,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
-            icon_height: None,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
-        };
+        let key = text_glyph_key("/", "Menlo", 28f32.to_bits(), 18, 18, 36);
         let RasterizedGlyph::Mask(image) = rasterize_text(&key) else {
             panic!("slash must stay on the mask path")
         };
@@ -3230,22 +3138,8 @@ mod tests {
                 .count()
         };
         let key_with = |icon_height: Option<crate::settings::MetricModifier>| GlyphKey {
-            text: Arc::from("\u{f001}"),
-            family: Arc::from("Menlo"),
-            font_size_bits: 28f32.to_bits(),
-            bold: false,
-            italic: false,
-            cell_width: 18,
-            width: 18,
-            height: 36,
-            sprite: false,
-            baseline: None,
-            box_thickness: None,
             icon_height,
-            features: Arc::from(&[][..]),
-            glyph_id: None,
-            variations: Arc::from(&[][..]),
-            thicken: None,
+            ..text_glyph_key("\u{f001}", "Menlo", 28f32.to_bits(), 18, 18, 36)
         };
 
         let baseline = rasterize_text(&key_with(None));

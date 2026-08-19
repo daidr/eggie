@@ -111,27 +111,27 @@ fn download_inner(
 ) -> Result<()> {
     // `total` is the expected content length: local file size for `file://`, or the HTTP
     // `Content-Length` header for `http(s)://`. It drives the progress bar, so leaving it `None`
-    // for HTTP (as before) made the bar jump straight to 100% on the first chunk.
-    let mut total: Option<u64> = None;
-    let mut reader: Box<dyn Read> = match url.scheme() {
+    // for HTTP made the bar jump straight to 100% on the first chunk.
+    let (mut reader, total): (Box<dyn Read>, Option<u64>) = match url.scheme() {
         "file" => {
             let path = url
                 .to_file_path()
                 .map_err(|_| anyhow::anyhow!("invalid file URL: {url}"))?;
-            total = std::fs::metadata(&path).ok().map(|m| m.len());
-            Box::new(
+            let total = std::fs::metadata(&path).ok().map(|m| m.len());
+            let reader = Box::new(
                 File::open(&path).with_context(|| format!("failed to open {}", path.display()))?,
-            )
+            );
+            (reader, total)
         }
         "http" | "https" => {
             let response = ureq::get(url.as_str())
                 .call()
                 .with_context(|| format!("failed to download {url}"))?;
-            total = response
+            let total = response
                 .header("Content-Length")
                 .and_then(|value| value.trim().parse::<u64>().ok())
                 .filter(|&length| length > 0);
-            Box::new(response.into_reader())
+            (Box::new(response.into_reader()), total)
         }
         other => bail!("unsupported download URL scheme: {other}"),
     };

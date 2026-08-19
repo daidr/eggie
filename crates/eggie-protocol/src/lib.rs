@@ -641,13 +641,18 @@ pub struct TerminalAppearance {
     pub cursor_text: u32,
 }
 
+/// The 16 ANSI palette entries used when no theme overrides them. Shared by
+/// [`TerminalAppearance::default`] and by the UI's theme seeding so the fallback colors have a
+/// single source of truth.
+pub const DEFAULT_PALETTE: [u32; 16] = [
+    0x1d2027, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370,
+    0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
+];
+
 impl Default for TerminalAppearance {
     fn default() -> Self {
         Self {
-            palette: [
-                0x1d2027, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf,
-                0x5c6370, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
-            ],
+            palette: DEFAULT_PALETTE,
             foreground: 0xabb2bf,
             background: 0x1d2027,
             cursor: 0xabb2bf,

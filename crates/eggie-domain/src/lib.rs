@@ -754,20 +754,6 @@ fn interval_gap(first_start: f32, first_end: f32, second_start: f32, second_end:
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoCloseExitedTerminal {
-    Never,
-    #[default]
-    OnSuccess,
-    Always,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Settings {
-    pub auto_close_exited_terminal: AutoCloseExitedTerminal,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

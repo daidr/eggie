@@ -7,7 +7,6 @@
 //!
 //! 保存时机由 UI 层控制(停止输入 ~500ms 的防抖),这里只提供 `set_text` 落盘原语。
 
-use std::fs;
 use std::path::PathBuf;
 
 use gpui::Context;
@@ -32,13 +31,11 @@ pub(crate) struct NotesStore {
 
 impl NotesStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(notes_path())
+        Self::load_from(crate::persist::data_file_path("notes.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let text = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistedNotes>(&bytes).ok())
+        let text = crate::persist::load_json::<PersistedNotes>(&path)
             .map(|persisted| persisted.text)
             .unwrap_or_default();
         Self { text, path }
@@ -66,39 +63,18 @@ impl NotesStore {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let persisted = PersistedNotes {
             version: PERSIST_VERSION,
             text: self.text.clone(),
         };
-        let encoded = serde_json::to_vec_pretty(&persisted)?;
-        let temporary_path = self.path.with_extension("json.tmp");
-        fs::write(&temporary_path, encoded)?;
-        fs::rename(temporary_path, &self.path)
+        crate::persist::save_json_atomic(&self.path, &persisted)
     }
-}
-
-/// 与 `projects_path()` 同目录:macOS `~/Library/Application Support/Eggie/notes.json`,
-/// 其它平台 `~/.config/eggie/notes.json`。
-fn notes_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    return home
-        .join("Library")
-        .join("Application Support")
-        .join("Eggie")
-        .join("notes.json");
-    #[cfg(not(target_os = "macos"))]
-    return home.join(".config").join("eggie").join("notes.json");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp_path() -> PathBuf {
         let dir =
