@@ -1025,6 +1025,49 @@ impl TerminalSnapshot {
             .collect()
     }
 
+    /// Whether a URL scheme separator (`://` or `mailto:`) appears on any row, scanning the sparse
+    /// `cells` directly without materializing the grid.
+    ///
+    /// Equivalent to `plain_lines().iter().any(|l| l.contains("://") || l.contains("mailto:"))`
+    /// but allocation-free: `cells` is emitted row-major with strictly ascending columns (the grid
+    /// iterator's order, preserved through the empty-cell filter), so a scheme substring can only
+    /// span cells that are on the same row at consecutive columns. This runs on every published
+    /// frame as a cheap precheck that short-circuits the regex pass on high-throughput output,
+    /// which rarely contains URLs; `plain_lines()`'s per-row `String` allocation made that precheck
+    /// as expensive as the thing it guards.
+    pub fn has_scheme_candidate(&self) -> bool {
+        // Longest needle is `mailto:` (7 chars). Track the current run of consecutive same-row
+        // cells as a small ring so a match check never allocates.
+        const MAILTO: [char; 7] = ['m', 'a', 'i', 'l', 't', 'o', ':'];
+        const SCHEME_SEP: [char; 3] = [':', '/', '/'];
+        let mut window: [char; 7] = [' '; 7];
+        let mut len: usize = 0;
+        let mut prev: Option<(u16, u16)> = None;
+        for cell in &self.cells {
+            // A gap (new row, or a skipped empty column) breaks character adjacency, so the needle
+            // cannot straddle it: reset the run before considering this cell.
+            let contiguous = matches!(prev, Some((line, column)) if line == cell.line && column + 1 == cell.column);
+            if !contiguous {
+                len = 0;
+            }
+            if len == window.len() {
+                window.rotate_left(1);
+                window[window.len() - 1] = cell.character;
+            } else {
+                window[len] = cell.character;
+                len += 1;
+            }
+            if len >= SCHEME_SEP.len() && window[len - SCHEME_SEP.len()..len] == SCHEME_SEP {
+                return true;
+            }
+            if len >= MAILTO.len() && window[len - MAILTO.len()..len] == MAILTO {
+                return true;
+            }
+            prev = Some((cell.line, cell.column));
+        }
+        false
+    }
+
     pub fn apply_delta(&self, delta: &TerminalSnapshotDelta) -> Option<Self> {
         if self.session_id != delta.session_id
             || self.revision != delta.base_revision
@@ -1246,6 +1289,91 @@ pub fn encode_line<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Minimal snapshot carrying only the fields `plain_lines`/`has_scheme_candidate` read.
+    fn snapshot_with_cells(columns: u16, rows: u16, cells: Vec<TerminalCell>) -> TerminalSnapshot {
+        TerminalSnapshot {
+            session_id: Uuid::nil(),
+            size: TerminalSize {
+                columns,
+                rows,
+                cell_width: 0,
+                cell_height: 0,
+            },
+            cells,
+            color_overrides: Vec::new(),
+            cursor_line: 0,
+            cursor_column: 0,
+            cursor_shape: TerminalCursorShape::Hidden,
+            cursor_width: 1,
+            cursor_blinking: false,
+            title: String::new(),
+            revision: 0,
+            last_input_sequence: 0,
+            input_modes: TerminalInputModes::default(),
+            images: Vec::new(),
+            image_placements: Vec::new(),
+            selection: None,
+            detected_links: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
+        }
+    }
+
+    /// Row-major, ascending-column cells spelling `text` on `line` starting at column 0, mirroring
+    /// how the grid iterator emits a rendered line (empty cells omitted, so spaces create column
+    /// gaps just as the daemon's snapshot builder produces).
+    fn row_cells(line: u16, text: &str) -> Vec<TerminalCell> {
+        text.chars()
+            .enumerate()
+            .filter(|(_, character)| *character != ' ')
+            .map(|(column, character)| TerminalCell {
+                line,
+                column: column as u16,
+                character,
+                zerowidth: Vec::new(),
+                foreground: TerminalColor::Indexed(0),
+                background: TerminalColor::Indexed(0),
+                underline_color: None,
+                hyperlink: None,
+                flags: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn has_scheme_candidate_matches_plain_lines_precheck() {
+        // (columns, rows, per-row text). Each row's cells are built sparse (spaces omitted), so the
+        // ` : / /` cases exercise the column-gap break that must NOT match `://`.
+        let cases: &[(u16, u16, &[&str])] = &[
+            (20, 1, &["visit https://x.io"]),   // scheme separator present
+            (20, 1, &["plain text no urls"]),    // none
+            (20, 1, &["mailto:me@example.com"]), // mailto needle
+            (20, 1, &["scheme : // spaced"]),    // gaps between :,/,/ -> no match
+            (10, 2, &["nothing", "a://b"]),      // match on a later row
+            (8, 1, &["::://"]),                  // overlapping colons then //
+            (5, 1, &["a://"]),                   // match at window edge
+            (3, 1, &["://"]),                    // exactly the needle, full width
+            (20, 1, &["trailing://   "]),        // match before trimmed trailing space
+        ];
+        for (columns, rows, lines) in cases {
+            let cells: Vec<TerminalCell> = lines
+                .iter()
+                .enumerate()
+                .flat_map(|(line, text)| row_cells(line as u16, text))
+                .collect();
+            let snapshot = snapshot_with_cells(*columns, *rows, cells);
+            let expected = snapshot
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("://") || line.contains("mailto:"));
+            assert_eq!(
+                snapshot.has_scheme_candidate(),
+                expected,
+                "mismatch for {lines:?}"
+            );
+        }
+    }
 
     #[test]
     fn request_round_trips_as_a_single_json_line() {

@@ -1,7 +1,7 @@
 use crate::{
     app::EggieApp,
     input_latency::InputLatencyTracker,
-    metal_terminal::{GlyphRasterCache, MetalBackend},
+    metal_terminal::{GlyphPreparation, GlyphRasterCache, MetalBackend},
     settings::{ResolvedMetricAdjustments, TerminalTheme, minimum_contrast_rgb},
     terminal_sprites::{self, SpriteKind},
 };
@@ -963,11 +963,6 @@ impl Element for MetalTerminalElement {
             (f32::from(bounds.origin.x) * scale_factor).round(),
             (f32::from(bounds.origin.y) * scale_factor).round(),
         ];
-        let glyphs = self.renderer.glyph_raster_cache.prepare_terminal(
-            &prepared,
-            scale_factor,
-            physical_origin,
-        );
         let layout = RasterLayoutKey {
             viewport_origin_x_bits: physical_origin[0].to_bits(),
             viewport_origin_y_bits: physical_origin[1].to_bits(),
@@ -978,6 +973,34 @@ impl Element for MetalTerminalElement {
             scale_factor_bits: scale_factor.to_bits(),
             family,
             font_size_bits: font_size.to_bits(),
+        };
+        // Steady-state fast path: if the previous frame already confirmed *this exact* prepared
+        // terminal (same `Arc`, i.e. a revision cache hit) fully ready at this same layout, its
+        // glyph set is unchanged and every raster is already resident. Re-running the readiness
+        // pass would rebuild a full `FxHashSet<GlyphKey>` — thousands of `Arc::clone`s + hashes —
+        // purely to re-confirm what we already know, on every repaint (cursor blink, animation).
+        // Skip it. Trade-off: the skipped frame does not re-assert these keys into the shared CPU
+        // glyph cache's working set, so if a *different* session drives that cache past
+        // CPU_GLYPH_CACHE_LIMIT this session's rasters could be evicted and lazily rebuilt later;
+        // that only bites near the 65k-glyph ceiling and degrades to an async re-raster, never a
+        // wrong pixel.
+        let already_ready = {
+            let cache = self.renderer.preparation_cache.lock();
+            cache
+                .last_ready
+                .get(&self.snapshot.session_id)
+                .is_some_and(|ready| {
+                    ready.layout == layout && Arc::ptr_eq(&ready.terminal, &prepared)
+                })
+        };
+        let glyphs = if already_ready {
+            GlyphPreparation { ready: true }
+        } else {
+            self.renderer.glyph_raster_cache.prepare_terminal(
+                &prepared,
+                scale_factor,
+                physical_origin,
+            )
         };
         // A frame is presentable only when both its glyph rasters and its image textures are
         // ready. Gating on images here (not just in the App's frame scheduler) covers every

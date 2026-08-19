@@ -1031,11 +1031,10 @@ impl ListenerState {
             return;
         }
         // Precheck: only scan when a scheme separator is visible. This keeps high-throughput output
-        // (which rarely contains URLs) from paying for a regex pass every frame.
-        let has_candidate = snapshot.plain_lines().iter().any(|line| {
-            line.contains("://") || line.contains("mailto:")
-        });
-        if !has_candidate {
+        // (which rarely contains URLs) from paying for a regex pass every frame. Scans the sparse
+        // cells directly — materializing the grid into per-row `String`s here (the old
+        // `plain_lines()` precheck) cost as much as the regex it guards.
+        if !snapshot.has_scheme_candidate() {
             return;
         }
 

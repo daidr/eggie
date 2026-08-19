@@ -634,6 +634,11 @@ pub struct EggieApp {
     terminal_font_variations: std::sync::Arc<[crate::settings::FontVariation]>,
     terminal_font_thicken: Option<u8>,
     terminal_font_codepoint_map: std::sync::Arc<[crate::settings::CodepointMapEntry]>,
+    /// The last `AppSettings` whose config-derived state (font resolution, per-session policy
+    /// pushes) was applied. `render` re-derives that state only when the live config differs from
+    /// this, so the steady-state repaint (cursor blink, snapshot stream) skips cloning the 51-field
+    /// config and re-parsing every font feature/variation/codepoint string each frame.
+    applied_config: Option<crate::settings::AppSettings>,
     terminal_renderer: MetalTerminalRenderer,
     terminal_images_in_flight: HashSet<TerminalImageStreamKey>,
     terminal_frame_scheduled: bool,
@@ -1630,6 +1635,9 @@ impl EggieApp {
             terminal_font_variations,
             terminal_font_thicken: config.font_thicken.then_some(config.font_thicken_strength),
             terminal_font_codepoint_map,
+            // `None` so the first `render` applies the config-derived state once (pushing initial
+            // per-session policy to the daemon), then caches it to gate subsequent frames.
+            applied_config: None,
             terminal_renderer: MetalTerminalRenderer::default(),
             terminal_images_in_flight: HashSet::new(),
             terminal_frame_scheduled: false,
@@ -2796,6 +2804,11 @@ impl EggieApp {
             self.terminal_ime_states.remove(&session_id);
             self.session_inspections.remove(&session_id);
             self.session_inspection_errors.remove(&session_id);
+            self.shell_integration.remove(&session_id);
+            self.notification_routes
+                .borrow_mut()
+                .retain(|_, route| route.session_id != session_id);
+            self.reconcile_layout_caches();
         }
         changed
     }
@@ -2805,10 +2818,13 @@ impl EggieApp {
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             loop {
-                let session_id = this
-                    .update(cx, |app, _| app.active_session_id())
-                    .ok()
-                    .flatten();
+                // A dead weak entity (window closed) must end the loop; `Ok(None)` only means there
+                // is no active session right now, so keep polling. Folding both into `None` here
+                // would make the `break` below unreachable and leak this 1Hz task forever.
+                let session_id = match this.update(cx, |app, _| app.active_session_id()) {
+                    Ok(session_id) => session_id,
+                    Err(_) => break,
+                };
                 if let Some(session_id) = session_id {
                     let request_client = client.clone();
                     let result = executor
@@ -2861,16 +2877,20 @@ impl EggieApp {
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             loop {
-                let target = this
-                    .update(cx, |app, _| {
-                        if app.right_sidebar_collapsed || app.right_tab != RightTab::Commands {
-                            None
-                        } else {
-                            app.active_session_id()
-                        }
-                    })
-                    .ok()
-                    .flatten();
+                // `Err` means the window is gone — stop. `Ok(None)` means the Commands tab is not
+                // currently visible (or no active session); keep polling so the task resumes when
+                // the user switches back. Collapsing both into `None` would strand this task
+                // spinning once per second for the window's whole life.
+                let target = match this.update(cx, |app, _| {
+                    if app.right_sidebar_collapsed || app.right_tab != RightTab::Commands {
+                        None
+                    } else {
+                        app.active_session_id()
+                    }
+                }) {
+                    Ok(target) => target,
+                    Err(_) => break,
+                };
                 if let Some(session_id) = target {
                     let request_client = client.clone();
                     let result = executor
@@ -3035,6 +3055,37 @@ impl EggieApp {
         {
             self.active_project = first.id;
         }
+    }
+
+    /// Reap per-`GroupId` / per-`SplitId` render caches whose layout node no longer exists.
+    ///
+    /// `GroupId`/`SplitId` are globally unique across every project's layout, and these caches are
+    /// not partitioned by project, so the live set must span *all* `project_views` — retaining
+    /// against only the active workspace would wrongly drop another project's entries. Called after
+    /// any layout mutation (tab/split close) so closed nodes don't leak bounds/handles for the
+    /// window's lifetime.
+    fn reconcile_layout_caches(&mut self) {
+        let live_groups: HashSet<GroupId> = self
+            .project_views
+            .values()
+            .flat_map(|view| view.layout.group_ids())
+            .collect();
+        let live_splits: HashSet<SplitId> = self
+            .project_views
+            .values()
+            .flat_map(|view| view.layout.split_ids())
+            .collect();
+        self.terminal_viewports
+            .retain(|group_id, _| live_groups.contains(group_id));
+        self.scrollbar_bounds
+            .borrow_mut()
+            .retain(|group_id, _| live_groups.contains(group_id));
+        self.tab_bar_scroll_handles
+            .borrow_mut()
+            .retain(|group_id, _| live_groups.contains(group_id));
+        self.split_bounds
+            .borrow_mut()
+            .retain(|split_id, _| live_splits.contains(split_id));
     }
 
     fn active_session_id(&self) -> Option<SessionId> {
@@ -3639,7 +3690,15 @@ impl EggieApp {
             }
             self.session_inspections.remove(&session_id);
             self.session_inspection_errors.remove(&session_id);
+            self.shell_integration.remove(&session_id);
+            // Drop any un-actioned system-notification routes owned by this session: the session is
+            // gone, so their "user clicked the notification" callback can never fire to remove them.
+            self.notification_routes
+                .borrow_mut()
+                .retain(|_, route| route.session_id != session_id);
         }
+        // The closed item may have collapsed a group or split out of the layout; reap their caches.
+        self.reconcile_layout_caches();
         self.ensure_snapshot_watchers(cx);
         self.sync_terminal_focus();
         cx.notify();
@@ -4327,6 +4386,10 @@ impl EggieApp {
                         },
                     );
                     input.set_placeholder(self.language.search_placeholder());
+                    // Seed the edit-menu language here rather than relying on `render` to patch it
+                    // next frame: `render` now only pushes language on a config change, so a search
+                    // opened while the config is stable would otherwise keep the default language.
+                    input.set_language(self.language);
                     input
                 });
                 let subscription =
@@ -8094,7 +8157,6 @@ impl EggieApp {
 
 impl gpui::Render for EggieApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let config = self.settings.read(cx).config().clone();
         // Read the *resolved* theme (persisted theme, or the settings window's live hover preview if
         // one is active) so a hovered theme lights up the real terminals here, not just the preview.
         self.terminal_theme = self
@@ -8114,61 +8176,71 @@ impl gpui::Render for EggieApp {
             }
         }
         self.colors = UiColors::from_theme(self.terminal_theme);
-        self.terminal_font_families = config.resolved_font_families();
-        self.terminal_font_features = config.resolved_font_features().into();
-        self.terminal_ligatures = config.ligatures;
-        self.terminal_shaping_break_cursor = config.font_shaping_break_cursor;
-        self.terminal_font_variations = config.resolved_font_variations().into();
-        self.terminal_font_thicken =
-            config.font_thicken.then_some(config.font_thicken_strength);
-        self.terminal_font_codepoint_map = config.resolved_codepoint_map().into();
-        self.terminal_font_family = config.font_family.into();
-        self.terminal_font_size = config.font_size;
-        self.terminal_padding_x = config.terminal_padding_x;
-        self.terminal_padding_y = config.terminal_padding_y;
-        self.terminal_minimum_contrast = config.minimum_contrast;
-        self.terminal_metric_adjustments = config.font_metrics.resolve();
-        let progress_timeouts = TerminalProgressTimeouts {
-            completed_ms: config.progress_complete_timeout_secs.saturating_mul(1_000),
-            stale_ms: config.progress_stale_timeout_secs.saturating_mul(1_000),
-        };
-        if progress_timeouts != self.progress_timeouts {
-            self.progress_timeouts = progress_timeouts;
-            for session_id in self.window_session_ids() {
-                self.configure_session_progress(session_id);
+        // Re-derive config-dependent state (font resolution, per-session daemon policy) only when the
+        // config actually changed since last applied. The steady-state repaint — cursor blink,
+        // snapshot stream, hover — leaves the config untouched, so this skips a 51-field clone plus
+        // re-parsing every font feature/variation/codepoint string on every frame. `settings`
+        // changes flow through `cx.observe` (which notifies), so a real edit still re-renders here.
+        let config_changed = self.applied_config.as_ref() != Some(self.settings.read(cx).config());
+        if config_changed {
+            let config = self.settings.read(cx).config().clone();
+            self.terminal_font_families = config.resolved_font_families();
+            self.terminal_font_features = config.resolved_font_features().into();
+            self.terminal_ligatures = config.ligatures;
+            self.terminal_shaping_break_cursor = config.font_shaping_break_cursor;
+            self.terminal_font_variations = config.resolved_font_variations().into();
+            self.terminal_font_thicken =
+                config.font_thicken.then_some(config.font_thicken_strength);
+            self.terminal_font_codepoint_map = config.resolved_codepoint_map().into();
+            self.terminal_font_family = config.font_family.clone().into();
+            self.terminal_font_size = config.font_size;
+            self.terminal_padding_x = config.terminal_padding_x;
+            self.terminal_padding_y = config.terminal_padding_y;
+            self.terminal_minimum_contrast = config.minimum_contrast;
+            self.terminal_metric_adjustments = config.font_metrics.resolve();
+            let progress_timeouts = TerminalProgressTimeouts {
+                completed_ms: config.progress_complete_timeout_secs.saturating_mul(1_000),
+                stale_ms: config.progress_stale_timeout_secs.saturating_mul(1_000),
+            };
+            if progress_timeouts != self.progress_timeouts {
+                self.progress_timeouts = progress_timeouts;
+                for session_id in self.window_session_ids() {
+                    self.configure_session_progress(session_id);
+                }
             }
-        }
-        if config.allow_osc_clipboard_read != self.allow_osc_clipboard_read {
-            self.allow_osc_clipboard_read = config.allow_osc_clipboard_read;
-            for session_id in self.window_session_ids() {
-                self.configure_session_osc_policy(session_id);
+            if config.allow_osc_clipboard_read != self.allow_osc_clipboard_read {
+                self.allow_osc_clipboard_read = config.allow_osc_clipboard_read;
+                for session_id in self.window_session_ids() {
+                    self.configure_session_osc_policy(session_id);
+                }
             }
-        }
-        if config.detect_urls != self.detect_urls {
-            self.detect_urls = config.detect_urls;
-            for session_id in self.window_session_ids() {
-                self.configure_session_url_detection(session_id);
+            if config.detect_urls != self.detect_urls {
+                self.detect_urls = config.detect_urls;
+                for session_id in self.window_session_ids() {
+                    self.configure_session_url_detection(session_id);
+                }
             }
-        }
-        if config.cursor_shape != self.cursor_shape {
-            self.cursor_shape = config.cursor_shape;
-            for session_id in self.window_session_ids() {
-                self.configure_session_cursor_shape(session_id);
+            if config.cursor_shape != self.cursor_shape {
+                self.cursor_shape = config.cursor_shape;
+                for session_id in self.window_session_ids() {
+                    self.configure_session_cursor_shape(session_id);
+                }
             }
-        }
-        if config.scrollback_lines != self.scrollback_limit {
-            self.scrollback_limit = config.scrollback_lines;
-            for session_id in self.window_session_ids() {
-                self.configure_session_scrollback(session_id);
+            if config.scrollback_lines != self.scrollback_limit {
+                self.scrollback_limit = config.scrollback_lines;
+                for session_id in self.window_session_ids() {
+                    self.configure_session_scrollback(session_id);
+                }
             }
-        }
-        self.cursor_blink = config.cursor_blink;
-        self.language = config.language;
-        self.copy_on_select = config.copy_on_select;
-        // Keep the search input's edit-menu labels in sync with the current language. Cheap: clone
-        // the handle first to avoid overlapping the `self.terminal_search` borrow with `cx`.
-        if let Some(input) = self.terminal_search.as_ref().map(|s| s.input.clone()) {
-            input.update(cx, |input, _| input.set_language(config.language));
+            self.cursor_blink = config.cursor_blink;
+            self.language = config.language;
+            self.copy_on_select = config.copy_on_select;
+            // Keep the search input's edit-menu labels in sync with the current language. Cheap:
+            // clone the handle first to avoid overlapping the `self.terminal_search` borrow with `cx`.
+            if let Some(input) = self.terminal_search.as_ref().map(|s| s.input.clone()) {
+                input.update(cx, |input, _| input.set_language(config.language));
+            }
+            self.applied_config = Some(config);
         }
         // Keep the blink timer running while the active cursor blinks; it self-terminates otherwise.
         self.ensure_cursor_blink(cx);
