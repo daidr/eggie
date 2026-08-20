@@ -58,7 +58,18 @@ use metal::{MTLClearColor, MTLLoadAction, MTLStoreAction, RenderPassDescriptor};
 
 const MASK_ATLAS_SIZE: usize = 4096;
 const COLOR_ATLAS_SIZE: usize = 2048;
+/// Hard ceiling on cached CPU glyph rasters. When the cache grows past this, `prepare_terminal`
+/// falls back to keeping only the visible working set plus in-flight jobs, regardless of recency.
 const CPU_GLYPH_CACHE_LIMIT: usize = 65_536;
+/// Soft threshold above which idle glyphs are reclaimed. Below this the cache never evicts, so
+/// ordinary sessions (a few thousand distinct glyphs) keep everything warm. A graphics-heavy
+/// workload (e.g. a demo that rasterizes tens of thousands of distinct glyphs) blows past it and
+/// then sheds anything not drawn recently, so process memory falls back once the burst ends.
+const CPU_GLYPH_CACHE_IDLE_WATERMARK: usize = 4_096;
+/// A `Ready` glyph untouched for this many prepared frames is eligible for idle reclamation. At
+/// ~60fps this is roughly 10 seconds — long enough that tab switches and scrollback revisits still
+/// hit the cache, short enough that a finished burst is reclaimed promptly.
+const CPU_GLYPH_CACHE_IDLE_FRAMES: u64 = 600;
 
 #[link(name = "CoreText", kind = "framework")]
 unsafe extern "C" {
@@ -240,7 +251,12 @@ struct GlyphKey {
 
 enum RasterCacheEntry {
     Pending,
-    Ready(Arc<RasterizedGlyph>),
+    Ready {
+        glyph: Arc<RasterizedGlyph>,
+        /// Prepared-frame index at which this glyph was last part of the visible working set (or
+        /// first rasterized). Idle reclamation compares it against the current frame counter.
+        last_used: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -276,6 +292,9 @@ pub(crate) struct GlyphRasterCache {
     entries: Arc<Mutex<FxHashMap<GlyphKey, RasterCacheEntry>>>,
     sender: SyncSender<GlyphKey>,
     counters: Arc<GlyphRasterCounters>,
+    /// Monotonic count of `prepare_terminal` calls, used as the "now" for idle reclamation. Shared
+    /// with the raster workers so freshly rasterized glyphs are stamped with the current frame.
+    frame: Arc<AtomicU64>,
 }
 
 impl Default for GlyphRasterCache {
@@ -283,6 +302,7 @@ impl Default for GlyphRasterCache {
         const QUEUE_CAPACITY: usize = 32_768;
         let entries = Arc::new(Mutex::new(FxHashMap::default()));
         let counters = Arc::new(GlyphRasterCounters::default());
+        let frame = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = sync_channel(QUEUE_CAPACITY);
         let receiver = Arc::new(Mutex::new(receiver));
         let worker_count = thread::available_parallelism()
@@ -293,20 +313,55 @@ impl Default for GlyphRasterCache {
             let entries = Arc::clone(&entries);
             let receiver = Arc::clone(&receiver);
             let counters = Arc::clone(&counters);
+            let frame = Arc::clone(&frame);
             thread::Builder::new()
                 .name(format!("eggie-glyph-raster-{index}"))
-                .spawn(move || glyph_raster_worker(receiver, entries, counters))
+                .spawn(move || glyph_raster_worker(receiver, entries, counters, frame))
                 .expect("spawn terminal glyph raster worker");
         }
         Self {
             entries,
             sender,
             counters,
+            frame,
         }
     }
 }
 
 impl GlyphRasterCache {
+    /// Bound the cache in place before this frame's visible glyphs are (re)stamped.
+    ///
+    /// Two tiers, cheapest-common-case first:
+    /// - Below [`CPU_GLYPH_CACHE_IDLE_WATERMARK`]: no scan at all, so ordinary sessions keep every
+    ///   glyph warm.
+    /// - Past the watermark: drop `Ready` glyphs neither visible this frame nor drawn within the
+    ///   last [`CPU_GLYPH_CACHE_IDLE_FRAMES`] frames, so a finished graphics burst is reclaimed.
+    /// - At the hard [`CPU_GLYPH_CACHE_LIMIT`]: keep only the visible set (plus in-flight jobs),
+    ///   ignoring recency, so a single frame that references that many distinct glyphs still can't
+    ///   grow the process without bound.
+    ///
+    /// `Pending` entries are always kept: a raster job for them is in flight and would otherwise be
+    /// resurrected with a stale key.
+    fn evict_stale(
+        entries: &mut FxHashMap<GlyphKey, RasterCacheEntry>,
+        visible: &FxHashSet<GlyphKey>,
+        frame: u64,
+    ) {
+        if entries.len() >= CPU_GLYPH_CACHE_LIMIT {
+            entries.retain(|key, entry| {
+                visible.contains(key) || matches!(entry, RasterCacheEntry::Pending)
+            });
+        } else if entries.len() > CPU_GLYPH_CACHE_IDLE_WATERMARK {
+            entries.retain(|key, entry| match entry {
+                RasterCacheEntry::Pending => true,
+                RasterCacheEntry::Ready { last_used, .. } => {
+                    visible.contains(key)
+                        || frame.wrapping_sub(*last_used) <= CPU_GLYPH_CACHE_IDLE_FRAMES
+                }
+            });
+        }
+    }
+
     pub(crate) fn prepare_terminal(
         &self,
         terminal: &PreparedMetalTerminal,
@@ -318,21 +373,15 @@ impl GlyphRasterCache {
             .iter()
             .filter_map(|command| glyph_key_for_command(terminal, command, scale, origin))
             .collect::<FxHashSet<_>>();
+        let frame = self.frame.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let mut queued = Vec::new();
         let mut pending: usize = 0;
         {
             let mut entries = self.entries.lock();
-            if entries.len() >= CPU_GLYPH_CACHE_LIMIT {
-                // Retain the complete visible working set and in-flight jobs. Old raster images are
-                // cheap to regenerate asynchronously after a font/scale change and must not turn
-                // a long-running Unicode workload into unbounded process memory.
-                entries.retain(|key, entry| {
-                    keys.contains(key) || matches!(entry, RasterCacheEntry::Pending)
-                });
-            }
+            Self::evict_stale(&mut entries, &keys, frame);
             for key in keys {
-                match entries.get(&key) {
-                    Some(RasterCacheEntry::Ready(_)) => {}
+                match entries.get_mut(&key) {
+                    Some(RasterCacheEntry::Ready { last_used, .. }) => *last_used = frame,
                     Some(RasterCacheEntry::Pending) => pending += 1,
                     None => {
                         entries.insert(key.clone(), RasterCacheEntry::Pending);
@@ -363,8 +412,14 @@ impl GlyphRasterCache {
     }
 
     fn ready(&self, key: &GlyphKey) -> Option<Arc<RasterizedGlyph>> {
-        match self.entries.lock().get(key) {
-            Some(RasterCacheEntry::Ready(rasterized)) => Some(Arc::clone(rasterized)),
+        let frame = self.frame.load(Ordering::Relaxed);
+        match self.entries.lock().get_mut(key) {
+            Some(RasterCacheEntry::Ready { glyph, last_used }) => {
+                // A glyph actually drawn this frame is live; refresh recency so idle reclamation in
+                // a later `prepare_terminal` does not drop something still on screen.
+                *last_used = frame;
+                Some(Arc::clone(glyph))
+            }
             _ => None,
         }
     }
@@ -375,9 +430,14 @@ impl GlyphRasterCache {
         rasterized: Arc<RasterizedGlyph>,
         elapsed: Duration,
     ) {
-        self.entries
-            .lock()
-            .insert(key, RasterCacheEntry::Ready(rasterized));
+        let last_used = self.frame.load(Ordering::Relaxed);
+        self.entries.lock().insert(
+            key,
+            RasterCacheEntry::Ready {
+                glyph: rasterized,
+                last_used,
+            },
+        );
         self.counters
             .synchronous_jobs
             .fetch_add(1, Ordering::Relaxed);
@@ -405,6 +465,7 @@ fn glyph_raster_worker(
     receiver: Arc<Mutex<Receiver<GlyphKey>>>,
     entries: Arc<Mutex<FxHashMap<GlyphKey, RasterCacheEntry>>>,
     counters: Arc<GlyphRasterCounters>,
+    frame: Arc<AtomicU64>,
 ) {
     loop {
         let Ok(key) = receiver.lock().recv() else {
@@ -413,9 +474,14 @@ fn glyph_raster_worker(
         let started = Instant::now();
         let rasterized = Arc::new(rasterize_glyph(&key));
         let elapsed = started.elapsed();
-        entries
-            .lock()
-            .insert(key, RasterCacheEntry::Ready(rasterized));
+        let last_used = frame.load(Ordering::Relaxed);
+        entries.lock().insert(
+            key,
+            RasterCacheEntry::Ready {
+                glyph: rasterized,
+                last_used,
+            },
+        );
         counters.pending.fetch_sub(1, Ordering::Relaxed);
         counters.background_jobs.fetch_add(1, Ordering::Relaxed);
         counters
@@ -2396,6 +2462,97 @@ mod tests {
             variations: Arc::from(&[][..]),
             thicken: None,
         }
+    }
+
+    /// A distinct dummy glyph key per index, so a test can populate the cache with many entries
+    /// without caring what they rasterize to.
+    fn dummy_key(index: usize) -> GlyphKey {
+        text_glyph_key(&format!("g{index}"), "Test", 16, 8, 8, 16)
+    }
+
+    /// A `Ready` entry whose pixels are irrelevant to eviction (which only inspects `last_used`).
+    fn ready_entry(last_used: u64) -> RasterCacheEntry {
+        RasterCacheEntry::Ready {
+            glyph: Arc::new(RasterizedGlyph::exact_mask(Vec::new(), 0, 0)),
+            last_used,
+        }
+    }
+
+    #[test]
+    fn evict_stale_keeps_everything_below_idle_watermark() {
+        let mut entries = FxHashMap::default();
+        // Half the cap's worth of glyphs, all stale (last_used far behind the current frame).
+        for index in 0..CPU_GLYPH_CACHE_IDLE_WATERMARK {
+            entries.insert(dummy_key(index), ready_entry(0));
+        }
+        let visible = FxHashSet::default();
+        let frame = CPU_GLYPH_CACHE_IDLE_FRAMES + 10_000;
+        GlyphRasterCache::evict_stale(&mut entries, &visible, frame);
+        // Under the watermark the scan is skipped entirely — nothing is dropped despite being idle.
+        assert_eq!(entries.len(), CPU_GLYPH_CACHE_IDLE_WATERMARK);
+    }
+
+    #[test]
+    fn evict_stale_reclaims_idle_but_keeps_visible_and_recent_past_watermark() {
+        let mut entries = FxHashMap::default();
+        let count = CPU_GLYPH_CACHE_IDLE_WATERMARK + 3;
+        for index in 0..count {
+            entries.insert(dummy_key(index), ready_entry(0));
+        }
+        let frame = CPU_GLYPH_CACHE_IDLE_FRAMES + 100;
+        // One idle glyph is still on screen this frame; one was drawn recently (just inside the
+        // window); the rest are idle and older than the window.
+        let visible: FxHashSet<GlyphKey> = [dummy_key(0)].into_iter().collect();
+        entries.insert(
+            dummy_key(1),
+            ready_entry(frame - CPU_GLYPH_CACHE_IDLE_FRAMES),
+        );
+        // A queued raster job for a glyph nobody references this frame must not be reaped.
+        entries.insert(dummy_key(count), RasterCacheEntry::Pending);
+
+        GlyphRasterCache::evict_stale(&mut entries, &visible, frame);
+
+        assert!(
+            entries.contains_key(&dummy_key(0)),
+            "visible glyph survives"
+        );
+        assert!(
+            entries.contains_key(&dummy_key(1)),
+            "recently used glyph survives"
+        );
+        let pending = entries.get(&dummy_key(count));
+        assert!(
+            matches!(pending, Some(RasterCacheEntry::Pending)),
+            "pending job survives"
+        );
+        assert!(
+            !entries.contains_key(&dummy_key(2)),
+            "idle glyph is reclaimed"
+        );
+        // Only the three deliberately-kept entries remain.
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn evict_stale_at_hard_limit_keeps_only_visible_and_pending() {
+        let mut entries = FxHashMap::default();
+        for index in 0..CPU_GLYPH_CACHE_LIMIT {
+            // Every glyph was used *this* frame, so recency alone would keep them all.
+            entries.insert(dummy_key(index), ready_entry(1_000));
+        }
+        entries.insert(dummy_key(CPU_GLYPH_CACHE_LIMIT), RasterCacheEntry::Pending);
+        let visible: FxHashSet<GlyphKey> = [dummy_key(0), dummy_key(1)].into_iter().collect();
+
+        GlyphRasterCache::evict_stale(&mut entries, &visible, 1_000);
+
+        // At the hard ceiling recency is ignored: only the visible set and the pending job stay.
+        assert!(entries.contains_key(&dummy_key(0)));
+        assert!(entries.contains_key(&dummy_key(1)));
+        assert!(matches!(
+            entries.get(&dummy_key(CPU_GLYPH_CACHE_LIMIT)),
+            Some(RasterCacheEntry::Pending)
+        ));
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
