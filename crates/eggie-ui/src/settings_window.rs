@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::{
     app::{EggieApp, NewWindowInit, NotificationRoutes},
@@ -16,10 +16,10 @@ use crate::{
 use eggie_daemon::DaemonClient;
 use eggie_update::UpdateState;
 use gpui::{
-    Anchor, AnyElement, App, Bounds, Context, Entity, Menu,
+    Anchor, AnyElement, App, Bounds, Context, Entity, Image, ImageFormat, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
-    actions, anchored, deferred, div, point, prelude::*, px, rgb, size,
+    actions, anchored, deferred, div, img, point, prelude::*, px, rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -93,6 +93,20 @@ const SELECTOR_WINDOW_MARGIN: f32 = 8.;
 /// Width of the compact bell-mode dropdown (trigger and popover).
 const BELL_DROPDOWN_WIDTH: f32 = 180.;
 const BELL_DROPDOWN_ROW_HEIGHT: f32 = 30.;
+
+/// App logo shown at the top of the "About" panel. Embedded so it ships with the
+/// binary (the UI registers no image asset source; see `HUGEICONS_FONT`).
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+
+/// The decoded logo, built once and reused. GPUI already keys its frame cache on
+/// `Image.id` (a hash of the bytes), so the texture would be reused regardless —
+/// the `OnceLock` additionally avoids re-hashing and re-allocating the PNG bytes
+/// on every repaint. Returns an owned `Arc`, so it never borrows `self`.
+fn logo_image() -> Arc<Image> {
+    static LOGO: OnceLock<Arc<Image>> = OnceLock::new();
+    LOGO.get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Png, LOGO_PNG.to_vec())))
+        .clone()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectorKind {
@@ -234,14 +248,16 @@ enum SettingsSection {
     Appearance,
     Keybindings,
     Advanced,
+    About,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::General,
         Self::Appearance,
         Self::Keybindings,
         Self::Advanced,
+        Self::About,
     ];
 }
 
@@ -2254,6 +2270,140 @@ impl SettingsWindow {
         });
     }
 
+    /// The "About" panel: a branded header (logo + name + version), a
+    /// check-for-updates button, build metadata, and the update preferences that
+    /// used to live under "Advanced".
+    fn render_about_section(&self, language: Language, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let colors = self.colors;
+        // Copy the two update-preference values out so the `settings` borrow is
+        // released before the `&mut cx` render calls below.
+        let (auto_check_updates, update_channel) = {
+            let config = self.settings.read(cx).config();
+            (config.auto_check_updates, config.update_channel)
+        };
+        let auto_check_updates_control =
+            self.render_auto_check_updates_control(auto_check_updates, cx);
+        let update_channel_control = self.render_update_channel_control(update_channel, cx);
+
+        let build_mode = if cfg!(debug_assertions) {
+            language.build_mode_debug()
+        } else {
+            language.build_mode_release()
+        };
+
+        // A metadata line: label on the left, value right-aligned and muted.
+        let metadata_row = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(px(44.))
+                .px_4()
+                .py_2()
+                .child(div().flex_none().text_color(rgb(colors.text)).child(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.))
+                        .text_color(rgb(colors.muted))
+                        .text_right()
+                        .child(value),
+                )
+                .into_any_element()
+        };
+
+        let header = div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .py_4()
+            .child(img(logo_image()).w(px(72.)).h(px(72.)))
+            .child(
+                div()
+                    .text_size(px(22.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(colors.text))
+                    .child("Eggie"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.muted))
+                    .child(format!(
+                        "{} {}",
+                        language.version_row(),
+                        env!("CARGO_PKG_VERSION")
+                    )),
+            )
+            .child(
+                div().pt_2().child(crate::update_window::button(
+                    language.check_for_updates_button(),
+                    true,
+                    colors,
+                    cx.listener(|window, _, _, cx| {
+                        let channel = window.settings.read(cx).config().update_channel.slug();
+                        window.updates.update(cx, |controller, cx| {
+                            if matches!(
+                                controller.state(),
+                                UpdateState::Idle | UpdateState::UpToDate | UpdateState::Error(_)
+                            ) {
+                                controller.check(false, channel, cx);
+                            }
+                        });
+                        crate::update_window::open_update_window(
+                            window.updates.clone(),
+                            window.settings.clone(),
+                            cx,
+                        );
+                    }),
+                )),
+            )
+            .into_any_element();
+
+        let metadata = settings_section(
+            language.build_info_section(),
+            vec![
+                metadata_row(
+                    language.version_row(),
+                    env!("CARGO_PKG_VERSION").to_owned(),
+                ),
+                metadata_row(
+                    language.protocol_version_row(),
+                    eggie_protocol::PROTOCOL_VERSION.to_string(),
+                ),
+                metadata_row(language.build_date_row(), env!("EGGIE_BUILD_DATE").to_owned()),
+                metadata_row(language.build_id_row(), env!("EGGIE_BUILD_ID").to_owned()),
+                metadata_row(language.build_mode_row(), build_mode.to_owned()),
+            ],
+            colors,
+        );
+
+        let updates = settings_section(
+            language.updates_section(),
+            vec![
+                settings_row(
+                    language.auto_check_updates_row(),
+                    language.auto_check_updates_description(),
+                    auto_check_updates_control,
+                    colors,
+                ),
+                settings_row(
+                    language.update_channel_row(),
+                    language.update_channel_description(),
+                    update_channel_control,
+                    colors,
+                ),
+            ],
+            colors,
+        );
+
+        vec![header, metadata, updates]
+    }
+
     fn render_keybindings_section(
         &self,
         language: Language,
@@ -2797,10 +2947,6 @@ impl gpui::Render for SettingsWindow {
         let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
         let copy_on_select_control =
             self.render_copy_on_select_control(config.copy_on_select, cx);
-        let auto_check_updates_control =
-            self.render_auto_check_updates_control(config.auto_check_updates, cx);
-        let update_channel_control =
-            self.render_update_channel_control(config.update_channel, cx);
         let scrollback_control = self.render_scrollback_control(config.scrollback_lines, cx);
         let shell_program_control =
             self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
@@ -2889,6 +3035,11 @@ impl gpui::Render for SettingsWindow {
                                     SettingsSection::Advanced => (
                                         "settings-sidebar-advanced",
                                         language.advanced_sidebar(),
+                                        IconName::Sliders,
+                                    ),
+                                    SettingsSection::About => (
+                                        "settings-sidebar-about",
+                                        language.about_sidebar(),
                                         IconName::Info,
                                     ),
                                 };
@@ -2955,16 +3106,25 @@ impl gpui::Render for SettingsWindow {
                                                     .max_w(px(640.))
                                                     .p_5()
                                                     .gap_5()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(18.))
-                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .child(match self.selected_section {
-                                                                SettingsSection::General => language.general_section(),
-                                                                SettingsSection::Appearance => language.appearance_section(),
-                                                                SettingsSection::Keybindings => language.keybindings_section(),
-                                                                SettingsSection::Advanced => language.advanced_section(),
-                                                            }),
+                                                    // The "About" panel has its own branded header
+                                                    // (logo + name), so it skips the shared section
+                                                    // title to avoid a redundant "About Eggie" line.
+                                                    .when(
+                                                        self.selected_section != SettingsSection::About,
+                                                        |element| {
+                                                            element.child(
+                                                                div()
+                                                                    .text_size(px(18.))
+                                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                                    .child(match self.selected_section {
+                                                                        SettingsSection::General => language.general_section(),
+                                                                        SettingsSection::Appearance => language.appearance_section(),
+                                                                        SettingsSection::Keybindings => language.keybindings_section(),
+                                                                        SettingsSection::Advanced => language.advanced_section(),
+                                                                        SettingsSection::About => language.about_eggie(),
+                                                                    }),
+                                                            )
+                                                        },
                                                     )
                                                     .children(match self.selected_section {
                                                         SettingsSection::General => vec![
@@ -3194,24 +3354,6 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.updates_section(),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.auto_check_updates_row(),
-                                                                        language.auto_check_updates_description(),
-                                                                        auto_check_updates_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.update_channel_row(),
-                                                                        language.update_channel_description(),
-                                                                        update_channel_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
                                                                 language.shell_section(),
                                                                 vec![
                                                                     settings_row(
@@ -3238,6 +3380,9 @@ impl gpui::Render for SettingsWindow {
                                                         ],
                                                         SettingsSection::Keybindings => {
                                                             self.render_keybindings_section(language, cx)
+                                                        }
+                                                        SettingsSection::About => {
+                                                            self.render_about_section(language, cx)
                                                         }
                                                     }),
                                             ),

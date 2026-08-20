@@ -1005,6 +1005,76 @@ impl Language {
         }
     }
 
+    pub(crate) fn about_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "About",
+            Self::SimplifiedChinese => "关于",
+        }
+    }
+
+    pub(crate) fn version_row(self) -> &'static str {
+        match self {
+            Self::English => "Version",
+            Self::SimplifiedChinese => "版本",
+        }
+    }
+
+    pub(crate) fn protocol_version_row(self) -> &'static str {
+        match self {
+            Self::English => "Protocol version",
+            Self::SimplifiedChinese => "协议版本",
+        }
+    }
+
+    pub(crate) fn build_date_row(self) -> &'static str {
+        match self {
+            Self::English => "Build date",
+            Self::SimplifiedChinese => "构建日期",
+        }
+    }
+
+    pub(crate) fn build_id_row(self) -> &'static str {
+        match self {
+            Self::English => "Build ID",
+            Self::SimplifiedChinese => "构建标识",
+        }
+    }
+
+    pub(crate) fn build_mode_row(self) -> &'static str {
+        match self {
+            Self::English => "Build mode",
+            Self::SimplifiedChinese => "构建模式",
+        }
+    }
+
+    pub(crate) fn build_mode_debug(self) -> &'static str {
+        match self {
+            Self::English => "Debug",
+            Self::SimplifiedChinese => "调试",
+        }
+    }
+
+    pub(crate) fn build_mode_release(self) -> &'static str {
+        match self {
+            Self::English => "Release",
+            Self::SimplifiedChinese => "发布",
+        }
+    }
+
+    pub(crate) fn check_for_updates_button(self) -> &'static str {
+        match self {
+            Self::English => "Check for updates",
+            Self::SimplifiedChinese => "检查更新",
+        }
+    }
+
+    pub(crate) fn build_info_section(self) -> &'static str {
+        match self {
+            Self::English => "Build info",
+            Self::SimplifiedChinese => "构建信息",
+        }
+    }
+
     pub(crate) fn cut(self) -> &'static str {
         match self {
             Self::English => "Cut",

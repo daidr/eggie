@@ -478,7 +478,7 @@ fn render_progress_bar(colors: UiColors, progress: eggie_update::DownloadProgres
         .into_any_element()
 }
 
-fn button(
+pub(crate) fn button(
     label: &str,
     primary: bool,
     colors: UiColors,
