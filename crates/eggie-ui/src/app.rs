@@ -3279,10 +3279,40 @@ impl EggieApp {
         }
     }
 
+    /// Working directory for a terminal created in `group_id`: the live cwd of the group's active
+    /// session (OSC 7-reported, falling back to the foreground process cwd in the daemon), so a new
+    /// tab or split opens beside where the user is working. `source_item` names a specific tab the
+    /// creation was requested from (the tab context menu's Split); when present, its session's cwd
+    /// wins over the group's active tab. Falls back to the project root when no session can be
+    /// resolved (empty group, non-terminal item, or no summary yet) or its directory no longer
+    /// exists. The existence check covers the most common failure — a directory deleted between
+    /// poll cycles, which would otherwise make the PTY spawn fail.
+    fn new_terminal_cwd(&self, group_id: GroupId, source_item: Option<ItemId>) -> PathBuf {
+        let session_id = match source_item {
+            Some(item_id) => self
+                .workspace()
+                .layout
+                .find_group(group_id)
+                .and_then(|group| group.items.iter().find(|item| item.id == item_id))
+                .and_then(|item| item.session_id),
+            None => self
+                .workspace()
+                .layout
+                .find_group(group_id)
+                .and_then(|group| group.active_item())
+                .and_then(|item| item.session_id),
+        };
+        let active_cwd = session_id
+            .and_then(|session_id| self.sessions.iter().find(|s| s.id == session_id))
+            .map(|session| session.current_directory.clone());
+        resolve_new_terminal_cwd(active_cwd.as_deref(), &self.active_project_data().effective_root())
+    }
+
     fn new_terminal(
         &mut self,
         group_id: GroupId,
         split: Option<Direction>,
+        source_item: Option<ItemId>,
         cx: &mut Context<Self>,
     ) {
         let project = self.active_project_data().clone();
@@ -3295,7 +3325,7 @@ impl EggieApp {
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
                 window_id: self.window_id,
-                cwd: project.effective_root(),
+                cwd: self.new_terminal_cwd(group_id, source_item),
                 size: TerminalSize::default(),
                 appearance: self.terminal_appearance,
                 scrollback_limit,
@@ -4283,13 +4313,13 @@ impl EggieApp {
 
     fn new_tab_in_active_group(&mut self, cx: &mut Context<Self>) -> bool {
         let group_id = self.workspace().active_group_id;
-        self.new_terminal(group_id, None, cx);
+        self.new_terminal(group_id, None, None, cx);
         true
     }
 
     fn split_active_group(&mut self, direction: Direction, cx: &mut Context<Self>) -> bool {
         let group_id = self.workspace().active_group_id;
-        self.new_terminal(group_id, Some(direction), cx);
+        self.new_terminal(group_id, Some(direction), None, cx);
         true
     }
 
@@ -5886,7 +5916,7 @@ impl EggieApp {
                 }
                 match command {
                     NativeTabMenuCommand::Split(direction) => {
-                        app.new_terminal(group_id, Some(direction), cx);
+                        app.new_terminal(group_id, Some(direction), Some(item_id), cx);
                     }
                     NativeTabMenuCommand::Move(direction) => {
                         app.move_tab_in_direction(group_id, item_id, direction, cx);
@@ -7133,7 +7163,7 @@ impl EggieApp {
                 false,
                 false,
                 Some(self.language.new_terminal_tooltip().into()),
-                cx.listener(move |app, _, _, cx| app.new_terminal(group_id, None, cx)),
+                cx.listener(move |app, _, _, cx| app.new_terminal(group_id, None, None, cx)),
             ));
         if is_top_right_group {
             let right_sidebar_icon = if self.right_sidebar_collapsed {
@@ -8510,6 +8540,18 @@ fn terminal_container_borders(
         right: !touches_right_layout_edge || !right_sidebar_collapsed,
         // The upper group owns each internal horizontal seam.
         bottom: !touches_bottom_layout_edge,
+    }
+}
+
+/// Pick the working directory for a new terminal: inherit the active session's live cwd when it
+/// names an existing directory, otherwise fall back to the project root. The existence check
+/// covers the most common stale-summary case — a directory deleted between poll cycles, which
+/// would otherwise make the PTY spawn fail (other failures, e.g. permissions lost after the check,
+/// still surface as spawn errors).
+fn resolve_new_terminal_cwd(active_cwd: Option<&Path>, project_root: &Path) -> PathBuf {
+    match active_cwd {
+        Some(dir) if dir.is_dir() => dir.to_path_buf(),
+        _ => project_root.to_path_buf(),
     }
 }
 
@@ -10022,5 +10064,53 @@ mod tests {
             Language::English,
         );
         assert!(completed.starts_with("Complete · 100% · updated"));
+    }
+
+    #[test]
+    fn new_terminal_cwd_inherits_live_directory_and_falls_back_safely() {
+        // RAII cleanup so a failed assert never leaks the temp directories.
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for dir in &self.0 {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        let root = std::env::temp_dir()
+            .join(format!("eggie-cwd-inherit-test-{}-root", std::process::id()));
+        let live = std::env::temp_dir()
+            .join(format!("eggie-cwd-inherit-test-{}-live", std::process::id()));
+        let _cleanup = Cleanup(vec![root.clone(), live.clone()]);
+        let _ = std::fs::create_dir_all(&root);
+        let _ = std::fs::create_dir_all(&live);
+
+        // A live directory is inherited as-is.
+        assert_eq!(
+            resolve_new_terminal_cwd(Some(&live), &root),
+            live,
+            "new terminals should inherit the active session's cwd"
+        );
+
+        // A deleted directory falls back to the project root instead of failing the PTY spawn.
+        std::fs::remove_dir_all(&live).unwrap();
+        assert_eq!(
+            resolve_new_terminal_cwd(Some(&live), &root),
+            root,
+            "a vanished cwd must fall back to the project root"
+        );
+
+        // A path that exists but is not a directory (e.g. a swapped-in file) falls back too.
+        let _ = std::fs::write(&live, b"not a directory");
+        assert_eq!(
+            resolve_new_terminal_cwd(Some(&live), &root),
+            root,
+            "a non-directory cwd must fall back to the project root"
+        );
+        let _ = std::fs::remove_file(&live);
+
+        // No active session (empty group / brand-new project) uses the project root.
+        assert_eq!(resolve_new_terminal_cwd(None, &root), root);
     }
 }
