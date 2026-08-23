@@ -2192,12 +2192,65 @@ fn non_integrated_shell_has_no_injection() {
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let root = PathBuf::from("/tmp/eggie-integration");
     let launch =
-        build_shell_env("fish", "/usr/bin/fish", &terminfo, Some(&root), None, None, None, None, "path");
+        build_shell_env("elvish", "/usr/bin/elvish", &terminfo, Some(&root), None, None, None, None, "path");
     assert!(!launch.env.contains_key("ZDOTDIR"));
     assert!(!launch.env.contains_key("ENV"));
     assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
+    assert!(!launch.env.contains_key("XDG_DATA_DIRS"));
     // Base environment is still populated.
     assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+}
+
+#[test]
+fn fish_integration_uses_xdg_data_dirs() {
+    let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let launch =
+        build_shell_env("fish", "/opt/homebrew/bin/fish", &terminfo, Some(&root), None, None, None, None, "path");
+    let dirs = launch
+        .env
+        .get("XDG_DATA_DIRS")
+        .expect("fish must get XDG_DATA_DIRS pointing at the integration root");
+    // The integration root must be first so fish finds our vendor_conf.d. (The remaining entries
+    // depend on the test machine's XDG_DATA_DIRS — fish_xdg_data_dirs' unit tests cover those.)
+    assert_eq!(
+        dirs.split(':').next(),
+        Some(root.to_string_lossy().as_ref())
+    );
+    // Fish gets no zsh/bash injection.
+    assert!(!launch.env.contains_key("ZDOTDIR"));
+    assert!(!launch.env.contains_key("ENV"));
+    // Base environment is still populated.
+    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+}
+
+#[test]
+fn fish_integration_preserves_existing_xdg_data_dirs() {
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let dirs = fish_xdg_data_dirs(&root, Some("/custom/share:/other/share"));
+    let mut parts = dirs.split(':');
+    assert_eq!(parts.next(), Some(root.to_string_lossy().as_ref()));
+    assert_eq!(parts.next(), Some("/custom/share"));
+    assert_eq!(parts.next(), Some("/other/share"));
+    // No fallback paths appended when the variable was already set.
+    assert_eq!(parts.next(), None);
+}
+
+#[test]
+fn fish_xdg_data_dirs_falls_back_when_unset() {
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let dirs = fish_xdg_data_dirs(&root, None);
+    let mut parts = dirs.split(':');
+    assert_eq!(parts.next(), Some(root.to_string_lossy().as_ref()));
+    // The fallback always includes the /usr paths; Homebrew only on macOS.
+    assert!(dirs.contains("/usr/local/share"));
+    assert!(dirs.contains("/usr/share"));
+    if cfg!(target_os = "macos") {
+        assert!(dirs.contains("/opt/homebrew/share"));
+    }
+    // An empty value is treated like unset.
+    let dirs = fish_xdg_data_dirs(&root, Some(""));
+    assert!(dirs.contains("/usr/local/share"));
 }
 
 #[test]
@@ -2272,8 +2325,8 @@ fn without_bin_dir_only_features_is_injected() {
 
 #[test]
 fn features_injected_even_for_non_integrated_shell() {
-    // fish has no integration script yet, but the env vars are injected unconditionally so its
-    // future script (or a manually-sourced one) can act on them.
+    // When integration installation fails (root=None), no shell gets injection, but the feature
+    // env vars are still injected unconditionally so a manually-sourced script can act on them.
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let bin_dir = PathBuf::from("/opt/eggie/bin");
     let launch = build_shell_env(
@@ -2370,20 +2423,21 @@ fn custom_args_pass_through_for_non_integrated_shell() {
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let root = PathBuf::from("/tmp/eggie-integration");
     let launch = build_shell_env(
-        "fish",
-        "/usr/bin/fish",
+        "elvish",
+        "/usr/bin/elvish",
         &terminfo,
         Some(&root),
         None,
         None,
-        Some(vec!["-C".to_owned(), "echo hi".to_owned()]),
+        Some(vec!["-c".to_owned(), "echo hi".to_owned()]),
         None,
         "path",
     );
-    // fish gets no injection; custom args used verbatim.
-    assert_eq!(launch.args, vec!["-C".to_owned(), "echo hi".to_owned()]);
+    // elvish gets no injection; custom args used verbatim.
+    assert_eq!(launch.args, vec!["-c".to_owned(), "echo hi".to_owned()]);
     assert!(!launch.env.contains_key("ENV"));
     assert!(!launch.env.contains_key("ZDOTDIR"));
+    assert!(!launch.env.contains_key("XDG_DATA_DIRS"));
 }
 
 #[test]

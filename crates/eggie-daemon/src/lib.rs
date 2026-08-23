@@ -101,6 +101,7 @@ const BUNDLED_ZSH_ZSHENV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggi
 const BUNDLED_ZSH_INTEGRATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/eggie-zsh-integration"));
 const BUNDLED_BASH_INTEGRATION: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggie-bash"));
+const BUNDLED_FISH_INTEGRATION: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggie-fish"));
 static INSTALLED_SHELL_INTEGRATION: OnceLock<std::result::Result<PathBuf, String>> =
     OnceLock::new();
 static RENDER_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -4666,10 +4667,41 @@ fn build_shell_env(
             // from here. We do not intercept --norc/--rcfile from SHELL today, so this is just "1".
             env.insert("EGGIE_BASH_INJECT".to_owned(), "1".to_owned());
         }
+        // Fish sources vendor conf.d from every XDG_DATA_DIRS entry (not just the first), so
+        // prepending the integration root makes fish pick up `fish/vendor_conf.d/eggie.fish`
+        // alongside the user's other vendor confs. The script's own run-once guard prevents
+        // double-loading. Preserve any existing XDG_DATA_DIRS (other tools read it too); when
+        // unset, seed the common macOS/Linux paths so Homebrew's vendor confs still load.
+        // Known gap: MacPorts (/opt/local/share) and nix paths are not in the fallback, but
+        // fish's compiled-in vendor conf dir is always searched regardless of XDG_DATA_DIRS.
+        ("fish", Some(root)) => {
+            env.insert(
+                "XDG_DATA_DIRS".to_owned(),
+                fish_xdg_data_dirs(root, std::env::var("XDG_DATA_DIRS").ok().as_deref()),
+            );
+        }
         _ => {}
     }
 
     ShellLaunch { args, env }
+}
+
+/// Build the XDG_DATA_DIRS value for a fish session: the integration root first (so our
+/// `fish/vendor_conf.d/eggie.fish` is found), then the user's existing dirs, or the common
+/// macOS/Linux data paths when the variable is unset/empty so Homebrew's vendor confs still load.
+fn fish_xdg_data_dirs(root: &Path, existing: Option<&str>) -> String {
+    let mut dirs = vec![root.to_string_lossy().into_owned()];
+    match existing {
+        Some(value) if !value.is_empty() => dirs.push(value.to_owned()),
+        _ => {
+            if cfg!(target_os = "macos") {
+                dirs.push("/opt/homebrew/share".to_owned());
+            }
+            dirs.push("/usr/local/share".to_owned());
+            dirs.push("/usr/share".to_owned());
+        }
+    }
+    dirs.join(":")
 }
 
 fn install_bundled_terminfo() -> Result<PathBuf> {
@@ -4718,7 +4750,8 @@ fn write_if_changed(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// Install the bundled shell-integration scripts into a per-user runtime directory and return its
-/// root. The zsh subdirectory becomes `ZDOTDIR`; the bash script under it becomes `ENV`.
+/// root. The zsh subdirectory becomes `ZDOTDIR`; the bash script under it becomes `ENV`; the fish
+/// script is placed under `fish/vendor_conf.d/` and found via `XDG_DATA_DIRS`.
 fn install_bundled_shell_integration() -> Result<PathBuf> {
     match INSTALLED_SHELL_INTEGRATION.get_or_init(|| {
         install_bundled_shell_integration_inner().map_err(|error| format!("{error:#}"))
@@ -4735,16 +4768,21 @@ fn install_bundled_shell_integration_inner() -> Result<PathBuf> {
         .join("shell-integration-v1");
     let zsh = root.join("zsh");
     let bash = root.join("bash");
+    let fish = root.join("fish").join("vendor_conf.d");
     fs::create_dir_all(&zsh)?;
     fs::create_dir_all(&bash)?;
+    fs::create_dir_all(&fish)?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     fs::set_permissions(&zsh, fs::Permissions::from_mode(0o700))?;
     fs::set_permissions(&bash, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&fish, fs::Permissions::from_mode(0o700))?;
 
     // The dotfile name is required verbatim so zsh's ZDOTDIR mechanism finds it.
     write_if_changed(&zsh.join(".zshenv"), BUNDLED_ZSH_ZSHENV)?;
     write_if_changed(&zsh.join("eggie-integration"), BUNDLED_ZSH_INTEGRATION)?;
     write_if_changed(&bash.join("eggie.bash"), BUNDLED_BASH_INTEGRATION)?;
+    // The vendor_conf.d path is required verbatim so fish's XDG_DATA_DIRS mechanism finds it.
+    write_if_changed(&fish.join("eggie.fish"), BUNDLED_FISH_INTEGRATION)?;
     Ok(root)
 }
 
