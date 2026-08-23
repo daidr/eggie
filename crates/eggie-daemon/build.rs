@@ -34,6 +34,10 @@ fn main() {
         ("shell-integration/zsh/.zshenv", "eggie-zsh-zshenv"),
         ("shell-integration/zsh/eggie-integration", "eggie-zsh-integration"),
         ("shell-integration/bash/eggie.bash", "eggie-bash"),
+        (
+            "shell-integration/fish/vendor_conf.d/eggie.fish",
+            "eggie-fish",
+        ),
     ] {
         println!("cargo:rerun-if-changed={source}");
         fs::copy(source, out_dir.join(staged))
