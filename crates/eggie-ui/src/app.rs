@@ -28,6 +28,7 @@ use crate::terminal_renderer::{
     TerminalTextureKey,
     terminal_background, terminal_cell_metrics,
 };
+use crate::workspace::{SidebarRestoreState, WindowProjectView, WorkspaceRestoreState};
 use eggie_daemon::{DaemonClient, DaemonConnection, DaemonInputSender, TerminalImageFrame};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
@@ -98,10 +99,8 @@ const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 28.;
 const ITEM_ICON_SLOT_SIZE: f32 = 16.;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
 const CONTENT_SPLIT_EDGE_FACTOR: f32 = 0.1;
-const LEFT_SIDEBAR_DEFAULT_WIDTH: f32 = 230.;
 const LEFT_SIDEBAR_MIN_WIDTH: f32 = 180.;
 const LEFT_SIDEBAR_MAX_WIDTH: f32 = 420.;
-const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 300.;
 const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 220.;
 const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 520.;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 5.;
@@ -552,14 +551,6 @@ impl gpui::Render for DraggedTabPreview {
     }
 }
 
-/// Per-window, per-project view state. The `Project` itself (id/name/root) lives in the shared
-/// [`ProjectStore`] so it syncs across windows; the layout tree and the active group are local to
-/// this window because sessions are not shared between windows.
-struct WindowProjectView {
-    layout: LayoutNode,
-    active_group_id: GroupId,
-}
-
 /// Identifies one of the two directory rows in the right sidebar's Info tab. Used as the key for the
 /// per-row "open with" dropdown state so each row's split-button anchors its own dropdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -574,19 +565,6 @@ impl DirectoryField {
         match self {
             Self::Current => "current",
             Self::Initial => "initial",
-        }
-    }
-}
-
-impl WindowProjectView {
-    /// A view for a project that currently has no terminal in this window: an empty layout whose
-    /// single empty group is the active group (and a valid drop target for the first new terminal).
-    fn empty() -> Self {
-        let layout = LayoutNode::empty();
-        let active_group_id = layout.first_group_id();
-        Self {
-            layout,
-            active_group_id,
         }
     }
 }
@@ -1312,7 +1290,7 @@ impl EggieApp {
         config: &crate::settings::AppSettings,
         appearance: TerminalAppearance,
         cx: &mut Context<Self>,
-    ) -> (ProjectId, Vec<SessionSummary>) {
+    ) -> (ProjectId, Vec<SessionSummary>, Option<WorkspaceRestoreState>) {
         match init {
             NewWindowInit::ColdStart { project_root } => {
                 Self::seed_cold_start(project_root, window_id, client, project_store, config, appearance, cx)
@@ -1330,7 +1308,7 @@ impl EggieApp {
                 let sessions = Self::create_session(client, *project_id, window_id, root, config, appearance)
                     .into_iter()
                     .collect();
-                (*project_id, sessions)
+                (*project_id, sessions, None)
             }
             NewWindowInit::Empty => {
                 // New Window (Cmd+N): activate the first shared project, show it empty (D7).
@@ -1340,13 +1318,13 @@ impl EggieApp {
                     .first()
                     .map(|project| project.id);
                 match active {
-                    Some(id) => (id, Vec::new()),
+                    Some(id) => (id, Vec::new(), None),
                     None => {
                         // No projects at all (should not happen once Home exists); create one.
                         let project = Project::new("Home".to_owned());
                         let id = project.id;
                         project_store.update(cx, |store, cx| store.add(project, cx));
-                        (id, Vec::new())
+                        (id, Vec::new(), None)
                     }
                 }
             }
@@ -1362,23 +1340,58 @@ impl EggieApp {
         config: &crate::settings::AppSettings,
         appearance: TerminalAppearance,
         cx: &mut Context<Self>,
-    ) -> (ProjectId, Vec<SessionSummary>) {
-        let all_sessions = match client.request(ClientRequest::ListSessions) {
-            Ok(DaemonResponse::Sessions { sessions }) => sessions,
-            _ => Vec::new(),
-        };
+    ) -> (ProjectId, Vec<SessionSummary>, Option<WorkspaceRestoreState>) {
         // Adopt a project for the launch directory: reuse a persisted project with the same root,
-        // otherwise create one. If there are no persisted projects at all, fall back to Home.
-        let (active_project, project_root_buf) = project_store.update(cx, |store, cx| {
+        // otherwise create one. Done before restore so `eggie <dir>` lands in the store even when
+        // an unrelated workspace is restored.
+        let (launch_project, project_root_buf) = project_store.update(cx, |store, cx| {
             let (id, _) = store.upsert_by_root(project_root.to_path_buf(), cx);
             (id, project_root.to_path_buf())
         });
 
-        // Claim every surviving session whose project this window is adopting, and any that match the
-        // launch directory, into this window. This preserves the old "restart keeps your terminals".
+        // Restore the persisted workspace first: claim each session the saved layouts reference by
+        // id (the daemon re-owns unconditionally; dead sessions fail and are pruned). When at least
+        // one session survives, rebuild the old tabs/splits around it.
+        if let Some(mut restored) = WorkspaceRestoreState::load() {
+            // Drop views for projects that no longer exist BEFORE claiming, so their sessions aren't
+            // claimed into this window with no tab to hold them (orphan sessions the user can't see).
+            let known_projects: HashSet<ProjectId> = project_store
+                .read(cx)
+                .projects()
+                .iter()
+                .map(|project| project.id)
+                .collect();
+            restored
+                .views
+                .retain(|project_id, _| known_projects.contains(project_id));
+
+            let mut claimed = Vec::new();
+            for session_id in restored.persisted_session_ids() {
+                if let Ok(DaemonResponse::SessionClaimed { session }) =
+                    client.request(ClientRequest::ClaimSession {
+                        session_id,
+                        window_id,
+                    })
+                {
+                    claimed.push(session);
+                }
+            }
+            let live: HashSet<_> = claimed.iter().map(|session| session.id).collect();
+            let projects = project_store.read(cx).projects().to_vec();
+            if restored.prune_to_live(&live, &projects) {
+                return (restored.active_project, claimed, Some(restored));
+            }
+        }
+
+        // No restorable workspace (or nothing survived in the daemon): claim every surviving
+        // session whose project this window is adopting, and any that match the launch directory.
+        let all_sessions = match client.request(ClientRequest::ListSessions) {
+            Ok(DaemonResponse::Sessions { sessions }) => sessions,
+            _ => Vec::new(),
+        };
         let mut owned: Vec<SessionSummary> = Vec::new();
         for session in all_sessions {
-            let belongs = session.project_id == active_project
+            let belongs = session.project_id == launch_project
                 || session.initial_directory == project_root_buf;
             if !belongs {
                 continue;
@@ -1399,19 +1412,19 @@ impl EggieApp {
                 .read(cx)
                 .projects()
                 .iter()
-                .find(|project| project.id == active_project)
+                .find(|project| project.id == launch_project)
                 .map(|project| project.effective_root())
                 .unwrap_or(project_root_buf);
             owned.extend(Self::create_session(
                 client,
-                active_project,
+                launch_project,
                 window_id,
                 root,
                 config,
                 appearance,
             ));
         }
-        (active_project, owned)
+        (launch_project, owned, None)
     }
 
     /// Spawn a single terminal session in the daemon, returning its summary (or `None` on error).
@@ -1466,8 +1479,9 @@ impl EggieApp {
         let colors = UiColors::from_theme(terminal_theme);
 
         // Resolve the requested init into this window's active project and owned sessions, mutating
-        // the shared project store as needed (seeding Home / adopting the launch directory).
-        let (active_project, sessions) = Self::seed_window(
+        // the shared project store as needed (seeding Home / adopting the launch directory). A cold
+        // start additionally returns the restored workspace layout when one survived.
+        let (active_project, sessions, restored) = Self::seed_window(
             &init,
             window_id,
             &client,
@@ -1477,22 +1491,42 @@ impl EggieApp {
             cx,
         );
 
-        // Build a per-window view for every shared project (empty by default), then place this
-        // window's sessions into their project's layout so adopted terminals show up as tabs.
+        // Build a per-window view for every shared project (empty by default). With a restored
+        // workspace, adopt the saved layouts (dead tabs already pruned by `seed_cold_start`);
+        // otherwise place this window's sessions into their project's layout as fresh tabs.
         let projects = project_store.read(cx).projects().to_vec();
         let mut project_views: HashMap<ProjectId, WindowProjectView> = projects
             .iter()
             .map(|project| (project.id, WindowProjectView::empty()))
             .collect();
-        for session in &sessions {
-            if let Some(view) = project_views.get_mut(&session.project_id) {
-                let group_id = view.layout.first_group_id();
-                if let Some(group) = view.layout.find_group_mut(group_id) {
-                    group.add_item(TabItem::terminal(session.id, session.title.clone()));
+        let restored_sidebar = match restored {
+            Some(restored) => {
+                let sidebar = restored.sidebar_states();
+                for (project_id, view) in restored.views {
+                    project_views.insert(project_id, view);
                 }
-                view.active_group_id = group_id;
+                // Persisted tab titles may be stale (the shell kept running); refresh from the
+                // claimed summaries. The session poll would fix these too, but not before first paint.
+                for session in &sessions {
+                    for view in project_views.values_mut() {
+                        view.layout.update_terminal_title(session.id, &session.title);
+                    }
+                }
+                sidebar
             }
-        }
+            None => {
+                for session in &sessions {
+                    if let Some(view) = project_views.get_mut(&session.project_id) {
+                        let group_id = view.layout.first_group_id();
+                        if let Some(group) = view.layout.find_group_mut(group_id) {
+                            group.add_item(TabItem::terminal(session.id, session.title.clone()));
+                        }
+                        view.active_group_id = group_id;
+                    }
+                }
+                SidebarRestoreState::default()
+            }
+        };
 
         for session in &sessions {
             if let Err(error) = client.request(ClientRequest::SetAppearance {
@@ -1690,10 +1724,10 @@ impl EggieApp {
             command_history_collapsed: false,
             snippets_collapsed: false,
             notes_editor: Some(notes_editor),
-            left_sidebar_width: LEFT_SIDEBAR_DEFAULT_WIDTH,
-            right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
-            left_sidebar_collapsed: false,
-            right_sidebar_collapsed: false,
+            left_sidebar_width: restored_sidebar.left_width,
+            right_sidebar_width: restored_sidebar.right_width,
+            left_sidebar_collapsed: restored_sidebar.left_collapsed,
+            right_sidebar_collapsed: restored_sidebar.right_collapsed,
             resizing_sidebar: None,
             resizing_split: None,
             split_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -1728,6 +1762,14 @@ impl EggieApp {
         app.start_shell_integration_polling(cx);
         app.start_latency_reporting(cx);
         app.install_close_confirmation(window, cx);
+        // Persist the workspace on quit so the next cold start restores tabs/splits. Every window
+        // registers; each saves its own state (last-writer-wins for the single restore snapshot).
+        // A window that closed earlier leaves a dead entity behind — the weak update then no-ops.
+        cx.on_app_quit(move |app, _| {
+            app.persist_workspace();
+            std::future::ready(())
+        })
+        .detach();
         cx.on_focus_in(&app.focus_handle, window, |app, _, cx| {
             app.set_terminal_has_focus(true);
             cx.notify();
@@ -2955,6 +2997,27 @@ impl EggieApp {
         }
     }
 
+    /// Snapshot this window's workspace (project layouts, active project, sidebar states) to disk
+    /// so the next cold start can restore it. Registered on `on_app_quit` for every window;
+    /// best-effort, errors are logged inside `save`. v1 persists a single snapshot — with multiple
+    /// windows open the last writer wins and one window is restored.
+    fn persist_workspace(&self) {
+        let views = self
+            .project_views
+            .iter()
+            .map(|(id, view)| (*id, view.clone()))
+            .collect();
+        WorkspaceRestoreState {
+            active_project: self.active_project,
+            views,
+            left_sidebar_collapsed: self.left_sidebar_collapsed,
+            right_sidebar_collapsed: self.right_sidebar_collapsed,
+            left_sidebar_width: self.left_sidebar_width,
+            right_sidebar_width: self.right_sidebar_width,
+        }
+        .save();
+    }
+
     fn install_close_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -2984,6 +3047,11 @@ impl EggieApp {
                     }
                     let _ = cx.update(|window, cx| {
                         let _ = app.update(cx, |app, _| {
+                            // Persist before the window is torn down: on_app_quit's weak entity is
+                            // already dead by the time the async platform quit runs, so the close
+                            // path must save explicitly. Harmless for both choices — dead sessions
+                            // are pruned on restore.
+                            app.persist_workspace();
                             if choice == 0 {
                                 // Terminate all: kill this window's sessions.
                                 for session_id in app.window_session_ids() {

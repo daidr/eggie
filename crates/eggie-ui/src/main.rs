@@ -24,6 +24,7 @@ mod terminal_sprites;
 mod text_input;
 mod update_controller;
 mod update_window;
+mod workspace;
 
 use anyhow::{Context, Result};
 use eggie_daemon::{DaemonClient, is_daemon_invocation, run_daemon};
