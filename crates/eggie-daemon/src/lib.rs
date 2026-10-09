@@ -23,11 +23,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::read::DecoderReader;
-use eggie_domain::{ProjectId, SessionId, WindowId};
+use eggie_domain::{ProjectId, RemoteTarget, SessionId, WindowId};
 #[cfg(test)]
 use eggie_protocol::encode_line;
 use eggie_protocol::{
-    ClientRequest, DaemonResponse, PROTOCOL_VERSION, ProcessSummary,
+    ClientRequest, DaemonResponse, PROTOCOL_VERSION, PortForwardSpec, ProcessSummary,
     SessionInspection, SessionStatus, SessionSummary, TERMINAL_SCROLL_DELTA_SCALE,
     TerminalAppearance, TerminalAttentionRequest, TerminalCell, TerminalCellPosition,
     TerminalClipboardContent, TerminalClipboardSelection, TerminalColorOverride,
@@ -47,8 +47,9 @@ use eggie_protocol::{
 use flate2::write::ZlibDecoder;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, Read, Write},
     os::{
         fd::AsRawFd,
@@ -72,9 +73,11 @@ use std::{
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 mod process_monitor;
-use process_monitor::{descendant_processes, listening_ports};
+use process_monitor::{descendant_processes, listening_ports, parse_remote_inspection};
 #[cfg(test)]
-use process_monitor::{cpu_usage_tenths_percent, filter_descendant_processes, parse_lsof_ports};
+use process_monitor::{
+    cpu_usage_tenths_percent, filter_descendant_processes, parse_lsof_ports,
+};
 // Re-exported for the test module's `use super::*`; the daemon body no longer names these directly
 // since the process-monitor helpers moved out.
 #[cfg(test)]
@@ -82,6 +85,9 @@ use eggie_protocol::{ListeningPort, ProcessInfo};
 
 mod osc_util;
 use osc_util::*;
+
+mod remote_bootstrap;
+use remote_bootstrap::{RemoteScripts, control_path, remote_launch};
 
 mod terminal_input_encode;
 use terminal_input_encode::*;
@@ -102,6 +108,45 @@ const BUNDLED_ZSH_INTEGRATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/eggie-zsh-integration"));
 const BUNDLED_BASH_INTEGRATION: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggie-bash"));
 const BUNDLED_FISH_INTEGRATION: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eggie-fish"));
+
+/// Version marker written to the remote host. Derived from a hash of the bundled script **bytes**,
+/// not the crate version: the idempotence check compares this against the marker already on the
+/// host, and an unchanged crate version would make every post-release script fix (e.g. the OSC 7
+/// directory reports) look "already installed" and never get pushed. Hashing the contents means a
+/// changed script changes the marker and triggers a reinstall, while identical scripts stay a
+/// no-op. [`DefaultHasher`] uses a fixed key, so the value is deterministic across builds and hosts.
+fn integration_version() -> String {
+    fn hash_bytes(hasher: &mut DefaultHasher, bytes: &[u8]) {
+        bytes.hash(hasher);
+    }
+    let mut hasher = DefaultHasher::new();
+    hash_bytes(&mut hasher, BUNDLED_ZSH_ZSHENV);
+    hash_bytes(&mut hasher, BUNDLED_ZSH_INTEGRATION);
+    hash_bytes(&mut hasher, BUNDLED_BASH_INTEGRATION);
+    hash_bytes(&mut hasher, BUNDLED_FISH_INTEGRATION);
+    format!("{}-{:016x}", env!("CARGO_PKG_VERSION"), hasher.finish())
+}
+
+#[cfg(test)]
+mod integration_version_tests {
+    use super::integration_version;
+
+    #[test]
+    fn marker_is_stable_and_versioned_but_distinct_from_the_bare_crate_version() {
+        let marker = integration_version();
+        // Deterministic across calls (DefaultHasher has a fixed key), so the idempotence check is
+        // stable across builds/hosts.
+        assert_eq!(marker, integration_version());
+        // It carries the crate version for human identification…
+        assert!(
+            marker.starts_with(concat!(env!("CARGO_PKG_VERSION"), "-")),
+            "marker should be `<crate-version>-<hash>`, got {marker}"
+        );
+        // …but is NOT equal to it — otherwise post-release script fixes would look "already installed".
+        assert_ne!(marker, env!("CARGO_PKG_VERSION"));
+    }
+}
+
 static INSTALLED_SHELL_INTEGRATION: OnceLock<std::result::Result<PathBuf, String>> =
     OnceLock::new();
 static RENDER_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -2715,6 +2760,12 @@ struct TerminalSession {
     initial_directory: PathBuf,
     shell_pid: u32,
     pty_fd: i32,
+    /// Set for a remote profile: the session runs `ssh` instead of a local shell, and inspection and
+    /// tunnels go through the control channel rather than local syscalls.
+    remote: Option<RemoteTarget>,
+    /// The ControlPath for this session's ssh master, if multiplexing is enabled. Used by inspection
+    /// and tunnels to run commands over the one authenticated connection.
+    control_path: Option<PathBuf>,
     runtime_metadata: Mutex<SessionRuntimeMetadata>,
     inspection_system: Mutex<System>,
     terminal: Arc<FairMutex<Term<DaemonEventListener>>>,
@@ -2790,6 +2841,15 @@ struct SessionSpawnConfig {
     /// Comma-separated `EGGIE_SHELL_FEATURES` tokens (e.g. `"path"`), injected verbatim into the
     /// shell environment. Empty = no features.
     shell_features: String,
+    /// Profile-supplied environment variables, applied before Eggie's own so integration always wins.
+    profile_env: BTreeMap<String, String>,
+    /// When set, this session is an `ssh` connection rather than a local shell.
+    remote: Option<eggie_domain::RemoteTarget>,
+    /// Whether the user consented to installing the integration on `remote`'s host.
+    remote_install_consented: bool,
+    /// Working directory on the remote host (profile-supplied). Local `cwd` still applies to the
+    /// `ssh` process itself.
+    remote_cwd: Option<String>,
 }
 
 impl TerminalSession {
@@ -2804,6 +2864,10 @@ impl TerminalSession {
             shell_program,
             shell_args,
             shell_features,
+            profile_env,
+            remote,
+            remote_install_consented,
+            remote_cwd,
         } = config;
         let id = SessionId::new_v4();
         let last_input_sequence = Arc::new(AtomicU64::new(0));
@@ -2855,9 +2919,63 @@ impl TerminalSession {
             shell_args,
             bin_dir.as_deref(),
             &shell_features,
+            &profile_env,
         );
+        // A remote profile replaces the local shell with `ssh`. The environment built above still
+        // applies to the *local* `ssh` process (TERM and TERMINFO especially — ssh propagates TERM to
+        // the remote end), but the profile's own variables and working directory belong on the far
+        // side, so they are carried inside the bootstrap payload instead of the local environment.
+        // The ControlPath for this session's ssh master, if the home directory is short enough. A
+        // longer home directory disables multiplexing rather than breaking the session.
+        let control_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|home| {
+                let short_id = &id.simple().to_string()[..16];
+                control_path(&home, short_id)
+            });
+        // Create the control socket directory before ssh needs to bind there. ssh cannot create the
+        // directory itself, and a missing directory makes the connection fail.
+        if let Some(path) = control_path.as_ref()
+            && let Some(dir) = path.parent()
+        {
+            let _ = fs::create_dir_all(dir);
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        let (program, args) = match remote.as_ref().filter(|target| {
+            // Re-validated here rather than trusting the client: the daemon is a separate process
+            // reachable over a socket, and a host that could pass as an ssh option means local code
+            // execution (`-oProxyCommand=`). The argv also carries a `--` guard; this is the second
+            // of two independent checks.
+            let usable = target.is_usable();
+            if !usable {
+                eprintln!(
+                    "refusing remote session: unusable target {:?}; opening a local shell instead",
+                    target.host
+                );
+            }
+            usable
+        }) {
+            Some(target) => {
+                let bootstrap = remote_launch(
+                    target,
+                    &RemoteScripts {
+                        zsh_zshenv: BUNDLED_ZSH_ZSHENV,
+                        zsh_integration: BUNDLED_ZSH_INTEGRATION,
+                        bash: BUNDLED_BASH_INTEGRATION,
+                        fish: BUNDLED_FISH_INTEGRATION,
+                        version: integration_version(),
+                    },
+                    &profile_env,
+                    remote_cwd.as_deref(),
+                    remote_install_consented,
+                    control_path.as_deref(),
+                );
+                (bootstrap.program, bootstrap.args)
+            }
+            None => (shell, launch.args),
+        };
         let options = tty::Options {
-            shell: Some(tty::Shell::new(shell, launch.args)),
+            shell: Some(tty::Shell::new(program, args)),
             working_directory: Some(cwd.clone()),
             drain_on_exit: true,
             env: launch.env,
@@ -2884,6 +3002,8 @@ impl TerminalSession {
             initial_directory: cwd.clone(),
             shell_pid,
             pty_fd,
+            remote,
+            control_path,
             runtime_metadata: Mutex::new(SessionRuntimeMetadata {
                 system: System::new(),
                 last_foreground_pid: None,
@@ -2927,6 +3047,10 @@ impl TerminalSession {
             shell_program: None,
             shell_args: None,
             shell_features: "path".to_owned(),
+            profile_env: BTreeMap::new(),
+            remote: None,
+            remote_install_consented: false,
+            remote_cwd: None,
         })
     }
 
@@ -2954,6 +3078,11 @@ impl TerminalSession {
     }
 
     fn inspection(&self) -> SessionInspection {
+        // A remote session cannot use local syscalls: the shell_pid is the local ssh client, and the
+        // processes and ports are on the far side. Run the queries over the control channel instead.
+        if self.remote.is_some() {
+            return self.remote_inspection();
+        }
         let processes = descendant_processes(self.shell_pid, &mut self.inspection_system.lock());
         let ports = listening_ports(&processes);
         SessionInspection {
@@ -2961,6 +3090,105 @@ impl TerminalSession {
             processes,
             ports,
         }
+    }
+
+    /// Inspect a remote session by running `ps` and `lsof` over the ssh master in a single round
+    /// trip, then filtering by **process ancestry** rather than by tty.
+    ///
+    /// Filtering by tty (`ps -t pts/N`) is wrong on Linux: when a previous session dies, background
+    /// shells it left behind (powerlevel10k/gitstatus, disowned jobs) get reparented to init but keep
+    /// the controlling terminal open, and pts numbers are recycled — so a tty filter drags in
+    /// zombies from *other* sessions. The reliable anchor is the sshd session process, which is the
+    /// parent (`$PPID`) of the shell the master runs our probe in: everything under it is this
+    /// session, and everything else is not. This mirrors the local inspection's descendant walk.
+    ///
+    /// A remote host that lacks either tool, or whose output cannot be parsed, yields an empty list
+    /// rather than a failed inspection.
+    fn remote_inspection(&self) -> SessionInspection {
+        let empty = SessionInspection {
+            session_id: self.id,
+            processes: Vec::new(),
+            ports: Vec::new(),
+        };
+        // One round trip. ROOT is the sshd session pid (our parent); SELF is the throwaway shell
+        // running this probe — it sits under the same sshd and would otherwise show up as a second
+        // top-level shell, along with the `ps` it forks. `lsof ... || true` keeps a missing lsof from
+        // failing the whole command, so the ps half still comes back.
+        let Some(output) = self.run_over_master(
+            "printf 'ROOT %s\\nSELF %s\\n' \"$PPID\" \"$$\"; \
+             ps -eo pid,ppid,pcpu,rss,comm; \
+             printf '%s\\n' '===EGGIE-LSOF==='; \
+             lsof -nP -iTCP -sTCP:LISTEN -FpcPn 2>/dev/null || true",
+        ) else {
+            return empty;
+        };
+
+        let (processes, ports) = parse_remote_inspection(&output);
+        SessionInspection {
+            session_id: self.id,
+            processes,
+            ports,
+        }
+    }
+
+    /// Run a command over the session's ssh master, returning stdout. Returns None when the control
+    /// channel is unavailable or the command exits non-zero, so the caller degrades to an empty list.
+    fn run_over_master(&self, command: &str) -> Option<String> {
+        let control_path = self.control_path.as_ref()?;
+        let destination = self.remote.as_ref()?.destination();
+        let output = std::process::Command::new("ssh")
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("--")
+            .arg(destination)
+            .arg(command)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()
+    }
+
+    /// Open a port forward on this session's ssh master. The tunnel dies with the session, so no
+    /// daemon-side bookkeeping is needed.
+    fn forward_port(&self, spec: &PortForwardSpec) -> Result<()> {
+        self.port_forward_command(spec, "forward")
+    }
+
+    /// Cancel a port forward on this session's ssh master.
+    fn cancel_port(&self, spec: &PortForwardSpec) -> Result<()> {
+        self.port_forward_command(spec, "cancel")
+    }
+
+    /// Run `ssh -O forward|cancel` with the spec's tunnel option.
+    fn port_forward_command(&self, spec: &PortForwardSpec, operation: &str) -> Result<()> {
+        let control_path = self
+            .control_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("port forwarding requires a session with multiplexing enabled"))?;
+        let destination = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow!("port forwarding requires a remote session"))?
+            .destination();
+        let tunnel_option = spec.tunnel_option();
+        let status = std::process::Command::new("ssh")
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .arg("-O")
+            .arg(operation)
+            .arg(tunnel_option)
+            .arg("--")
+            .arg(destination)
+            .status()
+            .context("failed to run ssh")?;
+        if !status.success() {
+            anyhow::bail!("ssh -{operation} failed");
+        }
+        Ok(())
     }
 
     fn refresh_runtime_metadata(&self) {
@@ -4265,6 +4493,10 @@ impl DaemonState {
                 shell_program,
                 shell_args,
                 shell_features,
+                env,
+                remote,
+                remote_install_consented,
+                remote_cwd,
             } => {
                 let session = Arc::new(TerminalSession::spawn(SessionSpawnConfig {
                     project_id,
@@ -4276,6 +4508,10 @@ impl DaemonState {
                     shell_program: (!shell_program.is_empty()).then_some(shell_program),
                     shell_args: (!shell_args.is_empty()).then_some(shell_args),
                     shell_features,
+                    profile_env: env,
+                    remote,
+                    remote_install_consented,
+                    remote_cwd,
                 })?);
                 let summary = session.summary();
                 self.sessions.write().insert(session.id, session);
@@ -4553,6 +4789,16 @@ impl DaemonState {
                 }
                 Ok(DaemonResponse::Ok)
             }
+            ClientRequest::ForwardPort { session_id, spec } => {
+                let session = self.session(session_id)?;
+                session.forward_port(&spec)?;
+                Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::CancelPort { session_id, spec } => {
+                let session = self.session(session_id)?;
+                session.cancel_port(&spec)?;
+                Ok(DaemonResponse::Ok)
+            }
         }
     }
 
@@ -4591,6 +4837,37 @@ struct ShellLaunch {
 // Every argument is an independent shell-launch input assembled into one env map; grouping them
 // into a struct would just move the same fields elsewhere without improving clarity.
 #[allow(clippy::too_many_arguments)]
+/// Whether `key` is an environment variable Eggie itself owns, and therefore must never be settable
+/// from a profile's `env`.
+///
+/// This is a **prefix/allowlist filter, not an insert-order race**: several of Eggie's variables are
+/// set only conditionally (`EGGIE_ZDOTDIR_ORIG` and `EGGIE_BASH_ENV` only when the daemon itself has
+/// `ZDOTDIR`/`ENV`, which a GUI launch does not), and some are read by the integration scripts but
+/// never written by Rust at all (`EGGIE_BASH_RCFILE`, and the `EGGIE_FISH_INTEGRATION` / `_eggie_state`
+/// run-once guards). Relying on "Eggie inserts last so it wins" therefore leaves real holes — the worst
+/// being `EGGIE_ZDOTDIR_ORIG`, which `zsh/.zshenv` exports as `ZDOTDIR` and then sources startup files
+/// from, turning a profile variable into arbitrary code execution in every zsh of that profile.
+///
+/// Filtering by prefix also keeps the guarantee true as later steps add variables: a new `EGGIE_*`
+/// name is covered the moment it exists, with no second place to remember to update.
+fn is_eggie_owned_env_key(key: &str) -> bool {
+    key.starts_with("EGGIE_")
+        // The zsh integration's run-once guard is a shell variable, but an inherited environment
+        // variable of the same name trips it and silently disables integration.
+        || key.starts_with("_eggie")
+        || matches!(
+            key,
+            "TERM"
+                | "TERMINFO"
+                | "COLORTERM"
+                | "TERM_PROGRAM"
+                | "TERM_PROGRAM_VERSION"
+                | "ZDOTDIR"
+                | "ENV"
+                | "XDG_DATA_DIRS"
+        )
+}
+
 fn build_shell_env(
     shell_name: &str,
     shell_path: &str,
@@ -4601,8 +4878,25 @@ fn build_shell_env(
     custom_args: Option<Vec<String>>,
     bin_dir: Option<&Path>,
     shell_features: &str,
+    profile_env: &BTreeMap<String, String>,
 ) -> ShellLaunch {
     let mut env = HashMap::new();
+    // Profile variables first, minus anything Eggie owns (see `is_eggie_owned_env_key` — the filter,
+    // not the insert order, is what makes shell integration untamperable from a profile). A profile can
+    // still set everything Eggie does not own (AWS_PROFILE, DOCKER_HOST, …), which is the point.
+    //
+    // Scope note: this map is layered onto the daemon's inherited environment (the PTY builder never
+    // clears it), so a profile extends rather than replaces the environment. Two variables sit outside
+    // the filter: `USER` and `HOME` are applied by the PTY layer *before* this map, so a profile naming
+    // them does win — deliberate, since a container-style profile may need a different HOME. `PATH` is
+    // not set here at all; the integration scripts append `EGGIE_BIN_DIR` to whatever the shell
+    // resolves, so a profile-supplied PATH is honored and still gets the eggie directory.
+    env.extend(
+        profile_env
+            .iter()
+            .filter(|(key, _)| !is_eggie_owned_env_key(key))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
     env.insert("TERM".to_owned(), "alacritty".to_owned());
     env.insert(
         "TERMINFO".to_owned(),

@@ -235,6 +235,34 @@ pub enum ClientRequest {
         /// know and ignore the rest. Empty = no features. The client always sends its resolved value.
         #[serde(default = "default_shell_features")]
         shell_features: String,
+        /// Extra environment variables for the shell, from the terminal's profile. Applied *before*
+        /// Eggie's own integration variables (`TERM`, `ZDOTDIR`, `EGGIE_*`, …), which therefore win —
+        /// a profile cannot break shell integration by naming one of them. A `BTreeMap` so the wire
+        /// encoding is deterministic.
+        ///
+        /// Additive, like the shell fields above, so [`PROTOCOL_VERSION`] does not change: a release
+        /// daemon predating profiles ignores the field (unknown fields are not denied) and spawns the
+        /// shell without the profile's variables. The user-visible effect is a profile's `env` not
+        /// applying until the daemon is restarted onto the new build — the session still starts, and a
+        /// debug build swaps the daemon on every recompile via the build-id check.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: std::collections::BTreeMap<String, String>,
+        /// When set, the session is an `ssh` connection to this host rather than a local shell, and
+        /// the daemon may install its shell integration there (see the `remote_bootstrap` module).
+        /// `None` = a local session. A profile can still run `ssh` as a plain `shell_program`; it just
+        /// gets no automatic remote integration, because the host is not known before connecting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<eggie_domain::RemoteTarget>,
+        /// Whether the user has consented to Eggie writing its integration into this host's home
+        /// directory. Ignored unless `remote` is set. `false` opens the session without installing
+        /// anything — usable, just without integration.
+        #[serde(default, skip_serializing_if = "is_false")]
+        remote_install_consented: bool,
+        /// Working directory on the *remote* host, from the profile. Distinct from `cwd`, which is a
+        /// local path the `ssh` process itself starts in; a remote path is meaningless locally and
+        /// vice versa. Ignored unless `remote` is set. `None` = the remote home directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_cwd: Option<String>,
     },
     ListSessions,
     InspectSession {
@@ -409,6 +437,71 @@ pub enum ClientRequest {
     DetachWindow {
         window_id: WindowId,
     },
+    /// Open a port forward on a session's ssh master. The daemon replies with [`DaemonResponse::Ok`].
+    ForwardPort {
+        session_id: SessionId,
+        spec: PortForwardSpec,
+    },
+    /// Cancel a port forward on a session's ssh master. The daemon replies with [`DaemonResponse::Ok`].
+    CancelPort {
+        session_id: SessionId,
+        spec: PortForwardSpec,
+    },
+}
+
+/// A port forward to open or cancel on a session's ssh master.
+///
+/// The bind address defaults to 127.0.0.1, so a tunnel is not exposed to the local network unless
+/// the user explicitly asks for it. The destination is required for Local and Remote forwards (the
+/// address and port to connect to on the other side) and ignored for Dynamic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortForwardSpec {
+    pub kind: PortForwardKind,
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortForwardKind {
+    /// Local forward: connections to the bound port are forwarded to the destination through the
+    /// remote host (`ssh -L`).
+    Local,
+    /// Remote forward: connections to the bound port on the remote host are forwarded to the
+    /// destination through the local machine (`ssh -R`).
+    Remote,
+    /// Dynamic forward: the bound port becomes a SOCKS proxy (`ssh -D`).
+    Dynamic,
+}
+
+fn default_bind_address() -> String {
+    "127.0.0.1".to_owned()
+}
+
+impl PortForwardSpec {
+    /// The ssh tunnel option for this spec: `-L`, `-R`, or `-D` followed by the bind and destination.
+    ///
+    /// The bind address is included so a tunnel on a non-loopback address is explicit. The
+    /// destination is required for Local and Remote forwards and ignored for Dynamic.
+    pub fn tunnel_option(&self) -> String {
+        let flag = match self.kind {
+            PortForwardKind::Local => "-L",
+            PortForwardKind::Remote => "-R",
+            PortForwardKind::Dynamic => "-D",
+        };
+        match self.kind {
+            PortForwardKind::Dynamic => format!("{flag}{}:{}", self.bind_address, self.port),
+            _ => format!(
+                "{flag}{}:{}:{}",
+                self.bind_address,
+                self.port,
+                self.destination.as_deref().unwrap_or_default()
+            ),
+        }
+    }
 }
 
 /// Default `CreateSession::shell_features` when deserializing a request that predates the field.
@@ -1678,6 +1771,18 @@ mod tests {
             shell_program: "/opt/homebrew/bin/fish".to_owned(),
             shell_args: vec!["-l".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
             shell_features: "path".to_owned(),
+            env: std::collections::BTreeMap::from([
+                ("AWS_PROFILE".to_owned(), "prod".to_owned()),
+                // Values with punctuation and non-ASCII must survive both encodings.
+                ("GREETING".to_owned(), "你好; world".to_owned()),
+            ]),
+            remote: Some(eggie_domain::RemoteTarget {
+                host: "prod.example.com".to_owned(),
+                user: Some("deploy".to_owned()),
+                port: Some(2222),
+            }),
+            remote_install_consented: true,
+            remote_cwd: Some("/srv/www".to_owned()),
         };
         let encoded = encode_line(&request).unwrap();
         assert_eq!(
@@ -1706,6 +1811,10 @@ mod tests {
                 shell_program,
                 shell_args,
                 shell_features,
+                env,
+                remote,
+                remote_install_consented,
+                remote_cwd,
                 ..
             } => {
                 assert_eq!(scrollback_limit, 0);
@@ -1713,6 +1822,15 @@ mod tests {
                 assert!(shell_args.is_empty());
                 // Absent field falls back to the default feature set (`path`), not empty.
                 assert_eq!(shell_features, "path");
+                // A client that predates profiles sends no env; the shell gets Eggie's own only.
+                assert!(env.is_empty());
+                // And no remote fields: a local session, with consent absent rather than assumed.
+                assert!(remote.is_none(), "absent `remote` must mean a local session");
+                assert!(
+                    !remote_install_consented,
+                    "consent must never default to true — it authorizes writing to another host"
+                );
+                assert!(remote_cwd.is_none());
             }
             other => panic!("unexpected decode: {other:?}"),
         }

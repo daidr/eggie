@@ -21,10 +21,50 @@ pub(crate) fn data_file_path(file_name: &str) -> PathBuf {
 
 /// 从 `path` 读取并反序列化一个 JSON 值。文件缺失、读取失败或内容损坏都返回 `None`,由调用方决定
 /// 回退策略(通常 `unwrap_or_default`)。这与各 store「损坏文件回退空」的既有语义一致。
+///
+/// 需要区分「文件不存在」与「文件存在但读不懂」时用 [`load_json_outcome`] —— 前者可以安全地当作
+/// 首次运行,后者意味着磁盘上有用户数据读不出来,盖写它会造成数据丢失。
 pub(crate) fn load_json<T: DeserializeOwned>(path: &PathBuf) -> Option<T> {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<T>(&bytes).ok())
+    match load_json_outcome(path) {
+        LoadOutcome::Loaded(value) => Some(value),
+        LoadOutcome::Missing | LoadOutcome::Corrupt(_) => None,
+    }
+}
+
+/// [`load_json`] 的三态版本:区分「加载成功」「文件不存在」「文件存在但无法解析」。
+///
+/// 只有 `Missing` 才是真正的首次运行。`Corrupt` 说明磁盘上有内容读不出来 —— 调用方应把原文件挪到
+/// 一边保留证据(见 [`quarantine_corrupt_file`]),而不是当作空白重来。
+pub(crate) enum LoadOutcome<T> {
+    Loaded(T),
+    Missing,
+    /// 文件存在但读取或解析失败,附带原因(用于日志)。
+    Corrupt(String),
+}
+
+pub(crate) fn load_json_outcome<T: DeserializeOwned>(path: &PathBuf) -> LoadOutcome<T> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
+        Err(error) => return LoadOutcome::Corrupt(error.to_string()),
+    };
+    match serde_json::from_slice::<T>(&bytes) {
+        Ok(value) => LoadOutcome::Loaded(value),
+        Err(error) => LoadOutcome::Corrupt(error.to_string()),
+    }
+}
+
+/// 把无法解析的文件重命名到带时间戳的 `.corrupt-<epoch_secs>` 旁路,保留用户数据以便人工抢救。
+/// 返回挪到的路径(失败则 `None`,此时调用方只能记日志继续 —— 保留证据是尽力而为,不能阻断启动)。
+pub(crate) fn quarantine_corrupt_file(path: &PathBuf) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut file_name = path.file_name()?.to_os_string();
+    file_name.push(format!(".corrupt-{stamp}"));
+    let quarantined = path.with_file_name(file_name);
+    fs::rename(path, &quarantined).ok().map(|()| quarantined)
 }
 
 /// 原子地把 `value` 序列化为美化 JSON 写入 `path`:先确保父目录存在,写入同目录的 `.json.tmp`,再

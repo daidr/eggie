@@ -2,12 +2,13 @@ use crate::icons::{IconName, icon, icon_sized};
 use crate::command_palette::{PaletteEntry, command_matches, palette_entries};
 use crate::input_latency::InputLatencyTracker;
 use crate::native_menu::{
-    NativeProcessMenuCommand, NativeProjectMenuCommand, NativeSnippetMenuCommand,
-    NativeTabMenuCommand, prepare_process_menu, prepare_project_menu, prepare_snippet_menu,
-    prepare_tab_menu,
+    NativeProcessMenuCommand, NativeProfileMenuCommand, NativeProjectMenuCommand,
+    NativeSnippetMenuCommand, NativeTabMenuCommand, prepare_process_menu, prepare_profile_menu,
+    prepare_project_menu, prepare_snippet_menu, prepare_tab_menu,
 };
 use crate::command_history::{CommandStatus, format_relative_time};
 use crate::notes_store::NotesStore;
+use crate::profile_store::ProfileStore;
 use crate::project_store::ProjectStore;
 use crate::snippet_store::{Snippet, SnippetStore};
 use crate::settings::{
@@ -16,10 +17,10 @@ use crate::settings::{
 };
 use crate::settings_window::{
     ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
-    FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NextTab,
-    PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown, SplitLeft, SplitRight, SplitUp,
-    TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
-    ToggleLeftSidebar, ToggleRightSidebar, ZoomWindow, is_dark_appearance,
+    FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab,
+    NewTabWithProfile, NextTab, PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown,
+    SplitLeft, SplitRight, SplitUp, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
+    ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar, ZoomWindow, is_dark_appearance,
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::terminal_renderer::{
@@ -31,8 +32,8 @@ use crate::terminal_renderer::{
 use crate::workspace::{SidebarRestoreState, WindowProjectView, WorkspaceRestoreState};
 use eggie_daemon::{DaemonClient, DaemonConnection, DaemonInputSender, TerminalImageFrame};
 use eggie_domain::{
-    Direction, GroupId, ItemId, ItemKind, LayoutNode, Project, ProjectId, SessionId, SplitAxis,
-    SplitId, TabGroup, TabItem, WindowId,
+    Direction, GroupId, ItemId, ItemKind, LayoutNode, Profile, Project, ProjectId, SessionId,
+    SplitAxis, SplitId, TabGroup, TabItem, WindowId,
 };
 use eggie_protocol::{
     ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionStatus,
@@ -93,6 +94,9 @@ const TAB_BAR_PADDING: f32 = 5.;
 const TAB_GAP: f32 = 5.;
 const TAB_TITLE_FONT_SIZE: f32 = 11.;
 const TAB_CLOSE_ICON_SIZE: f32 = 10.;
+/// Diameter of the profile badge dot on a tab. Small enough to read as a marker beside the title
+/// rather than as another control, and it only appears when the profile defines a color.
+const TAB_BADGE_SIZE: f32 = 6.;
 const TAB_DROP_INDICATOR_WIDTH: f32 = 2.;
 const TAB_DROP_INDICATOR_OFFSET: f32 = (TAB_GAP + TAB_DROP_INDICATOR_WIDTH) / 2.;
 const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 28.;
@@ -404,6 +408,10 @@ struct TerminalSearchUi {
 /// State for the command palette (⌘⇧P). A centered modal listing every command; the query filters
 /// it, ↑/↓ move the selection, Enter/click runs the selected command, Esc closes. At most one is
 /// open at a time. The command data comes from [`crate::command_palette::palette_entries`].
+///
+/// The same modal doubles as the profile picker ([`PaletteMode::Profiles`]): identical chrome and key
+/// handling, but the rows are profiles and confirming creates a terminal instead of dispatching an
+/// action. Reusing the overlay keeps one focus/Esc path rather than two competing modals.
 struct CommandPaletteUi {
     /// The reusable text-input component holding the filter query, cursor, and focus.
     input: Entity<TextInput>,
@@ -411,8 +419,32 @@ struct CommandPaletteUi {
     selected_index: usize,
     /// Scroll handle for the results list, so the selected row can be kept in view.
     scroll_handle: ScrollHandle,
+    /// Whether this modal is listing commands or profiles.
+    mode: PaletteMode,
     /// Subscription to the input's events; dropped (unsubscribed) when the palette closes.
     _subscription: Subscription,
+}
+
+/// What the palette modal is currently listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteMode {
+    Commands,
+    /// The profile picker: rows are profiles, confirming launches a terminal from the chosen one.
+    Profiles,
+    /// The same profile list, but confirming sets the named project's default profile instead of
+    /// launching anything. A distinct mode rather than a flag on `Profiles` so `confirm` cannot
+    /// accidentally do both.
+    ProjectDefaultProfile(ProjectId),
+}
+
+/// One rendered row of the palette modal, flattened from either a command or a profile so the render
+/// path has a single shape to draw.
+struct PaletteRow {
+    label: String,
+    /// Right-aligned muted text: a command's shortcut, or a profile's "project default" marker.
+    trailing: Option<String>,
+    /// Leading accent dot (`0xRRGGBB`) for a profile that defines one.
+    badge_color: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -531,7 +563,7 @@ impl gpui::Render for TextTooltip {
 }
 
 /// Build a `.tooltip(...)` callback showing `text`. Use as `element.tooltip(tooltip_text(label, colors))`.
-fn tooltip_text(
+pub(crate) fn tooltip_text(
     text: impl Into<SharedString>,
     colors: UiColors,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
@@ -597,15 +629,40 @@ pub struct EggieApp {
     settings: Entity<SettingsStore>,
     updates: Entity<crate::update_controller::UpdateController>,
     colors: UiColors,
+    /// The theme driving this window's own chrome (via [`UiColors`]). Independent from
+    /// `terminal_theme`: the user can pair a dark interface with a light terminal.
+    interface_theme: &'static TerminalTheme,
+    /// The theme driving terminal cells before any profile override. Equals `interface_theme` while
+    /// the terminal is set to follow the interface.
     terminal_theme: &'static TerminalTheme,
-    terminal_appearance: TerminalAppearance,
-    terminal_font_family: SharedString,
-    terminal_font_size: f32,
+    /// Whether the dark half of every theme pair is in effect. Kept alongside the resolved themes
+    /// because the profile layer has to repeat the same dark/light choice, and because a system flip
+    /// that leaves the global palette unchanged must still re-resolve profile overrides.
+    use_dark: bool,
+    /// The palette derived from the *global* theme. Not "what the terminals currently have" — with
+    /// per-profile themes each session has its own, tracked in `session_appearances`. Used as the
+    /// global layer a profile's overrides merge over, and as a reconcile-gate input.
+    global_appearance: TerminalAppearance,
+    /// The palette last pushed to each of this window's sessions, so the per-frame reconcile only
+    /// sends a `SetAppearance` when a terminal's own resolved colors actually changed. Keyed by
+    /// session; entries for sessions the window no longer owns are pruned as they are noticed.
+    session_appearances: HashMap<SessionId, TerminalAppearance>,
+    /// The inputs the session-appearance reconcile last ran against: (global terminal palette,
+    /// profile-store revision, wrapping sum of owned session ids, whether the dark half is in effect,
+    /// active hover-preview key). Compared on every render so the O(sessions × tabs) walk is skipped on
+    /// the steady-state repaint (cursor blink, snapshot stream), which cannot change any of them.
+    #[allow(clippy::type_complexity)]
+    applied_appearance_inputs: Option<(
+        TerminalAppearance,
+        u64,
+        u128,
+        bool,
+        Option<(crate::settings::PreviewSlot, usize)>,
+    )>,
     terminal_padding_x: f32,
     terminal_padding_y: f32,
     terminal_minimum_contrast: f32,
     terminal_metric_adjustments: crate::settings::ResolvedMetricAdjustments,
-    terminal_font_families: crate::settings::ResolvedFontFamilies,
     terminal_font_features: std::sync::Arc<[crate::settings::FontFeature]>,
     terminal_ligatures: bool,
     terminal_shaping_break_cursor: bool,
@@ -644,6 +701,11 @@ pub struct EggieApp {
     /// Shared, cross-window project list (name/root/order). Cloned handle of the one `Entity` all
     /// windows observe; mutating it re-renders every window and re-syncs their `project_views`.
     project_store: Entity<ProjectStore>,
+    /// Shared, cross-window profile list (launch recipes + appearance overrides). Mirrors the
+    /// `ProjectStore` pattern; new terminals resolve their launch config through it.
+    // TODO(profiles step 2): read by spawn-config resolution and the tab badge.
+    #[allow(dead_code)]
+    profile_store: Entity<ProfileStore>,
     /// Shared snippet store (cross-window), mirrors the ProjectStore pattern.
     snippet_store: Entity<SnippetStore>,
     /// Shared global-notes store (cross-window).
@@ -1050,9 +1112,40 @@ fn prompt_for_snippet(
     rx
 }
 
+/// A session produced by window seeding, plus the profile it was launched from.
+///
+/// `profile` is `Some` only for sessions this window just created — an adopted one (claimed back from
+/// the daemon after a restart, or inherited from a closed window) was launched by an earlier run, and
+/// the restored layout already records whatever profile its tab carried. Keeping the two apart is what
+/// lets a freshly seeded tab render its profile's appearance instead of the global one.
+struct SeededSession {
+    summary: SessionSummary,
+    profile: Option<eggie_domain::ProfileId>,
+}
+
+impl SeededSession {
+    fn launched(summary: SessionSummary, profile: eggie_domain::ProfileId) -> Self {
+        Self {
+            summary,
+            profile: Some(profile),
+        }
+    }
+
+    fn adopted(summary: SessionSummary) -> Self {
+        Self {
+            summary,
+            profile: None,
+        }
+    }
+}
+
 impl EggieApp {
     pub fn launch(project_root: PathBuf, client: DaemonClient) {
         let settings_store = SettingsStore::load();
+        // Profiles carry the launch fields that used to live in the global settings, so the store is
+        // built from those values: on first run they migrate into the built-in Default profile, and
+        // once `profiles.json` exists they are ignored.
+        let profile_store = ProfileStore::load(settings_store.config().legacy_shell_settings());
         let project_store = ProjectStore::load();
         let snippet_store = SnippetStore::load();
         let notes_store = NotesStore::load();
@@ -1087,12 +1180,14 @@ impl EggieApp {
                 .expect("failed to register the embedded Hugeicons font");
             let settings = cx.new(|_| settings_store);
             let project_store = cx.new(|_| project_store);
+            let profile_store = cx.new(|_| profile_store);
             let snippet_store = cx.new(|_| snippet_store);
             let notes_store = cx.new(|_| notes_store);
             let updates = cx.new(|_| crate::update_controller::UpdateController::new());
             crate::settings_window::install(
                 settings.clone(),
                 project_store.clone(),
+                profile_store.clone(),
                 snippet_store.clone(),
                 notes_store.clone(),
                 client.clone(),
@@ -1106,6 +1201,7 @@ impl EggieApp {
                 settings.clone(),
                 updates.clone(),
                 project_store.clone(),
+                profile_store.clone(),
                 snippet_store.clone(),
                 notes_store.clone(),
                 notification_routes.clone(),
@@ -1121,6 +1217,7 @@ impl EggieApp {
                 settings.clone(),
                 updates.clone(),
                 project_store.clone(),
+                profile_store.clone(),
                 snippet_store.clone(),
                 notes_store.clone(),
                 notification_routes.clone(),
@@ -1163,12 +1260,14 @@ impl EggieApp {
     /// Bind the GUI single-instance socket and serve wake requests. A blocking `accept` loop runs on
     /// a dedicated std thread (the socket API is blocking); each decoded [`GuiWakeMessage`] is pushed
     /// onto a channel that a foreground task drains, so window creation happens on the main thread.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_wake_listener(
         cx: &mut App,
         client: DaemonClient,
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
+        profile_store: Entity<ProfileStore>,
         snippet_store: Entity<SnippetStore>,
         notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
@@ -1202,6 +1301,7 @@ impl EggieApp {
                 let settings = settings.clone();
                 let updates = updates.clone();
                 let project_store = project_store.clone();
+                let profile_store = profile_store.clone();
                 let snippet_store = snippet_store.clone();
                 let notes_store = notes_store.clone();
                 let notification_routes = notification_routes.clone();
@@ -1216,6 +1316,7 @@ impl EggieApp {
                         settings,
                         updates,
                         project_store.clone(),
+                        profile_store,
                         snippet_store,
                         notes_store,
                         notification_routes,
@@ -1230,13 +1331,15 @@ impl EggieApp {
 
     /// Open a new main window on an already-running app. Called for the first (cold-start) window
     /// and for every subsequent `New Window` / single-instance wake. All windows share the same
-    /// `settings` and `project_store` entities, so their project lists stay in sync.
+    /// `settings`, `project_store` and `profile_store` entities, so their lists stay in sync.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_new_window(
         cx: &mut App,
         client: DaemonClient,
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
+        profile_store: Entity<ProfileStore>,
         snippet_store: Entity<SnippetStore>,
         notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
@@ -1266,6 +1369,7 @@ impl EggieApp {
                         settings,
                         updates,
                         project_store,
+                        profile_store,
                         snippet_store,
                         notes_store,
                         notification_routes,
@@ -1282,32 +1386,43 @@ impl EggieApp {
     /// Resolve a [`NewWindowInit`] into this window's `(active_project, owned_sessions)`, mutating the
     /// shared [`ProjectStore`] as needed. Runs before the `EggieApp` struct exists, so it takes the
     /// pieces it needs explicitly and talks to the daemon directly.
+    #[allow(clippy::too_many_arguments)]
     fn seed_window(
         init: &NewWindowInit,
         window_id: WindowId,
         client: &DaemonClient,
         project_store: &Entity<ProjectStore>,
+        profile_store: &Entity<ProfileStore>,
         config: &crate::settings::AppSettings,
-        appearance: TerminalAppearance,
+        global: crate::settings::GlobalTerminalLayer,
         cx: &mut Context<Self>,
-    ) -> (ProjectId, Vec<SessionSummary>, Option<WorkspaceRestoreState>) {
+    ) -> (ProjectId, Vec<SeededSession>, Option<WorkspaceRestoreState>) {
         match init {
-            NewWindowInit::ColdStart { project_root } => {
-                Self::seed_cold_start(project_root, window_id, client, project_store, config, appearance, cx)
-            }
+            NewWindowInit::ColdStart { project_root } => Self::seed_cold_start(
+                project_root,
+                window_id,
+                client,
+                project_store,
+                profile_store,
+                config,
+                global,
+                cx,
+            ),
             NewWindowInit::OpenDir { project_id } => {
                 // The project already exists in the shared store (added by the waking path). Open one
                 // terminal in it, since `eggie <dir>` is an explicit request for a terminal there.
-                let root = project_store
-                    .read(cx)
-                    .projects()
-                    .iter()
-                    .find(|project| project.id == *project_id)
-                    .map(|project| project.effective_root())
-                    .unwrap_or_else(fallback_home_dir);
-                let sessions = Self::create_session(client, *project_id, window_id, root, config, appearance)
-                    .into_iter()
-                    .collect();
+                let (root, profile) = Self::project_root_and_profile(
+                    *project_id,
+                    project_store,
+                    profile_store,
+                    cx,
+                );
+                let sessions = Self::create_session(
+                    client, *project_id, window_id, root, &profile, config, global,
+                )
+                .map(|summary| SeededSession::launched(summary, profile.id))
+                .into_iter()
+                .collect();
                 (*project_id, sessions, None)
             }
             NewWindowInit::Empty => {
@@ -1331,16 +1446,44 @@ impl EggieApp {
         }
     }
 
+    /// A project's effective root and the profile its new terminals launch from. Used by the seeding
+    /// paths, which run before the `EggieApp` struct exists and so cannot use the instance methods.
+    /// An unknown project id falls back to the home directory and the built-in Default profile.
+    fn project_root_and_profile(
+        project_id: ProjectId,
+        project_store: &Entity<ProjectStore>,
+        profile_store: &Entity<ProfileStore>,
+        cx: &mut Context<Self>,
+    ) -> (PathBuf, Profile) {
+        let project = project_store
+            .read(cx)
+            .projects()
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned();
+        let root = project
+            .as_ref()
+            .map(Project::effective_root)
+            .unwrap_or_else(fallback_home_dir);
+        let profile = profile_store
+            .read(cx)
+            .resolve(project.and_then(|project| project.default_profile_id))
+            .clone();
+        (root, profile)
+    }
+
     /// Cold-start seeding: reconcile the persisted project list with the daemon's surviving sessions.
+    #[allow(clippy::too_many_arguments)]
     fn seed_cold_start(
         project_root: &Path,
         window_id: WindowId,
         client: &DaemonClient,
         project_store: &Entity<ProjectStore>,
+        profile_store: &Entity<ProfileStore>,
         config: &crate::settings::AppSettings,
-        appearance: TerminalAppearance,
+        global: crate::settings::GlobalTerminalLayer,
         cx: &mut Context<Self>,
-    ) -> (ProjectId, Vec<SessionSummary>, Option<WorkspaceRestoreState>) {
+    ) -> (ProjectId, Vec<SeededSession>, Option<WorkspaceRestoreState>) {
         // Adopt a project for the launch directory: reuse a persisted project with the same root,
         // otherwise create one. Done before restore so `eggie <dir>` lands in the store even when
         // an unrelated workspace is restored.
@@ -1379,6 +1522,7 @@ impl EggieApp {
             let live: HashSet<_> = claimed.iter().map(|session| session.id).collect();
             let projects = project_store.read(cx).projects().to_vec();
             if restored.prune_to_live(&live, &projects) {
+                let claimed = claimed.into_iter().map(SeededSession::adopted).collect();
                 return (restored.active_project, claimed, Some(restored));
             }
         }
@@ -1389,7 +1533,7 @@ impl EggieApp {
             Ok(DaemonResponse::Sessions { sessions }) => sessions,
             _ => Vec::new(),
         };
-        let mut owned: Vec<SessionSummary> = Vec::new();
+        let mut owned: Vec<SeededSession> = Vec::new();
         for session in all_sessions {
             let belongs = session.project_id == launch_project
                 || session.initial_directory == project_root_buf;
@@ -1402,50 +1546,91 @@ impl EggieApp {
                     window_id,
                 })
             {
-                owned.push(session);
+                owned.push(SeededSession::adopted(session));
             }
         }
 
         // Nothing to adopt: open a fresh terminal so the window is not empty on first launch.
         if owned.is_empty() {
-            let root = project_store
+            // `launch_project` was just upserted from `project_root`, so the lookup all but always
+            // hits; `project_root_buf` covers the impossible case without reaching for the home dir.
+            let project = project_store
                 .read(cx)
                 .projects()
                 .iter()
                 .find(|project| project.id == launch_project)
-                .map(|project| project.effective_root())
+                .cloned();
+            let root = project
+                .as_ref()
+                .map(Project::effective_root)
                 .unwrap_or(project_root_buf);
-            owned.extend(Self::create_session(
-                client,
-                launch_project,
-                window_id,
-                root,
-                config,
-                appearance,
-            ));
+            let profile = profile_store
+                .read(cx)
+                .resolve(project.and_then(|project| project.default_profile_id))
+                .clone();
+            owned.extend(
+                Self::create_session(
+                    client,
+                    launch_project,
+                    window_id,
+                    root,
+                    &profile,
+                    config,
+                    global,
+                )
+                .map(|summary| SeededSession::launched(summary, profile.id)),
+            );
         }
         (launch_project, owned, None)
     }
 
     /// Spawn a single terminal session in the daemon, returning its summary (or `None` on error).
+    ///
+    /// `profile` supplies the launch fields and, when it overrides the theme, the spawn palette;
+    /// `cwd` is the already-resolved working directory (the cold-start path has no active terminal to
+    /// inherit from, so its caller resolves the project root and a profile `cwd` still wins here via
+    /// [`resolve_spawn_config`]). `global` is the already-resolved global terminal layer the profile's
+    /// overrides merge over, plus the dark/light decision selecting which half of them applies.
     fn create_session(
         client: &DaemonClient,
         project_id: ProjectId,
         window_id: WindowId,
         cwd: PathBuf,
+        profile: &Profile,
         config: &crate::settings::AppSettings,
-        appearance: TerminalAppearance,
+        global: crate::settings::GlobalTerminalLayer,
     ) -> Option<SessionSummary> {
+        let spawn = resolve_spawn_config(profile, None, &cwd);
+        // Born in the profile's own colors when it overrides the theme, the global palette otherwise.
+        // No hover preview here: this runs at spawn time, outside any settings-window interaction.
+        let appearance = crate::settings::resolve_appearance(
+            config,
+            (!profile.appearance.is_empty()).then_some(&profile.appearance),
+            global,
+            None,
+        )
+        .theme
+        .appearance();
         match client.request(ClientRequest::CreateSession {
             project_id,
             window_id,
-            cwd,
+            cwd: spawn.cwd,
             size: TerminalSize::default(),
             appearance,
             scrollback_limit: config.scrollback_lines,
-            shell_program: config.shell_program.clone(),
-            shell_args: config.shell_args.clone(),
-            shell_features: config.shell_features_string(),
+            shell_program: spawn.shell_program,
+            shell_args: spawn.shell_args,
+            shell_features: spawn.shell_features,
+            env: spawn.env,
+            // Seeding runs before any window exists, so it cannot put a consent prompt on screen.
+            // A host the user already answered for is honored; an unanswered one connects without
+            // installing, and the next terminal opened from a live window does the asking.
+            remote_install_consented: spawn
+                .remote
+                .as_ref()
+                .is_some_and(|target| config.remote_install_consent.get(&target.consent_key()) == Some(&true)),
+            remote: spawn.remote,
+            remote_cwd: spawn.remote_cwd,
         }) {
             Ok(DaemonResponse::SessionCreated { session }) => Some(session),
             other => {
@@ -1462,6 +1647,7 @@ impl EggieApp {
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
         project_store: Entity<ProjectStore>,
+        profile_store: Entity<ProfileStore>,
         snippet_store: Entity<SnippetStore>,
         notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
@@ -1470,26 +1656,38 @@ impl EggieApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let config = settings.read(cx).config().clone();
-        let terminal_theme = config.effective_theme(is_dark_appearance(window.appearance()));
-        let terminal_appearance = terminal_theme.appearance();
+        let system_is_dark = is_dark_appearance(window.appearance());
+        let interface_theme = config.interface_theme(system_is_dark);
+        let terminal_theme = config.terminal_theme(system_is_dark);
+        let global_appearance = terminal_theme.appearance();
         let progress_timeouts = TerminalProgressTimeouts {
             completed_ms: config.progress_complete_timeout_secs.saturating_mul(1_000),
             stale_ms: config.progress_stale_timeout_secs.saturating_mul(1_000),
         };
-        let colors = UiColors::from_theme(terminal_theme);
+        let colors = UiColors::from_theme(interface_theme);
 
         // Resolve the requested init into this window's active project and owned sessions, mutating
         // the shared project store as needed (seeding Home / adopting the launch directory). A cold
         // start additionally returns the restored workspace layout when one survived.
-        let (active_project, sessions, restored) = Self::seed_window(
+        let (active_project, seeded, restored) = Self::seed_window(
             &init,
             window_id,
             &client,
             &project_store,
+            &profile_store,
             &config,
-            terminal_appearance,
+            crate::settings::GlobalTerminalLayer::new(&config, system_is_dark),
             cx,
         );
+        // Split the seeding result: `sessions` is what the rest of construction expects, while
+        // `seeded_profiles` records which of them this window just launched (and from which profile),
+        // so their tabs can be built with that profile rather than defaulting to "no overrides".
+        let seeded_profiles: HashMap<SessionId, eggie_domain::ProfileId> = seeded
+            .iter()
+            .filter_map(|seeded| seeded.profile.map(|profile| (seeded.summary.id, profile)))
+            .collect();
+        let sessions: Vec<SessionSummary> =
+            seeded.into_iter().map(|seeded| seeded.summary).collect();
 
         // Build a per-window view for every shared project (empty by default). With a restored
         // workspace, adopt the saved layouts (dead tabs already pruned by `seed_cold_start`);
@@ -1519,7 +1717,16 @@ impl EggieApp {
                     if let Some(view) = project_views.get_mut(&session.project_id) {
                         let group_id = view.layout.first_group_id();
                         if let Some(group) = view.layout.find_group_mut(group_id) {
-                            group.add_item(TabItem::terminal(session.id, session.title.clone()));
+                            // Carry the launching profile onto the tab, so the terminal renders its
+                            // appearance overrides instead of silently falling back to the global layer.
+                            group.add_item(match seeded_profiles.get(&session.id) {
+                                Some(profile) => TabItem::terminal_with_profile(
+                                    session.id,
+                                    session.title.clone(),
+                                    *profile,
+                                ),
+                                None => TabItem::terminal(session.id, session.title.clone()),
+                            });
                         }
                         view.active_group_id = group_id;
                     }
@@ -1528,13 +1735,13 @@ impl EggieApp {
             }
         };
 
+        // Appearance is deliberately NOT pushed here. Broadcasting the global palette would clobber the
+        // profile-resolved palette a freshly launched session was spawned with, and for a claimed
+        // session the daemon still holds the palette from the run that created it — which may predate a
+        // theme change. `applied_appearance_inputs: None` makes the first render reconcile every session
+        // to its own resolved palette, which is both correct by construction and the same one request
+        // per session this loop used to send.
         for session in &sessions {
-            if let Err(error) = client.request(ClientRequest::SetAppearance {
-                session_id: session.id,
-                appearance: terminal_appearance,
-            }) {
-                eprintln!("failed to set terminal appearance: {error:#}");
-            }
             if let Err(error) = client.request(ClientRequest::SetProgressTimeouts {
                 session_id: session.id,
                 timeouts: progress_timeouts,
@@ -1589,6 +1796,9 @@ impl EggieApp {
             cx.notify();
         })
         .detach();
+        // Profile edits from any window re-render here (tab badges, profile pickers). Launch fields
+        // only affect terminals created from now on; appearance overrides are re-resolved on render.
+        cx.observe(&profile_store, |_, _, cx| cx.notify()).detach();
         // Snippet edits from any window re-render the Commands tab here.
         cx.observe(&snippet_store, |_, _, cx| cx.notify()).detach();
         // Notes edits from another window: reseed our editor so it mirrors the shared text (unless
@@ -1606,7 +1816,6 @@ impl EggieApp {
         .detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
-        let terminal_font_families = config.resolved_font_families();
         let terminal_font_features: std::sync::Arc<[crate::settings::FontFeature]> =
             config.resolved_font_features().into();
         let terminal_font_variations: std::sync::Arc<[crate::settings::FontVariation]> =
@@ -1654,15 +1863,24 @@ impl EggieApp {
             settings,
             updates,
             colors,
+            interface_theme,
             terminal_theme,
-            terminal_appearance,
-            terminal_font_family: config.font_family.into(),
-            terminal_font_size: config.font_size,
+            use_dark: config.use_dark(system_is_dark),
+            global_appearance,
+            // Empty on purpose: what the daemon holds for a seeded session is not knowable here (a
+            // launched one carries its profile's palette, a claimed one carries the palette of the run
+            // that spawned it). Pre-filling with the global palette would make the reconcile's diff
+            // report "no change" and leave those terminals on stale daemon-side colors, so instead the
+            // first render pushes every session its resolved palette — one request each, correct by
+            // construction rather than by coincidence.
+            session_appearances: HashMap::new(),
+            // `None` so the first render runs the reconcile once, catching any seeded session whose
+            // profile overrides the theme.
+            applied_appearance_inputs: None,
             terminal_padding_x: config.terminal_padding_x,
             terminal_padding_y: config.terminal_padding_y,
             terminal_minimum_contrast: config.minimum_contrast,
             terminal_metric_adjustments: config.font_metrics.resolve(),
-            terminal_font_families,
             terminal_font_features,
             terminal_ligatures: config.ligatures,
             terminal_shaping_break_cursor: config.font_shaping_break_cursor,
@@ -1690,6 +1908,7 @@ impl EggieApp {
             pending_progress_updates: HashMap::new(),
             window_id,
             project_store,
+            profile_store,
             snippet_store,
             notes_store,
             projects,
@@ -2329,6 +2548,17 @@ impl EggieApp {
         .detach();
     }
 
+    /// The badge color and profile name for a tab, or `None` when it should carry no badge.
+    ///
+    /// Uses [`ProfileStore::profile`] rather than `resolve`: a tab whose profile was deleted while it
+    /// ran must lose its badge, not inherit the built-in Default's. That matches
+    /// [`ProfileStore::appearance_override`] — a deleted profile means "no overrides" everywhere, so a
+    /// terminal never silently adopts a different profile's identity.
+    fn tab_profile_badge(&self, item: &TabItem, cx: &App) -> Option<(u32, SharedString)> {
+        let profile = self.profile_store.read(cx).profile(item.profile_id?)?;
+        Some((profile.badge_color?, SharedString::from(profile.name.clone())))
+    }
+
     fn render_item_icon(
         &self,
         kind: ItemKind,
@@ -2351,9 +2581,13 @@ impl EggieApp {
         };
 
         let colors = self.colors;
+        // The ring is chrome (it sits in the tab strip and the sidebar), so its semantic red/yellow
+        // come from the *interface* theme's palette — the same source `colors` is derived from. Reading
+        // the terminal theme here would tint the sidebar with a profile-independent terminal palette
+        // the surrounding chrome knows nothing about.
         let color = match progress.state {
-            TerminalProgressState::Error => self.terminal_theme.palette[1],
-            TerminalProgressState::Paused => self.terminal_theme.palette[3],
+            TerminalProgressState::Error => self.interface_theme.palette[1],
+            TerminalProgressState::Paused => self.interface_theme.palette[3],
             TerminalProgressState::Normal | TerminalProgressState::Indeterminate => colors.accent,
         };
         let phase = (self.progress_animation_epoch.elapsed().as_secs_f32() * 0.8).fract();
@@ -3347,15 +3581,16 @@ impl EggieApp {
         }
     }
 
-    /// Working directory for a terminal created in `group_id`: the live cwd of the group's active
-    /// session (OSC 7-reported, falling back to the foreground process cwd in the daemon), so a new
-    /// tab or split opens beside where the user is working. `source_item` names a specific tab the
-    /// creation was requested from (the tab context menu's Split); when present, its session's cwd
-    /// wins over the group's active tab. Falls back to the project root when no session can be
-    /// resolved (empty group, non-terminal item, or no summary yet) or its directory no longer
-    /// exists. The existence check covers the most common failure — a directory deleted between
-    /// poll cycles, which would otherwise make the PTY spawn fail.
-    fn new_terminal_cwd(&self, group_id: GroupId, source_item: Option<ItemId>) -> PathBuf {
+    /// The live working directory of the session a new terminal should inherit from: the OSC 7-reported
+    /// cwd (falling back to the foreground process cwd in the daemon), so a new tab or split opens
+    /// beside where the user is working. `source_item` names a specific tab the creation was requested
+    /// from (the tab context menu's Split); when present, its session's cwd wins over the group's
+    /// active tab. `None` when the tab has no session (empty group, non-terminal item) or no summary
+    /// has arrived yet.
+    ///
+    /// Returned raw (not existence-checked) because the callers layer different fallbacks on top:
+    /// [`resolve_spawn_config`] lets a profile's own `cwd` win first, then applies the existence check.
+    fn active_session_cwd(&self, group_id: GroupId, source_item: Option<ItemId>) -> Option<PathBuf> {
         let session_id = match source_item {
             Some(item_id) => self
                 .workspace()
@@ -3370,10 +3605,17 @@ impl EggieApp {
                 .and_then(|group| group.active_item())
                 .and_then(|item| item.session_id),
         };
-        let active_cwd = session_id
+        session_id
             .and_then(|session_id| self.sessions.iter().find(|s| s.id == session_id))
-            .map(|session| session.current_directory.clone());
-        resolve_new_terminal_cwd(active_cwd.as_deref(), &self.active_project_data().effective_root())
+            .map(|session| session.current_directory.clone())
+    }
+
+    /// The profile a new terminal in this project should launch from: the project's configured
+    /// default, falling back to the built-in Default when unset or stale (see
+    /// [`ProfileStore::resolve`]).
+    fn new_terminal_profile(&self, cx: &App) -> Profile {
+        let configured = self.active_project_data().default_profile_id;
+        self.profile_store.read(cx).resolve(configured).clone()
     }
 
     fn new_terminal(
@@ -3381,30 +3623,154 @@ impl EggieApp {
         group_id: GroupId,
         split: Option<Direction>,
         source_item: Option<ItemId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let profile = self.new_terminal_profile(cx);
+        self.new_terminal_with_profile(group_id, split, source_item, profile, window, cx);
+    }
+
+    /// Ask whether Eggie may install its shell integration on `destination`, remember the answer, and
+    /// then create the terminal either way.
+    ///
+    /// Asked once per `user@host` (the install lands in that account's home directory), and a refusal
+    /// is remembered too — declining must not mean being asked again on every new terminal. Either
+    /// answer proceeds to a session: consent adds the integration, refusal opens a plain ssh session.
+    /// Dismissing the prompt without choosing cancels the terminal instead of guessing.
+    fn prompt_remote_install_consent(
+        &mut self,
+        destination: String,
+        group_id: GroupId,
+        split: Option<Direction>,
+        source_item: Option<ItemId>,
+        profile: Profile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let language = self.language;
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            language.remote_install_title(),
+            Some(&language.remote_install_message(&destination)),
+            &[language.remote_install_allow(), language.remote_install_skip()],
+            cx,
+        );
+        let app = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            // A dismissed prompt (Esc) resolves to an error: no answer was given, so record nothing
+            // and open no terminal — silently picking one would either write to a host the user did
+            // not agree to, or bake in a refusal they never made.
+            let Ok(choice) = prompt.await else {
+                return;
+            };
+            let consented = choice == 0;
+            let _ = cx.update(|window, cx| {
+                let _ = app.update(cx, |app, cx| {
+                    app.settings.update(cx, |settings, cx| {
+                        settings.update(
+                            |settings| {
+                                settings
+                                    .remote_install_consent
+                                    .insert(destination.clone(), consented);
+                            },
+                            cx,
+                        );
+                    });
+                    // Re-enter with the answer recorded: the consent gate now finds an entry and
+                    // proceeds straight to creating the session.
+                    app.new_terminal_with_profile(group_id, split, source_item, profile, window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Create a terminal from an explicitly chosen `profile` (the command palette's
+    /// "New Terminal with Profile…"), bypassing the project default.
+    fn new_terminal_with_profile(
+        &mut self,
+        group_id: GroupId,
+        split: Option<Direction>,
+        source_item: Option<ItemId>,
+        profile: Profile,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let project = self.active_project_data().clone();
-        let config = self.settings.read(cx).config();
-        let scrollback_limit = config.scrollback_lines;
-        let shell_program = config.shell_program.clone();
-        let shell_args = config.shell_args.clone();
-        let shell_features = config.shell_features_string();
+        let scrollback_limit = self.settings.read(cx).config().scrollback_lines;
+        // Launch fields come from the profile; scrollback stays global (it is a resource limit, not
+        // part of a terminal's identity). The cwd resolution needs the same source-item lookup the
+        // inheritance path uses, so compute it here and let the profile override it.
+        let active_cwd = self.active_session_cwd(group_id, source_item);
+        let spawn = resolve_spawn_config(
+            &profile,
+            active_cwd.as_deref(),
+            &project.effective_root(),
+        );
+        // Spawn with the profile's own palette, so a themed terminal is born in its colors instead of
+        // painting the global theme for the frame before the render reconcile catches up.
+        let appearance = crate::settings::resolve_appearance(
+            self.settings.read(cx).config(),
+            (!profile.appearance.is_empty()).then_some(&profile.appearance),
+            self.global_terminal_layer(),
+            None,
+        )
+        .theme
+        .appearance();
+
+        // A remote profile whose host the user has not answered for yet needs a decision before the
+        // session is created — the bootstrap writes into that host's home directory. Defer to the
+        // async prompt path; it re-enters here once the answer is recorded.
+        if let Some(target) = spawn.remote.as_ref()
+            && !self
+                .settings
+                .read(cx)
+                .config()
+                .remote_install_consent
+                .contains_key(&target.consent_key())
+        {
+            self.prompt_remote_install_consent(
+                target.consent_key(),
+                group_id,
+                split,
+                source_item,
+                profile,
+                window,
+                cx,
+            );
+            return;
+        }
+        let remote_install_consented = spawn.remote.as_ref().is_some_and(|target| {
+            self.settings
+                .read(cx)
+                .config()
+                .remote_install_consent
+                .get(&target.consent_key())
+                == Some(&true)
+        });
+
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
                 window_id: self.window_id,
-                cwd: self.new_terminal_cwd(group_id, source_item),
+                cwd: spawn.cwd,
                 size: TerminalSize::default(),
-                appearance: self.terminal_appearance,
+                appearance,
                 scrollback_limit,
-                shell_program,
-                shell_args,
-                shell_features,
+                shell_program: spawn.shell_program,
+                shell_args: spawn.shell_args,
+                shell_features: spawn.shell_features,
+                env: spawn.env,
+                remote: spawn.remote,
+                remote_cwd: spawn.remote_cwd,
+                remote_install_consented,
             })
         else {
             return;
         };
-        let item = TabItem::terminal(session.id, session.title.clone());
+        // Record what the daemon now has, so the render reconcile does not immediately re-send it.
+        self.session_appearances.insert(session.id, appearance);
+        let item = TabItem::terminal_with_profile(session.id, session.title.clone(), profile.id);
         let workspace = self.workspace_mut();
         if let Some(direction) = split {
             if let Some(new_group) = workspace
@@ -3528,6 +3894,31 @@ impl EggieApp {
             let Some(command) = menu.show() else {
                 return;
             };
+            // Open the picker in "set this project's default" mode. Reused rather than adding a submenu
+            // of profiles to the native menu: the list is user-defined and unbounded, and the picker
+            // already filters, marks the current default, and shows badge colors.
+            //
+            // It needs a `&mut Window` (it focuses the palette's input) and there is none in scope —
+            // the native menu ran a nested event loop. `update_in` supplies the entity's own window
+            // alongside its context, and is called at the top level of this task rather than inside
+            // another `update`: nesting a second update of the *same* entity aborts the process with
+            // "cannot update EggieApp while it is already being updated". The sibling commands below
+            // look like they nest too, but they either update a different entity (`window.update`) or
+            // do it from a further `spawn`, by which point this lease is released.
+            if matches!(command, NativeProjectMenuCommand::SetDefaultProfile) {
+                this.update_in(cx, move |app, window, cx| {
+                    if !app.project_views.contains_key(&project_id) {
+                        return;
+                    }
+                    app.open_palette(
+                        PaletteMode::ProjectDefaultProfile(project_id),
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+                return;
+            }
             this.update(cx, move |app, cx| {
                 if !app.project_views.contains_key(&project_id) {
                     return;
@@ -3545,6 +3936,8 @@ impl EggieApp {
                     NativeProjectMenuCommand::DeleteProject => {
                         app.delete_project(project_id, cx);
                     }
+                    // Handled above: it needs a window, so it cannot share this closure.
+                    NativeProjectMenuCommand::SetDefaultProfile => {}
                 }
             })
             .ok();
@@ -3636,6 +4029,42 @@ impl EggieApp {
                 .detach();
             })
             .ok();
+    }
+
+    /// Prompt for a port forward spec and open it on the session's ssh master. The spec is a single
+    /// line parsed by [`parse_forward_spec`].
+    fn prompt_forward_port(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let language = self.language;
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        let receiver = prompt_for_text(
+            window,
+            language.forward_port(),
+            language.forward_port_prompt(),
+            None,
+            None,
+            language.ok(),
+            language.cancel(),
+        );
+        cx.spawn(async move |_, _| {
+            let text = receiver.await.ok()??;
+            let Some(spec) = parse_forward_spec(text.trim()) else {
+                return None;
+            };
+            let request_client = client.clone();
+            let _ = executor
+                .spawn(async move {
+                    request_client.request(ClientRequest::ForwardPort { session_id, spec })
+                })
+                .await;
+            Some(())
+        })
+        .detach();
     }
 
     fn close_project_tabs(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
@@ -3755,6 +4184,107 @@ impl EggieApp {
             .map(|(id, _)| *id)
         {
             self.activate_session(project_id, session_id, window, cx);
+        }
+    }
+
+    /// The profile a live session was launched from, if its tab recorded one and that profile still
+    /// exists. `None` means "no overrides" — the terminal follows the global appearance.
+    ///
+    /// Adopted sessions (restored from the daemon, or claimed from another window) legitimately have no
+    /// recorded profile, and a profile deleted while its terminals run resolves to `None` rather than
+    /// keeping a dangling override.
+    ///
+    /// Returns the profile id alongside the overrides because resolving also needs to ask whether the
+    /// settings window's hover preview targets *this* profile.
+    fn session_profile_appearance(
+        &self,
+        session_id: SessionId,
+        cx: &App,
+    ) -> Option<(eggie_domain::ProfileId, eggie_domain::ProfileAppearance)> {
+        let profile_id = self
+            .project_views
+            .values()
+            .find_map(|view| {
+                view.layout
+                    .terminal_items()
+                    .find(|item| item.session_id == Some(session_id))
+            })
+            .and_then(|item| item.profile_id)?;
+        // A deleted profile yields no overrides, but the id is still the right preview target: the
+        // settings window cannot have it selected, so the preview simply will not match.
+        let appearance = self
+            .profile_store
+            .read(cx)
+            .appearance_override(profile_id)
+            .unwrap_or_default();
+        Some((profile_id, appearance))
+    }
+
+    /// The global terminal layer plus the dark/light decision, as the profile merge needs them.
+    fn global_terminal_layer(&self) -> crate::settings::GlobalTerminalLayer {
+        crate::settings::GlobalTerminalLayer {
+            theme: self.terminal_theme,
+            use_dark: self.use_dark,
+        }
+    }
+
+    /// A terminal's appearance after merging its profile's overrides over the global layer.
+    fn resolved_session_appearance(
+        &self,
+        session_id: SessionId,
+        cx: &App,
+    ) -> crate::settings::ResolvedAppearance {
+        let profile = self.session_profile_appearance(session_id, cx);
+        // The hover preview applies only while the settings window is previewing *this* session's
+        // profile, so a preview never leaks into terminals from other profiles.
+        let preview = profile.as_ref().and_then(|(profile_id, _)| {
+            self.settings
+                .read(cx)
+                .profile_theme_preview(*profile_id)
+        });
+        crate::settings::resolve_appearance(
+            self.settings.read(cx).config(),
+            profile
+                .as_ref()
+                .map(|(_, appearance)| appearance)
+                .filter(|appearance| !appearance.is_empty()),
+            self.global_terminal_layer(),
+            preview,
+        )
+    }
+
+    /// Send every session whose resolved palette changed a fresh `SetAppearance`, and forget the ones
+    /// this window no longer owns.
+    ///
+    /// A failed request is deliberately *not* recorded, so the next reconcile retries it — a terminal
+    /// left painting stale colors is worse than one redundant request. Since the reconcile is gated on
+    /// its inputs changing, a persistently failing daemon does not spin: the retry happens on the next
+    /// input change, not on the next frame.
+    fn reconcile_session_appearances(&mut self, cx: &App) {
+        for session_id in self.window_session_ids() {
+            let appearance = self
+                .resolved_session_appearance(session_id, cx)
+                .theme
+                .appearance();
+            if self.session_appearances.get(&session_id) == Some(&appearance) {
+                continue;
+            }
+            match self.client.request(ClientRequest::SetAppearance {
+                session_id,
+                appearance,
+            }) {
+                Ok(_) => {
+                    self.session_appearances.insert(session_id, appearance);
+                }
+                Err(error) => eprintln!("failed to update terminal appearance: {error:#}"),
+            }
+        }
+        // Forget sessions this window no longer owns, so the map cannot grow without bound across a
+        // long-lived window's tab churn.
+        if self.session_appearances.len() > self.sessions.len() {
+            let live: HashSet<SessionId> = self.sessions.iter().map(|session| session.id).collect();
+            self.session_appearances
+                .retain(|session_id, _| live.contains(session_id));
         }
     }
 
@@ -4379,15 +4909,20 @@ impl EggieApp {
     // These are thin wrappers over existing capabilities, invoked by the configurable keymap.
     // Each returns whether it acted so the caller can stop action propagation.
 
-    fn new_tab_in_active_group(&mut self, cx: &mut Context<Self>) -> bool {
+    fn new_tab_in_active_group(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let group_id = self.workspace().active_group_id;
-        self.new_terminal(group_id, None, None, cx);
+        self.new_terminal(group_id, None, None, window, cx);
         true
     }
 
-    fn split_active_group(&mut self, direction: Direction, cx: &mut Context<Self>) -> bool {
+    fn split_active_group(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let group_id = self.workspace().active_group_id;
-        self.new_terminal(group_id, Some(direction), None, cx);
+        self.new_terminal(group_id, Some(direction), None, window, cx);
         true
     }
 
@@ -4762,7 +5297,25 @@ impl EggieApp {
             self.close_command_palette(window, cx);
             return;
         }
+        self.open_palette(PaletteMode::Commands, window, cx);
+    }
+
+    /// Open the profile picker: same modal as the command palette, listing profiles. Replaces an open
+    /// command palette (the picker is reached *from* it, so the first modal must not linger).
+    fn open_profile_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::Profiles, window, cx);
+    }
+
+    /// Build the palette modal in `mode` and focus its filter input.
+    fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
         let colors = self.colors;
+        let placeholder = match mode {
+            PaletteMode::Commands => self.language.command_palette_placeholder(),
+            PaletteMode::Profiles => self.language.profile_picker_placeholder(),
+            PaletteMode::ProjectDefaultProfile(_) => {
+                self.language.project_default_profile_placeholder()
+            }
+        };
         let input = cx.new(|cx| {
             let mut input = TextInput::new(
                 window,
@@ -4774,7 +5327,7 @@ impl EggieApp {
                     selection_color: (colors.accent << 8) | 0x55,
                 },
             );
-            input.set_placeholder(self.language.command_palette_placeholder());
+            input.set_placeholder(placeholder);
             input
         });
         let subscription = cx.subscribe_in(&input, window, Self::on_palette_input_event);
@@ -4783,6 +5336,7 @@ impl EggieApp {
             input,
             selected_index: 0,
             scroll_handle: ScrollHandle::new(),
+            mode,
             _subscription: subscription,
         });
         handle.focus(window, cx);
@@ -4843,9 +5397,74 @@ impl EggieApp {
             .collect()
     }
 
+    /// The profiles matching the current query, in store order (built-in Default first).
+    fn filtered_profiles(&self, cx: &App) -> Vec<Profile> {
+        let query = self.command_palette_query(cx);
+        self.profile_store
+            .read(cx)
+            .profiles()
+            .iter()
+            .filter(|profile| command_matches(&profile.name, &query))
+            .cloned()
+            .collect()
+    }
+
+    /// How many rows the open palette currently shows (0 when closed).
+    fn palette_row_count(&self, cx: &App) -> usize {
+        match self.command_palette.as_ref().map(|palette| palette.mode) {
+            Some(PaletteMode::Commands) => self.filtered_palette_entries(cx).len(),
+            Some(PaletteMode::Profiles) | Some(PaletteMode::ProjectDefaultProfile(_)) => {
+                self.filtered_profiles(cx).len()
+            }
+            None => 0,
+        }
+    }
+
+    /// The open palette's rows, rendered uniformly regardless of mode: commands show their shortcut
+    /// on the right, profiles their badge dot on the left and a "project default" marker on the right.
+    fn palette_rows(&self, cx: &App) -> Vec<PaletteRow> {
+        match self.command_palette.as_ref().map(|palette| palette.mode) {
+            Some(PaletteMode::Commands) => self
+                .filtered_palette_entries(cx)
+                .into_iter()
+                .map(|entry| PaletteRow {
+                    label: entry.label.to_owned(),
+                    trailing: entry.keystroke,
+                    badge_color: None,
+                })
+                .collect(),
+            Some(mode @ (PaletteMode::Profiles | PaletteMode::ProjectDefaultProfile(_))) => {
+                // Mark the default of whichever project the picker is about: the *named* project when
+                // setting its default (it may not be the active one — the menu came from its sidebar
+                // row), otherwise the active project, whose default a launch would use.
+                let configured = match mode {
+                    PaletteMode::ProjectDefaultProfile(project_id) => self
+                        .projects
+                        .iter()
+                        .find(|project| project.id == project_id)
+                        .and_then(|project| project.default_profile_id),
+                    _ => self.active_project_data().default_profile_id,
+                };
+                // An unset project default means "use the built-in Default", so mark that row instead
+                // of leaving no row marked.
+                let marked = self.profile_store.read(cx).resolve(configured).id;
+                self.filtered_profiles(cx)
+                    .into_iter()
+                    .map(|profile| PaletteRow {
+                        trailing: (profile.id == marked)
+                            .then(|| self.language.profile_picker_project_default().to_owned()),
+                        label: profile.name,
+                        badge_color: profile.badge_color,
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Move the palette selection by `delta`, clamped to the filtered list, and keep it in view.
     fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.filtered_palette_entries(cx).len();
+        let count = self.palette_row_count(cx);
         let Some(palette) = &mut self.command_palette else {
             return;
         };
@@ -4861,32 +5480,75 @@ impl EggieApp {
         cx.notify();
     }
 
-    /// Run the currently selected command: pull its action out of the filtered list, close the
-    /// palette (which returns focus to the terminal), then dispatch. Order matters — the dispatch
-    /// path is captured against the focused node, so focus must be back on the workspace root first
-    /// for window-level command handlers to receive it.
+    /// Confirm the palette's current selection: dispatch the chosen command, or — in profile mode —
+    /// create a terminal from the chosen profile.
     fn run_selected_palette_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(palette) = &self.command_palette else {
             return;
         };
+        // Clamp rather than read `selected_index` raw: the list can shrink under an open palette
+        // without a query change or arrow key (a profile deleted in another window re-renders this one
+        // through the store observer). Render already clamps the *highlight*, so reading the raw index
+        // here would make Enter a silent no-op on a visibly highlighted row.
+        let mode = palette.mode;
         let index = palette.selected_index;
-        let mut entries = self.filtered_palette_entries(cx);
-        if index >= entries.len() {
-            return;
+        match mode {
+            PaletteMode::Commands => {
+                let mut entries = self.filtered_palette_entries(cx);
+                if entries.is_empty() {
+                    return;
+                }
+                let index = index.min(entries.len() - 1);
+                let action = entries.swap_remove(index).action;
+                // Order matters — the dispatch path is captured against the focused node, so focus
+                // must be back on the workspace root first for window-level handlers to receive it.
+                self.close_command_palette(window, cx);
+                window.dispatch_action(action, cx);
+            }
+            PaletteMode::Profiles => {
+                let mut profiles = self.filtered_profiles(cx);
+                if profiles.is_empty() {
+                    return;
+                }
+                let profile = profiles.swap_remove(index.min(profiles.len() - 1));
+                // Close first so the new terminal receives focus, not the modal.
+                self.close_command_palette(window, cx);
+                let group_id = self.workspace().active_group_id;
+                self.new_terminal_with_profile(group_id, None, None, profile, window, cx);
+            }
+            PaletteMode::ProjectDefaultProfile(project_id) => {
+                let mut profiles = self.filtered_profiles(cx);
+                if profiles.is_empty() {
+                    return;
+                }
+                let profile = profiles.swap_remove(index.min(profiles.len() - 1));
+                self.close_command_palette(window, cx);
+                // Store the built-in Default as `None` rather than as its id: "unset" and "explicitly
+                // the built-in Default" resolve identically, and `None` is the one that keeps following
+                // the built-in if a future release ever changes what that is.
+                let selected = (profile.id != eggie_domain::DEFAULT_PROFILE_ID).then_some(profile.id);
+                self.project_store.update(cx, |store, cx| {
+                    store.set_default_profile(project_id, selected, cx);
+                });
+            }
         }
-        let action = entries.swap_remove(index).action;
-        self.close_command_palette(window, cx);
-        window.dispatch_action(action, cx);
     }
 
     /// Render the command palette as a centered modal over the whole workspace, or `None` when it is
     /// closed. A dimmed backdrop catches clicks (and, via `.occlude()`, all other pointer events) to
-    /// close it; the panel holds the filter input above a scrollable, filterable command list.
+    /// close it; the panel holds the filter input above a scrollable, filterable list. Serves both
+    /// palette modes — the rows and the empty-state text differ, the chrome does not.
     fn render_command_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let palette = self.command_palette.as_ref()?;
         let colors = self.colors;
-        let entries = self.filtered_palette_entries(cx);
-        let selected = palette.selected_index.min(entries.len().saturating_sub(1));
+        let rows = self.palette_rows(cx);
+        let selected = palette.selected_index.min(rows.len().saturating_sub(1));
+        let empty_text = match palette.mode {
+            PaletteMode::Commands => self.language.command_palette_empty(),
+            PaletteMode::Profiles | PaletteMode::ProjectDefaultProfile(_) => {
+                self.language.profile_picker_empty()
+            }
+        };
 
         let mut list = div()
             .id("command-palette-list")
@@ -4897,7 +5559,7 @@ impl EggieApp {
             .overflow_y_scroll()
             .track_scroll(&palette.scroll_handle)
             .py_1();
-        if entries.is_empty() {
+        if rows.is_empty() {
             list = list.child(
                 div()
                     .flex()
@@ -4905,10 +5567,10 @@ impl EggieApp {
                     .h(px(36.))
                     .px_3()
                     .text_color(rgb(colors.muted))
-                    .child(self.language.command_palette_empty()),
+                    .child(empty_text),
             );
         } else {
-            for (index, entry) in entries.into_iter().enumerate() {
+            for (index, entry) in rows.into_iter().enumerate() {
                 let is_selected = index == selected;
                 let mut row = div()
                     .id(("command-palette-row", index))
@@ -4937,12 +5599,22 @@ impl EggieApp {
                     }))
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .child(entry.label.to_string()),
+                            // A profile's accent dot, so its identity is recognizable before launch.
+                            .children(entry.badge_color.map(|color| {
+                                div()
+                                    .flex_none()
+                                    .size(px(8.))
+                                    .rounded_full()
+                                    .bg(rgb(color))
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(entry.label)),
                     );
-                if let Some(keystroke) = entry.keystroke {
+                if let Some(keystroke) = entry.trailing {
                     row = row.child(
                         div()
                             .flex_none()
@@ -5935,6 +6607,59 @@ impl EggieApp {
         .into_any_element()
     }
 
+    /// Right-click menu on the tab bar's "+" button: list every profile and open a tab running the
+    /// one picked. Mirrors `show_native_tab_context_menu` — the menu is an AppKit modal and runs a
+    /// nested event loop, so it is shown from a foreground future after this listener has returned,
+    /// and the picked profile is re-fetched by id after the menu closes rather than carried across
+    /// the await (it may have been deleted while the menu was open).
+    fn show_profile_picker_menu(
+        &mut self,
+        group_id: GroupId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let default_profile_id = self.active_project_data().default_profile_id;
+        let profiles: Vec<(eggie_domain::ProfileId, String, bool)> = self
+            .profile_store
+            .read(cx)
+            .profiles()
+            .iter()
+            .map(|profile| {
+                (
+                    profile.id,
+                    profile.name.clone(),
+                    Some(profile.id) == default_profile_id,
+                )
+            })
+            .collect();
+        let menu_entries: Vec<(String, bool)> = profiles
+            .iter()
+            .map(|(_, name, is_default)| (name.clone(), *is_default))
+            .collect();
+        let Some(menu) = prepare_profile_menu(window, menu_entries, self.language) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Some(NativeProfileMenuCommand::PickProfile(index)) = menu.show() else {
+                return;
+            };
+            // Re-fetch by id: the menu's index is only meaningful for the list as it was at open
+            // time, and a remote profile may need a consent prompt, which requires a live window.
+            this.update_in(cx, move |app, window, cx| {
+                let Some(profile) = profiles
+                    .get(index)
+                    .and_then(|(id, _, _)| app.profile_store.read(cx).profile(*id).cloned())
+                else {
+                    return;
+                };
+                app.new_terminal_with_profile(group_id, None, None, profile, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn show_native_tab_context_menu(
         &mut self,
         group_id: GroupId,
@@ -5973,7 +6698,10 @@ impl EggieApp {
             let Some(command) = menu.show() else {
                 return;
             };
-            this.update(cx, |app, cx| {
+            // `update_in` rather than `update`: creating a terminal may need to put a consent prompt
+            // on screen (a remote profile on an unanswered host), which requires a live window. The
+            // menu's own `window` cannot cross the await.
+            this.update_in(cx, |app, window, cx| {
                 let item_still_exists = app
                     .workspace()
                     .layout
@@ -5984,7 +6712,7 @@ impl EggieApp {
                 }
                 match command {
                     NativeTabMenuCommand::Split(direction) => {
-                        app.new_terminal(group_id, Some(direction), Some(item_id), cx);
+                        app.new_terminal(group_id, Some(direction), Some(item_id), window, cx);
                     }
                     NativeTabMenuCommand::Move(direction) => {
                         app.move_tab_in_direction(group_id, item_id, direction, cx);
@@ -6586,6 +7314,43 @@ impl EggieApp {
             .into_any_element()
     }
 
+    /// A button that opens a prompt for a port forward spec, for a remote session. The spec is a
+    /// single line: `L 8080 localhost:80` for local, `R 8080 localhost:80` for remote, or
+    /// `D 1080` for dynamic.
+    fn render_forward_port_button(
+        &self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors;
+        let language = self.language;
+        div()
+            .id(format!("forward-port-{session_id}"))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(28.))
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .text_size(px(12.))
+            .text_color(rgb(colors.muted))
+            .cursor_pointer()
+            .hover(move |element| {
+                element
+                    .bg(rgb(colors.panel_alt))
+                    .text_color(rgb(colors.text))
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |app, _, window, cx| {
+                app.prompt_forward_port(session_id, window, cx);
+            }))
+            .child(language.forward_port())
+            .into_any_element()
+    }
+
     /// The dropdown listing the available [`OpenWith`] apps for `field`, anchored below its split
     /// button. Selecting an option persists it as the new default opener. Same anchored + deferred +
     /// `.occlude()` overlay pattern as the settings dropdowns.
@@ -7075,6 +7840,23 @@ impl EggieApp {
                         item.session_id,
                         format!("tab-progress-{item_id}"),
                     ))
+                    .when_some(
+                        self.tab_profile_badge(item, cx),
+                        |element, (color, name)| {
+                            element.child(
+                                div()
+                                    // `tooltip` requires a stateful (identified) element.
+                                    .id(format!("tab-badge-{item_id}"))
+                                    .flex_none()
+                                    .size(px(TAB_BADGE_SIZE))
+                                    .rounded_full()
+                                    .bg(rgb(color))
+                                    // The dot alone says "this tab is special" but not which profile;
+                                    // the tooltip names it, which is the whole point of the marker.
+                                    .tooltip(tooltip_text(name, self.colors)),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -7224,15 +8006,32 @@ impl EggieApp {
         tabs = tabs
             .child(scroll_wrapper)
             .child(tab_bar_drag_gap)
-            .child(top_bar_icon_button(
-                IconName::Add,
-                format!("new-terminal-{group_id}"),
-                self.colors,
-                false,
-                false,
-                Some(self.language.new_terminal_tooltip().into()),
-                cx.listener(move |app, _, _, cx| app.new_terminal(group_id, None, None, cx)),
-            ));
+            .child(
+                // Right click on the "+" picks the profile the new tab runs, instead of the project
+                // default. The handler sits on this wrapper because `top_bar_icon_button` returns an
+                // opaque element that cannot take another method.
+                div()
+                    .flex()
+                    .flex_none()
+                    .h_full()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |app, _, window, cx| {
+                            app.show_profile_picker_menu(group_id, window, cx);
+                        }),
+                    )
+                    .child(top_bar_icon_button(
+                        IconName::Add,
+                        format!("new-terminal-{group_id}"),
+                        self.colors,
+                        false,
+                        false,
+                        Some(self.language.new_terminal_tooltip().into()),
+                        cx.listener(move |app, _, window, cx| {
+                            app.new_terminal(group_id, None, None, window, cx)
+                        }),
+                    )),
+            );
         if is_top_right_group {
             let right_sidebar_icon = if self.right_sidebar_collapsed {
                 IconName::PanelRightOpen
@@ -7306,14 +8105,17 @@ impl EggieApp {
                 // Resolve the blink phase before `snapshot` is moved into the renderer.
                 let cursor_visible = self.cursor_visible_this_frame(&snapshot);
                 let metric_adjustments = self.terminal_metric_adjustments;
+                // This terminal's own appearance: its profile's overrides merged over the global
+                // layer. Recomputed per frame so an edit to either layer moves it immediately.
+                let appearance = self.resolved_session_appearance(session_id, cx);
                 div()
                     .size_full()
                     .overflow_hidden()
-                    .bg(rgba(terminal_background(&snapshot, self.terminal_theme)))
+                    .bg(rgba(terminal_background(&snapshot, appearance.theme)))
                     .px(px(self.terminal_padding_x))
                     .py(px(self.terminal_padding_y))
-                    .font_family(self.terminal_font_family.clone())
-                    .text_size(px(self.terminal_font_size))
+                    .font_family(SharedString::from(appearance.font_family.to_string()))
+                    .text_size(px(appearance.font_size))
                     .on_children_prepainted(move |children, window, cx| {
                         let Some(bounds) = children.first().copied() else {
                             return;
@@ -7346,8 +8148,13 @@ impl EggieApp {
                     .child(self.terminal_renderer.render(
                         snapshot,
                         TerminalRenderOptions::new(
-                            self.terminal_theme,
-                            self.colors.accent,
+                            appearance.theme,
+                            // The accent tints the selection band and the URL-hover underline, both of
+                            // which are painted *inside* terminal cells — so it has to come from this
+                            // terminal's own resolved theme, not from `self.colors` (which is derived
+                            // from the interface theme). Reading the chrome accent here would paint a
+                            // light-interface selection over a dark terminal once the two layers differ.
+                            UiColors::from_theme(appearance.theme).accent,
                             self.terminal_minimum_contrast,
                             selection,
                             ime,
@@ -7358,7 +8165,7 @@ impl EggieApp {
                         .with_url_hover(url_hover)
                         .with_cursor_visible(cursor_visible)
                         .with_metric_adjustments(metric_adjustments)
-                        .with_font_families(self.terminal_font_families.clone())
+                        .with_font_families(appearance.families.clone())
                         .with_font_features(
                             self.terminal_font_features.clone(),
                             self.terminal_ligatures,
@@ -7700,14 +8507,21 @@ impl EggieApp {
                                 .gap_2()
                                 .child(info_row(
                                     self.language.current_directory(),
-                                    session.current_directory.display().to_string(),
+                                    displayed_directory(session),
                                     self.colors,
                                 ))
-                                .child(self.render_directory_actions(
-                                    DirectoryField::Current,
-                                    &session.current_directory,
-                                    cx,
-                                )),
+                                // A remote path cannot be opened locally, so the Finder/VS Code
+                                // buttons are omitted for a remote session.
+                                .when(
+                                    session.reported_location.as_ref().is_none_or(|location| location.local),
+                                    |element| {
+                                        element.child(self.render_directory_actions(
+                                            DirectoryField::Current,
+                                            &session.current_directory,
+                                            cx,
+                                        ))
+                                    },
+                                ),
                         )
                         .child(
                             div()
@@ -7726,10 +8540,24 @@ impl EggieApp {
                                 )),
                         );
                     if let Some(inspection) = self.session_inspections.get(&session.id) {
-                        content =
-                            content.child(process_section(&inspection.processes, self.colors, self.language, cx));
+                        let is_remote = session
+                            .reported_location
+                            .as_ref()
+                            .is_some_and(|location| !location.local);
+                        content = content.child(process_section(
+                            &inspection.processes,
+                            self.colors,
+                            self.language,
+                            is_remote,
+                            cx,
+                        ));
                         if let Some(ports) = ports_section(inspection, self.colors, self.language) {
                             content = content.child(ports);
+                        }
+                        // A remote session can open a port forward over its ssh master.
+                        if is_remote {
+                            content =
+                                content.child(self.render_forward_port_button(session.id, cx));
                         }
                     } else {
                         let status = self
@@ -8255,25 +9083,49 @@ impl EggieApp {
 
 impl gpui::Render for EggieApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Read the *resolved* theme (persisted theme, or the settings window's live hover preview if
-        // one is active) so a hovered theme lights up the real terminals here, not just the preview.
-        self.terminal_theme = self
-            .settings
-            .read(cx)
-            .resolved_theme(is_dark_appearance(window.appearance()));
-        let appearance = self.terminal_theme.appearance();
-        if appearance != self.terminal_appearance {
-            self.terminal_appearance = appearance;
-            for session_id in self.window_session_ids() {
-                if let Err(error) = self.client.request(ClientRequest::SetAppearance {
-                    session_id,
-                    appearance,
-                }) {
-                    eprintln!("failed to update terminal appearance: {error:#}");
-                }
-            }
+        // Read the *resolved* themes (persisted pair, or the settings window's live hover preview if one
+        // is active) so a hovered theme lights up the real chrome and terminals here, not just the
+        // settings preview. The two layers resolve independently: the interface drives chrome, the
+        // terminal drives cells, and they coincide only while the terminal follows the interface.
+        let system_is_dark = is_dark_appearance(window.appearance());
+        let settings = self.settings.read(cx);
+        self.interface_theme = settings.resolved_interface_theme(system_is_dark);
+        self.terminal_theme = settings.resolved_terminal_theme(system_is_dark);
+        self.use_dark = settings.config().use_dark(system_is_dark);
+        let theme_preview_key = settings.theme_preview_key();
+        self.global_appearance = self.terminal_theme.appearance();
+        // Push each session its *own* resolved palette. The daemon needs the real colors (it resolves
+        // palette-dependent output such as minimum-contrast and selection), and with per-profile themes
+        // a single window-wide broadcast would paint every terminal the active window's colors.
+        //
+        // Gated on something actually having changed. The reconcile is O(sessions × tabs) — each
+        // session's profile is found by walking the layouts — and `render` also runs for cursor blink
+        // and every snapshot frame, so doing this unconditionally would burn that walk 60×/second for
+        // nothing. The inputs are the global palette, the profile definitions, and which sessions this
+        // window owns; a tab moving between groups cannot change a session's profile (it is recorded on
+        // the tab and travels with it), so the session set is the only layout fact that matters.
+        //
+        // The session set is keyed by a wrapping sum of its ids rather than a count: closing one tab and
+        // opening another between frames leaves the count identical, which would skip the reconcile and
+        // leave the new terminal on the previous palette.
+        //
+        // `use_dark` is an input in its own right, not merely implied by the global palette: a profile's
+        // overrides are a dark/light pair too, so a system flip must re-resolve them even when the global
+        // palette is unchanged (`theme_mode` pinned to Dark/Light, or both halves naming the same theme).
+        // Likewise the preview key — a profile preview changes no global palette, so without it the
+        // reconcile would skip the very repaint the preview exists to show.
+        let appearance_inputs = (
+            self.global_appearance,
+            self.profile_store.read(cx).revision(),
+            session_set_key(self.sessions.iter().map(|session| session.id)),
+            self.use_dark,
+            theme_preview_key,
+        );
+        if self.applied_appearance_inputs != Some(appearance_inputs) {
+            self.applied_appearance_inputs = Some(appearance_inputs);
+            self.reconcile_session_appearances(cx);
         }
-        self.colors = UiColors::from_theme(self.terminal_theme);
+        self.colors = UiColors::from_theme(self.interface_theme);
         // Re-derive config-dependent state (font resolution, per-session daemon policy) only when the
         // config actually changed since last applied. The steady-state repaint — cursor blink,
         // snapshot stream, hover — leaves the config untouched, so this skips a 51-field clone plus
@@ -8282,7 +9134,6 @@ impl gpui::Render for EggieApp {
         let config_changed = self.applied_config.as_ref() != Some(self.settings.read(cx).config());
         if config_changed {
             let config = self.settings.read(cx).config().clone();
-            self.terminal_font_families = config.resolved_font_families();
             self.terminal_font_features = config.resolved_font_features().into();
             self.terminal_ligatures = config.ligatures;
             self.terminal_shaping_break_cursor = config.font_shaping_break_cursor;
@@ -8290,8 +9141,6 @@ impl gpui::Render for EggieApp {
             self.terminal_font_thicken =
                 config.font_thicken.then_some(config.font_thicken_strength);
             self.terminal_font_codepoint_map = config.resolved_codepoint_map().into();
-            self.terminal_font_family = config.font_family.clone().into();
-            self.terminal_font_size = config.font_size;
             self.terminal_padding_x = config.terminal_padding_x;
             self.terminal_padding_y = config.terminal_padding_y;
             self.terminal_minimum_contrast = config.minimum_contrast;
@@ -8368,8 +9217,8 @@ impl gpui::Render for EggieApp {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|app, _: &NewTab, _, cx| {
-                if app.new_tab_in_active_group(cx) {
+            .on_action(cx.listener(|app, _: &NewTab, window, cx| {
+                if app.new_tab_in_active_group(window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -8388,13 +9237,13 @@ impl gpui::Render for EggieApp {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|app, _: &SplitRight, _, cx| {
-                if app.split_active_group(Direction::Right, cx) {
+            .on_action(cx.listener(|app, _: &SplitRight, window, cx| {
+                if app.split_active_group(Direction::Right, window, cx) {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|app, _: &SplitDown, _, cx| {
-                if app.split_active_group(Direction::Down, cx) {
+            .on_action(cx.listener(|app, _: &SplitDown, window, cx| {
+                if app.split_active_group(Direction::Down, window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -8448,13 +9297,13 @@ impl gpui::Render for EggieApp {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|app, _: &SplitLeft, _, cx| {
-                if app.split_active_group(Direction::Left, cx) {
+            .on_action(cx.listener(|app, _: &SplitLeft, window, cx| {
+                if app.split_active_group(Direction::Left, window, cx) {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|app, _: &SplitUp, _, cx| {
-                if app.split_active_group(Direction::Up, cx) {
+            .on_action(cx.listener(|app, _: &SplitUp, window, cx| {
+                if app.split_active_group(Direction::Up, window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -8488,6 +9337,10 @@ impl gpui::Render for EggieApp {
             }))
             .on_action(cx.listener(|app, _: &CommandPalette, window, cx| {
                 app.toggle_command_palette(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &NewTabWithProfile, window, cx| {
+                app.open_profile_picker(window, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|app, _: &ToggleLeftSidebar, _, cx| {
@@ -8620,6 +9473,122 @@ fn resolve_new_terminal_cwd(active_cwd: Option<&Path>, project_root: &Path) -> P
     match active_cwd {
         Some(dir) if dir.is_dir() => dir.to_path_buf(),
         _ => project_root.to_path_buf(),
+    }
+}
+
+/// The launch fields a new terminal is spawned with, resolved from its profile.
+///
+/// Separated from the [`ClientRequest::CreateSession`] call so the precedence rules are unit-testable
+/// without a daemon or a window.
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedSpawnConfig {
+    cwd: PathBuf,
+    shell_program: String,
+    shell_args: Vec<String>,
+    shell_features: String,
+    env: std::collections::BTreeMap<String, String>,
+    /// Set for a remote profile: the daemon opens an `ssh` session instead of a local shell.
+    remote: Option<eggie_domain::RemoteTarget>,
+    /// The profile's `cwd` when it is a remote profile — a path on the far side, which is why it does
+    /// not go into `cwd` (the local directory the `ssh` process itself starts in).
+    remote_cwd: Option<String>,
+}
+
+/// A key identifying *which* sessions a window owns, for the appearance reconcile's change gate.
+///
+/// A wrapping sum rather than a count: closing one tab and opening another between frames leaves the
+/// count identical, which would skip the reconcile and leave the new terminal on the previous palette.
+/// Order-independent on purpose — reordering tabs cannot change any session's profile, so it must not
+/// invalidate the gate.
+fn session_set_key(session_ids: impl Iterator<Item = SessionId>) -> u128 {
+    session_ids.fold(0u128, |key, id| key.wrapping_add(id.as_u128()))
+}
+
+/// Whether `key` is usable as an environment variable name.
+///
+/// Forwards to [`eggie_domain::is_valid_env_key`], which owns the rule so the profile editor, this
+/// spawn filter, and the daemon's remote bootstrap cannot drift apart. Locally, a rejected key would
+/// fail the PTY spawn opaquely (NUL) or create an entry no shell can reference (`=`); remotely it
+/// would execute on the far host. Since profiles can be hand-edited on disk, this filter still runs
+/// even though the editor validates at entry.
+fn is_valid_env_key(key: &str) -> bool {
+    eggie_domain::is_valid_env_key(key)
+}
+
+/// Resolve a profile into the launch fields for a new terminal.
+///
+/// Precedence, field by field:
+/// - **cwd**: the profile's explicit `cwd` (it names a fixed directory on purpose, so it beats
+///   inheritance) → else the active terminal's live cwd → else the project root. A profile `cwd`
+///   that no longer exists is ignored rather than fatal, matching [`resolve_new_terminal_cwd`].
+///   `project_root` itself is assumed to exist — it comes from the project's own configuration, and a
+///   root deleted since it was configured surfaces as a PTY spawn error.
+/// - **shell program/args**: the profile's, verbatim. Empty means "let the daemon fall back to
+///   `$SHELL`", which is the same sentinel the daemon already understands.
+/// - **shell features**: assembled from the profile's own toggles, not the global settings — a remote
+///   or container profile has no local `eggie` binary worth putting on `PATH`.
+/// - **env**: the profile's map, minus unusable keys ([`is_valid_env_key`]). The daemon additionally
+///   drops the variables Eggie owns, so integration cannot be tampered with (enforced by
+///   `profile_env_is_injected_but_never_shadows_eggie_variables`).
+///
+/// A remote profile's `cwd` is a path on the remote host, so it must not be sent as the local PTY
+/// working directory nor tested for local existence; the local side starts in the inherited/project
+/// directory and the remote bootstrap `cd`s once connected (that bootstrap lands in a later step).
+fn resolve_spawn_config(
+    profile: &Profile,
+    active_cwd: Option<&Path>,
+    project_root: &Path,
+) -> ResolvedSpawnConfig {
+    let cwd = match profile.cwd.as_deref() {
+        // Remote: `profile.cwd` describes the far side. Resolve the local cwd as usual.
+        Some(_) if profile.is_remote() => resolve_new_terminal_cwd(active_cwd, project_root),
+        Some(dir) if dir.is_dir() => dir.to_path_buf(),
+        // A configured-but-missing local directory falls back rather than failing the spawn.
+        _ => resolve_new_terminal_cwd(active_cwd, project_root),
+    };
+    let mut env = std::collections::BTreeMap::new();
+    for (key, value) in &profile.env {
+        if is_valid_env_key(key) {
+            env.insert(key.clone(), value.clone());
+        } else {
+            eprintln!(
+                "profile {:?}: ignoring unusable environment variable name {key:?}",
+                profile.name
+            );
+        }
+    }
+    ResolvedSpawnConfig {
+        cwd,
+        shell_program: profile.shell_program.clone(),
+        shell_args: profile.shell_args.clone(),
+        shell_features: crate::settings::ShellFeatures {
+            path: profile.shell_integration_path,
+        }
+        .to_env_string(),
+        env,
+        // A target whose host/user could be mistaken for an ssh option is dropped, not defanged: the
+        // profile is malformed, and connecting to a *different* place than the user wrote would be
+        // worse than not connecting. Dropping it makes the profile launch a plain local shell, which
+        // is visible and harmless.
+        remote: profile
+            .remote
+            .as_ref()
+            .filter(|target| {
+                let usable = target.is_usable();
+                if !usable {
+                    eprintln!(
+                        "profile {:?}: ignoring unusable remote target {:?}",
+                        profile.name, target.host
+                    );
+                }
+                usable
+            })
+            .cloned(),
+        // Only meaningful for a remote profile; a local one's cwd already went into `cwd` above.
+        remote_cwd: profile
+            .is_remote()
+            .then(|| profile.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()))
+            .flatten(),
     }
 }
 
@@ -9086,6 +10055,7 @@ fn process_section(
     processes: &[ProcessInfo],
     colors: UiColors,
     language: Language,
+    is_remote: bool,
     cx: &mut Context<EggieApp>,
 ) -> AnyElement {
     let body = if processes.is_empty() {
@@ -9110,6 +10080,7 @@ fn process_section(
                 row.branch_has_next,
                 colors,
                 is_root,
+                is_remote,
                 cx,
             ));
         }
@@ -9172,6 +10143,48 @@ fn info_row(label: &'static str, value: String, colors: UiColors) -> impl IntoEl
         .child(div().min_w_0().truncate().child(value))
 }
 
+/// Parse a port forward spec from the prompt: `L 8080 localhost:80`, `R 8080 localhost:80`, or
+/// `D 1080`. Returns None for a malformed spec.
+fn parse_forward_spec(text: &str) -> Option<eggie_protocol::PortForwardSpec> {
+    let mut parts = text.split_whitespace();
+    let kind = match parts.next()?.to_ascii_uppercase().as_str() {
+        "L" => eggie_protocol::PortForwardKind::Local,
+        "R" => eggie_protocol::PortForwardKind::Remote,
+        "D" => eggie_protocol::PortForwardKind::Dynamic,
+        _ => return None,
+    };
+    let port = parts.next()?.parse::<u16>().ok()?;
+    let destination = parts.next().map(str::to_owned);
+    if matches!(kind, eggie_protocol::PortForwardKind::Local | eggie_protocol::PortForwardKind::Remote)
+        && destination.is_none()
+    {
+        return None;
+    }
+    Some(eggie_protocol::PortForwardSpec {
+        kind,
+        bind_address: "127.0.0.1".to_owned(),
+        port,
+        destination,
+    })
+}
+
+/// The directory to display for a session: the remote cwd when the session is remote, otherwise the
+/// local cwd. A remote path is shown as `user@host:path` so it is not mistaken for a local path.
+fn displayed_directory(session: &eggie_protocol::SessionSummary) -> String {
+    if let Some(location) = session.reported_location.as_ref()
+        && !location.local
+        && !location.path.is_empty()
+    {
+        let authority = match (location.user.as_deref(), location.host.as_deref()) {
+            (Some(user), Some(host)) => format!("{user}@{host}"),
+            (None, Some(host)) => host.to_owned(),
+            _ => return location.path.clone(),
+        };
+        return format!("{authority}:{}", location.path);
+    }
+    session.current_directory.display().to_string()
+}
+
 fn process_summary(
     process: &eggie_protocol::ProcessSummary,
     colors: UiColors,
@@ -9202,6 +10215,7 @@ fn process_info_row(
     branch_has_next: Vec<bool>,
     colors: UiColors,
     is_root: bool,
+    is_remote: bool,
     cx: &mut Context<EggieApp>,
 ) -> impl IntoElement {
     let pid = process.pid;
@@ -9216,7 +10230,10 @@ fn process_info_row(
         .ml_neg_1()
         .mr_neg_2();
 
-    if !is_root {
+    // A remote process cannot be killed or inspected locally: kill would signal a local process with
+    // the same pid, and the executable path is on the far side. So the context menu is omitted for a
+    // remote session.
+    if !is_root && !is_remote {
         content = content
             .cursor_pointer()
             .hover(|element| element.bg(rgb(colors.hover)))
@@ -9560,6 +10577,80 @@ mod tests {
         assert_eq!(scrollbar_thumb_geometry(400., 0, 24, 0), None);
         // Zero-height track is degenerate.
         assert_eq!(scrollbar_thumb_geometry(0., 100, 24, 0), None);
+    }
+
+    #[test]
+    fn a_remote_directory_is_shown_with_its_host() {
+        let mut session = test_session();
+        session.reported_location = Some(eggie_protocol::TerminalReportedLocation {
+            user: Some("deploy".to_owned()),
+            host: Some("prod.example.com".to_owned()),
+            path: "/srv/www".to_owned(),
+            local: false,
+        });
+        assert_eq!(
+            displayed_directory(&session),
+            "deploy@prod.example.com:/srv/www",
+            "a remote path is shown with its host so it is not mistaken for a local path"
+        );
+    }
+
+    #[test]
+    fn a_local_directory_is_shown_as_a_plain_path() {
+        let mut session = test_session();
+        session.current_directory = std::path::PathBuf::from("/Users/alice/project");
+        assert_eq!(
+            displayed_directory(&session),
+            "/Users/alice/project",
+            "a local path is shown without a host"
+        );
+    }
+
+    /// A minimal session for display tests, with only the fields the tests read.
+    fn test_session() -> eggie_protocol::SessionSummary {
+        eggie_protocol::SessionSummary {
+            id: uuid::Uuid::nil(),
+            project_id: uuid::Uuid::nil(),
+            window_id: None,
+            title: String::new(),
+            initial_directory: std::path::PathBuf::from("/"),
+            current_directory: std::path::PathBuf::from("/"),
+            reported_location: None,
+            shell_pid: 0,
+            current_process: eggie_protocol::ProcessSummary {
+                pid: 0,
+                name: String::new(),
+            },
+            status: eggie_protocol::SessionStatus::Running,
+        }
+    }
+
+    #[test]
+    fn forward_spec_parses_each_kind() {
+        let local = parse_forward_spec("L 8080 localhost:80").expect("local parses");
+        assert_eq!(local.kind, eggie_protocol::PortForwardKind::Local);
+        assert_eq!(local.port, 8080);
+        assert_eq!(local.destination.as_deref(), Some("localhost:80"));
+
+        let remote = parse_forward_spec("R 9090 example.com:443").expect("remote parses");
+        assert_eq!(remote.kind, eggie_protocol::PortForwardKind::Remote);
+        assert_eq!(remote.port, 9090);
+
+        let dynamic = parse_forward_spec("D 1080").expect("dynamic parses");
+        assert_eq!(dynamic.kind, eggie_protocol::PortForwardKind::Dynamic);
+        assert_eq!(dynamic.port, 1080);
+        assert!(dynamic.destination.is_none(), "dynamic has no destination");
+    }
+
+    #[test]
+    fn forward_spec_rejects_malformed_input() {
+        // A local or remote forward requires a destination.
+        assert!(parse_forward_spec("L 8080").is_none());
+        assert!(parse_forward_spec("R 8080").is_none());
+        // Unknown kind, missing port, non-numeric port.
+        assert!(parse_forward_spec("X 8080 localhost:80").is_none());
+        assert!(parse_forward_spec("L").is_none());
+        assert!(parse_forward_spec("L not-a-port localhost:80").is_none());
     }
 
     #[test]
@@ -10180,5 +11271,137 @@ mod tests {
 
         // No active session (empty group / brand-new project) uses the project root.
         assert_eq!(resolve_new_terminal_cwd(None, &root), root);
+    }
+
+    #[test]
+    fn the_session_set_key_distinguishes_a_swap_from_no_change() {
+        let a = SessionId::new_v4();
+        let b = SessionId::new_v4();
+        let c = SessionId::new_v4();
+
+        let two = session_set_key([a, b].into_iter());
+        // Identical sets key identically, so a steady-state repaint skips the reconcile.
+        assert_eq!(two, session_set_key([a, b].into_iter()));
+        // Order must not matter: reordering tabs cannot change any session's profile, so it must not
+        // invalidate the gate and trigger a pointless O(sessions × tabs) walk.
+        assert_eq!(two, session_set_key([b, a].into_iter()));
+        // The case a plain count would miss: one tab closed, another opened, same total.
+        assert_ne!(
+            two,
+            session_set_key([a, c].into_iter()),
+            "swapping a session must invalidate the gate, or the new terminal keeps the old palette"
+        );
+        // Adding and removing are both visible.
+        assert_ne!(two, session_set_key([a, b, c].into_iter()));
+        assert_ne!(two, session_set_key([a].into_iter()));
+        assert_eq!(session_set_key(std::iter::empty()), 0);
+    }
+
+    #[test]
+    fn spawn_config_takes_launch_fields_from_the_profile() {
+        let mut profile = Profile::new("Fish".to_owned());
+        profile.shell_program = "/opt/homebrew/bin/fish".to_owned();
+        profile.shell_args = vec!["-l".to_owned(), "-C".to_owned(), "echo hi".to_owned()];
+        profile.env.insert("AWS_PROFILE".to_owned(), "prod".to_owned());
+
+        let root = PathBuf::from("/tmp");
+        let spawn = resolve_spawn_config(&profile, None, &root);
+        assert_eq!(spawn.shell_program, "/opt/homebrew/bin/fish");
+        assert_eq!(spawn.shell_args, profile.shell_args);
+        assert_eq!(spawn.env.get("AWS_PROFILE").map(String::as_str), Some("prod"));
+        // The `path` feature defaults on, so the assembled token list carries it.
+        assert_eq!(spawn.shell_features, "path");
+
+        // Turning the profile's own toggle off drops the token — a remote/container profile has no
+        // local eggie binary worth putting on PATH.
+        profile.shell_integration_path = false;
+        assert_eq!(
+            resolve_spawn_config(&profile, None, &root).shell_features,
+            "",
+        );
+    }
+
+    #[test]
+    fn spawn_config_cwd_precedence_prefers_profile_then_inheritance() {
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for dir in &self.0 {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!("eggie-spawn-cwd-{}", std::process::id()));
+        let root = base.join("root");
+        let live = base.join("live");
+        let pinned = base.join("pinned");
+        let _cleanup = Cleanup(vec![base.clone()]);
+        for dir in [&root, &live, &pinned] {
+            std::fs::create_dir_all(dir).expect("create temp dirs");
+        }
+
+        let mut profile = Profile::new("P".to_owned());
+
+        // No profile cwd: inherit the live directory (the step-1 behavior is preserved).
+        assert_eq!(
+            resolve_spawn_config(&profile, Some(&live), &root).cwd,
+            live
+        );
+
+        // An explicit profile cwd wins over inheritance — it names a fixed directory on purpose.
+        profile.cwd = Some(pinned.clone());
+        assert_eq!(
+            resolve_spawn_config(&profile, Some(&live), &root).cwd,
+            pinned
+        );
+
+        // A profile cwd that no longer exists falls back rather than failing the spawn.
+        std::fs::remove_dir_all(&pinned).expect("remove pinned dir");
+        assert_eq!(
+            resolve_spawn_config(&profile, Some(&live), &root).cwd,
+            live,
+            "a missing profile cwd falls back to the inherited directory"
+        );
+        assert_eq!(
+            resolve_spawn_config(&profile, None, &root).cwd,
+            root,
+            "with nothing to inherit it falls back to the project root"
+        );
+    }
+
+    #[test]
+    fn spawn_config_drops_unusable_env_keys() {
+        let mut profile = Profile::new("Sloppy".to_owned());
+        // A hand-edited profiles.json can contain any of these; each would otherwise either fail the
+        // PTY spawn with an opaque error (NUL) or create an unreferenceable variable.
+        profile.env.insert("GOOD".to_owned(), "yes".to_owned());
+        profile.env.insert(String::new(), "empty key".to_owned());
+        profile.env.insert("HAS=EQUALS".to_owned(), "x".to_owned());
+        profile.env.insert("HAS\0NUL".to_owned(), "x".to_owned());
+
+        let spawn = resolve_spawn_config(&profile, None, Path::new("/tmp"));
+        assert_eq!(spawn.env.len(), 1, "only the usable key survives");
+        assert_eq!(spawn.env.get("GOOD").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn a_remote_profiles_cwd_is_not_used_as_the_local_working_directory() {
+        let root = std::env::temp_dir().join(format!("eggie-remote-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+
+        let mut profile = Profile::new("Prod".to_owned());
+        profile.remote = Some(eggie_domain::RemoteTarget::new("prod.example.com".to_owned()));
+        // A path that means something on the remote host and (almost certainly) nothing here.
+        profile.cwd = Some(PathBuf::from("/srv/www"));
+
+        // The local PTY must start somewhere local; the remote directory is the bootstrap's job.
+        assert_eq!(
+            resolve_spawn_config(&profile, None, &root).cwd,
+            root,
+            "a remote profile's cwd describes the far side and must not be sent as the local cwd"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

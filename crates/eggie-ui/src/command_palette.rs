@@ -16,8 +16,8 @@ use gpui::Action;
 use crate::keybindings::{ACTION_SPECS, display_keystroke, effective_keystroke};
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
-    About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, ShowAll, SplitLeft,
-    SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
+    About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, NewTabWithProfile, ShowAll,
+    SplitLeft, SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
 };
 
 /// A command that exists only in the menu bar (no configurable keybinding), surfaced in the palette
@@ -38,6 +38,12 @@ const MENU_ONLY_COMMANDS: &[MenuCommand] = &[
     MenuCommand {
         label: Language::secure_keyboard_entry,
         make_action: || Box::new(ToggleSecureKeyboardEntry),
+    },
+    // Opens a second-stage picker rather than acting immediately: profile names are runtime data, so
+    // they cannot be `&'static str` palette rows of their own.
+    MenuCommand {
+        label: Language::action_new_tab_with_profile,
+        make_action: || Box::new(NewTabWithProfile),
     },
     MenuCommand {
         label: Language::action_split_left,
@@ -157,5 +163,20 @@ mod tests {
             .find(|entry| entry.label == Language::English.about_eggie())
             .expect("about should be present");
         assert_eq!(about.keystroke, None);
+    }
+
+    #[test]
+    fn palette_offers_the_profile_picker_as_a_menu_only_command() {
+        let config = AppSettings::default();
+        let entries = palette_entries(&config);
+        let label = Language::English.action_new_tab_with_profile();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.label == label)
+            .expect("the profile picker must be reachable from the palette");
+        // No configurable shortcut: it opens a second-stage picker rather than acting immediately.
+        assert_eq!(entry.keystroke, None);
+        // Searchable by the word users would reach for.
+        assert!(command_matches(entry.label, "profile"));
     }
 }

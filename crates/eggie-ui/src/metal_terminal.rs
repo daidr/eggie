@@ -2432,6 +2432,25 @@ pub(crate) fn font_metrics(family: &str, font_size: f32, scale_factor: f32) -> (
 mod tests {
     use super::*;
 
+    /// `font_metrics` takes the family and size as arguments — the caller reads them from the
+    /// terminal's own `window.text_style()` — so per-profile font sizes produce per-terminal cell
+    /// boxes. This pins the arithmetic that makes that possible: distinct sizes must yield distinct
+    /// boxes, and identical inputs must be stable so a repaint cannot resize the grid on its own.
+    ///
+    /// It does NOT cover the part that carries a terminal's font into `window.text_style()` in the
+    /// first place (GPUI pushes the div's style around both the child prepaint and the
+    /// `on_children_prepainted` callback); that needs a gpui test window.
+    #[test]
+    fn cell_metrics_are_a_pure_function_of_family_and_size() {
+        let (small_width, small_height) = font_metrics("Menlo", 12., 2.);
+        let (large_width, large_height) = font_metrics("Menlo", 24., 2.);
+        assert!(
+            large_width > small_width && large_height > small_height,
+            "a larger font must yield a larger cell box ({small_width}x{small_height} vs {large_width}x{large_height})"
+        );
+        assert_eq!(font_metrics("Menlo", 12., 2.), (small_width, small_height));
+    }
+
     /// Builds a `GlyphKey` for ordinary text with every non-dimensional field at its default
     /// (no bold/italic, not a sprite, no metric modifiers, empty feature/variation sets). Tests
     /// that need a non-default field layer it on with struct-update syntax

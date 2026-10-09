@@ -1,14 +1,15 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::{
-    app::{EggieApp, NewWindowInit, NotificationRoutes},
+    app::{EggieApp, NewWindowInit, NotificationRoutes, tooltip_text},
     icons::{IconName, icon, icon_sized},
     project_store::ProjectStore,
     settings::{
         AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, MAX_FONT_SIZE,
         MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING,
         MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
-        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme, ThemeMode,
+        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme,
+        TerminalThemeSource, ThemeMode,
         UiColors, UpdateChannel, minimum_contrast_rgb, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
@@ -69,7 +70,10 @@ actions!(
         HelpDocs,
         CommandPalette,
         ToggleLeftSidebar,
-        ToggleRightSidebar
+        ToggleRightSidebar,
+        /// Open the profile picker, then create a terminal from the chosen profile (a one-off
+        /// override of the project's default profile).
+        NewTabWithProfile
     ]
 );
 
@@ -94,6 +98,29 @@ const SELECTOR_WINDOW_MARGIN: f32 = 8.;
 const BELL_DROPDOWN_WIDTH: f32 = 180.;
 const BELL_DROPDOWN_ROW_HEIGHT: f32 = 30.;
 
+/// Text color for a "this input is being ignored" warning. Theme-independent on purpose: it has to
+/// read as a problem against every one of the ~200 bundled themes, and a palette-derived red would be
+/// the theme's *decorative* red, which in some themes is barely distinguishable from the body text.
+const WARNING_TEXT: u32 = 0xff6b6b;
+
+/// The badge colors offered in the profile editor's palette.
+///
+/// A fixed palette rather than a full color picker: the badge is a 8px dot whose only job is telling
+/// terminals apart at a glance, so what matters is that any two choices are actually distinguishable.
+/// Hand-picked to stay legible against both light and dark terminal backgrounds.
+const BADGE_COLORS: [u32; 10] = [
+    0xe5484d, // red
+    0xf76b15, // orange
+    0xffb224, // amber
+    0x46a758, // green
+    0x12a594, // teal
+    0x0091ff, // blue
+    0x3e63dd, // indigo
+    0x8e4ec6, // purple
+    0xe93d82, // pink
+    0x8d8d8d, // gray
+];
+
 /// App logo shown at the top of the "About" panel. Embedded so it ships with the
 /// binary (the UI registers no image asset source; see `HUGEICONS_FONT`).
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
@@ -110,23 +137,112 @@ fn logo_image() -> Arc<Image> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectorKind {
-    DarkTheme,
-    LightTheme,
+    /// Interface theme for the dark appearance — the app's own chrome.
+    InterfaceDark,
+    /// Interface theme for the light appearance.
+    InterfaceLight,
+    /// Terminal theme for the dark appearance. Only reachable while the terminal uses its own pair
+    /// rather than following the interface.
+    TerminalDark,
+    /// Terminal theme for the light appearance. See [`Self::TerminalDark`].
+    TerminalLight,
     Font,
     FontBold,
     FontItalic,
     FontBoldItalic,
+    /// The selected profile's terminal theme override for the dark appearance, clearable back to
+    /// "follow global". A profile never overrides the interface theme: chrome is window-level, and one
+    /// window can show tabs from several profiles at once.
+    ProfileTerminalDark,
+    /// The selected profile's terminal theme override for the light appearance.
+    ProfileTerminalLight,
+    /// The selected profile's font-family override, clearable back to "follow global".
+    ProfileFont,
 }
 
 impl SelectorKind {
+    /// Every variant, in `index()` order. A test pins that `index()` is a bijection onto
+    /// `0..ALL.len()` and that `selector_bounds` is exactly this long — both are hand-maintained, and
+    /// an out-of-range `index()` panics when the dropdown reads or writes its bounds slot.
+    const ALL: [Self; 11] = [
+        Self::InterfaceDark,
+        Self::InterfaceLight,
+        Self::TerminalDark,
+        Self::TerminalLight,
+        Self::Font,
+        Self::FontBold,
+        Self::FontItalic,
+        Self::FontBoldItalic,
+        Self::ProfileTerminalDark,
+        Self::ProfileTerminalLight,
+        Self::ProfileFont,
+    ];
+
     const fn index(self) -> usize {
         match self {
-            Self::DarkTheme => 0,
-            Self::LightTheme => 1,
-            Self::Font => 2,
-            Self::FontBold => 3,
-            Self::FontItalic => 4,
-            Self::FontBoldItalic => 5,
+            Self::InterfaceDark => 0,
+            Self::InterfaceLight => 1,
+            Self::TerminalDark => 2,
+            Self::TerminalLight => 3,
+            Self::Font => 4,
+            Self::FontBold => 5,
+            Self::FontItalic => 6,
+            Self::FontBoldItalic => 7,
+            Self::ProfileTerminalDark => 8,
+            Self::ProfileTerminalLight => 9,
+            Self::ProfileFont => 10,
+        }
+    }
+
+    /// Whether this selector edits a profile override (writes to the profile store) rather than a
+    /// global setting (writes to `AppSettings`).
+    const fn is_profile(self) -> bool {
+        matches!(
+            self,
+            Self::ProfileTerminalDark | Self::ProfileTerminalLight | Self::ProfileFont
+        )
+    }
+
+    /// Whether the dropdown should render each option in the font it names.
+    const fn is_font(self) -> bool {
+        matches!(
+            self,
+            Self::Font
+                | Self::FontBold
+                | Self::FontItalic
+                | Self::FontBoldItalic
+                | Self::ProfileFont
+        )
+    }
+
+    /// Whether this selector picks a theme (as opposed to a font). Gates the live hover preview.
+    const fn is_theme(self) -> bool {
+        !self.is_font()
+    }
+
+    /// Whether this selector picks from the dark half of the catalog. Only meaningful for theme
+    /// selectors; each half offers only themes that measure that way, so a dark slot can never hold a
+    /// light theme.
+    const fn is_dark(self) -> bool {
+        matches!(
+            self,
+            Self::InterfaceDark | Self::TerminalDark | Self::ProfileTerminalDark
+        )
+    }
+
+    /// The preview slot this selector drives, so a hover resolves through the same layering the
+    /// committed value would. Profile slots carry the profile being edited.
+    fn preview_slot(self, profile_id: eggie_domain::ProfileId) -> Option<crate::settings::PreviewSlot> {
+        use crate::settings::PreviewSlot;
+        match self {
+            Self::InterfaceDark => Some(PreviewSlot::InterfaceDark),
+            Self::InterfaceLight => Some(PreviewSlot::InterfaceLight),
+            Self::TerminalDark => Some(PreviewSlot::TerminalDark),
+            Self::TerminalLight => Some(PreviewSlot::TerminalLight),
+            Self::ProfileTerminalDark => Some(PreviewSlot::ProfileTerminalDark(profile_id)),
+            Self::ProfileTerminalLight => Some(PreviewSlot::ProfileTerminalLight(profile_id)),
+            Self::Font | Self::FontBold | Self::FontItalic | Self::FontBoldItalic
+            | Self::ProfileFont => None,
         }
     }
 }
@@ -246,24 +362,28 @@ enum SettingsSection {
     #[default]
     General,
     Appearance,
+    Profiles,
     Keybindings,
     Advanced,
     About,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::General,
         Self::Appearance,
+        Self::Profiles,
         Self::Keybindings,
         Self::Advanced,
         Self::About,
     ];
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install(
     settings: Entity<SettingsStore>,
     project_store: Entity<ProjectStore>,
+    profile_store: Entity<crate::profile_store::ProfileStore>,
     snippet_store: Entity<crate::snippet_store::SnippetStore>,
     notes_store: Entity<crate::notes_store::NotesStore>,
     client: DaemonClient,
@@ -273,14 +393,23 @@ pub(crate) fn install(
 ) {
     let settings_for_action = settings.clone();
     let updates_for_action = updates.clone();
+    let profile_store_for_action = profile_store.clone();
+    let project_store_for_action = project_store.clone();
     cx.on_action(move |_: &OpenSettings, cx| {
-        open_settings_window(settings_for_action.clone(), updates_for_action.clone(), cx)
+        open_settings_window(
+            settings_for_action.clone(),
+            updates_for_action.clone(),
+            profile_store_for_action.clone(),
+            project_store_for_action.clone(),
+            cx,
+        )
     });
     // New Window is an app-level action (like OpenSettings): it works even when no Eggie window is
     // focused, and opens a fresh main window sharing the same settings/project-store entities.
     let settings_for_new_window = settings.clone();
     let updates_for_new_window = updates.clone();
     let project_store_for_new_window = project_store.clone();
+    let profile_store_for_new_window = profile_store.clone();
     let snippet_store_for_new_window = snippet_store.clone();
     let notes_store_for_new_window = notes_store.clone();
     let client_for_new_window = client.clone();
@@ -292,6 +421,7 @@ pub(crate) fn install(
             settings_for_new_window.clone(),
             updates_for_new_window.clone(),
             project_store_for_new_window.clone(),
+            profile_store_for_new_window.clone(),
             snippet_store_for_new_window.clone(),
             notes_store_for_new_window.clone(),
             routes_for_new_window.clone(),
@@ -470,6 +600,8 @@ fn build_menus(language: Language) -> Vec<Menu> {
 fn open_settings_window(
     settings: Entity<SettingsStore>,
     updates: Entity<crate::update_controller::UpdateController>,
+    profile_store: Entity<crate::profile_store::ProfileStore>,
+    project_store: Entity<ProjectStore>,
     cx: &mut App,
 ) {
     if let Some(existing) = cx
@@ -505,7 +637,17 @@ fn open_settings_window(
             ..Default::default()
         },
         move |window, cx| {
-            cx.new(|cx| SettingsWindow::new(settings.clone(), updates.clone(), fonts, window, cx))
+            cx.new(|cx| {
+                SettingsWindow::new(
+                    settings.clone(),
+                    updates.clone(),
+                    profile_store.clone(),
+                    project_store.clone(),
+                    fonts,
+                    window,
+                    cx,
+                )
+            })
         },
     )
     .expect("failed to open Eggie settings window");
@@ -592,6 +734,15 @@ fn monospace_font_names_uncached(cx: &App) -> Vec<String> {
 struct SettingsWindow {
     settings: Entity<SettingsStore>,
     updates: Entity<crate::update_controller::UpdateController>,
+    /// Shared profile store. The Shell controls edit the built-in Default profile (which owns the
+    /// launch fields since profiles landed), writing through to `settings` as well so a downgrade to a
+    /// build that predates profiles still sees the user's choice.
+    profile_store: Entity<crate::profile_store::ProfileStore>,
+    /// Shared project store. Needed only so deleting a profile can clear it from any project that
+    /// named it as their default, keeping a dangling id off disk.
+    project_store: Entity<ProjectStore>,
+    /// The catalog split by measured darkness. Every theme slot — interface, terminal, and per-profile
+    /// override — offers exactly one of these two, because each slot is validated against that half.
     dark_theme_names: Vec<String>,
     light_theme_names: Vec<String>,
     font_names: Vec<String>,
@@ -604,7 +755,7 @@ struct SettingsWindow {
     shell_args_input: Entity<TextInput>,
     selector_scroll_handle: ScrollHandle,
     settings_scroll_handle: ScrollHandle,
-    selector_bounds: [Option<Bounds<Pixels>>; 6],
+    selector_bounds: [Option<Bounds<Pixels>>; SelectorKind::ALL.len()],
     moving_window: bool,
     selected_section: SettingsSection,
     /// The action id currently being recorded (its shortcut cell is capturing keys), if any.
@@ -617,21 +768,69 @@ struct SettingsWindow {
     bell_dropdown_open: bool,
     /// Bounds of the bell-mode dropdown trigger, for positioning the popover.
     bell_dropdown_bounds: Option<Bounds<Pixels>>,
+    /// The profile the Profiles pane is editing. `None` until the pane is first opened, then always a
+    /// live id (a deleted profile hands selection to the built-in Default).
+    selected_profile: Option<eggie_domain::ProfileId>,
+    /// Per-field inputs for the selected profile. Re-seeded when the selection changes; every edit
+    /// writes straight through to the profile store.
+    profile_inputs: ProfileInputs,
+    /// The profile whose values `profile_inputs` currently hold, so a re-render can tell "the user is
+    /// typing" from "the selection moved and the inputs are stale".
+    profile_inputs_for: Option<eggie_domain::ProfileId>,
+    /// The exact text last seeded into the inputs, in `profile_input_list` order.
+    ///
+    /// The write-through compares against *this*, not against the stored profile, and that distinction
+    /// is load-bearing. `set_content` emits `Changed` whose delivery GPUI defers past the render that
+    /// seeded it, so the handler always runs once per selection with text the user never touched. And
+    /// the text↔struct round trip is lossy for anything the parser refuses (an invalid env name, an
+    /// out-of-range port), so "does the parsed result differ from what is stored?" answers *yes* in
+    /// exactly the case that must not be written — silently deleting a hand-edited bad line from
+    /// `profiles.json` instead of showing the warning this pane renders. Comparing raw text is
+    /// immune: seeded text is byte-identical to itself, so only a real keystroke writes.
+    seeded_profile_text: Option<[String; 8]>,
+    /// Whether the badge-color picker popover is open, and where to anchor it.
+    badge_picker_open: bool,
+    badge_picker_bounds: Option<Bounds<Pixels>>,
+}
+
+/// The eight text inputs backing the selected profile's fields.
+///
+/// Grouped in their own struct so seeding them is one call that cannot forget a field — the failure
+/// mode of a flat list of eight `Entity<TextInput>` members is a newly added field that is never
+/// re-seeded, which shows the *previous* profile's value while writing to the current one.
+struct ProfileInputs {
+    name: Entity<TextInput>,
+    shell_program: Entity<TextInput>,
+    shell_args: Entity<TextInput>,
+    cwd: Entity<TextInput>,
+    env: Entity<TextInput>,
+    remote_host: Entity<TextInput>,
+    remote_user: Entity<TextInput>,
+    remote_port: Entity<TextInput>,
 }
 
 impl SettingsWindow {
     fn new(
         settings: Entity<SettingsStore>,
         updates: Entity<crate::update_controller::UpdateController>,
+        profile_store: Entity<crate::profile_store::ProfileStore>,
+        project_store: Entity<ProjectStore>,
         font_names: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        // No explicit `cx.observe(&profile_store)`: `render` reads that entity, so GPUI records it in
+        // the window's `tracked_entities` and any `cx.notify()` on it invalidates this view
+        // (`App::notify` → `WindowInvalidator::invalidate_view`). Every ProfileStore mutation ends in
+        // `persist`, which notifies — so edits from this pane and from another window both repaint.
+        // Verified live by mutating the store from outside every settings-window listener.
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         let system_is_dark = is_dark_appearance(window.appearance());
-        let theme = settings.read(cx).config().effective_theme(system_is_dark);
+        // Chrome only, so this reads the *interface* layer. Still `config` rather than the resolved
+        // preview: no hover can be active while the window is being constructed.
+        let theme = settings.read(cx).config().interface_theme(system_is_dark);
         let colors = UiColors::from_theme(theme);
         let selector_search_input = cx.new(|cx| {
             TextInput::new(
@@ -655,13 +854,42 @@ impl SettingsWindow {
         };
         let shell_program_input = cx.new(|cx| TextInput::new(window, cx, input_style));
         let shell_args_input = cx.new(|cx| TextInput::new(window, cx, input_style));
-        // Seed the shell inputs from the persisted config exactly once. `set_content` emits Changed,
-        // but that fires before the subscriptions below are installed, so it won't loop back.
+        // The Profiles pane's inputs. Created here (not lazily on first open) so the subscriptions are
+        // installed exactly once; they stay empty until `sync_profile_inputs` seeds them.
+        let profile_inputs = ProfileInputs {
+            name: cx.new(|cx| TextInput::new(window, cx, input_style)),
+            shell_program: cx.new(|cx| TextInput::new(window, cx, input_style)),
+            shell_args: cx.new(|cx| TextInput::new(window, cx, input_style)),
+            cwd: cx.new(|cx| TextInput::new(window, cx, input_style)),
+            env: cx.new(|cx| TextInput::new(window, cx, input_style).multiline()),
+            remote_host: cx.new(|cx| TextInput::new(window, cx, input_style)),
+            remote_user: cx.new(|cx| TextInput::new(window, cx, input_style)),
+            remote_port: cx.new(|cx| TextInput::new(window, cx, input_style)),
+        };
+        for input in [
+            &profile_inputs.name,
+            &profile_inputs.shell_program,
+            &profile_inputs.shell_args,
+            &profile_inputs.cwd,
+            &profile_inputs.env,
+            &profile_inputs.remote_host,
+            &profile_inputs.remote_user,
+            &profile_inputs.remote_port,
+        ] {
+            // Not `profile_input_list()`: `self` does not exist yet. The compiler still catches a
+            // forgotten field here, because `ProfileInputs` has no `Default` — a new field must be
+            // named in the initializer above.
+            cx.subscribe_in(input, window, Self::on_profile_input_event)
+                .detach();
+        }
+        // Seed the shell inputs exactly once, from the built-in Default profile — it owns the launch
+        // fields, so `AppSettings`' copies may be a stale downgrade mirror. `set_content` emits
+        // Changed, but that fires before the subscriptions below are installed, so it won't loop back.
         {
-            let config = settings.read(cx).config();
-            let language = config.language;
-            let program = config.shell_program.clone();
-            let args = config.shell_args.join(" ");
+            let language = settings.read(cx).config().language;
+            let default_profile = profile_store.read(cx).default_profile();
+            let program = default_profile.shell_program.clone();
+            let args = default_profile.shell_args.join(" ");
             shell_program_input.update(cx, |input, cx| {
                 input.set_placeholder(language.shell_program_placeholder());
                 input.set_content(program, cx);
@@ -686,6 +914,8 @@ impl SettingsWindow {
         Self {
             settings,
             updates,
+            profile_store,
+            project_store,
             dark_theme_names: theme_catalog().dark_names(),
             light_theme_names: theme_catalog().light_names(),
             font_names,
@@ -696,7 +926,7 @@ impl SettingsWindow {
             shell_args_input,
             selector_scroll_handle: ScrollHandle::new(),
             settings_scroll_handle: ScrollHandle::new(),
-            selector_bounds: [None; 6],
+            selector_bounds: [None; SelectorKind::ALL.len()],
             moving_window: false,
             selected_section: SettingsSection::default(),
             recording: None,
@@ -704,6 +934,12 @@ impl SettingsWindow {
             recording_conflict: None,
             bell_dropdown_open: false,
             bell_dropdown_bounds: None,
+            selected_profile: None,
+            profile_inputs,
+            profile_inputs_for: None,
+            seeded_profile_text: None,
+            badge_picker_open: false,
+            badge_picker_bounds: None,
         }
     }
 
@@ -733,6 +969,19 @@ impl SettingsWindow {
         }
     }
 
+    /// Apply an edit to the built-in Default profile, which owns the launch fields since profiles
+    /// landed. The Shell controls in this window edit that profile — without this write-through they
+    /// would persist to `settings.json` and never affect a terminal.
+    fn update_default_profile(
+        &mut self,
+        update: impl FnOnce(&mut eggie_domain::Profile),
+        cx: &mut Context<Self>,
+    ) {
+        self.profile_store.update(cx, |store, cx| {
+            store.update(eggie_domain::DEFAULT_PROFILE_ID, update, cx);
+        });
+    }
+
     fn on_shell_program_event(
         &mut self,
         input: &Entity<TextInput>,
@@ -747,9 +996,12 @@ impl SettingsWindow {
             TextInputEvent::Changed | TextInputEvent::Confirm | TextInputEvent::ConfirmReverse
         ) {
             let program = input.read(cx).content().to_owned();
+            // Mirror into AppSettings as well: the field is vestigial for spawning, but it is what a
+            // build predating profiles reads, and what the one-time migration would pick up.
             self.settings.update(cx, |settings, cx| {
-                settings.update(|settings| settings.shell_program = program, cx);
+                settings.update(|settings| settings.shell_program = program.clone(), cx);
             });
+            self.update_default_profile(|profile| profile.shell_program = program, cx);
         }
     }
 
@@ -766,16 +1018,70 @@ impl SettingsWindow {
         ) {
             // Tokenize the single edit line into an argv on whitespace. Quoting is not handled (v1):
             // arguments containing spaces must be split into separate whitespace-free tokens.
-            let args = input
-                .read(cx)
-                .content()
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
+            let args = crate::profile_editor::parse_args(input.read(cx).content());
             self.settings.update(cx, |settings, cx| {
-                settings.update(|settings| settings.shell_args = args, cx);
+                settings.update(|settings| settings.shell_args = args.clone(), cx);
             });
+            self.update_default_profile(|profile| profile.shell_args = args, cx);
         }
+    }
+
+    /// The option list a selector offers. The single place that decides it, so adding a slot cannot
+    /// leave one of the several read sites (Enter-to-commit, the dropdown list) offering the wrong half
+    /// of the catalog.
+    ///
+    /// Each theme slot offers only its own half: the dark slots hold only themes that measure dark, so
+    /// the light list would be invalid there and `AppSettings::normalize` would reject it anyway.
+    fn selector_names(&self, kind: SelectorKind) -> &[String] {
+        match kind {
+            SelectorKind::InterfaceDark
+            | SelectorKind::TerminalDark
+            | SelectorKind::ProfileTerminalDark => &self.dark_theme_names,
+            SelectorKind::InterfaceLight
+            | SelectorKind::TerminalLight
+            | SelectorKind::ProfileTerminalLight => &self.light_theme_names,
+            SelectorKind::Font
+            | SelectorKind::FontBold
+            | SelectorKind::FontItalic
+            | SelectorKind::FontBoldItalic
+            | SelectorKind::ProfileFont => &self.font_names,
+        }
+    }
+
+    /// Write `choice` to whatever `kind` edits — a profile override or a global setting. The single
+    /// commit path, shared by clicking an option and by Enter-to-commit-first-match, so a new slot
+    /// cannot land in one and be forgotten in the other.
+    fn commit_selector_choice(
+        &mut self,
+        kind: SelectorKind,
+        choice: String,
+        cx: &mut Context<Self>,
+    ) {
+        if kind.is_profile() {
+            self.apply_profile_selector_choice(kind, Some(choice), cx);
+            return;
+        }
+        self.settings.update(cx, |store, cx| {
+            store.update(
+                |config| match kind {
+                    SelectorKind::InterfaceDark => config.interface_dark_theme = choice.clone(),
+                    SelectorKind::InterfaceLight => config.interface_light_theme = choice.clone(),
+                    SelectorKind::TerminalDark => config.terminal_dark_theme = choice.clone(),
+                    SelectorKind::TerminalLight => config.terminal_light_theme = choice.clone(),
+                    SelectorKind::Font => config.font_family = choice.clone(),
+                    SelectorKind::FontBold => config.font_family_bold = choice.clone(),
+                    SelectorKind::FontItalic => config.font_family_italic = choice.clone(),
+                    SelectorKind::FontBoldItalic => {
+                        config.font_family_bold_italic = choice.clone()
+                    }
+                    // Handled above: these write to the profile store, not to AppSettings.
+                    SelectorKind::ProfileTerminalDark
+                    | SelectorKind::ProfileTerminalLight
+                    | SelectorKind::ProfileFont => {}
+                },
+                cx,
+            )
+        });
     }
 
     /// Apply the first item matching the current filter for the open selector, then close it.
@@ -784,39 +1090,362 @@ impl SettingsWindow {
             return;
         };
         let query = self.selector_search_input.read(cx).content().trim().to_owned();
-        let names = match kind {
-            SelectorKind::DarkTheme => &self.dark_theme_names,
-            SelectorKind::LightTheme => &self.light_theme_names,
-            SelectorKind::Font
-            | SelectorKind::FontBold
-            | SelectorKind::FontItalic
-            | SelectorKind::FontBoldItalic => &self.font_names,
-        };
-        let Some(choice) = names
+        let Some(choice) = self
+            .selector_names(kind)
             .iter()
             .find(|item| selector_matches(item, &query))
             .cloned()
         else {
             return;
         };
-        self.settings.update(cx, |store, cx| {
-            store.update(
-                |config| match kind {
-                    SelectorKind::DarkTheme => config.dark_theme = choice.clone(),
-                    SelectorKind::LightTheme => config.light_theme = choice.clone(),
-                    SelectorKind::Font => config.font_family = choice.clone(),
-                    SelectorKind::FontBold => config.font_family_bold = choice.clone(),
-                    SelectorKind::FontItalic => config.font_family_italic = choice.clone(),
-                    SelectorKind::FontBoldItalic => {
-                        config.font_family_bold_italic = choice.clone()
-                    }
-                },
-                cx,
-            )
-        });
+        self.commit_selector_choice(kind, choice, cx);
         self.clear_theme_preview(cx);
         self.open_selector = None;
         cx.notify();
+    }
+
+    // --- Profiles pane -----------------------------------------------------------------------
+
+    /// Every profile input, in field order. The single place that enumerates them, so language sync,
+    /// subscription installation, and seeding cannot fall out of step with the struct.
+    fn profile_input_list(&self) -> [&Entity<TextInput>; 8] {
+        [
+            &self.profile_inputs.name,
+            &self.profile_inputs.shell_program,
+            &self.profile_inputs.shell_args,
+            &self.profile_inputs.cwd,
+            &self.profile_inputs.env,
+            &self.profile_inputs.remote_host,
+            &self.profile_inputs.remote_user,
+            &self.profile_inputs.remote_port,
+        ]
+    }
+
+    /// Write an appearance override on the selected profile. `None` clears it back to "follow the
+    /// global setting".
+    fn apply_profile_selector_choice(
+        &mut self,
+        kind: SelectorKind,
+        choice: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_profile else {
+            return;
+        };
+        self.profile_store.update(cx, |store, cx| {
+            store.update(
+                id,
+                // Exhaustive on purpose: a catch-all arm would let a newly added profile selector
+                // compile and then silently write nothing.
+                |profile| match kind {
+                    SelectorKind::ProfileTerminalDark => {
+                        profile.appearance.terminal_dark_theme = choice
+                    }
+                    SelectorKind::ProfileTerminalLight => {
+                        profile.appearance.terminal_light_theme = choice
+                    }
+                    SelectorKind::ProfileFont => profile.appearance.font_family = choice,
+                    // Global selectors write to AppSettings; they never reach here.
+                    SelectorKind::InterfaceDark
+                    | SelectorKind::InterfaceLight
+                    | SelectorKind::TerminalDark
+                    | SelectorKind::TerminalLight
+                    | SelectorKind::Font
+                    | SelectorKind::FontBold
+                    | SelectorKind::FontItalic
+                    | SelectorKind::FontBoldItalic => {}
+                },
+                cx,
+            );
+        });
+    }
+
+    /// The profile the Profiles pane is editing, resolving a stale selection to the built-in Default.
+    ///
+    /// Never returns `None` once the store exists: the store's own invariant guarantees a built-in
+    /// Default, and every stale selection (deleted in this window, or in another one) lands there
+    /// rather than leaving the pane blank.
+    fn selected_profile_id(&self, cx: &App) -> eggie_domain::ProfileId {
+        self.profile_store.read(cx).resolve(self.selected_profile).id
+    }
+
+    /// Re-seed the profile inputs from the store when the selection has moved.
+    ///
+    /// Called from `render`, which is what makes it correct across *both* ways the selection can
+    /// change: a click in this window, and a profile deleted elsewhere. The second works because
+    /// `render` reads the profile store, so GPUI tracks that entity for this window and every
+    /// `ProfileStore` mutation (each ends in `persist`, which notifies) invalidates this view — the
+    /// now-stale id then resolves to the built-in Default here.
+    ///
+    /// Guarded on `profile_inputs_for`, deliberately *not* on a "currently seeding" flag: GPUI's
+    /// `cx.emit` queues the event in `pending_effects` and delivers it after this call returns
+    /// (`vendor/zed-gpui/.../app/context.rs`), so any flag cleared at the end of this function would
+    /// already be false when `Changed` arrives. That deferral is also why the write-through compares
+    /// against `seeded_profile_text` rather than trying to suppress the echo here.
+    fn sync_profile_inputs(&mut self, cx: &mut Context<Self>) {
+        let id = self.selected_profile_id(cx);
+        if self.profile_inputs_for == Some(id) {
+            return;
+        }
+        let Some(profile) = self.profile_store.read(cx).profile(id).cloned() else {
+            return;
+        };
+        let language = self.settings.read(cx).config().language;
+        let fields = crate::profile_editor::ProfileFields::from_profile(&profile);
+        // Record the owner *before* seeding. `set_content` emits `Changed`, and although delivery is
+        // deferred, it must find the inputs already attributed to this profile — otherwise the
+        // write-through would attribute the seeded text to whichever profile was selected before.
+        self.profile_inputs_for = Some(id);
+        self.selected_profile = Some(id);
+        let seeds: [(&Entity<TextInput>, String, &'static str); 8] = [
+            (&self.profile_inputs.name, fields.name, ""),
+            (
+                &self.profile_inputs.shell_program,
+                fields.shell_program,
+                language.shell_program_placeholder(),
+            ),
+            (
+                &self.profile_inputs.shell_args,
+                fields.shell_args,
+                language.shell_args_placeholder(),
+            ),
+            (
+                &self.profile_inputs.cwd,
+                fields.cwd,
+                language.profile_cwd_placeholder(),
+            ),
+            (
+                &self.profile_inputs.env,
+                fields.env,
+                language.profile_env_placeholder(),
+            ),
+            (
+                &self.profile_inputs.remote_host,
+                fields.remote_host,
+                language.profile_remote_host_placeholder(),
+            ),
+            (&self.profile_inputs.remote_user, fields.remote_user, ""),
+            (&self.profile_inputs.remote_port, fields.remote_port, ""),
+        ];
+        for (input, value, placeholder) in seeds {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(placeholder);
+                input.set_content(value, cx);
+            });
+        }
+        // Snapshot what was just seeded. Read back from the inputs rather than reusing `fields`, so the
+        // record is exactly what the write-through will read — if `set_content` ever normalized its
+        // argument, comparing against the pre-normalization string would make every open look edited.
+        self.seeded_profile_text = Some(self.profile_text(cx));
+    }
+
+    /// The current text of all eight profile inputs, in `profile_input_list` order.
+    fn profile_text(&self, cx: &App) -> [String; 8] {
+        self.profile_input_list()
+            .map(|input| input.read(cx).content().to_owned())
+    }
+
+    /// Write every profile input back to the selected profile.
+    ///
+    /// Reads all eight inputs on each edit rather than tracking which one fired: the alternative is
+    /// eight near-identical handlers, and this one runs only on keystrokes in a settings pane.
+    ///
+    /// Ignores events that arrive while the inputs belong to a different profile than the current
+    /// selection — that is a seed in flight, and applying it would copy one profile's values onto
+    /// another.
+    fn on_profile_input_event(
+        &mut self,
+        _input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(
+            event,
+            TextInputEvent::Changed | TextInputEvent::Confirm | TextInputEvent::ConfirmReverse
+        ) {
+            return;
+        }
+        let Some(id) = self.selected_profile else {
+            return;
+        };
+        // The inputs must already be attributed to this profile. A mismatch means `sync_profile_inputs`
+        // is mid-flight (its deferred `Changed` events are arriving), and the text belongs to neither
+        // profile yet.
+        if self.profile_inputs_for != Some(id) {
+            return;
+        }
+        // Nothing to write unless the *text* differs from what seeding put there.
+        //
+        // Compared against the seeded text, not against the stored profile. `set_content` emits
+        // `Changed` whose delivery GPUI defers past the render that seeded it, so this handler always
+        // runs once per selection on text the user never touched — and comparing the *parsed* result to
+        // the stored struct answers "changed" in exactly the case that must not be written, because the
+        // text↔struct round trip is lossy for input the parser refuses. Verified against a real
+        // `profiles.json`: with the struct comparison alone, merely opening this pane deleted a
+        // hand-edited `"BAD KEY"` env entry from disk. Raw text is immune — seeded text equals itself.
+        let current = self.profile_text(cx);
+        let Some(seeded) = self.seeded_profile_text.clone() else {
+            // Not seeded yet, so there is no baseline to diff against and nothing can be attributed to
+            // the user. `sync_profile_inputs` always seeds before the pane can be interacted with.
+            return;
+        };
+        if seeded == current {
+            return;
+        }
+
+        let Some(stored) = self.profile_store.read(cx).profile(id).cloned() else {
+            return;
+        };
+        // Apply only the fields whose *own* text changed, field by field.
+        //
+        // Rebuilding the whole struct from all eight inputs is wrong, even behind the guard above:
+        // these inputs are seeded once per selection, so another surface writing the same profile
+        // leaves them stale — and a whole-struct write then reverts that surface's edit. Reproduced
+        // live: the Advanced → Shell pane sets `shell_program` to `/bin/bash`, then typing a single
+        // character into this pane's *Name* field wrote `shell_program: ""` back over it, because the
+        // Profiles pane's shell input still held the value from when it was seeded. Diffing per field
+        // makes a stale input inert: it matches its own seed, so it is never applied.
+        let mut edited = stored.clone();
+        let changed = |index: usize| seeded[index] != current[index];
+        // Indices follow `profile_input_list` order; `profile_text` builds `current` from it.
+        if changed(0) {
+            // An all-whitespace name would render as a blank row in the picker with nothing to click;
+            // keep the stored name until the user types something real.
+            let name = current[0].trim();
+            if !name.is_empty() {
+                edited.name = name.to_owned();
+            }
+        }
+        if changed(1) {
+            edited.shell_program = current[1].trim().to_owned();
+        }
+        if changed(2) {
+            edited.shell_args = crate::profile_editor::parse_args(&current[2]);
+        }
+        if changed(3) {
+            // Empty means "inherit" (active terminal's cwd, then the project root), which is `None` —
+            // not `Some("")`, which would be a path that never exists.
+            let cwd = current[3].trim();
+            edited.cwd = (!cwd.is_empty()).then(|| std::path::PathBuf::from(cwd));
+        }
+        if changed(4) {
+            let (mut env, _rejected) = crate::profile_editor::parse_env(&current[4]);
+            // Carry back the entries the editor cannot show (a value containing a newline). They are
+            // valid POSIX values, just not expressible one-per-line — without this, editing any other
+            // variable would delete them. Parsed entries win on a key collision: that key is visible in
+            // the editor, so what the user sees is what they get.
+            for (key, value) in crate::profile_editor::unrepresentable_env(&stored.env) {
+                env.entry(key).or_insert(value);
+            }
+            edited.env = env;
+        }
+        // The three remote fields build one value, so any of them moving re-derives it from all three.
+        if changed(5) || changed(6) || changed(7) {
+            edited.remote = crate::profile_editor::parse_remote(
+                &current[5],
+                &current[6],
+                &current[7],
+            );
+        }
+        // Baseline moves only now, and only for text that was actually consumed above. Set before the
+        // no-op return below so a keystroke that parses to the same profile (typing then deleting a
+        // character) still updates the baseline instead of re-diffing against an ever-older seed.
+        self.seeded_profile_text = Some(current);
+        // A keystroke can leave the parsed profile identical (whitespace, a refused env line); don't
+        // churn the file for it.
+        if edited == stored {
+            return;
+        }
+        self.profile_store.update(cx, |store, cx| {
+            store.update(id, |profile| *profile = edited, cx);
+        });
+        cx.notify();
+    }
+
+    /// Create a profile, select it, and focus its name field so it can be renamed immediately.
+    fn add_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.settings.read(cx).config().language;
+        let profile = eggie_domain::Profile::new(language.new_profile_name().to_owned());
+        let id = profile.id;
+        self.profile_store
+            .update(cx, |store, cx| store.add(profile, cx));
+        self.select_profile(id, cx);
+        // The name is a placeholder, so put the caret in it rather than making the user hunt for it.
+        self.profile_inputs
+            .name
+            .read(cx)
+            .focus_handle()
+            .focus(window, cx);
+    }
+
+    /// Point the pane at `id`. The inputs are re-seeded by the next `render` (see
+    /// [`Self::sync_profile_inputs`]), which is also the path a selection change from another window
+    /// travels, so there is only one seeding code path.
+    fn select_profile(&mut self, id: eggie_domain::ProfileId, cx: &mut Context<Self>) {
+        if self.selected_profile == Some(id) {
+            return;
+        }
+        self.selected_profile = Some(id);
+        self.open_selector = None;
+        self.badge_picker_open = false;
+        cx.notify();
+    }
+
+    /// Confirm, then delete the profile. The built-in Default is not deletable and never reaches here.
+    ///
+    /// Projects naming it as their default are cleaned up too. That is belt-and-braces —
+    /// `ProfileStore::resolve` already sends a stale id to Default — but it keeps a dangling id off
+    /// disk, where a future profile could otherwise inherit it (import, restore from backup) and
+    /// silently become some project's default.
+    fn prompt_delete_profile(
+        &mut self,
+        id: eggie_domain::ProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profile_store.read(cx).profile(id) else {
+            return;
+        };
+        if profile.builtin {
+            return;
+        }
+        let language = self.settings.read(cx).config().language;
+        let message = language.delete_profile_message(&profile.name);
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            language.delete_profile_title(),
+            Some(&message),
+            &[language.delete(), language.cancel()],
+            cx,
+        );
+        let settings_window = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            settings_window
+                .update(cx, |settings, cx| {
+                    let removed = settings
+                        .profile_store
+                        .update(cx, |store, cx| store.remove(id, cx));
+                    if !removed {
+                        return;
+                    }
+                    // Clear the deleted id from any project that named it as their default. The
+                    // "anything changed" return is deliberately ignored: the store already skips the
+                    // write and the notify when no project referenced this profile, and there is
+                    // nothing further for this callsite to do either way.
+                    settings.project_store.update(cx, |store, cx| {
+                        let _ = store.forget_profile(id, cx);
+                    });
+                    // Hand the pane to the built-in Default rather than leaving it on a dead id.
+                    let default = settings.profile_store.read(cx).default_profile().id;
+                    settings.select_profile(default, cx);
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
@@ -825,12 +1454,37 @@ impl SettingsWindow {
         });
     }
 
+    /// Switch between "the terminal follows the interface theme" and "the terminal has its own pair".
+    ///
+    /// Opting into the custom pair seeds it from the interface pair (see
+    /// [`AppSettings::use_custom_terminal_themes`]) so the toggle itself changes nothing on screen.
+    /// Going back keeps the custom pair on disk, so toggling twice does not discard the choice.
+    fn set_terminal_theme_source(&mut self, custom: bool, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.update(
+                |config| {
+                    if custom {
+                        config.use_custom_terminal_themes();
+                    } else {
+                        config.terminal_theme_source = TerminalThemeSource::FollowInterface;
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
     /// Light up `name` as a transient hover preview across the app (real terminals + the settings
-    /// preview). No-op if the name doesn't resolve to a known theme.
-    fn preview_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+    /// preview), attributed to `kind`'s slot so it resolves through the same layering the committed
+    /// value would. No-op if the name doesn't resolve to a known theme, or if `kind` picks a font.
+    fn preview_theme(&mut self, kind: SelectorKind, name: &str, cx: &mut Context<Self>) {
+        let profile_id = self.selected_profile_id(cx);
+        let Some(slot) = kind.preview_slot(profile_id) else {
+            return;
+        };
         if let Some(theme) = theme_catalog().theme_by_name(name) {
             self.settings
-                .update(cx, |store, cx| store.set_theme_preview(theme, cx));
+                .update(cx, |store, cx| store.set_theme_preview(slot, theme, cx));
         }
     }
 
@@ -862,6 +1516,7 @@ impl SettingsWindow {
         self.settings.update(cx, |settings, cx| {
             settings.update(|settings| settings.shell_integration_path = enabled, cx)
         });
+        self.update_default_profile(|profile| profile.shell_integration_path = enabled, cx);
     }
 
     fn set_copy_on_select(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1218,6 +1873,42 @@ impl SettingsWindow {
             "theme-mode",
             options,
             |settings, index, cx| settings.set_theme_mode(ThemeMode::ALL[index], cx),
+            cx,
+        )
+    }
+
+    /// "Follow the interface theme" vs "use a custom pair" for the terminal.
+    fn render_terminal_theme_source_control(
+        &self,
+        selected: TerminalThemeSource,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        let options = TerminalThemeSource::ALL
+            .into_iter()
+            .map(|source| {
+                let label = match source {
+                    TerminalThemeSource::FollowInterface => {
+                        language.terminal_theme_follow_interface()
+                    }
+                    TerminalThemeSource::Custom => language.terminal_theme_custom(),
+                };
+                (
+                    SharedString::from(format!("{source:?}")),
+                    SharedString::from(label),
+                    selected == source,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "terminal-theme-source",
+            options,
+            |settings, index, cx| {
+                settings.set_terminal_theme_source(
+                    TerminalThemeSource::ALL[index] == TerminalThemeSource::Custom,
+                    cx,
+                )
+            },
             cx,
         )
     }
@@ -1849,12 +2540,25 @@ impl SettingsWindow {
                             settings.open_selector = Some(kind);
                             let language = settings.settings.read(cx).config().language;
                             let placeholder = match kind {
-                                SelectorKind::DarkTheme => language.search_dark_themes(),
-                                SelectorKind::LightTheme => language.search_light_themes(),
+                                // Every theme slot searches one half of the catalog, so the placeholder
+                                // follows the slot's darkness rather than naming the layer.
+                                SelectorKind::InterfaceDark
+                                | SelectorKind::InterfaceLight
+                                | SelectorKind::TerminalDark
+                                | SelectorKind::TerminalLight
+                                | SelectorKind::ProfileTerminalDark
+                                | SelectorKind::ProfileTerminalLight => {
+                                    if kind.is_dark() {
+                                        language.search_dark_themes()
+                                    } else {
+                                        language.search_light_themes()
+                                    }
+                                }
                                 SelectorKind::Font
                                 | SelectorKind::FontBold
                                 | SelectorKind::FontItalic
-                                | SelectorKind::FontBoldItalic => language.search_fonts(),
+                                | SelectorKind::FontBoldItalic
+                                | SelectorKind::ProfileFont => language.search_fonts(),
                             };
                             settings.selector_search_input.update(cx, |input, cx| {
                                 input.set_placeholder(placeholder);
@@ -1909,30 +2613,42 @@ impl SettingsWindow {
     ) -> AnyElement {
         let config = self.settings.read(cx).config();
         let language = config.language;
-        let (current, items) = match kind {
-            SelectorKind::DarkTheme => (
-                config.dark_theme.clone(),
-                self.dark_theme_names.clone(),
-            ),
-            SelectorKind::LightTheme => (
-                config.light_theme.clone(),
-                self.light_theme_names.clone(),
-            ),
-            SelectorKind::Font => (
-                config.font_family.clone(),
-                self.font_names.clone(),
-            ),
-            SelectorKind::FontBold => {
-                (config.font_family_bold.clone(), self.font_names.clone())
+        // The option list comes from `selector_names` (the single source), so this only has to answer
+        // "what is the current value". Exhaustive on purpose: a catch-all would let a new slot read
+        // another slot's field, which compiles and silently shows the wrong selection.
+        let current = match kind {
+            SelectorKind::InterfaceDark => config.interface_dark_theme.clone(),
+            SelectorKind::InterfaceLight => config.interface_light_theme.clone(),
+            SelectorKind::TerminalDark => config.terminal_dark_theme.clone(),
+            SelectorKind::TerminalLight => config.terminal_light_theme.clone(),
+            SelectorKind::Font => config.font_family.clone(),
+            SelectorKind::FontBold => config.font_family_bold.clone(),
+            SelectorKind::FontItalic => config.font_family_italic.clone(),
+            SelectorKind::FontBoldItalic => config.font_family_bold_italic.clone(),
+            // Profile overrides read from the store, not from `config`. An unset override is an empty
+            // string here, which is what makes the "follow global setting" entry render as selected.
+            SelectorKind::ProfileTerminalDark
+            | SelectorKind::ProfileTerminalLight
+            | SelectorKind::ProfileFont => {
+                let id = self.selected_profile_id(cx);
+                let appearance = self
+                    .profile_store
+                    .read(cx)
+                    .profile(id)
+                    .map(|profile| profile.appearance.clone())
+                    .unwrap_or_default();
+                match kind {
+                    SelectorKind::ProfileTerminalDark => {
+                        appearance.terminal_dark_theme.unwrap_or_default()
+                    }
+                    SelectorKind::ProfileTerminalLight => {
+                        appearance.terminal_light_theme.unwrap_or_default()
+                    }
+                    _ => appearance.font_family.unwrap_or_default(),
+                }
             }
-            SelectorKind::FontItalic => {
-                (config.font_family_italic.clone(), self.font_names.clone())
-            }
-            SelectorKind::FontBoldItalic => (
-                config.font_family_bold_italic.clone(),
-                self.font_names.clone(),
-            ),
         };
+        let items = self.selector_names(kind).to_vec();
         let query_owned = self.selector_search_input.read(cx).content().trim().to_owned();
         let items = items
             .into_iter()
@@ -1941,15 +2657,23 @@ impl SettingsWindow {
         let has_items = !items.is_empty();
 
         // Per-style families (bold/italic/bold-italic) can be cleared back to "follow the regular
-        // family". Offer that as a pinned first entry when not actively searching, so a set value is
-        // always reversible (an empty stored value means "inherit regular"). Regular Font and themes
-        // always resolve to a concrete value, so they get no clear entry.
-        let style_font = matches!(
+        // family", and every profile override back to "follow the global setting". Offer that as a
+        // pinned first entry when not actively searching, so a set value is always reversible (an
+        // empty stored value means "inherit"). The global regular Font and the global themes always
+        // resolve to a concrete value, so they get no clear entry.
+        let clearable = matches!(
             kind,
             SelectorKind::FontBold | SelectorKind::FontItalic | SelectorKind::FontBoldItalic
-        );
-        let show_clear = style_font && query_owned.is_empty();
+        ) || kind.is_profile();
+        let show_clear = clearable && query_owned.is_empty();
         let clear_selected = show_clear && current.trim().is_empty();
+        // The two clear entries say different things: a style font falls back to the regular family,
+        // a profile override falls back to the global setting.
+        let clear_label = if kind.is_profile() {
+            language.profile_appearance_inherit()
+        } else {
+            language.font_family_use_regular()
+        };
 
         let mut list = div()
             .id("settings-selector-list")
@@ -1983,34 +2707,49 @@ impl SettingsWindow {
                     })
                     .hover(|element| element.bg(rgb(self.colors.panel_alt)))
                     .on_click(cx.listener(move |settings, _, _, cx| {
-                        settings.settings.update(cx, |store, cx| {
-                            store.update(
-                                |config| match kind {
-                                    SelectorKind::FontBold => config.font_family_bold.clear(),
-                                    SelectorKind::FontItalic => config.font_family_italic.clear(),
-                                    SelectorKind::FontBoldItalic => {
-                                        config.font_family_bold_italic.clear()
-                                    }
-                                    _ => {}
-                                },
-                                cx,
-                            )
-                        });
+                        if kind.is_profile() {
+                            settings.apply_profile_selector_choice(kind, None, cx);
+                        } else {
+                            settings.settings.update(cx, |store, cx| {
+                                store.update(
+                                    // Exhaustive on purpose: the non-clearable slots have to be listed
+                                    // rather than swept into a catch-all, or a new clearable slot would
+                                    // compile with a clear button that silently does nothing.
+                                    |config| match kind {
+                                        SelectorKind::FontBold => config.font_family_bold.clear(),
+                                        SelectorKind::FontItalic => {
+                                            config.font_family_italic.clear()
+                                        }
+                                        SelectorKind::FontBoldItalic => {
+                                            config.font_family_bold_italic.clear()
+                                        }
+                                        // Not clearable: these always resolve to a concrete value, so
+                                        // `clearable` never offers this row for them.
+                                        SelectorKind::InterfaceDark
+                                        | SelectorKind::InterfaceLight
+                                        | SelectorKind::TerminalDark
+                                        | SelectorKind::TerminalLight
+                                        | SelectorKind::Font => {}
+                                        // Handled above: these write to the profile store.
+                                        SelectorKind::ProfileTerminalDark
+                                        | SelectorKind::ProfileTerminalLight
+                                        | SelectorKind::ProfileFont => {}
+                                    },
+                                    cx,
+                                )
+                            });
+                        }
                         settings.open_selector = None;
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .child(language.font_family_use_regular()),
-                    ),
+                    .child(div().min_w_0().truncate().child(clear_label)),
             );
         }
         // Theme selectors get a live hover preview: resting on an option lights the theme up across
         // the real terminals and the preview swatch. Font selectors don't (fonts can't preview live).
-        let is_theme_selector =
-            matches!(kind, SelectorKind::DarkTheme | SelectorKind::LightTheme);
+        // Every theme slot previews — including the per-profile overrides, which reach the same live
+        // path but apply only to that profile's terminals.
+        let is_theme_selector = kind.is_theme();
         for (index, item) in items.into_iter().enumerate() {
             let selected = item == current;
             let selected_item = item.clone();
@@ -2032,16 +2771,9 @@ impl SettingsWindow {
                             .bg(rgb(self.colors.panel_alt))
                             .text_color(rgb(self.colors.accent))
                     })
-                    .when(
-                        matches!(
-                            kind,
-                            SelectorKind::Font
-                                | SelectorKind::FontBold
-                                | SelectorKind::FontItalic
-                                | SelectorKind::FontBoldItalic
-                        ),
-                        |element| element.font_family(SharedString::from(item.clone())),
-                    )
+                    .when(kind.is_font(), |element| {
+                        element.font_family(SharedString::from(item.clone()))
+                    })
                     .hover(|element| element.bg(rgb(self.colors.panel_alt)))
                     .when(is_theme_selector, |element| {
                         element.on_hover(cx.listener(move |settings, hovered: &bool, _, cx| {
@@ -2049,39 +2781,15 @@ impl SettingsWindow {
                             // flip back to the persisted theme mid-glide. The dropdown container's
                             // own on_hover clears the preview once the pointer leaves the list.
                             if *hovered {
-                                settings.preview_theme(&hover_item, cx);
+                                settings.preview_theme(kind, &hover_item, cx);
                             }
                         }))
                     })
                     .on_click(cx.listener(move |settings, _, _, cx| {
-                        // Committing supersedes the preview: clear it so `resolved_theme` falls back
+                        // Committing supersedes the preview: clear it so the resolved theme falls back
                         // to the now-persisted value (identical pixels, but no stale override left).
                         settings.clear_theme_preview(cx);
-                        settings.settings.update(cx, |store, cx| {
-                            store.update(
-                                |config| match kind {
-                                    SelectorKind::DarkTheme => {
-                                        config.dark_theme = selected_item.clone()
-                                    }
-                                    SelectorKind::LightTheme => {
-                                        config.light_theme = selected_item.clone()
-                                    }
-                                    SelectorKind::Font => {
-                                        config.font_family = selected_item.clone()
-                                    }
-                                    SelectorKind::FontBold => {
-                                        config.font_family_bold = selected_item.clone()
-                                    }
-                                    SelectorKind::FontItalic => {
-                                        config.font_family_italic = selected_item.clone()
-                                    }
-                                    SelectorKind::FontBoldItalic => {
-                                        config.font_family_bold_italic = selected_item.clone()
-                                    }
-                                },
-                                cx,
-                            )
-                        });
+                        settings.commit_selector_choice(kind, selected_item.clone(), cx);
                         settings.open_selector = None;
                         cx.notify();
                     }))
@@ -2365,7 +3073,7 @@ impl SettingsWindow {
             .into_any_element();
 
         let metadata = settings_section(
-            language.build_info_section(),
+            Some(language.build_info_section()),
             vec![
                 metadata_row(
                     language.version_row(),
@@ -2383,7 +3091,7 @@ impl SettingsWindow {
         );
 
         let updates = settings_section(
-            language.updates_section(),
+            Some(language.updates_section()),
             vec![
                 settings_row(
                     language.auto_check_updates_row(),
@@ -2402,6 +3110,709 @@ impl SettingsWindow {
         );
 
         vec![header, metadata, updates]
+    }
+
+    /// The Profiles pane: the profile list, then the selected profile's fields.
+    fn render_profiles_section(
+        &self,
+        language: Language,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let selected_id = self.selected_profile_id(cx);
+        let store = self.profile_store.read(cx);
+        let Some(profile) = store.profile(selected_id).cloned() else {
+            return Vec::new();
+        };
+        let entries: Vec<(eggie_domain::ProfileId, String, bool, Option<u32>)> = store
+            .profiles()
+            .iter()
+            .map(|profile| {
+                (
+                    profile.id,
+                    profile.name.clone(),
+                    profile.builtin,
+                    profile.badge_color,
+                )
+            })
+            .collect();
+
+        let mut list_rows = Vec::with_capacity(entries.len());
+        for (id, name, builtin, badge_color) in entries {
+            let selected = id == selected_id;
+            list_rows.push(
+                div()
+                    .id(("settings-profile-row", id.as_u128() as usize))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(34.))
+                    .px_3()
+                    .cursor_pointer()
+                    .when(selected, |element| {
+                        element
+                            .bg(rgb(self.colors.panel_alt))
+                            .text_color(rgb(self.colors.accent))
+                    })
+                    .when(!selected, |element| {
+                        element.hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                    })
+                    .on_click(cx.listener(move |settings, _, _, cx| {
+                        settings.select_profile(id, cx);
+                    }))
+                    // The badge dot doubles as the list's leading marker, so the color a tab will
+                    // carry is visible while picking the profile, not only after launching it.
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(8.))
+                            .rounded_full()
+                            .when_some(badge_color, |element, color| element.bg(rgb(color)))
+                            .when(badge_color.is_none(), |element| {
+                                element.border_1().border_color(rgb(self.colors.border))
+                            }),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when(builtin, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.))
+                                .text_color(rgb(self.colors.muted))
+                                .child(language.builtin_profile_marker()),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        // The list's caption is omitted for the same reason as the General pane's first section: the
+        // pane title right above it already reads "Profiles". The add/delete buttons sit *below* the
+        // card, matching how macOS Settings places the controls for a list (Login Items, Users &
+        // Groups) rather than leaving a button row floating in empty space above it.
+        let list = div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .gap_2()
+            .child(settings_card(list_rows, self.colors))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .px_1()
+                    .child(
+                        div()
+                            .id("settings-profile-add")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(24.))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(rgb(self.colors.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(self.colors.panel_alt))
+                                    .text_color(rgb(self.colors.text))
+                            })
+                            .tooltip(tooltip_text(
+                                SharedString::from(language.add_profile_tooltip()),
+                                self.colors,
+                            ))
+                            .on_click(cx.listener(|settings, _, window, cx| {
+                                settings.add_profile(window, cx);
+                            }))
+                            .child(icon(IconName::Add)),
+                    )
+                    // Deleting the built-in Default is not offered at all: it is the fallback
+                    // every stale profile reference resolves to, so the control is absent
+                    // rather than present-and-inert.
+                    .when(!profile.builtin, |element| {
+                        element.child(
+                            div()
+                                .id("settings-profile-delete")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(24.))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(rgb(self.colors.muted))
+                                .hover(|element| {
+                                    element
+                                        .bg(rgb(self.colors.panel_alt))
+                                        .text_color(rgb(self.colors.text))
+                                })
+                                .tooltip(tooltip_text(
+                                    SharedString::from(language.delete_profile_tooltip()),
+                                    self.colors,
+                                ))
+                                .on_click(cx.listener(move |settings, _, window, cx| {
+                                    settings.prompt_delete_profile(selected_id, window, cx);
+                                }))
+                                .child(icon(IconName::Close)),
+                        )
+                    }),
+            )
+            .into_any_element();
+
+        // --- The selected profile's fields ---
+        let name_row = settings_row(
+            language.profile_name_row(),
+            language.profile_name_description(),
+            self.render_profile_input("settings-profile-name", &self.profile_inputs.name, 220.),
+            self.colors,
+        );
+
+        let launch_rows = vec![
+            settings_row(
+                language.shell_program_row(),
+                language.shell_program_description(),
+                self.render_profile_input(
+                    "settings-profile-shell-program",
+                    &self.profile_inputs.shell_program,
+                    220.,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.shell_args_row(),
+                language.shell_args_description(),
+                self.render_profile_input(
+                    "settings-profile-shell-args",
+                    &self.profile_inputs.shell_args,
+                    220.,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.profile_cwd_row(),
+                language.profile_cwd_description(),
+                self.render_profile_input(
+                    "settings-profile-cwd",
+                    &self.profile_inputs.cwd,
+                    220.,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.shell_integration_path_row(),
+                language.shell_integration_path_description(),
+                self.render_profile_path_control(profile.shell_integration_path, language, cx),
+                self.colors,
+            ),
+            // The env editor is multi-line, so it gets a full-width row of its own rather than a
+            // squeezed control column.
+            self.render_profile_env_row(language, cx),
+        ];
+
+        let remote_target = crate::profile_editor::parse_remote(
+            self.profile_inputs.remote_host.read(cx).content(),
+            self.profile_inputs.remote_user.read(cx).content(),
+            self.profile_inputs.remote_port.read(cx).content(),
+        );
+        // Surface the same judgement the launch path makes: an unusable target is dropped there, so
+        // saying so here is the difference between "my profile connects" and a silent local shell.
+        let remote_warning = remote_target
+            .as_ref()
+            .is_some_and(|target| !target.is_usable())
+            .then(|| language.profile_remote_invalid());
+        let remote_rows = vec![
+            self.render_profile_remote_host_row(language, remote_warning),
+            settings_row(
+                language.profile_remote_user_row(),
+                language.profile_remote_user_description(),
+                self.render_profile_input(
+                    "settings-profile-remote-user",
+                    &self.profile_inputs.remote_user,
+                    160.,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.profile_remote_port_row(),
+                language.profile_remote_port_description(),
+                self.render_profile_input(
+                    "settings-profile-remote-port",
+                    &self.profile_inputs.remote_port,
+                    80.,
+                ),
+                self.colors,
+            ),
+        ];
+
+        let appearance_rows = vec![
+            settings_row(
+                language.profile_terminal_dark_theme_row(),
+                language.profile_terminal_dark_theme_description(),
+                self.render_selector(
+                    "settings-profile-terminal-dark-theme",
+                    profile
+                        .appearance
+                        .terminal_dark_theme
+                        .clone()
+                        .unwrap_or_else(|| language.profile_appearance_inherit().to_owned()),
+                    None,
+                    SelectorKind::ProfileTerminalDark,
+                    window,
+                    cx,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.profile_terminal_light_theme_row(),
+                language.profile_terminal_light_theme_description(),
+                self.render_selector(
+                    "settings-profile-terminal-light-theme",
+                    profile
+                        .appearance
+                        .terminal_light_theme
+                        .clone()
+                        .unwrap_or_else(|| language.profile_appearance_inherit().to_owned()),
+                    None,
+                    SelectorKind::ProfileTerminalLight,
+                    window,
+                    cx,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.profile_font_row(),
+                language.profile_font_description(),
+                self.render_selector(
+                    "settings-profile-font",
+                    profile
+                        .appearance
+                        .font_family
+                        .clone()
+                        .unwrap_or_else(|| language.profile_appearance_inherit().to_owned()),
+                    // Render the trigger in the chosen font, as the global font selector does.
+                    profile.appearance.font_family.clone(),
+                    SelectorKind::ProfileFont,
+                    window,
+                    cx,
+                ),
+                self.colors,
+            ),
+            settings_row(
+                language.profile_font_size_row(),
+                language.profile_font_size_description(),
+                self.render_profile_font_size_control(&profile, language, cx),
+                self.colors,
+            ),
+            settings_row(
+                language.profile_badge_row(),
+                language.profile_badge_description(),
+                self.render_profile_badge_control(&profile, language, cx),
+                self.colors,
+            ),
+        ];
+
+        vec![
+            list,
+            settings_section(Some(language.profile_name_row()), vec![name_row], self.colors),
+            settings_section(Some(language.profile_launch_section()), launch_rows, self.colors),
+            settings_section(Some(language.profile_remote_section()), remote_rows, self.colors),
+            settings_section(
+                Some(language.profile_appearance_section()),
+                appearance_rows,
+                self.colors,
+            ),
+        ]
+    }
+
+    /// A bordered single-line input for a profile field, `width` px wide.
+    fn render_profile_input(
+        &self,
+        id: &'static str,
+        input: &Entity<TextInput>,
+        width: f32,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .w(px(width))
+            .h(px(30.))
+            .px_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .bg(rgb(self.colors.panel_alt))
+            .text_size(px(12.))
+            .text_color(rgb(self.colors.text))
+            .overflow_hidden()
+            .child(div().flex().flex_1().min_w_0().h_full().child(input.clone()))
+            .into_any_element()
+    }
+
+    /// The remote host row, with the "this target is ignored" warning appended when it applies.
+    fn render_profile_remote_host_row(
+        &self,
+        language: Language,
+        warning: Option<&'static str>,
+    ) -> AnyElement {
+        let control = self.render_profile_input(
+            "settings-profile-remote-host",
+            &self.profile_inputs.remote_host,
+            220.,
+        );
+        let colors = self.colors;
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .min_h(px(64.))
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .flex_col()
+                    .gap_1()
+                    .child(language.profile_remote_host_row())
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.muted))
+                            .child(language.profile_remote_host_description()),
+                    )
+                    .when_some(warning, |element, warning| {
+                        // Tinted with the bell/attention color so a rejected target reads as a problem
+                        // rather than as more description.
+                        element.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(WARNING_TEXT))
+                                .child(warning),
+                        )
+                    }),
+            )
+            .child(div().flex_none().child(control))
+            .into_any_element()
+    }
+
+    /// The multi-line environment editor, plus a count of ignored lines when the text has any.
+    fn render_profile_env_row(&self, language: Language, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.colors;
+        // Recompute from the live text rather than from `profile.env`: the stored map has already had
+        // the bad lines dropped, so it cannot say how many there were.
+        let (_, rejected) =
+            crate::profile_editor::parse_env(self.profile_inputs.env.read(cx).content());
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(language.profile_env_row())
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.muted))
+                            .child(language.profile_env_description()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-profile-env")
+                    .w_full()
+                    .h(px(96.))
+                    .px_2()
+                    .py_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.panel_alt))
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.text))
+                    .overflow_hidden()
+                    .child(self.profile_inputs.env.clone()),
+            )
+            .when(rejected > 0, |element| {
+                element.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(WARNING_TEXT))
+                        .child(language.profile_env_rejected(rejected)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_profile_path_control(
+        &self,
+        enabled: bool,
+        language: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let options = vec![
+            (
+                SharedString::from("on"),
+                SharedString::from(language.cursor_blink_on()),
+                enabled,
+            ),
+            (
+                SharedString::from("off"),
+                SharedString::from(language.cursor_blink_off()),
+                !enabled,
+            ),
+        ];
+        self.render_segmented(
+            "settings-profile-path",
+            options,
+            move |settings, index, cx| {
+                let Some(id) = settings.selected_profile else {
+                    return;
+                };
+                settings.profile_store.update(cx, |store, cx| {
+                    store.update(id, |profile| profile.shell_integration_path = index == 0, cx);
+                });
+            },
+            cx,
+        )
+    }
+
+    /// The per-profile font-size stepper. Steps from the *resolved* size, so the first click moves
+    /// relative to what the terminal currently shows rather than jumping to a fixed number; a
+    /// dedicated entry clears the override back to the global size.
+    fn render_profile_font_size_control(
+        &self,
+        profile: &eggie_domain::Profile,
+        language: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let global = self.settings.read(cx).config().font_size;
+        let override_size = profile.appearance.font_size;
+        let effective = override_size.unwrap_or(global);
+        // An unset override displays the inherited value in parentheses, so "follow global" is visible
+        // as a state rather than looking identical to an override that happens to match.
+        let display = match override_size {
+            Some(size) => format!("{size:.0}"),
+            None => format!("({global:.0})"),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.render_stepper(
+                "settings-profile-font-size-dec",
+                "settings-profile-font-size-inc",
+                display,
+                effective > MIN_FONT_SIZE,
+                effective < MAX_FONT_SIZE,
+                56.,
+                move |settings, dir, cx| {
+                    let Some(id) = settings.selected_profile else {
+                        return;
+                    };
+                    let next = (effective + f32::from(dir)).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                    settings.profile_store.update(cx, |store, cx| {
+                        store.update(id, |profile| profile.appearance.font_size = Some(next), cx);
+                    });
+                },
+                cx,
+            ))
+            .when(override_size.is_some(), |element| {
+                element.child(
+                    div()
+                        .id("settings-profile-font-size-clear")
+                        .flex()
+                        .items_center()
+                        .h(px(30.))
+                        .px_2()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(rgb(self.colors.muted))
+                        .hover(|element| {
+                            element
+                                .bg(rgb(self.colors.panel_alt))
+                                .text_color(rgb(self.colors.text))
+                        })
+                        .on_click(cx.listener(|settings, _, _, cx| {
+                            let Some(id) = settings.selected_profile else {
+                                return;
+                            };
+                            settings.profile_store.update(cx, |store, cx| {
+                                store.update(
+                                    id,
+                                    |profile| profile.appearance.font_size = None,
+                                    cx,
+                                );
+                            });
+                        }))
+                        .child(language.profile_appearance_inherit()),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The badge color picker: a swatch that opens a small palette popover.
+    fn render_profile_badge_control(
+        &self,
+        profile: &eggie_domain::Profile,
+        language: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = profile.badge_color;
+        let dropdown_position = self.badge_picker_bounds.map(|bounds| {
+            point(bounds.left(), bounds.bottom() + px(SELECTOR_DROPDOWN_GAP))
+        });
+        let settings_entity = cx.entity().downgrade();
+        div()
+            .on_children_prepainted(move |children, _, cx| {
+                let Some(bounds) = children.first().copied() else {
+                    return;
+                };
+                let settings_entity = settings_entity.clone();
+                cx.defer(move |cx| {
+                    settings_entity
+                        .update(cx, |settings, cx| {
+                            if settings.badge_picker_bounds != Some(bounds) {
+                                settings.badge_picker_bounds = Some(bounds);
+                                if settings.badge_picker_open {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                });
+            })
+            .relative()
+            .child(
+                div()
+                    .id("settings-profile-badge")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.))
+                    .px_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(self.colors.border))
+                    .bg(rgb(self.colors.panel_alt))
+                    .cursor_pointer()
+                    .hover(|element| element.border_color(rgb(self.colors.accent)))
+                    .on_click(cx.listener(|settings, _, _, cx| {
+                        settings.badge_picker_open = !settings.badge_picker_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(12.))
+                            .rounded_full()
+                            .when_some(current, |element, color| element.bg(rgb(color)))
+                            .when(current.is_none(), |element| {
+                                element.border_1().border_color(rgb(self.colors.border))
+                            }),
+                    )
+                    .child(
+                        div().text_size(px(12.)).child(match current {
+                            Some(color) => format!("#{color:06X}"),
+                            None => language.profile_badge_none().to_owned(),
+                        }),
+                    ),
+            )
+            .when(self.badge_picker_open, |element| {
+                let mut popover = anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(SELECTOR_WINDOW_MARGIN));
+                if let Some(position) = dropdown_position {
+                    popover = popover.position(position);
+                }
+                element.child(
+                    deferred(popover.child(self.render_badge_palette(language, cx))).priority(2),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_badge_palette(&self, language: Language, cx: &mut Context<Self>) -> AnyElement {
+        let mut swatches = div().flex().flex_wrap().gap_2().max_w(px(180.));
+        for (index, color) in BADGE_COLORS.iter().copied().enumerate() {
+            swatches = swatches.child(
+                div()
+                    .id(("settings-badge-swatch", index))
+                    .size(px(20.))
+                    .rounded_full()
+                    .bg(rgb(color))
+                    .cursor_pointer()
+                    .hover(|element| element.border_2().border_color(rgb(self.colors.accent)))
+                    .on_click(cx.listener(move |settings, _, _, cx| {
+                        settings.set_badge_color(Some(color), cx);
+                    })),
+            );
+        }
+        div()
+            .id("settings-badge-palette")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .bg(rgb(self.colors.panel))
+            .shadow_lg()
+            // Floating overlay: block events for the rows painted behind it, so a click in the
+            // popover's padding cannot bubble through and hit a control underneath.
+            .occlude()
+            .on_mouse_down_out(cx.listener(|settings, _, window, cx| {
+                cx.defer_in(window, |settings, _, cx| {
+                    if settings.badge_picker_open {
+                        settings.badge_picker_open = false;
+                        cx.notify();
+                    }
+                });
+                let _ = settings;
+            }))
+            .child(swatches)
+            .child(
+                div()
+                    .id("settings-badge-clear")
+                    .flex()
+                    .items_center()
+                    .h(px(26.))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(self.colors.muted))
+                    .hover(|element| {
+                        element
+                            .bg(rgb(self.colors.panel_alt))
+                            .text_color(rgb(self.colors.text))
+                    })
+                    .on_click(cx.listener(|settings, _, _, cx| {
+                        settings.set_badge_color(None, cx);
+                    }))
+                    .child(language.profile_badge_none()),
+            )
+            .into_any_element()
+    }
+
+    fn set_badge_color(&mut self, color: Option<u32>, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_profile else {
+            return;
+        };
+        self.profile_store.update(cx, |store, cx| {
+            store.update(id, |profile| profile.badge_color = color, cx);
+        });
+        self.badge_picker_open = false;
+        cx.notify();
     }
 
     fn render_keybindings_section(
@@ -2456,7 +3867,8 @@ impl SettingsWindow {
 
         vec![
             header,
-            settings_section(language.keybindings_section(), rows, colors),
+            // Same reason as the General pane: the pane title already reads "Keyboard Shortcuts".
+            settings_section(None, rows, colors),
         ]
     }
 
@@ -2794,12 +4206,13 @@ impl gpui::Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = self.settings.read(cx).config().clone();
         let system_is_dark = is_dark_appearance(window.appearance());
-        // The whole settings window follows the *resolved* theme: hovering a theme option repaints
-        // the entire window (chrome + preview swatch) alongside the real terminals, so the preview is
-        // truly WYSIWYG. `resolved_theme` returns the live hover preview if one is active, otherwise
-        // the persisted theme.
-        let theme = self.settings.read(cx).resolved_theme(system_is_dark);
-        self.colors = UiColors::from_theme(theme);
+        // The settings window's own chrome follows the resolved *interface* theme, while the preview
+        // swatch below follows the resolved *terminal* theme — so hovering an interface option repaints
+        // the window, hovering a terminal option repaints only the swatch, and each preview shows
+        // exactly what committing it would do.
+        let interface_theme = self.settings.read(cx).resolved_interface_theme(system_is_dark);
+        let terminal_theme = self.settings.read(cx).resolved_terminal_theme(system_is_dark);
+        self.colors = UiColors::from_theme(interface_theme);
 
         let language = config.language;
         // Keep every input field's edit-menu labels in sync with the current language.
@@ -2809,25 +4222,58 @@ impl gpui::Render for SettingsWindow {
             .update(cx, |input, _| input.set_language(language));
         self.shell_args_input
             .update(cx, |input, _| input.set_language(language));
+        for input in self.profile_input_list() {
+            input.update(cx, |input, _| input.set_language(language));
+        }
+        // Re-seed the profile fields whenever the selection has moved — including when it moved because
+        // the selected profile was deleted elsewhere (reading the store here is what subscribes this
+        // view to it, so that mutation repaints us and the stale id resolves to the built-in Default).
+        self.sync_profile_inputs(cx);
         let language_control = self.render_language_control(language, cx);
         let bell_control = self.render_bell_control(config.bell_mode, window, cx);
         let mode_control = self.render_mode_control(config.theme_mode, cx);
-        let dark_selector = self.render_selector(
-            "dark-theme-selector",
-            config.dark_theme.clone(),
+        let interface_dark_selector = self.render_selector(
+            "interface-dark-theme-selector",
+            config.interface_dark_theme.clone(),
             None,
-            SelectorKind::DarkTheme,
+            SelectorKind::InterfaceDark,
             window,
             cx,
         );
-        let light_selector = self.render_selector(
-            "light-theme-selector",
-            config.light_theme.clone(),
+        let interface_light_selector = self.render_selector(
+            "interface-light-theme-selector",
+            config.interface_light_theme.clone(),
             None,
-            SelectorKind::LightTheme,
+            SelectorKind::InterfaceLight,
             window,
             cx,
         );
+        let terminal_theme_source_control =
+            self.render_terminal_theme_source_control(config.terminal_theme_source, cx);
+        // Only built when the terminal uses its own pair: under `FollowInterface` these two rows are
+        // omitted entirely rather than shown disabled, so the panel states what is actually in effect.
+        let terminal_theme_selectors = (config.terminal_theme_source
+            == TerminalThemeSource::Custom)
+            .then(|| {
+                (
+                    self.render_selector(
+                        "terminal-dark-theme-selector",
+                        config.terminal_dark_theme.clone(),
+                        None,
+                        SelectorKind::TerminalDark,
+                        window,
+                        cx,
+                    ),
+                    self.render_selector(
+                        "terminal-light-theme-selector",
+                        config.terminal_light_theme.clone(),
+                        None,
+                        SelectorKind::TerminalLight,
+                        window,
+                        cx,
+                    ),
+                )
+            });
         let font_selector = self.render_selector(
             "font-selector",
             config.font_family.clone(),
@@ -2907,6 +4353,58 @@ impl gpui::Render for SettingsWindow {
         let cursor_blink_control = self.render_cursor_blink_control(config.cursor_blink, cx);
         let minimum_contrast_control =
             self.render_minimum_contrast_control(config.minimum_contrast, cx);
+        // The Theme section, assembled here rather than inline because two of its rows are conditional
+        // and the section list sits several levels deep in the element tree.
+        //
+        // Order tells the story of the layering: the interface pair first (it decides the chrome, and
+        // the terminal follows it by default), then the terminal's own source and — only when it has
+        // one — its pair.
+        let mut theme_rows = vec![
+            settings_row(
+                language.theme_row(),
+                language.theme_description(),
+                mode_control,
+                self.colors,
+            ),
+            settings_row(
+                language.interface_dark_theme_row(),
+                language.interface_dark_theme_description(),
+                interface_dark_selector,
+                self.colors,
+            ),
+            settings_row(
+                language.interface_light_theme_row(),
+                language.interface_light_theme_description(),
+                interface_light_selector,
+                self.colors,
+            ),
+            settings_row(
+                language.terminal_theme_source_row(),
+                language.terminal_theme_source_description(),
+                terminal_theme_source_control,
+                self.colors,
+            ),
+        ];
+        if let Some((terminal_dark_selector, terminal_light_selector)) = terminal_theme_selectors {
+            theme_rows.push(settings_row(
+                language.terminal_dark_theme_row(),
+                language.terminal_dark_theme_description(),
+                terminal_dark_selector,
+                self.colors,
+            ));
+            theme_rows.push(settings_row(
+                language.terminal_light_theme_row(),
+                language.terminal_light_theme_description(),
+                terminal_light_selector,
+                self.colors,
+            ));
+        }
+        theme_rows.push(settings_row(
+            language.minimum_contrast_row(),
+            language.minimum_contrast_description(),
+            minimum_contrast_control,
+            self.colors,
+        ));
         let horizontal_padding_control = self.render_terminal_padding_control(
             PaddingAxis::Horizontal,
             config.terminal_padding_x,
@@ -2952,9 +4450,13 @@ impl gpui::Render for SettingsWindow {
             self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
         let shell_args_control =
             self.render_shell_input_control("settings-shell-args", &self.shell_args_input);
-        let shell_integration_path_control =
-            self.render_shell_integration_path_control(config.shell_integration_path, cx);
-        let terminal_preview = self.render_terminal_preview(&config, theme);
+        let shell_integration_path_control = self.render_shell_integration_path_control(
+            // Read from the Default profile, which owns this field — `config` keeps only the
+            // downgrade mirror, so reading it would show a stale value after an edit elsewhere.
+            self.profile_store.read(cx).default_profile().shell_integration_path,
+            cx,
+        );
+        let terminal_preview = self.render_terminal_preview(&config, terminal_theme);
 
         div()
             .relative()
@@ -3026,6 +4528,11 @@ impl gpui::Render for SettingsWindow {
                                         "settings-sidebar-appearance",
                                         language.appearance_sidebar(),
                                         IconName::Appearance,
+                                    ),
+                                    SettingsSection::Profiles => (
+                                        "settings-sidebar-profiles",
+                                        language.profiles_sidebar(),
+                                        IconName::Terminal,
                                     ),
                                     SettingsSection::Keybindings => (
                                         "settings-sidebar-keybindings",
@@ -3119,6 +4626,7 @@ impl gpui::Render for SettingsWindow {
                                                                     .child(match self.selected_section {
                                                                         SettingsSection::General => language.general_section(),
                                                                         SettingsSection::Appearance => language.appearance_section(),
+                                                                        SettingsSection::Profiles => language.profiles_section(),
                                                                         SettingsSection::Keybindings => language.keybindings_section(),
                                                                         SettingsSection::Advanced => language.advanced_section(),
                                                                         SettingsSection::About => language.about_eggie(),
@@ -3129,7 +4637,10 @@ impl gpui::Render for SettingsWindow {
                                                     .children(match self.selected_section {
                                                         SettingsSection::General => vec![
                                                             settings_section(
-                                                                language.general_section(),
+                                                                // The pane title above already reads
+                                                                // "General"; a caption here would
+                                                                // repeat it on the very next line.
+                                                                None,
                                                                 vec![settings_row(
                                                                     language.language_row(),
                                                                     language.language_description(),
@@ -3139,7 +4650,7 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.terminal_behavior_section(),
+                                                                Some(language.terminal_behavior_section()),
                                                                 vec![settings_row(
                                                                     language.scrollback_lines_row(),
                                                                     language.scrollback_lines_description(),
@@ -3151,37 +4662,12 @@ impl gpui::Render for SettingsWindow {
                                                         ],
                                                         SettingsSection::Appearance => vec![
                                                             settings_section(
-                                                                language.theme_section(),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.theme_row(),
-                                                                        language.theme_description(),
-                                                                        mode_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.dark_theme_row(),
-                                                                        language.dark_theme_description(),
-                                                                        dark_selector,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.light_theme_row(),
-                                                                        language.light_theme_description(),
-                                                                        light_selector,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.minimum_contrast_row(),
-                                                                        language.minimum_contrast_description(),
-                                                                        minimum_contrast_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
+                                                                Some(language.theme_section()),
+                                                                theme_rows,
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.terminal_text_section(),
+                                                                Some(language.terminal_text_section()),
                                                                 vec![
                                                                     settings_row(
                                                                         language.font_row(),
@@ -3259,7 +4745,7 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.cursor_section(),
+                                                                Some(language.cursor_section()),
                                                                 vec![
                                                                     settings_row(
                                                                         language.cursor_shape_row(),
@@ -3277,7 +4763,7 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.terminal_layout_section(),
+                                                                Some(language.terminal_layout_section()),
                                                                 vec![
                                                                     settings_row(
                                                                         language.horizontal_padding_row(),
@@ -3295,14 +4781,14 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.font_metrics_section(),
+                                                                Some(language.font_metrics_section()),
                                                                 metric_rows,
                                                                 self.colors,
                                                             ),
                                                         ],
                                                         SettingsSection::Advanced => vec![
                                                             settings_section(
-                                                                language.progress_indicators_section(),
+                                                                Some(language.progress_indicators_section()),
                                                                 vec![
                                                                     settings_row(
                                                                         language.completed_timeout_row(),
@@ -3320,7 +4806,7 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.terminal_behavior_section(),
+                                                                Some(language.terminal_behavior_section()),
                                                                 vec![
                                                                     settings_row(
                                                                         language.detect_urls_row(),
@@ -3344,7 +4830,7 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.terminal_security_section(),
+                                                                Some(language.terminal_security_section()),
                                                                 vec![settings_row(
                                                                     language.osc_clipboard_read_row(),
                                                                     language.osc_clipboard_read_description(),
@@ -3354,7 +4840,7 @@ impl gpui::Render for SettingsWindow {
                                                                 self.colors,
                                                             ),
                                                             settings_section(
-                                                                language.shell_section(),
+                                                                Some(language.shell_section()),
                                                                 vec![
                                                                     settings_row(
                                                                         language.shell_program_row(),
@@ -3381,6 +4867,9 @@ impl gpui::Render for SettingsWindow {
                                                         SettingsSection::Keybindings => {
                                                             self.render_keybindings_section(language, cx)
                                                         }
+                                                        SettingsSection::Profiles => {
+                                                            self.render_profiles_section(language, window, cx)
+                                                        }
                                                         SettingsSection::About => {
                                                             self.render_about_section(language, cx)
                                                         }
@@ -3396,7 +4885,45 @@ impl gpui::Render for SettingsWindow {
     }
 }
 
-fn settings_section(title: &'static str, rows: Vec<AnyElement>, colors: UiColors) -> AnyElement {
+/// A settings section: an optional caption above a rounded card holding the rows.
+///
+/// The caption sits *outside* the card, matching how macOS and iOS Settings group their rows. Pass
+/// `None` when the pane title already says the same thing — the 18px pane title is drawn right above
+/// the first section, so repeating it would put two identical lines next to each other.
+fn settings_section(
+    title: Option<&'static str>,
+    rows: Vec<AnyElement>,
+    colors: UiColors,
+) -> AnyElement {
+    let card = settings_card(rows, colors);
+    let Some(title) = title else {
+        return card;
+    };
+    div()
+        .flex()
+        .flex_none()
+        .flex_col()
+        // Tighter than the `gap_5` between sections, so a caption reads as belonging to the card
+        // below it rather than floating between two cards.
+        .gap_2()
+        .child(
+            div()
+                // Aligns the caption with the card's rounded corner instead of its outer edge.
+                .px_1()
+                .text_size(px(12.))
+                .text_color(rgb(colors.muted))
+                .child(title),
+        )
+        .child(card)
+        .into_any_element()
+}
+
+/// The rounded card every settings section is built from: one border, one background, and a
+/// separator between rows but never after the last one.
+///
+/// `overflow_hidden` is load-bearing — a row's background is square, so without it the first and
+/// last rows paint over the card's rounded corners.
+fn settings_card(rows: Vec<AnyElement>, colors: UiColors) -> AnyElement {
     let row_count = rows.len();
     rows.into_iter()
         .enumerate()
@@ -3409,17 +4936,7 @@ fn settings_section(title: &'static str, rows: Vec<AnyElement>, colors: UiColors
                 .rounded_xl()
                 .border_1()
                 .border_color(rgb(colors.border))
-                .bg(rgb(colors.panel))
-                .child(
-                    div()
-                        .px_4()
-                        .py_3()
-                        .text_size(px(12.))
-                        .text_color(rgb(colors.muted))
-                        .border_b_1()
-                        .border_color(rgb(colors.border))
-                        .child(title),
-                ),
+                .bg(rgb(colors.panel)),
             |section, (index, row)| {
                 section.child(
                     div()
@@ -3479,7 +4996,60 @@ fn selector_matches(item: &str, query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::selector_matches;
+    use super::{SelectorKind, selector_matches};
+
+    #[test]
+    fn selector_indices_are_a_bijection_onto_the_bounds_array() {
+        // `index()`, `ALL`, and the `selector_bounds` array length are three hand-maintained facts that
+        // must agree. They have drifted before (see CAPABILITIES_TODO), and the failure mode is a panic
+        // when the dropdown reads or writes its bounds slot — invisible until that selector is opened.
+        let mut seen = [false; SelectorKind::ALL.len()];
+        for kind in SelectorKind::ALL {
+            let index = kind.index();
+            assert!(
+                index < seen.len(),
+                "{kind:?} indexes {index}, past the end of selector_bounds ({})",
+                seen.len()
+            );
+            assert!(!seen[index], "{kind:?} reuses index {index}");
+            seen[index] = true;
+        }
+        assert!(
+            seen.into_iter().all(|hit| hit),
+            "every bounds slot must be claimed by exactly one selector"
+        );
+    }
+
+    #[test]
+    fn every_theme_selector_belongs_to_exactly_one_half() {
+        // Each theme slot offers one half of the catalog, so `is_dark` has to partition them. A font
+        // selector is not a theme selector and never previews.
+        for kind in SelectorKind::ALL {
+            if kind.is_font() {
+                assert!(!kind.is_theme(), "{kind:?} cannot be both a font and a theme selector");
+            } else {
+                assert!(kind.is_theme(), "{kind:?} must be a theme selector");
+            }
+        }
+        assert!(SelectorKind::InterfaceDark.is_dark());
+        assert!(!SelectorKind::InterfaceLight.is_dark());
+        assert!(SelectorKind::TerminalDark.is_dark());
+        assert!(!SelectorKind::TerminalLight.is_dark());
+        assert!(SelectorKind::ProfileTerminalDark.is_dark());
+        assert!(!SelectorKind::ProfileTerminalLight.is_dark());
+    }
+
+    #[test]
+    fn only_theme_selectors_have_a_preview_slot() {
+        let profile_id = eggie_domain::ProfileId::new_v4();
+        for kind in SelectorKind::ALL {
+            assert_eq!(
+                kind.preview_slot(profile_id).is_some(),
+                kind.is_theme(),
+                "{kind:?}: a preview slot exists exactly for theme selectors"
+            );
+        }
+    }
 
     #[test]
     fn selector_search_is_case_insensitive_and_supports_partial_matches() {
