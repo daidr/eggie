@@ -6,23 +6,24 @@ use crate::{
     icons::{IconName, icon, icon_sized},
     project_store::ProjectStore,
     settings::{
-        AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, DEFAULT_DARK_THEME,
-        DEFAULT_LIGHT_THEME, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS,
-        MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST,
-        MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES, MIN_TERMINAL_PADDING,
-        SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme, TerminalThemeSource, ThemeMode,
-        UiColors, UpdateChannel, minimum_contrast_rgb, theme_catalog,
+        AppSettings, BellMode, CursorBlink, CursorShapeSetting, DEFAULT_DARK_THEME,
+        DEFAULT_LIGHT_THEME, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST,
+        MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING, MIN_FONT_SIZE,
+        MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
+        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme,
+        TerminalThemeSource, ThemeMode, UiColors, UpdateChannel, minimum_contrast_rgb,
+        theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
 use eggie_daemon::DaemonClient;
 use eggie_update::UpdateState;
 use gpui::{
-    Anchor, AnyElement, App, Bounds, Context, Entity, Image, ImageFormat, Menu,
-    MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
-    actions, anchored, canvas, deferred, div, img, linear_color_stop, linear_gradient, point,
-    prelude::*, px, rgb, size,
+    Anchor, AnyElement, App, Bounds, Context, Entity, Image, ImageFormat, Menu, MenuItem,
+    MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, actions, anchored,
+    canvas, deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb,
+    size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -239,7 +240,10 @@ impl SelectorKind {
 
     /// The preview slot this selector drives, so a hover resolves through the same layering the
     /// committed value would. Profile slots carry the profile being edited.
-    fn preview_slot(self, profile_id: eggie_domain::ProfileId) -> Option<crate::settings::PreviewSlot> {
+    fn preview_slot(
+        self,
+        profile_id: eggie_domain::ProfileId,
+    ) -> Option<crate::settings::PreviewSlot> {
         use crate::settings::PreviewSlot;
         match self {
             Self::InterfaceDark => Some(PreviewSlot::InterfaceDark),
@@ -248,7 +252,10 @@ impl SelectorKind {
             Self::TerminalLight => Some(PreviewSlot::TerminalLight),
             Self::ProfileTerminalDark => Some(PreviewSlot::ProfileTerminalDark(profile_id)),
             Self::ProfileTerminalLight => Some(PreviewSlot::ProfileTerminalLight(profile_id)),
-            Self::Font | Self::FontBold | Self::FontItalic | Self::FontBoldItalic
+            Self::Font
+            | Self::FontBold
+            | Self::FontItalic
+            | Self::FontBoldItalic
             | Self::ProfileFont => None,
         }
     }
@@ -468,7 +475,9 @@ pub(crate) fn install(
     cx.on_action(|_: &About, _cx| crate::system_menu::show_about_panel());
     cx.on_action(|_: &CloseAllWindows, cx| {
         for handle in cx.windows() {
-            handle.update(cx, |_, window, _| window.remove_window()).ok();
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
         }
     });
     cx.on_action(|_: &HelpDocs, cx| cx.open_url(EGGIE_HELP_URL));
@@ -478,7 +487,12 @@ pub(crate) fn install(
     cx.on_action(move |_: &ToggleSecureKeyboardEntry, cx| {
         crate::system_menu::toggle_secure_input();
         let config = settings_for_secure_input.read(cx).config().clone();
-        crate::keybindings::rebuild_keymap(&config, cx);
+        let lua = settings_for_secure_input
+            .read(cx)
+            .lua_config()
+            .registered
+            .clone();
+        crate::keybindings::rebuild_keymap(&config, &lua, cx);
         cx.set_menus(build_menus(config.language));
     });
     // Build the keymap from settings (defaults + user overrides). This also
@@ -486,7 +500,8 @@ pub(crate) fn install(
     // binding-index tiebreak. Action handlers above are registered exactly once
     // and are intentionally *not* rebuilt when the keymap changes.
     let config = settings.read(cx).config().clone();
-    crate::keybindings::rebuild_keymap(&config, cx);
+    let lua = settings.read(cx).lua_config().registered.clone();
+    crate::keybindings::rebuild_keymap(&config, &lua, cx);
     let language = config.language;
     cx.set_menus(build_menus(language));
 
@@ -496,7 +511,12 @@ pub(crate) fn install(
         // Rebuild the keymap first: `set_menus` snapshots the current keymap to resolve each
         // menu item's shortcut, so it must run *after* the keymap reflects this change or the
         // menu bar lags one edit behind.
-        crate::keybindings::rebuild_keymap(&config, cx);
+        let lua = settings_for_observer
+            .read(cx)
+            .lua_config()
+            .registered
+            .clone();
+        crate::keybindings::rebuild_keymap(&config, &lua, cx);
         cx.set_menus(build_menus(config.language));
     })
     .detach();
@@ -546,8 +566,12 @@ fn build_menus(language: Language) -> Vec<Menu> {
             MenuItem::os_action(language.paste(), TerminalPaste, OsAction::Paste)
                 .icon("doc.on.clipboard"),
             MenuItem::separator(),
-            MenuItem::os_action(language.select_all(), TerminalSelectAll, OsAction::SelectAll)
-                .icon("text.justify"),
+            MenuItem::os_action(
+                language.select_all(),
+                TerminalSelectAll,
+                OsAction::SelectAll,
+            )
+            .icon("text.justify"),
             MenuItem::separator(),
             MenuItem::action(language.find_menu_item(), TerminalFind).icon("magnifyingglass"),
             MenuItem::action(language.action_find_next(), FindNext).icon("chevron.down"),
@@ -592,15 +616,12 @@ fn build_menus(language: Language) -> Vec<Menu> {
             MenuItem::action(language.action_next_tab(), NextTab).icon("chevron.right"),
             MenuItem::action(language.action_prev_tab(), PrevTab).icon("chevron.left"),
         ]),
-        Menu::new(language.help_menu())
-            .help()
-            .items([
-                MenuItem::action(language.help_docs_menu_item(), HelpDocs)
-                    .icon("questionmark.circle"),
-                MenuItem::separator(),
-                MenuItem::action(language.check_for_updates_menu_item(), CheckForUpdates)
-                    .icon("arrow.down.circle"),
-            ]),
+        Menu::new(language.help_menu()).help().items([
+            MenuItem::action(language.help_docs_menu_item(), HelpDocs).icon("questionmark.circle"),
+            MenuItem::separator(),
+            MenuItem::action(language.check_for_updates_menu_item(), CheckForUpdates)
+                .icon("arrow.down.circle"),
+        ]),
     ]
 }
 
@@ -852,8 +873,12 @@ impl SettingsWindow {
         let colors = UiColors::from_theme(theme);
         let input_style = settings_input_style(colors);
         let selector_search_input = cx.new(|cx| TextInput::new(window, cx, input_style));
-        cx.subscribe_in(&selector_search_input, window, Self::on_selector_search_event)
-            .detach();
+        cx.subscribe_in(
+            &selector_search_input,
+            window,
+            Self::on_selector_search_event,
+        )
+        .detach();
         let shell_program_input = cx.new(|cx| TextInput::new(window, cx, input_style));
         let shell_args_input = cx.new(|cx| TextInput::new(window, cx, input_style));
         // The Profiles pane's inputs. Created here (not lazily on first open) so the subscriptions are
@@ -1052,6 +1077,19 @@ impl SettingsWindow {
         }
     }
 
+    fn lua_manages_selector(&self, kind: SelectorKind, cx: &Context<Self>) -> bool {
+        let settings = self.settings.read(cx);
+        let lua = &settings.lua_config().registered;
+        match kind {
+            SelectorKind::InterfaceDark => lua.ui_dark_theme.is_some(),
+            SelectorKind::InterfaceLight => lua.ui_light_theme.is_some(),
+            SelectorKind::TerminalDark => lua.terminal_dark_theme.is_some(),
+            SelectorKind::TerminalLight => lua.terminal_light_theme.is_some(),
+            SelectorKind::Font => lua.terminal_font.is_some(),
+            _ => false,
+        }
+    }
+
     /// Write `choice` to whatever `kind` edits — a profile override or a global setting. The single
     /// commit path, shared by clicking an option and by Enter-to-commit-first-match, so a new slot
     /// cannot land in one and be forgotten in the other.
@@ -1061,6 +1099,9 @@ impl SettingsWindow {
         choice: String,
         cx: &mut Context<Self>,
     ) {
+        if self.lua_manages_selector(kind, cx) {
+            return;
+        }
         if kind.is_profile() {
             self.apply_profile_selector_choice(kind, Some(choice), cx);
             return;
@@ -1075,9 +1116,7 @@ impl SettingsWindow {
                     SelectorKind::Font => config.font_family = choice.clone(),
                     SelectorKind::FontBold => config.font_family_bold = choice.clone(),
                     SelectorKind::FontItalic => config.font_family_italic = choice.clone(),
-                    SelectorKind::FontBoldItalic => {
-                        config.font_family_bold_italic = choice.clone()
-                    }
+                    SelectorKind::FontBoldItalic => config.font_family_bold_italic = choice.clone(),
                     // Handled above: these write to the profile store, not to AppSettings.
                     SelectorKind::ProfileTerminalDark
                     | SelectorKind::ProfileTerminalLight
@@ -1093,7 +1132,12 @@ impl SettingsWindow {
         let Some(kind) = self.open_selector else {
             return;
         };
-        let query = self.selector_search_input.read(cx).content().trim().to_owned();
+        let query = self
+            .selector_search_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
         let Some(choice) = self
             .selector_names(kind)
             .iter()
@@ -1170,7 +1214,10 @@ impl SettingsWindow {
     /// Default, and every stale selection (deleted in this window, or in another one) lands there
     /// rather than leaving the pane blank.
     fn selected_profile_id(&self, cx: &App) -> eggie_domain::ProfileId {
-        self.profile_store.read(cx).resolve(self.selected_profile).id
+        self.profile_store
+            .read(cx)
+            .resolve(self.selected_profile)
+            .id
     }
 
     /// Re-seed the profile inputs from the store when the selection has moved.
@@ -1346,11 +1393,8 @@ impl SettingsWindow {
         }
         // The three remote fields build one value, so any of them moving re-derives it from all three.
         if changed(5) || changed(6) || changed(7) {
-            edited.remote = crate::profile_editor::parse_remote(
-                &current[5],
-                &current[6],
-                &current[7],
-            );
+            edited.remote =
+                crate::profile_editor::parse_remote(&current[5], &current[6], &current[7]);
         }
         // Baseline moves only now, and only for text that was actually consumed above. Set before the
         // no-op return below so a keystroke that parses to the same profile (typing then deleting a
@@ -1464,6 +1508,10 @@ impl SettingsWindow {
     /// [`AppSettings::use_custom_terminal_themes`]) so the toggle itself changes nothing on screen.
     /// Going back keeps the custom pair on disk, so toggling twice does not discard the choice.
     fn set_terminal_theme_source(&mut self, custom: bool, cx: &mut Context<Self>) {
+        let lua = &self.settings.read(cx).lua_config().registered;
+        if lua.terminal_light_theme.is_some() || lua.terminal_dark_theme.is_some() {
+            return;
+        }
         self.settings.update(cx, |settings, cx| {
             settings.update(
                 |config| {
@@ -1482,6 +1530,9 @@ impl SettingsWindow {
     /// preview), attributed to `kind`'s slot so it resolves through the same layering the committed
     /// value would. No-op if the name doesn't resolve to a known theme, or if `kind` picks a font.
     fn preview_theme(&mut self, kind: SelectorKind, name: &str, cx: &mut Context<Self>) {
+        if self.lua_manages_selector(kind, cx) {
+            return;
+        }
         let profile_id = self.selected_profile_id(cx);
         let Some(slot) = kind.preview_slot(profile_id) else {
             return;
@@ -1541,8 +1592,9 @@ impl SettingsWindow {
         });
         // Re-check against the newly selected channel's feed so a switch is
         // reflected immediately (silent: a failure just stays quiet).
-        self.updates
-            .update(cx, |controller, cx| controller.check(true, channel.slug(), cx));
+        self.updates.update(cx, |controller, cx| {
+            controller.check(true, channel.slug(), cx)
+        });
     }
 
     fn set_ligatures(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1567,9 +1619,8 @@ impl SettingsWindow {
         self.settings.update(cx, |settings, cx| {
             settings.update(
                 |settings| {
-                    settings.font_thicken_strength = (i32::from(settings.font_thicken_strength)
-                        + delta)
-                        .clamp(0, 255) as u8;
+                    settings.font_thicken_strength =
+                        (i32::from(settings.font_thicken_strength) + delta).clamp(0, 255) as u8;
                 },
                 cx,
             )
@@ -1618,6 +1669,16 @@ impl SettingsWindow {
     }
 
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if self
+            .settings
+            .read(cx)
+            .lua_config()
+            .registered
+            .terminal_font
+            .is_some()
+        {
+            return;
+        }
         self.settings.update(cx, |settings, cx| {
             settings.update(
                 |settings| settings.font_size = (settings.font_size + delta).round(),
@@ -1711,10 +1772,8 @@ impl SettingsWindow {
         self.settings.update(cx, |settings, cx| {
             settings.update(
                 |settings| {
-                    let next = (settings.scrollback_lines as i64 + delta).clamp(
-                        MIN_SCROLLBACK_LINES as i64,
-                        MAX_SCROLLBACK_LINES as i64,
-                    );
+                    let next = (settings.scrollback_lines as i64 + delta)
+                        .clamp(MIN_SCROLLBACK_LINES as i64, MAX_SCROLLBACK_LINES as i64);
                     settings.scrollback_lines = next as usize;
                 },
                 cx,
@@ -1765,9 +1824,9 @@ impl SettingsWindow {
                                     .bg(rgb(self.colors.background))
                                     .text_color(rgb(self.colors.accent))
                             })
-                            .on_click(cx.listener(move |settings, _, _, cx| {
-                                on_pick(settings, index, cx)
-                            }))
+                            .on_click(
+                                cx.listener(move |settings, _, _, cx| on_pick(settings, index, cx)),
+                            )
                             .child(label),
                     )
                 },
@@ -1812,9 +1871,7 @@ impl SettingsWindow {
                 .when(enabled, |element| {
                     element
                         .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, _, cx| {
-                            on_step(settings, dir, cx)
-                        }))
+                        .on_click(cx.listener(move |settings, _, _, cx| on_step(settings, dir, cx)))
                 })
                 .child(label)
         };
@@ -2024,37 +2081,37 @@ impl SettingsWindow {
         language: Language,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let options = BellMode::ALL.into_iter().fold(
-            div().flex().flex_col().py_1(),
-            |list, mode| {
-                let is_selected = mode == selected;
-                list.child(
-                    div()
-                        .id(SharedString::from(format!("bell-mode-{}", mode.slug())))
-                        .flex()
-                        .items_center()
-                        .flex_none()
-                        .h(px(BELL_DROPDOWN_ROW_HEIGHT))
-                        .mx_1()
-                        .px_3()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(is_selected, |element| {
-                            element
-                                .bg(rgb(self.colors.panel_alt))
-                                .text_color(rgb(self.colors.accent))
-                        })
-                        .hover(|element| element.bg(rgb(self.colors.panel_alt)))
-                        .on_click(cx.listener(move |settings, _, window, cx| {
-                            settings.set_bell_mode(mode, cx);
-                            settings.bell_dropdown_open = false;
-                            let _ = window;
-                            cx.notify();
-                        }))
-                        .child(Self::bell_mode_label(language, mode)),
-                )
-            },
-        );
+        let options =
+            BellMode::ALL
+                .into_iter()
+                .fold(div().flex().flex_col().py_1(), |list, mode| {
+                    let is_selected = mode == selected;
+                    list.child(
+                        div()
+                            .id(SharedString::from(format!("bell-mode-{}", mode.slug())))
+                            .flex()
+                            .items_center()
+                            .flex_none()
+                            .h(px(BELL_DROPDOWN_ROW_HEIGHT))
+                            .mx_1()
+                            .px_3()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(is_selected, |element| {
+                                element
+                                    .bg(rgb(self.colors.panel_alt))
+                                    .text_color(rgb(self.colors.accent))
+                            })
+                            .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                            .on_click(cx.listener(move |settings, _, window, cx| {
+                                settings.set_bell_mode(mode, cx);
+                                settings.bell_dropdown_open = false;
+                                let _ = window;
+                                cx.notify();
+                            }))
+                            .child(Self::bell_mode_label(language, mode)),
+                    )
+                });
         div()
             .id("bell-mode-dropdown")
             .flex()
@@ -2451,11 +2508,7 @@ impl SettingsWindow {
         )
     }
 
-    fn render_language_control(
-        &self,
-        selected: Language,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_language_control(&self, selected: Language, cx: &mut Context<Self>) -> AnyElement {
         let options = Language::ALL
             .into_iter()
             .map(|language| {
@@ -2483,6 +2536,7 @@ impl SettingsWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let managed = self.lua_manages_selector(kind, cx);
         let dropdown_position = self.selector_dropdown_position(kind, window);
         let selector = cx.entity().downgrade();
         div()
@@ -2522,9 +2576,15 @@ impl SettingsWindow {
                     .border_1()
                     .border_color(rgb(self.colors.border))
                     .bg(rgb(self.colors.panel_alt))
-                    .cursor_pointer()
-                    .hover(|element| element.border_color(rgb(self.colors.accent)))
+                    .when(!managed, |element| {
+                        element
+                            .cursor_pointer()
+                            .hover(|element| element.border_color(rgb(self.colors.accent)))
+                    })
                     .on_click(cx.listener(move |settings, _, window, cx| {
+                        if settings.lua_manages_selector(kind, cx) {
+                            return;
+                        }
                         if settings.open_selector == Some(kind) {
                             settings.open_selector = None;
                             settings.clear_theme_preview(cx);
@@ -2559,8 +2619,7 @@ impl SettingsWindow {
                             settings
                                 .selector_scroll_handle
                                 .set_offset(point(px(0.), px(0.)));
-                            let handle =
-                                settings.selector_search_input.read(cx).focus_handle();
+                            let handle = settings.selector_search_input.read(cx).focus_handle();
                             handle.focus(window, cx);
                         }
                         cx.notify();
@@ -2573,7 +2632,11 @@ impl SettingsWindow {
                             .when_some(font_family, |element, family| {
                                 element.font_family(SharedString::from(family))
                             })
-                            .child(value),
+                            .child(if managed {
+                                format!("{value} · init.lua")
+                            } else {
+                                value
+                            }),
                     )
                     .child(
                         div()
@@ -2661,7 +2724,12 @@ impl SettingsWindow {
             }
         };
         let items = self.selector_names(kind).to_vec();
-        let query_owned = self.selector_search_input.read(cx).content().trim().to_owned();
+        let query_owned = self
+            .selector_search_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
         let items = items
             .into_iter()
             .filter(|item| selector_matches(item, &query_owned))
@@ -2978,9 +3046,12 @@ impl SettingsWindow {
 
     fn reset_binding(&mut self, id: String, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
-            settings.update(|config| {
-                config.keybindings.remove(&id);
-            }, cx)
+            settings.update(
+                |config| {
+                    config.keybindings.remove(&id);
+                },
+                cx,
+            )
         });
     }
 
@@ -3059,43 +3130,41 @@ impl SettingsWindow {
                         env!("CARGO_PKG_VERSION")
                     )),
             )
-            .child(
-                div().pt_2().child(crate::update_window::button(
-                    language.check_for_updates_button(),
-                    true,
-                    colors,
-                    cx.listener(|window, _, _, cx| {
-                        let channel = window.settings.read(cx).config().update_channel.slug();
-                        window.updates.update(cx, |controller, cx| {
-                            if matches!(
-                                controller.state(),
-                                UpdateState::Idle | UpdateState::UpToDate | UpdateState::Error(_)
-                            ) {
-                                controller.check(false, channel, cx);
-                            }
-                        });
-                        crate::update_window::open_update_window(
-                            window.updates.clone(),
-                            window.settings.clone(),
-                            cx,
-                        );
-                    }),
-                )),
-            )
+            .child(div().pt_2().child(crate::update_window::button(
+                language.check_for_updates_button(),
+                true,
+                colors,
+                cx.listener(|window, _, _, cx| {
+                    let channel = window.settings.read(cx).config().update_channel.slug();
+                    window.updates.update(cx, |controller, cx| {
+                        if matches!(
+                            controller.state(),
+                            UpdateState::Idle | UpdateState::UpToDate | UpdateState::Error(_)
+                        ) {
+                            controller.check(false, channel, cx);
+                        }
+                    });
+                    crate::update_window::open_update_window(
+                        window.updates.clone(),
+                        window.settings.clone(),
+                        cx,
+                    );
+                }),
+            )))
             .into_any_element();
 
         let metadata = settings_section(
             Some(language.build_info_section()),
             vec![
-                metadata_row(
-                    language.version_row(),
-                    env!("CARGO_PKG_VERSION").to_owned(),
-                ),
+                metadata_row(language.version_row(), env!("CARGO_PKG_VERSION").to_owned()),
                 metadata_row(
                     language.protocol_version_row(),
                     eggie_protocol::PROTOCOL_VERSION.to_string(),
                 ),
-                metadata_row(language.build_date_row(), env!("EGGIE_BUILD_DATE").to_owned()),
+                metadata_row(
+                    language.build_date_row(),
+                    env!("EGGIE_BUILD_DATE").to_owned(),
+                ),
                 metadata_row(language.build_id_row(), env!("EGGIE_BUILD_ID").to_owned()),
                 metadata_row(language.build_mode_row(), build_mode.to_owned()),
             ],
@@ -3303,11 +3372,7 @@ impl SettingsWindow {
             settings_row(
                 language.profile_cwd_row(),
                 language.profile_cwd_description(),
-                self.render_profile_input(
-                    "settings-profile-cwd",
-                    &self.profile_inputs.cwd,
-                    220.,
-                ),
+                self.render_profile_input("settings-profile-cwd", &self.profile_inputs.cwd, 220.),
                 self.colors,
             ),
             settings_row(
@@ -3425,9 +3490,21 @@ impl SettingsWindow {
 
         vec![
             list,
-            settings_section(Some(language.profile_name_row()), vec![name_row], self.colors),
-            settings_section(Some(language.profile_launch_section()), launch_rows, self.colors),
-            settings_section(Some(language.profile_remote_section()), remote_rows, self.colors),
+            settings_section(
+                Some(language.profile_name_row()),
+                vec![name_row],
+                self.colors,
+            ),
+            settings_section(
+                Some(language.profile_launch_section()),
+                launch_rows,
+                self.colors,
+            ),
+            settings_section(
+                Some(language.profile_remote_section()),
+                remote_rows,
+                self.colors,
+            ),
             settings_section(
                 Some(language.profile_appearance_section()),
                 appearance_rows,
@@ -3457,7 +3534,14 @@ impl SettingsWindow {
             .text_size(px(12.))
             .text_color(rgb(self.colors.text))
             .overflow_hidden()
-            .child(div().flex().flex_1().min_w_0().h_full().child(input.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(input.clone()),
+            )
             .into_any_element()
     }
 
@@ -3589,7 +3673,11 @@ impl SettingsWindow {
                     return;
                 };
                 settings.profile_store.update(cx, |store, cx| {
-                    store.update(id, |profile| profile.shell_integration_path = index == 0, cx);
+                    store.update(
+                        id,
+                        |profile| profile.shell_integration_path = index == 0,
+                        cx,
+                    );
                 });
             },
             cx,
@@ -3658,11 +3746,7 @@ impl SettingsWindow {
                                 return;
                             };
                             settings.profile_store.update(cx, |store, cx| {
-                                store.update(
-                                    id,
-                                    |profile| profile.appearance.font_size = None,
-                                    cx,
-                                );
+                                store.update(id, |profile| profile.appearance.font_size = None, cx);
                             });
                         }))
                         .child(language.profile_appearance_inherit()),
@@ -3679,9 +3763,9 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let current = profile.badge_color;
-        let dropdown_position = self.badge_picker_bounds.map(|bounds| {
-            point(bounds.left(), bounds.bottom() + px(SELECTOR_DROPDOWN_GAP))
-        });
+        let dropdown_position = self
+            .badge_picker_bounds
+            .map(|bounds| point(bounds.left(), bounds.bottom() + px(SELECTOR_DROPDOWN_GAP)));
         let settings_entity = cx.entity().downgrade();
         div()
             .on_children_prepainted(move |children, _, cx| {
@@ -3731,12 +3815,10 @@ impl SettingsWindow {
                                 element.border_1().border_color(rgb(self.colors.border))
                             }),
                     )
-                    .child(
-                        div().text_size(px(12.)).child(match current {
-                            Some(color) => format!("#{color:06X}"),
-                            None => language.profile_badge_none().to_owned(),
-                        }),
-                    ),
+                    .child(div().text_size(px(12.)).child(match current {
+                        Some(color) => format!("#{color:06X}"),
+                        None => language.profile_badge_none().to_owned(),
+                    })),
             )
             .when(self.badge_picker_open, |element| {
                 let mut popover = anchored()
@@ -3894,8 +3976,13 @@ impl SettingsWindow {
         let colors = self.colors;
         let id = spec.id;
         let label = (spec.label)(language);
-        let effective = crate::keybindings::effective_keystroke(config, id)
-            .unwrap_or(spec.default_keystroke);
+        let effective =
+            crate::keybindings::effective_keystroke(config, id).unwrap_or(spec.default_keystroke);
+        let lua = &self.settings.read(cx).lua_config().registered;
+        let lua_managed = lua.bindings.iter().any(|operation| match operation {
+            eggie_config::BindingOp::Bind { key, action, .. } => key == effective || action == id,
+            eggie_config::BindingOp::Unbind { key } => key == effective,
+        });
         let is_overridden = config.keybindings.contains_key(id);
         let is_recording = self.recording.as_deref() == Some(id);
         let conflict = if is_recording {
@@ -3911,7 +3998,13 @@ impl SettingsWindow {
                 language.recording_prompt().to_owned()
             }
         } else {
-            crate::keybindings::display_keystroke(effective)
+            let shortcut = crate::command_palette::display_binding(config, lua, id)
+                .unwrap_or_else(|| "Unbound".to_owned());
+            if lua_managed {
+                format!("{shortcut} · init.lua")
+            } else {
+                shortcut
+            }
         };
         let cell_text_color = if conflict.is_some() {
             0xff6b6b
@@ -3940,7 +4033,7 @@ impl SettingsWindow {
             .border_color(rgb(cell_border))
             .text_size(px(13.))
             .text_color(rgb(cell_text_color))
-            .cursor_pointer()
+            .when(!lua_managed, |element| element.cursor_pointer())
             .when(!is_recording, |element| {
                 element.hover(|element| element.bg(rgb(colors.panel_alt)))
             })
@@ -3948,6 +4041,9 @@ impl SettingsWindow {
             .child(cell_text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |settings, _, _, cx| {
+                if lua_managed {
+                    return;
+                }
                 if settings.recording.as_deref() == Some(recorded_id.as_str()) {
                     settings.cancel_recording(cx);
                 } else {
@@ -3956,27 +4052,29 @@ impl SettingsWindow {
             }));
 
         let reset_id = id.to_string();
-        let reset_button = div().flex_none().when(is_overridden, |element| {
-            element.child(
-                div()
-                    .id(SharedString::from(format!("reset-keybind-{id}")))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(28.))
-                    .px_2()
-                    .rounded_md()
-                    .text_size(px(11.))
-                    .text_color(rgb(colors.muted))
-                    .cursor_pointer()
-                    .hover(|element| element.bg(rgb(colors.panel_alt)))
-                    .child(language.reset_to_default())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |settings, _, _, cx| {
-                        settings.reset_binding(reset_id.clone(), cx);
-                    })),
-            )
-        });
+        let reset_button = div()
+            .flex_none()
+            .when(is_overridden && !lua_managed, |element| {
+                element.child(
+                    div()
+                        .id(SharedString::from(format!("reset-keybind-{id}")))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(28.))
+                        .px_2()
+                        .rounded_md()
+                        .text_size(px(11.))
+                        .text_color(rgb(colors.muted))
+                        .cursor_pointer()
+                        .hover(|element| element.bg(rgb(colors.panel_alt)))
+                        .child(language.reset_to_default())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |settings, _, _, cx| {
+                            settings.reset_binding(reset_id.clone(), cx);
+                        })),
+                )
+            });
 
         div()
             .flex()
@@ -4000,12 +4098,23 @@ impl SettingsWindow {
     }
 
     fn render_font_size_control(&self, font_size: f32, cx: &mut Context<Self>) -> AnyElement {
+        let managed = self
+            .settings
+            .read(cx)
+            .lua_config()
+            .registered
+            .terminal_font
+            .is_some();
         self.render_stepper(
             "decrease-font-size",
             "increase-font-size",
-            format!("{font_size:.0}"),
-            font_size > MIN_FONT_SIZE,
-            font_size < MAX_FONT_SIZE,
+            if managed {
+                format!("{font_size:.0} · init.lua")
+            } else {
+                format!("{font_size:.0}")
+            },
+            !managed && font_size > MIN_FONT_SIZE,
+            !managed && font_size < MAX_FONT_SIZE,
             54.,
             |settings, dir, cx| settings.change_font_size(f32::from(dir), cx),
             cx,
@@ -4220,6 +4329,9 @@ impl SettingsWindow {
                     .hover(|element| element.bg(rgb(self.colors.panel_alt)))
                     .tooltip(tooltip_text(search_label, self.colors))
                     .on_click(cx.listener(move |settings, _, window, cx| {
+                        if settings.lua_manages_selector(kind, cx) {
+                            return;
+                        }
                         if settings.open_selector == Some(kind) {
                             settings.open_selector = None;
                             settings.clear_theme_preview(cx);
@@ -4264,6 +4376,7 @@ impl SettingsWindow {
         selected: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let managed = self.lua_manages_selector(kind, cx);
         let theme = theme_catalog()
             .theme_by_name(name)
             .expect("catalog name must resolve to a theme");
@@ -4283,13 +4396,17 @@ impl SettingsWindow {
             .flex_col()
             .gap_2()
             .w(px(THEME_CARD_WIDTH))
-            .cursor_pointer()
+            .when(!managed, |element| element.cursor_pointer())
+            .when(managed, |element| element.opacity(0.58))
             .on_hover(cx.listener(move |settings, hovered: &bool, _, cx| {
                 if *hovered {
                     settings.preview_theme(kind, &hover_name, cx);
                 }
             }))
             .on_click(cx.listener(move |settings, _, _, cx| {
+                if settings.lua_manages_selector(kind, cx) {
+                    return;
+                }
                 settings.clear_theme_preview(cx);
                 settings.commit_selector_choice(kind, selected_name.clone(), cx);
                 cx.notify();
@@ -4395,23 +4512,18 @@ impl SettingsWindow {
                                             ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .children(
-                                        theme.palette[..8].iter().enumerate().map(|(index, color)| {
-                                            div()
-                                                .flex_none()
-                                                .size(px(21.))
-                                                .rounded_full()
-                                                .border_1()
-                                                .border_color(rgb(card_fill))
-                                                .bg(rgb(*color))
-                                                .when(index > 0, |element| element.ml(px(-5.)))
-                                        }),
-                                    ),
-                            ),
+                            .child(div().flex().items_center().children(
+                                theme.palette[..8].iter().enumerate().map(|(index, color)| {
+                                    div()
+                                        .flex_none()
+                                        .size(px(21.))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(rgb(card_fill))
+                                        .bg(rgb(*color))
+                                        .when(index > 0, |element| element.ml(px(-5.)))
+                                }),
+                            )),
                     ),
             )
             .child(
@@ -4438,6 +4550,7 @@ impl SettingsWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let managed = self.lua_manages_selector(kind, cx);
         let scroll_handle = &self.theme_gallery_scroll_handles[kind.index()];
         let offset_x = -f32::from(scroll_handle.offset().x);
         let max_offset_x = f32::from(scroll_handle.max_offset().x);
@@ -4456,9 +4569,7 @@ impl SettingsWindow {
         };
         let names = self.selector_names(kind);
         let has_default = names.iter().any(|name| name == default);
-        let total_width = names.len() as f32 * card_step
-            + if has_default { 13. } else { 0. }
-            - 12.;
+        let total_width = names.len() as f32 * card_step + if has_default { 13. } else { 0. } - 12.;
         let mut visible_items = Vec::new();
         let mut item_x = 0.;
         if has_default {
@@ -4522,34 +4633,24 @@ impl SettingsWindow {
         let panel_color = rgb(self.colors.panel);
         let mut strip_wrapper = div().relative().min_w_0().w_full().child(strip);
         if offset_x > 0.5 {
-            strip_wrapper = strip_wrapper.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(28.))
-                    .bg(linear_gradient(
+            strip_wrapper =
+                strip_wrapper.child(div().absolute().left_0().top_0().bottom_0().w(px(28.)).bg(
+                    linear_gradient(
                         90.,
                         linear_color_stop(panel_color, 0.),
                         linear_color_stop(panel_color.opacity(0.), 1.),
-                    )),
-            );
+                    ),
+                ));
         }
         if offset_x < max_offset_x - 0.5 {
-            strip_wrapper = strip_wrapper.child(
-                div()
-                    .absolute()
-                    .right_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(28.))
-                    .bg(linear_gradient(
+            strip_wrapper =
+                strip_wrapper.child(div().absolute().right_0().top_0().bottom_0().w(px(28.)).bg(
+                    linear_gradient(
                         270.,
                         linear_color_stop(panel_color, 0.),
                         linear_color_stop(panel_color.opacity(0.), 1.),
-                    )),
-            );
+                    ),
+                ));
         }
         div()
             .flex()
@@ -4571,7 +4672,11 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .tooltip(tooltip_text(description, self.colors))
-                            .child(label),
+                            .child(if managed {
+                                format!("{label} · init.lua")
+                            } else {
+                                label.to_owned()
+                            }),
                     )
                     .child(self.render_theme_search(kind, window, cx)),
             )
@@ -4627,13 +4732,26 @@ impl SettingsWindow {
 impl gpui::Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = self.settings.read(cx).config().clone();
+        let config_error = self.settings.read(cx).lua_config().error.clone();
+        let lua_path = self
+            .settings
+            .read(cx)
+            .lua_config()
+            .exists
+            .then(|| self.settings.read(cx).lua_config().path.clone());
         let system_is_dark = is_dark_appearance(window.appearance());
         // The settings window's own chrome follows the resolved *interface* theme, while the preview
         // swatch below follows the resolved *terminal* theme — so hovering an interface option repaints
         // the window, hovering a terminal option repaints only the swatch, and each preview shows
         // exactly what committing it would do.
-        let interface_theme = self.settings.read(cx).resolved_interface_theme(system_is_dark);
-        let terminal_theme = self.settings.read(cx).resolved_terminal_theme(system_is_dark);
+        let interface_theme = self
+            .settings
+            .read(cx)
+            .resolved_interface_theme(system_is_dark);
+        let terminal_theme = self
+            .settings
+            .read(cx)
+            .resolved_terminal_theme(system_is_dark);
         if !std::ptr::eq(self.colors_for_theme, interface_theme) {
             let colors = UiColors::from_theme(interface_theme);
             let style = settings_input_style(colors);
@@ -4688,9 +4806,8 @@ impl gpui::Render for SettingsWindow {
             self.render_terminal_theme_source_control(config.terminal_theme_source, cx);
         // Only built when the terminal uses its own pair: under `FollowInterface` these two rows are
         // omitted entirely rather than shown disabled, so the panel states what is actually in effect.
-        let terminal_theme_galleries = (config.terminal_theme_source
-            == TerminalThemeSource::Custom)
-            .then(|| {
+        let terminal_theme_galleries =
+            (config.terminal_theme_source == TerminalThemeSource::Custom).then(|| {
                 (
                     self.render_theme_gallery(
                         SelectorKind::TerminalLight,
@@ -4721,11 +4838,11 @@ impl gpui::Render for SettingsWindow {
         // Per-style family selectors. An empty stored value means "fall back to the regular family";
         // show a localized hint and preview in the regular family in that case.
         let style_family_selector = |this: &Self,
-                                      id: &'static str,
-                                      stored: &str,
-                                      kind: SelectorKind,
-                                      window: &Window,
-                                      cx: &mut Context<Self>| {
+                                     id: &'static str,
+                                     stored: &str,
+                                     kind: SelectorKind,
+                                     window: &Window,
+                                     cx: &mut Context<Self>| {
             let has_value = !stored.trim().is_empty();
             let display = if has_value {
                 stored.to_owned()
@@ -4859,8 +4976,7 @@ impl gpui::Render for SettingsWindow {
         let osc_clipboard_read_control =
             self.render_osc_clipboard_read_control(config.allow_osc_clipboard_read, cx);
         let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
-        let copy_on_select_control =
-            self.render_copy_on_select_control(config.copy_on_select, cx);
+        let copy_on_select_control = self.render_copy_on_select_control(config.copy_on_select, cx);
         let scrollback_control = self.render_scrollback_control(config.scrollback_lines, cx);
         let shell_program_control =
             self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
@@ -4869,7 +4985,10 @@ impl gpui::Render for SettingsWindow {
         let shell_integration_path_control = self.render_shell_integration_path_control(
             // Read from the Default profile, which owns this field — `config` keeps only the
             // downgrade mirror, so reading it would show a stale value after an edit elsewhere.
-            self.profile_store.read(cx).default_profile().shell_integration_path,
+            self.profile_store
+                .read(cx)
+                .default_profile()
+                .shell_integration_path,
             cx,
         );
         let terminal_preview = self.render_terminal_preview(&config, terminal_theme);
@@ -4914,7 +5033,30 @@ impl gpui::Render for SettingsWindow {
                             window.titlebar_double_click();
                         }
                     })
-                    .child(div().text_size(px(15.)).font_weight(gpui::FontWeight::SEMIBOLD).child(language.settings_title())),
+                    .child(div().text_size(px(15.)).font_weight(gpui::FontWeight::SEMIBOLD).child(language.settings_title()))
+                    .when_some(lua_path, |element, path| {
+                        element.child(
+                            div()
+                                .id("settings-open-lua-config")
+                                .ml_auto()
+                                .cursor_pointer()
+                                .text_color(rgb(self.colors.accent))
+                                .hover(|element| element.text_color(rgb(self.colors.text)))
+                                .on_click(move |_, _, _| {
+                                    #[cfg(target_os = "macos")]
+                                    let opener = "open";
+                                    #[cfg(not(target_os = "macos"))]
+                                    let opener = "xdg-open";
+                                    if let Err(error) = std::process::Command::new(opener).arg(&path).spawn() {
+                                        eprintln!("failed to open {}: {error}", path.display());
+                                    }
+                                })
+                                .child(match language {
+                                    Language::English => "Open init.lua",
+                                    Language::SimplifiedChinese => "打开 init.lua",
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -5029,6 +5171,16 @@ impl gpui::Render for SettingsWindow {
                                                     .max_w(px(640.))
                                                     .p_5()
                                                     .gap_5()
+                                                    .when_some(config_error, |element, error| {
+                                                        element.child(
+                                                            div()
+                                                                .rounded_lg()
+                                                                .p_3()
+                                                                .bg(rgb(self.colors.panel_alt))
+                                                                .text_color(rgb(self.colors.accent))
+                                                                .child(format!("init.lua: {error}")),
+                                                        )
+                                                    })
                                                     // The "About" panel has its own branded header
                                                     // (logo + name), so it skips the shared section
                                                     // title to avoid a redundant "About Eggie" line.
@@ -5462,7 +5614,10 @@ mod tests {
         // selector is not a theme selector and never previews.
         for kind in SelectorKind::ALL {
             if kind.is_font() {
-                assert!(!kind.is_theme(), "{kind:?} cannot be both a font and a theme selector");
+                assert!(
+                    !kind.is_theme(),
+                    "{kind:?} cannot be both a font and a theme selector"
+                );
             } else {
                 assert!(kind.is_theme(), "{kind:?} must be a theme selector");
             }

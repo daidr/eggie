@@ -6,6 +6,18 @@ use super::*;
 /// its shell spawns run concurrently with the PTY tests and starve them into intermittent failure.
 pub(crate) static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn test_config_service() -> config_service::ConfigService {
+    config_service::ConfigService::new(
+        std::env::temp_dir().join(format!("eggie-test-{}.lua", SessionId::new_v4())),
+    )
+}
+
+fn test_preferences_service() -> preferences_service::PreferencesService {
+    preferences_service::PreferencesService::new_at(
+        std::env::temp_dir().join(format!("eggie-test-{}", SessionId::new_v4())),
+    )
+}
+
 /// [`super::build_shell_env`] with an empty profile environment, which is what almost every test
 /// wants. Shadows the real function for this module (`use super::*` brings it in, this definition
 /// wins); the profile-env tests bypass it by calling `super::build_shell_env` directly.
@@ -259,8 +271,7 @@ fn shm_transport_carries_images_larger_than_the_wire_frame_limit() {
     let (kind, length) = classify_wire_header(header);
     assert_eq!(kind, WireFrameKind::ShmImage);
     let mut destination = Vec::new();
-    let decoded =
-        read_terminal_image_shm_wire_into(&mut reader, length, &mut destination).unwrap();
+    let decoded = read_terminal_image_shm_wire_into(&mut reader, length, &mut destination).unwrap();
 
     writer_thread.join().unwrap().unwrap();
     assert_eq!(decoded.total_length as usize, total);
@@ -304,6 +315,9 @@ fn serve_connection_delivers_images_through_shared_memory() {
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
         build_id: Arc::from("shm-test"),
+        config: test_config_service(),
+        events: Arc::new(event_bus::EventBus::new()),
+        preferences: test_preferences_service(),
     });
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server_state = state.clone();
@@ -319,9 +333,8 @@ fn serve_connection_delivers_images_through_shared_memory() {
     // decodes to 1..=16.
     {
         let mut terminal = session.terminal.lock();
-        terminal.kitty_graphics_command(
-            b"a=T,f=32,s=2,v=2,i=11,c=1,r=1,C=1;AQIDBAUGBwgJCgsMDQ4PEA==",
-        );
+        terminal
+            .kitty_graphics_command(b"a=T,f=32,s=2,v=2,i=11,c=1,r=1,C=1;AQIDBAUGBwgJCgsMDQ4PEA==");
         session.events.publish_terminal(&terminal);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -335,7 +348,10 @@ fn serve_connection_delivers_images_through_shared_memory() {
             assert_eq!((descriptor.width, descriptor.height), (2, 2));
             break descriptor.key;
         }
-        assert!(Instant::now() < deadline, "image never reached the snapshot");
+        assert!(
+            Instant::now() < deadline,
+            "image never reached the snapshot"
+        );
         thread::sleep(Duration::from_millis(10));
     };
 
@@ -346,7 +362,10 @@ fn serve_connection_delivers_images_through_shared_memory() {
     assert_eq!(metadata.key, key);
     assert_eq!((metadata.width, metadata.height), (2, 2));
     assert_eq!(metadata.total_length, 16);
-    assert_eq!(metadata.chunk_length, 16, "shm frame delivers the whole image at once");
+    assert_eq!(
+        metadata.chunk_length, 16,
+        "shm frame delivers the whole image at once"
+    );
     assert_eq!(pixels, (1..=16).collect::<Vec<u8>>());
 
     session.terminate();
@@ -384,8 +403,7 @@ fn child_sessions_report_the_alacritty_terminal_contract() {
     );
     session
         .input(
-            b"printf 'EGGIE_ENV:%s:%s:%s\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\"\r"
-                .to_vec(),
+            b"printf 'EGGIE_ENV:%s:%s:%s\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\"\r".to_vec(),
             1,
         )
         .unwrap();
@@ -541,7 +559,13 @@ fn installed_notcurses_exercises_implemented_terminal_compatibility() {
                 .iter()
                 .any(|line| line.contains("rgba pixel") && line.contains("support"));
         let finished = lines.iter().any(|line| line.contains("renders,"));
-        if identified && quadrants && sextants && terminal_capabilities && graphics_and_input && finished {
+        if identified
+            && quadrants
+            && sextants
+            && terminal_capabilities
+            && graphics_and_input
+            && finished
+        {
             let placement = snapshot
                 .image_placements
                 .first()
@@ -563,9 +587,9 @@ fn installed_notcurses_exercises_implemented_terminal_compatibility() {
                 })
                 .collect::<std::collections::BTreeSet<_>>();
             assert!(
-                lines.iter().any(
-                    |line| line.contains("default fg 0x") && line.contains("default bg 0x")
-                ),
+                lines
+                    .iter()
+                    .any(|line| line.contains("default fg 0x") && line.contains("default bg 0x")),
                 "OSC default color queries were not answered: {lines:?}"
             );
             assert!(
@@ -594,9 +618,7 @@ fn installed_notcurses_exercises_implemented_terminal_compatibility() {
                 let cell = emoji_cells
                     .iter()
                     .find(|cell| cell.character == base && cell.zerowidth == suffix)
-                    .unwrap_or_else(|| {
-                        panic!("missing grapheme base {base:?}: {emoji_cells:?}")
-                    });
+                    .unwrap_or_else(|| panic!("missing grapheme base {base:?}: {emoji_cells:?}"));
                 assert!(Flags::from_bits_retain(cell.flags).contains(Flags::WIDE_CHAR));
             }
             break;
@@ -685,12 +707,10 @@ fn messagepack_wire_round_trip_preserves_truecolor_cells() {
     let mut encoded = Vec::new();
     let mut scratch = Vec::new();
     write_wire_message(&mut encoded, &mut scratch, &response).unwrap();
-    let decoded = read_wire_message::<DaemonResponse>(
-        &mut std::io::Cursor::new(encoded),
-        &mut Vec::new(),
-    )
-    .unwrap()
-    .expect("wire frame is present");
+    let decoded =
+        read_wire_message::<DaemonResponse>(&mut std::io::Cursor::new(encoded), &mut Vec::new())
+            .unwrap()
+            .expect("wire frame is present");
     assert_eq!(decoded, response);
 }
 
@@ -780,6 +800,7 @@ fn snapshot_wait_wakes_on_revision_without_polling_delay() {
         TerminalSize::default(),
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     ));
     let worker_state = state.clone();
     let worker = thread::spawn(move || {
@@ -1006,6 +1027,9 @@ fn sustained_full_screen_snapshot_transport_benchmark() {
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
         build_id: Arc::from("benchmark"),
+        config: test_config_service(),
+        events: Arc::new(event_bus::EventBus::new()),
+        preferences: test_preferences_service(),
     });
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server_state = state.clone();
@@ -1177,6 +1201,9 @@ fn image_generation_wire_transport_benchmark() {
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
         build_id: Arc::from("benchmark"),
+        config: test_config_service(),
+        events: Arc::new(event_bus::EventBus::new()),
+        preferences: test_preferences_service(),
     });
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server_state = state.clone();
@@ -1205,13 +1232,7 @@ fn image_generation_wire_transport_benchmark() {
         while pixels.len() < expected_length {
             let offset = pixels.len() as u32;
             let metadata = connection
-                .append_terminal_image_chunk(
-                    session_id,
-                    key,
-                    offset,
-                    16 * 1024 * 1024,
-                    &mut pixels,
-                )
+                .append_terminal_image_chunk(session_id, key, offset, 16 * 1024 * 1024, &mut pixels)
                 .unwrap();
             chunks += 1;
             assert_eq!(metadata.key, key);
@@ -1296,7 +1317,10 @@ fn image_generation_chunk_ref_stays_zero_copy() {
             fetched += chunk_len;
         }
         let elapsed = started.elapsed();
-        assert_eq!(fetched, expected_length, "chunk borrows did not cover the frame");
+        assert_eq!(
+            fetched, expected_length,
+            "chunk borrows did not cover the frame"
+        );
         samples.push(elapsed);
     }
 
@@ -1511,6 +1535,7 @@ fn runtime_scrollback_and_cursor_changes_do_not_clobber_each_other() {
         remote: None,
         remote_install_consented: false,
         remote_cwd: None,
+        event_bus: None,
     })
     .unwrap();
 
@@ -1599,6 +1624,7 @@ fn custom_shell_program_drives_the_session_shell() {
         remote: None,
         remote_install_consented: false,
         remote_cwd: None,
+        event_bus: None,
     })
     .unwrap();
     // The configured shell's basename becomes the session's initial process name.
@@ -1711,6 +1737,7 @@ fn primary_screen_resize_reflows_completed_output_without_losing_columns() {
         initial_size,
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     ));
     let listener = DaemonEventListener(state);
     let mut terminal = Term::new(Config::default(), &GridSize(initial_size), listener);
@@ -1724,8 +1751,7 @@ fn primary_screen_resize_reflows_completed_output_without_losing_columns() {
         terminal.grid_mut()[Line(1)][Column(column)].c = character;
     }
     // The cursor is on the active shell line below this completed wrapped output.
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(3), Column(0));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(3), Column(0));
 
     resize_terminal_with_history_reflow(
         &mut terminal,
@@ -1747,7 +1773,12 @@ fn primary_screen_resize_reflows_completed_output_without_losing_columns() {
             .contains(Flags::WRAPLINE)
     );
 
-    resize_terminal_with_history_reflow(&mut terminal, initial_size, TerminalSemanticPhase::Output, None);
+    resize_terminal_with_history_reflow(
+        &mut terminal,
+        initial_size,
+        TerminalSemanticPhase::Output,
+        None,
+    );
 
     assert_eq!(terminal.grid()[Line(0)][Column(0)].c, 'A');
     assert_eq!(terminal.grid()[Line(0)][Column(11)].c, 'L');
@@ -1766,6 +1797,7 @@ fn primary_screen_resize_clears_active_wrapped_input_for_shell_redraw() {
         initial_size,
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     ));
     let listener = DaemonEventListener(state);
     let mut terminal = Term::new(Config::default(), &GridSize(initial_size), listener);
@@ -1778,8 +1810,7 @@ fn primary_screen_resize_clears_active_wrapped_input_for_shell_redraw() {
     for (column, character) in "MNOP".chars().enumerate() {
         terminal.grid_mut()[Line(1)][Column(column)].c = character;
     }
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(1), Column(4));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(1), Column(4));
 
     resize_terminal_with_history_reflow(
         &mut terminal,
@@ -1828,6 +1859,7 @@ fn terminal_with_wrapped_active_line(size: TerminalSize) -> Term<DaemonEventList
         size,
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     ));
     let listener = DaemonEventListener(state);
     let mut terminal = Term::new(Config::default(), &GridSize(size), listener);
@@ -1840,8 +1872,7 @@ fn terminal_with_wrapped_active_line(size: TerminalSize) -> Term<DaemonEventList
     for (column, character) in "IJKL".chars().enumerate() {
         terminal.grid_mut()[Line(1)][Column(column)].c = character;
     }
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(1), Column(4));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(1), Column(4));
     terminal
 }
 
@@ -1948,7 +1979,12 @@ fn output_phase_reflows_natively_without_clearing() {
         grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
         "output content must be preserved (reflowed), not cleared"
     );
-    resize_terminal_with_history_reflow(&mut terminal, initial_size, TerminalSemanticPhase::Output, None);
+    resize_terminal_with_history_reflow(
+        &mut terminal,
+        initial_size,
+        TerminalSemanticPhase::Output,
+        None,
+    );
     assert!(
         grid_has_glyph(&terminal, "ABCDEFGHIJKL"),
         "output content must survive the reflow round trip"
@@ -2129,7 +2165,11 @@ fn prompt_jump_points_use_global_line_from_total_scrolled() {
     // history_size, without relying on a separate observe_scroll call.
     prompt_start(&mut tracker, 3, 5);
     assert_eq!(
-        tracker.prompt_jump_points.iter().copied().collect::<Vec<_>>(),
+        tracker
+            .prompt_jump_points
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
         vec![0, 8]
     );
 }
@@ -2147,7 +2187,11 @@ fn prompt_capture_uses_marker_history_not_stale_observe_scroll() {
     // the next prompt marker carries the true history_size = 50.
     prompt_start(&mut tracker, 2, 50); // prompt #1 at global 50 + 2 = 52
     assert_eq!(
-        tracker.prompt_jump_points.iter().copied().collect::<Vec<_>>(),
+        tracker
+            .prompt_jump_points
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
         vec![0, 52],
         "the second prompt must be recorded at its true post-scroll coordinate"
     );
@@ -2179,7 +2223,11 @@ fn observe_scroll_prunes_points_that_fall_out_of_a_shrunk_buffer() {
     // `10000 - 5` lines up, still inside the scrollback window (oldest live == 0), so it stays.
     tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
     assert_eq!(
-        tracker.prompt_jump_points.iter().copied().collect::<Vec<_>>(),
+        tracker
+            .prompt_jump_points
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
         vec![5, 9_000]
     );
 }
@@ -2199,11 +2247,17 @@ fn command_history_cap_bounds_the_jump_index() {
 fn observe_scroll_advances_after_saturation() {
     let mut tracker = ShellIntegrationTracker::default();
     tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
-    assert_eq!(tracker.total_scrolled_lines, TERMINAL_SCROLLBACK_LIMIT as u64);
+    assert_eq!(
+        tracker.total_scrolled_lines,
+        TERMINAL_SCROLLBACK_LIMIT as u64
+    );
     // history_size stays pinned at the limit, but observe_scroll must not stall: the delta is 0
     // here, so total stays; a later call with the same size keeps it monotonic.
     tracker.observe_scroll(TERMINAL_SCROLLBACK_LIMIT, TERMINAL_SCROLLBACK_LIMIT);
-    assert_eq!(tracker.total_scrolled_lines, TERMINAL_SCROLLBACK_LIMIT as u64);
+    assert_eq!(
+        tracker.total_scrolled_lines,
+        TERMINAL_SCROLLBACK_LIMIT as u64
+    );
 }
 
 #[test]
@@ -2224,14 +2278,20 @@ fn jump_target_selects_strictly_nearer_prompt_in_each_direction() {
     tracker.prompt_jump_points.extend([0, 10, 20]);
     // Viewport top at global 15: Up -> nearest below 15 is 10; Down -> nearest above 15 is 20.
     assert_eq!(tracker.jump_target(15, TerminalJumpDirection::Up), Some(10));
-    assert_eq!(tracker.jump_target(15, TerminalJumpDirection::Down), Some(20));
+    assert_eq!(
+        tracker.jump_target(15, TerminalJumpDirection::Down),
+        Some(20)
+    );
     // At the oldest prompt (0): Up has nothing strictly earlier.
     assert_eq!(tracker.jump_target(0, TerminalJumpDirection::Up), None);
     // At the newest prompt (20): Down has nothing strictly later.
     assert_eq!(tracker.jump_target(20, TerminalJumpDirection::Down), None);
     // Exactly on a prompt line (10): Up -> 0, Down -> 20 (strict inequality).
     assert_eq!(tracker.jump_target(10, TerminalJumpDirection::Up), Some(0));
-    assert_eq!(tracker.jump_target(10, TerminalJumpDirection::Down), Some(20));
+    assert_eq!(
+        tracker.jump_target(10, TerminalJumpDirection::Down),
+        Some(20)
+    );
 }
 
 #[test]
@@ -2258,7 +2318,10 @@ fn zsh_env_sets_zdotdir_and_preserves_original() {
         Some("/home/user/.zsh")
     );
     // Base environment still present, and the login arg is preserved for zsh.
-    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    assert_eq!(
+        launch.env.get("TERM").map(String::as_str),
+        Some("alacritty")
+    );
     assert!(launch.env.contains_key("TERMINFO"));
     assert_eq!(launch.args, vec!["-l".to_owned()]);
 }
@@ -2267,7 +2330,17 @@ fn zsh_env_sets_zdotdir_and_preserves_original() {
 fn zsh_env_without_user_zdotdir_sets_no_marker() {
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let root = PathBuf::from("/tmp/eggie-integration");
-    let launch = build_shell_env("zsh", "/bin/zsh", &terminfo, Some(&root), None, None, None, None, "path");
+    let launch = build_shell_env(
+        "zsh",
+        "/bin/zsh",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        None,
+        "path",
+    );
     assert!(launch.env.contains_key("ZDOTDIR"));
     assert!(!launch.env.contains_key("EGGIE_ZDOTDIR_ORIG"));
 }
@@ -2308,7 +2381,17 @@ fn bash_env_sets_env_var_and_inject() {
 fn apple_bin_bash_skips_integration() {
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let root = PathBuf::from("/tmp/eggie-integration");
-    let launch = build_shell_env("bash", "/bin/bash", &terminfo, Some(&root), None, None, None, None, "path");
+    let launch = build_shell_env(
+        "bash",
+        "/bin/bash",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        None,
+        "path",
+    );
     // Apple's /bin/bash cannot use the ENV-based POSIX startup path, so no injection.
     assert!(!launch.env.contains_key("ENV"));
     assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
@@ -2319,22 +2402,43 @@ fn apple_bin_bash_skips_integration() {
 fn non_integrated_shell_has_no_injection() {
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let root = PathBuf::from("/tmp/eggie-integration");
-    let launch =
-        build_shell_env("elvish", "/usr/bin/elvish", &terminfo, Some(&root), None, None, None, None, "path");
+    let launch = build_shell_env(
+        "elvish",
+        "/usr/bin/elvish",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        None,
+        "path",
+    );
     assert!(!launch.env.contains_key("ZDOTDIR"));
     assert!(!launch.env.contains_key("ENV"));
     assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
     assert!(!launch.env.contains_key("XDG_DATA_DIRS"));
     // Base environment is still populated.
-    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    assert_eq!(
+        launch.env.get("TERM").map(String::as_str),
+        Some("alacritty")
+    );
 }
 
 #[test]
 fn fish_integration_uses_xdg_data_dirs() {
     let terminfo = PathBuf::from("/tmp/eggie-terminfo");
     let root = PathBuf::from("/tmp/eggie-integration");
-    let launch =
-        build_shell_env("fish", "/opt/homebrew/bin/fish", &terminfo, Some(&root), None, None, None, None, "path");
+    let launch = build_shell_env(
+        "fish",
+        "/opt/homebrew/bin/fish",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        None,
+        "path",
+    );
     let dirs = launch
         .env
         .get("XDG_DATA_DIRS")
@@ -2349,7 +2453,10 @@ fn fish_integration_uses_xdg_data_dirs() {
     assert!(!launch.env.contains_key("ZDOTDIR"));
     assert!(!launch.env.contains_key("ENV"));
     // Base environment is still populated.
-    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    assert_eq!(
+        launch.env.get("TERM").map(String::as_str),
+        Some("alacritty")
+    );
 }
 
 /// The daemon must turn a remote spawn config into an `ssh` invocation carrying the bootstrap, and a
@@ -2380,7 +2487,10 @@ fn a_remote_spawn_config_produces_an_ssh_invocation_carrying_the_bootstrap() {
         true,
         None,
     );
-    assert_eq!(launch.program, "ssh", "a remote profile must exec ssh, not a local shell");
+    assert_eq!(
+        launch.program, "ssh",
+        "a remote profile must exec ssh, not a local shell"
+    );
     assert!(launch.args.contains(&"-t".to_owned()));
     assert!(launch.args.contains(&"deploy@prod.example.com".to_owned()));
     // The bundled scripts — the same bytes installed locally — ride along in the payload.
@@ -2448,7 +2558,10 @@ fn profile_env_is_injected_but_never_shadows_eggie_variables() {
         // profile that set it would gain arbitrary code execution in every zsh of that profile.
         ("EGGIE_ZDOTDIR_ORIG".to_owned(), "/tmp/hijack".to_owned()),
         ("EGGIE_BASH_ENV".to_owned(), "/tmp/hijack/env.sh".to_owned()),
-        ("EGGIE_BASH_RCFILE".to_owned(), "/tmp/hijack/rc.sh".to_owned()),
+        (
+            "EGGIE_BASH_RCFILE".to_owned(),
+            "/tmp/hijack/rc.sh".to_owned(),
+        ),
         ("EGGIE_BASH_INJECT".to_owned(), "0".to_owned()),
         ("EGGIE_FISH_INTEGRATION".to_owned(), "1".to_owned()),
         ("_eggie_state".to_owned(), "1".to_owned()),
@@ -2469,13 +2582,19 @@ fn profile_env_is_injected_but_never_shadows_eggie_variables() {
     );
 
     // Profile-only variables pass through.
-    assert_eq!(launch.env.get("AWS_PROFILE").map(String::as_str), Some("prod"));
+    assert_eq!(
+        launch.env.get("AWS_PROFILE").map(String::as_str),
+        Some("prod")
+    );
     assert_eq!(
         launch.env.get("DOCKER_HOST").map(String::as_str),
         Some("tcp://10.0.0.1:2375")
     );
     // Eggie's own values win over the profile's attempt to set them.
-    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    assert_eq!(
+        launch.env.get("TERM").map(String::as_str),
+        Some("alacritty")
+    );
     assert_eq!(
         launch.env.get("TERMINFO").map(String::as_str),
         Some(terminfo.to_string_lossy().as_ref())
@@ -2518,7 +2637,10 @@ fn profile_env_cannot_forge_the_bash_integration_variables() {
     let profile_env = BTreeMap::from([
         // `eggie.bash` sources EGGIE_BASH_RCFILE and exports EGGIE_BASH_ENV as ENV; Rust never sets
         // the former and sets the latter only when the daemon has its own ENV.
-        ("EGGIE_BASH_RCFILE".to_owned(), "/tmp/hijack/rc.sh".to_owned()),
+        (
+            "EGGIE_BASH_RCFILE".to_owned(),
+            "/tmp/hijack/rc.sh".to_owned(),
+        ),
         ("EGGIE_BASH_ENV".to_owned(), "/tmp/hijack/env.sh".to_owned()),
         ("EGGIE_BASH_INJECT".to_owned(), "0".to_owned()),
         ("KEEP_ME".to_owned(), "yes".to_owned()),
@@ -2544,7 +2666,12 @@ fn profile_env_cannot_forge_the_bash_integration_variables() {
     );
     assert_eq!(
         launch.env.get("ENV").map(String::as_str),
-        Some(root.join("bash").join("eggie.bash").to_string_lossy().as_ref())
+        Some(
+            root.join("bash")
+                .join("eggie.bash")
+                .to_string_lossy()
+                .as_ref()
+        )
     );
     assert_eq!(launch.env.get("KEEP_ME").map(String::as_str), Some("yes"));
 }
@@ -2601,7 +2728,10 @@ fn profile_env_reaches_shells_without_integration() {
         &profile_env,
     );
     assert_eq!(launch.env.get("MY_VAR").map(String::as_str), Some("value"));
-    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    assert_eq!(
+        launch.env.get("TERM").map(String::as_str),
+        Some("alacritty")
+    );
 }
 
 #[test]
@@ -2788,7 +2918,11 @@ fn bash_does_not_duplicate_a_user_supplied_posix_flag() {
         Some(&root),
         None,
         None,
-        Some(vec!["--posix".to_owned(), "-c".to_owned(), "true".to_owned()]),
+        Some(vec![
+            "--posix".to_owned(),
+            "-c".to_owned(),
+            "true".to_owned(),
+        ]),
         None,
         "path",
     );
@@ -2833,6 +2967,7 @@ fn repeated_column_reflow_keeps_images_attached_to_content_and_blank_cells() {
         initial_size,
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     ));
     let listener = DaemonEventListener(state);
     let mut terminal = Term::new(Config::default(), &GridSize(initial_size), listener);
@@ -2849,14 +2984,11 @@ fn repeated_column_reflow_keeps_images_attached_to_content_and_blank_cells() {
     }
     terminal.grid_mut()[Line(2)][Column(0)].c = '#';
 
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(1), Column(4));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(1), Column(4));
     terminal.kitty_graphics_command(b"a=T,f=32,s=1,v=1,i=7,c=2,r=2,C=1;AQIDBA==");
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(2), Column(10));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(2), Column(10));
     terminal.kitty_graphics_command(b"a=T,f=32,s=1,v=1,i=8,c=1,r=1,C=1;AQIDBA==");
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(5), Column(0));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(5), Column(0));
 
     let compact_size = TerminalSize {
         columns: 8,
@@ -2864,7 +2996,12 @@ fn repeated_column_reflow_keeps_images_attached_to_content_and_blank_cells() {
     };
 
     for _ in 0..3 {
-        resize_terminal_with_history_reflow(&mut terminal, compact_size, TerminalSemanticPhase::Output, None);
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            compact_size,
+            TerminalSemanticPhase::Output,
+            None,
+        );
         let marker = (-(terminal.grid().history_size() as i32)
             ..terminal.grid().screen_lines() as i32)
             .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
@@ -2889,7 +3026,12 @@ fn repeated_column_reflow_keeps_images_attached_to_content_and_blank_cells() {
         assert_eq!((content.line, content.column), (marker.0, marker.1 as u32));
         assert_eq!((blank.line, blank.column), (line_start.0 + 1, 2));
 
-        resize_terminal_with_history_reflow(&mut terminal, initial_size, TerminalSemanticPhase::Output, None);
+        resize_terminal_with_history_reflow(
+            &mut terminal,
+            initial_size,
+            TerminalSemanticPhase::Output,
+            None,
+        );
         let marker = (-(terminal.grid().history_size() as i32)
             ..terminal.grid().screen_lines() as i32)
             .flat_map(|line| (0..terminal.grid().columns()).map(move |column| (line, column)))
@@ -2930,17 +3072,16 @@ fn scrollback_round_trip_keeps_image_attached_to_its_text_row() {
         size,
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     ));
     let listener = DaemonEventListener(state);
     let mut terminal = Term::new(Config::default(), &GridSize(size), listener);
     terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
     terminal.grid_mut()[Line(1)][Column(8)].c = 'X';
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(1), Column(8));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(1), Column(8));
     terminal.kitty_graphics_command(b"a=T,f=32,s=1,v=1,i=7,c=1,r=2,C=1;AQIDBA==");
 
-    terminal.grid_mut().cursor.point =
-        alacritty_terminal::index::Point::new(Line(4), Column(0));
+    terminal.grid_mut().cursor.point = alacritty_terminal::index::Point::new(Line(4), Column(0));
     let mut parser: alacritty_terminal::vte::ansi::Processor =
         alacritty_terminal::vte::ansi::Processor::new();
     parser.advance(&mut terminal, b"\n\n\n\n\n\n\n\n");
@@ -2974,7 +3115,12 @@ fn scrollback_round_trip_keeps_image_attached_to_its_text_row() {
 
     terminal.scroll_display(Scroll::Bottom);
     let compact_size = TerminalSize { columns: 6, ..size };
-    resize_terminal_with_history_reflow(&mut terminal, compact_size, TerminalSemanticPhase::Output, None);
+    resize_terminal_with_history_reflow(
+        &mut terminal,
+        compact_size,
+        TerminalSemanticPhase::Output,
+        None,
+    );
     assert!(
         snapshot_terminal(&terminal, session_id, compact_size, String::new(), 5, 0,)
             .image_placements
@@ -3174,7 +3320,10 @@ fn terminal_search_finds_counts_and_navigates_matches() {
         "expected at least three matches for 'needle', got {}",
         first.total
     );
-    assert_eq!(first.index, 0, "fresh search should start at the first match");
+    assert_eq!(
+        first.index, 0,
+        "fresh search should start at the first match"
+    );
     let first_active = first.active.expect("active match should be present");
     assert!(
         first.matches.iter().any(|m| *m == first_active),
@@ -3192,7 +3341,10 @@ fn terminal_search_finds_counts_and_navigates_matches() {
         })
         .unwrap();
     assert_eq!(second.total, total);
-    assert_eq!(second.index, 1, "forward navigation should advance the index");
+    assert_eq!(
+        second.index, 1,
+        "forward navigation should advance the index"
+    );
 
     // A query with no matches reports nothing.
     let missing = session
@@ -3509,7 +3661,10 @@ fn output_while_scrolled_keeps_the_thumb_anchor() {
             );
             break;
         }
-        assert!(Instant::now() < deadline, "additional output did not arrive");
+        assert!(
+            Instant::now() < deadline,
+            "additional output did not arrive"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -3602,9 +3757,10 @@ fn interactive_selection_projects_into_the_visible_viewport() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let snapshot = session.snapshot();
-        let present = snapshot.plain_lines().iter().any(|line| {
-            line.contains("ALPHA BRAVO CHARLIE") && !line.contains("printf")
-        });
+        let present = snapshot
+            .plain_lines()
+            .iter()
+            .any(|line| line.contains("ALPHA BRAVO CHARLIE") && !line.contains("printf"));
         if present {
             break;
         }
@@ -3852,7 +4008,9 @@ fn terminal_search_overlapping_regex_navigation_advances_without_repeat() {
             fresh: true,
         })
         .unwrap();
-    let first_active = first.active.expect("first overlapping match should be found");
+    let first_active = first
+        .active
+        .expect("first overlapping match should be found");
     assert_eq!(first.index, 0, "fresh search starts at the first match");
 
     // Advancing forward must land on a different, later match (no overlap re-find).
@@ -4212,9 +4370,7 @@ fn mouse_motion_respects_drag_any_motion_shift_and_vi_modes() {
         modifiers,
     };
     let drag_mode = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
-    assert!(
-        mouse_report_bytes(drag_mode, 0, motion(None, TerminalModifiers::default())).is_none()
-    );
+    assert!(mouse_report_bytes(drag_mode, 0, motion(None, TerminalModifiers::default())).is_none());
     assert_eq!(
         mouse_report_bytes(
             drag_mode,
@@ -4439,9 +4595,10 @@ fn mouse_and_focus_reports_round_trip_through_the_real_pty() {
     let output_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let lines = session.snapshot().plain_lines();
-        if lines.iter().any(|line| {
-            line.contains("EGGIE_POINTER:1b5b3c303b353b334d1b5b4f:1b4f411b4f411b4f41")
-        }) {
+        if lines
+            .iter()
+            .any(|line| line.contains("EGGIE_POINTER:1b5b3c303b353b334d1b5b4f:1b4f411b4f411b4f41"))
+        {
             break;
         }
         assert!(
@@ -4544,6 +4701,7 @@ fn osc_listener_state() -> ListenerState {
         TerminalSize::default(),
         TerminalAppearance::default(),
         Arc::new(AtomicU64::new(0)),
+        None,
     )
 }
 
@@ -4572,8 +4730,7 @@ fn osc_reported_locations_distinguish_local_and_remote_hosts() {
     assert!(local.local);
     assert_eq!(local.user, None);
 
-    let remote =
-        parse_reported_location("file://alice@example.invalid/home/alice/repo").unwrap();
+    let remote = parse_reported_location("file://alice@example.invalid/home/alice/repo").unwrap();
     assert_eq!(remote.user.as_deref(), Some("alice"));
     assert_eq!(remote.host.as_deref(), Some("example.invalid"));
     assert_eq!(remote.path, "/home/alice/repo");
@@ -4597,33 +4754,57 @@ fn osc_reported_locations_distinguish_local_and_remote_hosts() {
 #[test]
 fn osc_133_tracks_prompt_command_output_and_aborted_input() {
     let mut tracker = ShellIntegrationTracker::default();
-    tracker.update(SemanticPrompt {
-        action: SemanticPromptAction::PromptStart,
-        options: String::new(),
-    }, 0, 0);
-    tracker.update(SemanticPrompt {
-        action: SemanticPromptAction::InputStart,
-        options: "cmdline=echo hello".to_owned(),
-    }, 0, 0);
-    tracker.update(SemanticPrompt {
-        action: SemanticPromptAction::CommandFinished,
-        options: "130".to_owned(),
-    }, 0, 0);
+    tracker.update(
+        SemanticPrompt {
+            action: SemanticPromptAction::PromptStart,
+            options: String::new(),
+        },
+        0,
+        0,
+    );
+    tracker.update(
+        SemanticPrompt {
+            action: SemanticPromptAction::InputStart,
+            options: "cmdline=echo hello".to_owned(),
+        },
+        0,
+        0,
+    );
+    tracker.update(
+        SemanticPrompt {
+            action: SemanticPromptAction::CommandFinished,
+            options: "130".to_owned(),
+        },
+        0,
+        0,
+    );
     assert_eq!(tracker.snapshot().phase, TerminalSemanticPhase::None);
     assert!(tracker.snapshot().history.is_empty());
 
-    tracker.update(SemanticPrompt {
-        action: SemanticPromptAction::InputStart,
-        options: "cmdline=printf ok".to_owned(),
-    }, 0, 0);
-    tracker.update(SemanticPrompt {
-        action: SemanticPromptAction::OutputStart,
-        options: String::new(),
-    }, 0, 0);
-    tracker.update(SemanticPrompt {
-        action: SemanticPromptAction::CommandFinished,
-        options: "7".to_owned(),
-    }, 0, 0);
+    tracker.update(
+        SemanticPrompt {
+            action: SemanticPromptAction::InputStart,
+            options: "cmdline=printf ok".to_owned(),
+        },
+        0,
+        0,
+    );
+    tracker.update(
+        SemanticPrompt {
+            action: SemanticPromptAction::OutputStart,
+            options: String::new(),
+        },
+        0,
+        0,
+    );
+    tracker.update(
+        SemanticPrompt {
+            action: SemanticPromptAction::CommandFinished,
+            options: "7".to_owned(),
+        },
+        0,
+        0,
+    );
     let snapshot = tracker.snapshot();
     assert_eq!(snapshot.phase, TerminalSemanticPhase::None);
     assert_eq!(snapshot.history.len(), 1);
@@ -4654,8 +4835,7 @@ fn kitty_notification_multipart_is_bounded_sanitized_and_published_once() {
         .wait_after(0, Duration::ZERO)
         .expect("completed notification publishes");
     assert_eq!(update.events.len(), 1);
-    let TerminalOscEventPayload::Notification { notification } = &update.events[0].payload
-    else {
+    let TerminalOscEventPayload::Notification { notification } = &update.events[0].payload else {
         panic!("unexpected OSC event: {:?}", update.events[0].payload);
     };
     assert_eq!(notification.id, "build");
@@ -4705,8 +4885,7 @@ fn kitty_rich_clipboard_commits_multipart_data_and_aliases_once() {
         .osc_events
         .wait_after(0, Duration::ZERO)
         .expect("clipboard write publishes");
-    let TerminalOscEventPayload::ClipboardWrite { contents, .. } = &update.events[0].payload
-    else {
+    let TerminalOscEventPayload::ClipboardWrite { contents, .. } = &update.events[0].payload else {
         panic!("unexpected OSC event: {:?}", update.events[0].payload);
     };
     assert_eq!(contents.len(), 2);
@@ -4756,8 +4935,7 @@ fn iterm2_variables_and_direct_copy_use_terminal_state() {
         .osc_events
         .wait_after(0, Duration::ZERO)
         .expect("iTerm2 direct copy publishes a clipboard event");
-    let TerminalOscEventPayload::ClipboardWrite { contents, .. } = &update.events[0].payload
-    else {
+    let TerminalOscEventPayload::ClipboardWrite { contents, .. } = &update.events[0].payload else {
         panic!("unexpected OSC event: {:?}", update.events[0].payload);
     };
     assert_eq!(contents[0].data, b"copy me");

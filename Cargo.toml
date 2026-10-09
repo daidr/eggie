@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/eggie-daemon",
+    "crates/eggie-config",
     "crates/eggie-domain",
     "crates/eggie-protocol",
     "crates/eggie-ui",
@@ -21,6 +22,7 @@ anyhow = "1.0.100"
 base64 = "0.22.1"
 crossterm = "0.29"
 eggie-daemon = { path = "crates/eggie-daemon" }
+eggie-config = { path = "crates/eggie-config" }
 eggie-domain = { path = "crates/eggie-domain" }
 eggie-protocol = { path = "crates/eggie-protocol" }
 eggie-update = { path = "crates/eggie-update" }
@@ -29,6 +31,7 @@ gpui = { path = "vendor/zed-gpui/crates/gpui", features = ["input-latency-histog
 gpui_platform = { path = "vendor/zed-gpui/crates/gpui_platform", features = ["font-kit", "runtime_shaders"] }
 libc = "0.2.177"
 memmap2 = "0.9"
+mlua = { version = "0.12", features = ["lua54", "vendored", "send", "serialize"] }
 parking_lot = "0.12.5"
 pulldown-cmark = { version = "0.12", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "underline-color", "layout-cache"] }

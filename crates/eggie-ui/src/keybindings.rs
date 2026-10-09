@@ -13,6 +13,7 @@
 //! edits in the settings window take effect without a restart.
 
 use gpui::{App, DummyKeyboardMapper, KeyBinding, Keystroke};
+use serde::Deserialize;
 
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
@@ -39,11 +40,37 @@ pub(crate) struct ActionSpec {
     pub make_action: fn() -> Box<dyn gpui::Action>,
 }
 
+/// A single GPUI adapter for all Lua-defined actions. The configuration service
+/// owns the callback; only its stable identity crosses into the UI.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub(crate) struct LuaAction {
+    pub(crate) name: String,
+    pub(crate) args: serde_json::Value,
+}
+
+impl gpui::Action for LuaAction {
+    fn boxed_clone(&self) -> Box<dyn gpui::Action> {
+        Box::new(self.clone())
+    }
+    fn partial_eq(&self, other: &dyn gpui::Action) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+    fn name(&self) -> &'static str {
+        "eggie::LuaAction"
+    }
+    fn name_for_type() -> &'static str {
+        "eggie::LuaAction"
+    }
+    fn build(value: serde_json::Value) -> anyhow::Result<Box<dyn gpui::Action>> {
+        Ok(Box::new(serde_json::from_value::<Self>(value)?))
+    }
+}
+
 /// Fallibly build a keybinding. Uses `KeyBinding::load` (not `::new`, which
 /// panics on parse error) so malformed keystrokes are skipped.
 fn load_binding(keystrokes: &str, action: Box<dyn gpui::Action>) -> Option<KeyBinding> {
     KeyBinding::load(
-        keystrokes,
+        &keystrokes.replace('>', " "),
         action,
         None,
         false,
@@ -376,21 +403,46 @@ fn display_key(key: &str) -> String {
 /// This only touches the keymap (keystroke -> action). Action *handlers*
 /// (`on_action`) are registered exactly once elsewhere and must never be
 /// re-registered here.
-pub(crate) fn rebuild_keymap(config: &AppSettings, cx: &mut App) {
+pub(crate) fn rebuild_keymap(
+    config: &AppSettings,
+    lua: &eggie_config::RegisteredConfig,
+    cx: &mut App,
+) {
     cx.clear_key_bindings();
-    let mut bindings = Vec::with_capacity(ACTION_SPECS.len());
+    let mut entries: Vec<(String, Box<dyn gpui::Action>)> =
+        Vec::with_capacity(ACTION_SPECS.len() + lua.bindings.len());
     for spec in ACTION_SPECS {
         let keystroke = config
             .keybindings
             .get(spec.id)
             .map(String::as_str)
             .unwrap_or(spec.default_keystroke);
-        if let Some(binding) = load_binding(keystroke, (spec.make_action)())
-            .or_else(|| load_binding(spec.default_keystroke, (spec.make_action)()))
-        {
-            bindings.push(binding);
+        if Keystroke::parse(keystroke).is_ok() {
+            entries.push((keystroke.to_owned(), (spec.make_action)()));
         }
     }
+    for operation in &lua.bindings {
+        match operation {
+            eggie_config::BindingOp::Unbind { key } => {
+                entries.retain(|(existing, _)| existing != key)
+            }
+            eggie_config::BindingOp::Bind { key, action, args } => {
+                entries.retain(|(existing, _)| existing != key);
+                let command: Box<dyn gpui::Action> = match spec_by_id(action) {
+                    Some(spec) => (spec.make_action)(),
+                    None => Box::new(LuaAction {
+                        name: action.clone(),
+                        args: args.clone(),
+                    }),
+                };
+                entries.push((key.clone(), command));
+            }
+        }
+    }
+    let bindings: Vec<_> = entries
+        .into_iter()
+        .filter_map(|(key, action)| load_binding(&key, action))
+        .collect();
     cx.bind_keys(bindings);
     crate::text_input::install_keybindings(cx);
 }
@@ -423,6 +475,17 @@ mod tests {
         for spec in ACTION_SPECS {
             assert!(seen.insert(spec.id), "duplicate action id: {}", spec.id);
         }
+    }
+
+    #[test]
+    fn builtin_action_names_match_ui_registry() {
+        let names: std::collections::HashSet<_> = ACTION_SPECS.iter().map(|spec| spec.id).collect();
+        let registered: std::collections::HashSet<_> = eggie_config::BUILTIN_ACTIONS
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "pane.split" | "tab.new"))
+            .collect();
+        assert_eq!(names, registered);
     }
 
     #[test]
@@ -463,7 +526,10 @@ mod tests {
             let parsed = Keystroke::parse(source).unwrap();
             let canonical = canonical_keystroke(&parsed);
             let reparsed = Keystroke::parse(&canonical).unwrap();
-            assert_eq!(parsed.modifiers, reparsed.modifiers, "modifiers for {source}");
+            assert_eq!(
+                parsed.modifiers, reparsed.modifiers,
+                "modifiers for {source}"
+            );
             assert_eq!(parsed.key, reparsed.key, "key for {source}");
         }
     }
@@ -552,7 +618,10 @@ mod tests {
     fn conflict_detected_against_default() {
         let config = AppSettings::default();
         // cmd-c is terminal_copy's default; recording it for new_tab conflicts.
-        assert_eq!(find_conflict(&config, "cmd-c", "new_tab"), Some("terminal_copy"));
+        assert_eq!(
+            find_conflict(&config, "cmd-c", "new_tab"),
+            Some("terminal_copy")
+        );
     }
 
     #[test]
@@ -581,7 +650,10 @@ mod tests {
     #[test]
     fn effective_keystroke_prefers_override() {
         let config = config_with(make_overrides(&[("terminal_copy", "cmd-shift-y")]));
-        assert_eq!(effective_keystroke(&config, "terminal_copy"), Some("cmd-shift-y"));
+        assert_eq!(
+            effective_keystroke(&config, "terminal_copy"),
+            Some("cmd-shift-y")
+        );
         assert_eq!(effective_keystroke(&config, "new_tab"), Some("cmd-t"));
         assert_eq!(effective_keystroke(&config, "unknown"), None);
     }

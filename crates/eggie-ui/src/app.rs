@@ -1,17 +1,17 @@
-use crate::icons::{IconName, icon, icon_sized};
+use crate::command_history::{CommandStatus, format_relative_time};
 use crate::command_palette::{PaletteEntry, command_matches, palette_entries};
+use crate::icons::{IconName, icon, icon_sized};
 use crate::input_latency::InputLatencyTracker;
+use crate::keybindings::LuaAction;
 use crate::native_menu::{
     NativeProcessMenuCommand, NativeProfileMenuCommand, NativeProjectMenuCommand,
     NativeSnippetMenuCommand, NativeTabMenuCommand, prepare_process_menu, prepare_profile_menu,
     prepare_project_menu, prepare_snippet_menu, prepare_tab_menu,
 };
-use crate::command_history::{CommandStatus, format_relative_time};
 use crate::notes_store::NotesStore;
-use crate::profile_store::ProfileStore;
 use crate::process_icons::{self, ProcessIcon};
+use crate::profile_store::ProfileStore;
 use crate::project_store::ProjectStore;
-use crate::snippet_store::{Snippet, SnippetStore};
 use crate::settings::{
     CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, OpenWith, SettingsStore,
     TerminalTheme, UiColors,
@@ -23,13 +23,13 @@ use crate::settings_window::{
     SplitLeft, SplitRight, SplitUp, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
     ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar, ZoomWindow, is_dark_appearance,
 };
-use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
+use crate::snippet_store::{Snippet, SnippetStore};
 use crate::terminal_renderer::{
     MetalTerminalRenderer, PixelStore, TerminalImageData, TerminalImeState, TerminalInputContext,
     TerminalPoint, TerminalRenderOptions, TerminalSearchHighlights, TerminalSelection,
-    TerminalTextureKey,
-    terminal_background, terminal_cell_metrics,
+    TerminalTextureKey, terminal_background, terminal_cell_metrics,
 };
+use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
 use crate::workspace::{SidebarRestoreState, WindowProjectView, WorkspaceRestoreState};
 use eggie_daemon::{DaemonClient, DaemonConnection, DaemonInputSender, TerminalImageFrame};
 use eggie_domain::{
@@ -38,29 +38,25 @@ use eggie_domain::{
 };
 use eggie_protocol::{
     ClientRequest, DaemonResponse, ListeningPort, ProcessInfo, SessionInspection, SessionStatus,
-    SessionSummary,
-    TERMINAL_SCROLL_DELTA_SCALE, TerminalAppearance, TerminalAttentionRequest,
+    SessionSummary, TERMINAL_SCROLL_DELTA_SCALE, TerminalAppearance, TerminalAttentionRequest,
     TerminalClipboardContent, TerminalClipboardSelection, TerminalCursorShape,
-    TerminalImageDescriptor,
-    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
-    TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
-    TerminalProgramState, TerminalProgramStatus, TerminalProgressState, TerminalProgressTimeouts,
-    TerminalProgressUpdate, TerminalScrollCommand,
-    TerminalScrollDelta, TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit,
-    TerminalSearchDirection,
-    TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind,
-    TerminalShellIntegrationState, TerminalSize, TerminalSnapshot,
+    TerminalImageDescriptor, TerminalModifiers, TerminalMouseAction, TerminalMouseButton,
+    TerminalMouseEvent, TerminalMouseTracking, TerminalOscEventPayload, TerminalProgramState,
+    TerminalProgramStatus, TerminalProgress, TerminalProgressState, TerminalProgressTimeouts,
+    TerminalProgressUpdate, TerminalScrollCommand, TerminalScrollDelta, TerminalScrollEvent,
+    TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection, TerminalSearchRequest,
+    TerminalSearchResult, TerminalSelectionKind, TerminalShellIntegrationState, TerminalSize,
+    TerminalSnapshot,
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
-    Animation, AnimationExt, DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent,
-    KeyUpEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions,
-    Pixels, Point, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
-    TouchPhase, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, anchored,
-    canvas, deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
-    relative, rgb, rgba, size,
+    Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem,
+    ClipboardString, Context, Div, DragMoveEvent, Entity, FocusHandle, Image, ImageFormat,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Role, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, Stateful, Subscription, SystemNotification,
+    SystemNotificationAction, TitlebarOptions, TouchPhase, WeakEntity, Window, WindowBounds,
+    WindowControlArea, WindowOptions, anchored, canvas, deferred, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, quad, relative, rgb, rgba, size,
 };
 use std::{
     borrow::Cow,
@@ -75,14 +71,14 @@ use std::{
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[cfg(target_os = "macos")]
+use block::ConcreteBlock;
+#[cfg(target_os = "macos")]
 use cocoa::{
     base::{id, nil},
-    foundation::{NSInteger, NSPoint, NSRect, NSString, NSSize},
+    foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString},
 };
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
-#[cfg(target_os = "macos")]
-use block::ConcreteBlock;
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -532,14 +528,13 @@ fn project_card_poses(
         angle: process_icons::stack_angle(index, count),
         opacity: 1.,
     };
-    let tween = |from: process_icons::CardPose, to: process_icons::CardPose| {
-        process_icons::CardPose {
+    let tween =
+        |from: process_icons::CardPose, to: process_icons::CardPose| process_icons::CardPose {
             icon: to.icon,
             offset_x: from.offset_x + (to.offset_x - from.offset_x) * progress,
             angle: from.angle + (to.angle - from.angle) * progress,
             opacity: from.opacity + (to.opacity - from.opacity) * progress,
-        }
-    };
+        };
     let mut poses = Vec::with_capacity(previous.len() + current.len());
     for (index, card) in previous.iter().enumerate().rev() {
         let target = current.iter().position(|next| next.id == card.id);
@@ -561,7 +556,10 @@ fn project_card_poses(
     for (index, card) in current.iter().enumerate().rev() {
         let target = at(card.icon, index, current.len());
         let from = if card.icon == ProcessIcon::ProjectPlaceholder {
-            process_icons::CardPose { opacity: 0., ..target }
+            process_icons::CardPose {
+                opacity: 0.,
+                ..target
+            }
         } else if let Some(previous_index) = previous.iter().position(|old| old.id == card.id) {
             let previous_card = previous[previous_index];
             let mut from = at(card.icon, previous_index, previous.len());
@@ -570,7 +568,10 @@ fn project_card_poses(
             }
             from
         } else if previous.is_empty() {
-            process_icons::CardPose { opacity: 0., ..target }
+            process_icons::CardPose {
+                opacity: 0.,
+                ..target
+            }
         } else {
             process_icons::CardPose {
                 opacity: 0.,
@@ -657,9 +658,9 @@ impl DraggedTab {
                     process_icons::card_stack(&[self.icon], self.dark, SIDEBAR_CARD_SIZE)
                         .expect("single process card"),
                 )
-                    .flex_none()
-                    .w(px(process_icons::stack_width(1, SIDEBAR_CARD_SIZE)))
-                    .h(px(SIDEBAR_CARD_SIZE + 5.)),
+                .flex_none()
+                .w(px(process_icons::stack_width(1, SIDEBAR_CARD_SIZE)))
+                .h(px(SIDEBAR_CARD_SIZE + 5.)),
             )
             .child(
                 div()
@@ -1041,7 +1042,11 @@ fn prompt_for_text(
                 if bytes.is_null() {
                     None
                 } else {
-                    Some(std::ffi::CStr::from_ptr(bytes).to_string_lossy().into_owned())
+                    Some(
+                        std::ffi::CStr::from_ptr(bytes)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
             } else {
                 None
@@ -1218,14 +1223,19 @@ fn prompt_for_snippet(
                 let name = if name_bytes.is_null() {
                     String::new()
                 } else {
-                    std::ffi::CStr::from_ptr(name_bytes).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(name_bytes)
+                        .to_string_lossy()
+                        .into_owned()
                 };
                 let content_value: id = msg_send![text_view, string];
-                let content_bytes: *const std::os::raw::c_char = msg_send![content_value, UTF8String];
+                let content_bytes: *const std::os::raw::c_char =
+                    msg_send![content_value, UTF8String];
                 let content = if content_bytes.is_null() {
                     String::new()
                 } else {
-                    std::ffi::CStr::from_ptr(content_bytes).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(content_bytes)
+                        .to_string_lossy()
+                        .into_owned()
                 };
                 let state: NSInteger = msg_send![checkbox, state];
                 Some((name, content, state != 0))
@@ -1295,7 +1305,21 @@ impl SeededSession {
 
 impl EggieApp {
     pub fn launch(project_root: PathBuf, client: DaemonClient) {
-        let settings_store = SettingsStore::load();
+        let settings_store = match (
+            client.request(ClientRequest::GetConfig),
+            client.request(ClientRequest::GetPreferences),
+        ) {
+            (
+                Ok(DaemonResponse::Config { snapshot }),
+                Ok(DaemonResponse::Preferences {
+                    snapshot: preferences,
+                }),
+            ) => SettingsStore::load_with_daemon(snapshot, preferences, client.clone()),
+            (config, preferences) => {
+                eprintln!("failed to load Eggie config/preferences: {config:?}, {preferences:?}");
+                SettingsStore::load()
+            }
+        };
         // Profiles carry the launch fields that used to live in the global settings, so the store is
         // built from those values: on first run they migrate into the built-in Default profile, and
         // once `profiles.json` exists they are ignored.
@@ -1349,6 +1373,7 @@ impl EggieApp {
                 updates.clone(),
                 cx,
             );
+            Self::spawn_config_watcher(cx, client.clone(), settings.clone());
             Self::open_new_window(
                 cx,
                 client.clone(),
@@ -1388,7 +1413,8 @@ impl EggieApp {
                         let config = settings.read(cx).config();
                         if config.auto_check_updates {
                             let channel = config.update_channel.slug();
-                            updates.update(cx, |controller, cx| controller.check(true, channel, cx));
+                            updates
+                                .update(cx, |controller, cx| controller.check(true, channel, cx));
                         }
                     });
                 })
@@ -1409,6 +1435,39 @@ impl EggieApp {
             .detach();
             cx.activate(true);
         });
+    }
+
+    fn spawn_config_watcher(cx: &mut App, client: DaemonClient, settings: Entity<SettingsStore>) {
+        let executor = cx.background_executor().clone();
+        let mut revision = settings.read(cx).lua_config().status_revision;
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            loop {
+                let request_client = client.clone();
+                let result = executor
+                    .spawn(async move {
+                        request_client.request(ClientRequest::WaitForConfig {
+                            after_revision: revision,
+                            timeout_ms: 30_000,
+                        })
+                    })
+                    .await;
+                match result {
+                    Ok(DaemonResponse::Config { snapshot }) => {
+                        revision = snapshot.status_revision;
+                        cx.update(|cx| {
+                            settings.update(cx, |store, cx| store.set_lua_snapshot(snapshot, cx));
+                        });
+                    }
+                    Ok(DaemonResponse::ConfigUnchanged { .. }) => {}
+                    Ok(response) => eprintln!("unexpected Lua config watch response: {response:?}"),
+                    Err(error) => {
+                        eprintln!("Lua config watch failed: {error:#}");
+                        executor.timer(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     /// Bind the GUI single-instance socket and serve wake requests. A blocking `accept` loop runs on
@@ -1462,8 +1521,8 @@ impl EggieApp {
                 cx.update(|cx| {
                     // D4: reuse a project with the same root, otherwise add one, then open a window
                     // focused on it.
-                    let (project_id, _created) = project_store
-                        .update(cx, |store, cx| store.upsert_by_root(cwd.clone(), cx));
+                    let (project_id, _created) =
+                        project_store.update(cx, |store, cx| store.upsert_by_root(cwd.clone(), cx));
                     Self::open_new_window(
                         cx,
                         client,
@@ -1565,14 +1624,16 @@ impl EggieApp {
             NewWindowInit::OpenDir { project_id } => {
                 // The project already exists in the shared store (added by the waking path). Open one
                 // terminal in it, since `eggie <dir>` is an explicit request for a terminal there.
-                let (root, profile) = Self::project_root_and_profile(
-                    *project_id,
-                    project_store,
-                    profile_store,
-                    cx,
-                );
+                let (root, profile) =
+                    Self::project_root_and_profile(*project_id, project_store, profile_store, cx);
                 let sessions = Self::create_session(
-                    client, *project_id, window_id, root, &profile, config, global,
+                    client,
+                    *project_id,
+                    window_id,
+                    root,
+                    &profile,
+                    config,
+                    global,
                 )
                 .map(|summary| SeededSession::launched(summary, profile.id))
                 .into_iter()
@@ -1779,10 +1840,9 @@ impl EggieApp {
             // Seeding runs before any window exists, so it cannot put a consent prompt on screen.
             // A host the user already answered for is honored; an unanswered one connects without
             // installing, and the next terminal opened from a live window does the asking.
-            remote_install_consented: spawn
-                .remote
-                .as_ref()
-                .is_some_and(|target| config.remote_install_consent.get(&target.consent_key()) == Some(&true)),
+            remote_install_consented: spawn.remote.as_ref().is_some_and(|target| {
+                config.remote_install_consent.get(&target.consent_key()) == Some(&true)
+            }),
             remote: spawn.remote,
             remote_cwd: spawn.remote_cwd,
         }) {
@@ -1861,7 +1921,8 @@ impl EggieApp {
                 // claimed summaries. The session poll would fix these too, but not before first paint.
                 for session in &sessions {
                     for view in project_views.values_mut() {
-                        view.layout.update_terminal_title(session.id, &session.title);
+                        view.layout
+                            .update_terminal_title(session.id, &session.title);
                     }
                 }
                 sidebar
@@ -1962,7 +2023,9 @@ impl EggieApp {
             if let Some(editor) = app.notes_editor.as_ref() {
                 let local = editor.input.read(cx).content().to_owned();
                 if local != shared {
-                    editor.input.update(cx, |input, cx| input.set_content(shared, cx));
+                    editor
+                        .input
+                        .update(cx, |input, cx| input.set_content(shared, cx));
                 }
             }
             cx.notify();
@@ -2000,7 +2063,9 @@ impl EggieApp {
             let subscription = cx.subscribe_in(&input, window, Self::on_notes_input_event);
             let scroll_handle = ScrollHandle::new();
             // Let the textarea drive this same scroll handle for edge-drag auto-scroll.
-            input.update(cx, |input, _| input.set_scroll_handle(scroll_handle.clone()));
+            input.update(cx, |input, _| {
+                input.set_scroll_handle(scroll_handle.clone())
+            });
             NotesEditor {
                 input,
                 _subscription: subscription,
@@ -2440,7 +2505,12 @@ impl EggieApp {
                         files: false,
                         directories: true,
                         multiple: false,
-                        prompt: Some(self.language.choose_receive_files_prompt().to_owned().into()),
+                        prompt: Some(
+                            self.language
+                                .choose_receive_files_prompt()
+                                .to_owned()
+                                .into(),
+                        ),
                     });
                     window
                         .spawn(cx, async move |_| {
@@ -2665,7 +2735,8 @@ impl EggieApp {
             return true;
         }
         let elapsed = self.cursor_blink_epoch.elapsed().as_secs_f32();
-        elapsed.rem_euclid(CURSOR_BLINK_PERIOD.as_secs_f32()) < CURSOR_BLINK_PERIOD.as_secs_f32() / 2.
+        elapsed.rem_euclid(CURSOR_BLINK_PERIOD.as_secs_f32())
+            < CURSOR_BLINK_PERIOD.as_secs_f32() / 2.
     }
 
     /// Whether the active session's cursor is blinking right now (drives the blink timer loop).
@@ -2715,7 +2786,10 @@ impl EggieApp {
     /// terminal never silently adopts a different profile's identity.
     fn tab_profile_badge(&self, item: &TabItem, cx: &App) -> Option<(u32, SharedString)> {
         let profile = self.profile_store.read(cx).profile(item.profile_id?)?;
-        Some((profile.badge_color?, SharedString::from(profile.name.clone())))
+        Some((
+            profile.badge_color?,
+            SharedString::from(profile.name.clone()),
+        ))
     }
 
     fn icon_for_item(&self, kind: ItemKind, session_id: Option<SessionId>) -> ProcessIcon {
@@ -2828,9 +2902,7 @@ impl EggieApp {
                 }
                 label
             }
-            IconIndicator::Attention(state) => {
-                program_state_label(state, self.language).to_owned()
-            }
+            IconIndicator::Attention(state) => program_state_label(state, self.language).to_owned(),
             IconIndicator::Progress(progress) => progress_label(progress, self.language),
         };
         let base = base
@@ -3070,7 +3142,6 @@ impl EggieApp {
         })
         .detach();
     }
-
 
     /// Coalesce terminal revisions and image arrivals onto the platform frame boundary.
     ///
@@ -3607,9 +3678,8 @@ impl EggieApp {
                             if choice == 0 {
                                 // Terminate all: kill this window's sessions.
                                 for session_id in app.window_session_ids() {
-                                    let _ = app
-                                        .client
-                                        .request(ClientRequest::Terminate { session_id });
+                                    let _ =
+                                        app.client.request(ClientRequest::Terminate { session_id });
                                 }
                             } else {
                                 // Detach (choice == 1): clear this window's ownership so the sessions
@@ -3843,9 +3913,7 @@ impl EggieApp {
 
     /// Permanently terminate a detached session from the popover.
     fn destroy_detached_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let _ = self
-            .client
-            .request(ClientRequest::Terminate { session_id });
+        let _ = self.client.request(ClientRequest::Terminate { session_id });
         self.detached_sessions
             .retain(|candidate| candidate.id != session_id);
         if self.detached_sessions.is_empty() {
@@ -3908,7 +3976,11 @@ impl EggieApp {
     ///
     /// Returned raw (not existence-checked) because the callers layer different fallbacks on top:
     /// [`resolve_spawn_config`] lets a profile's own `cwd` win first, then applies the existence check.
-    fn active_session_cwd(&self, group_id: GroupId, source_item: Option<ItemId>) -> Option<PathBuf> {
+    fn active_session_cwd(
+        &self,
+        group_id: GroupId,
+        source_item: Option<ItemId>,
+    ) -> Option<PathBuf> {
         let session_id = match source_item {
             Some(item_id) => self
                 .workspace()
@@ -3970,7 +4042,10 @@ impl EggieApp {
             PromptLevel::Info,
             language.remote_install_title(),
             Some(&language.remote_install_message(&destination)),
-            &[language.remote_install_allow(), language.remote_install_skip()],
+            &[
+                language.remote_install_allow(),
+                language.remote_install_skip(),
+            ],
             cx,
         );
         let app = cx.entity().downgrade();
@@ -3996,7 +4071,14 @@ impl EggieApp {
                     });
                     // Re-enter with the answer recorded: the consent gate now finds an entry and
                     // proceeds straight to creating the session.
-                    app.new_terminal_with_profile(group_id, split, source_item, profile, window, cx);
+                    app.new_terminal_with_profile(
+                        group_id,
+                        split,
+                        source_item,
+                        profile,
+                        window,
+                        cx,
+                    );
                 });
             });
         })
@@ -4020,11 +4102,8 @@ impl EggieApp {
         // part of a terminal's identity). The cwd resolution needs the same source-item lookup the
         // inheritance path uses, so compute it here and let the profile override it.
         let active_cwd = self.active_session_cwd(group_id, source_item);
-        let spawn = resolve_spawn_config(
-            &profile,
-            active_cwd.as_deref(),
-            &project.effective_root(),
-        );
+        let spawn =
+            resolve_spawn_config(&profile, active_cwd.as_deref(), &project.effective_root());
         // Spawn with the profile's own palette, so a themed terminal is born in its colors instead of
         // painting the global theme for the frame before the render reconcile catches up.
         let appearance = crate::settings::resolve_appearance(
@@ -4178,7 +4257,12 @@ impl EggieApp {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some(self.language.set_working_directory_prompt().to_owned().into()),
+            prompt: Some(
+                self.language
+                    .set_working_directory_prompt()
+                    .to_owned()
+                    .into(),
+            ),
         });
         let app = cx.entity().downgrade();
         cx.spawn(async move |_this, cx| {
@@ -4228,11 +4312,7 @@ impl EggieApp {
                     if !app.project_views.contains_key(&project_id) {
                         return;
                     }
-                    app.open_palette(
-                        PaletteMode::ProjectDefaultProfile(project_id),
-                        window,
-                        cx,
-                    );
+                    app.open_palette(PaletteMode::ProjectDefaultProfile(project_id), window, cx);
                 })
                 .ok();
                 return;
@@ -4263,12 +4343,7 @@ impl EggieApp {
         .detach();
     }
 
-    fn show_process_context_menu(
-        &mut self,
-        pid: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn show_process_context_menu(&mut self, pid: u32, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let Some(menu) = prepare_process_menu(window, self.language) else {
             return;
@@ -4310,7 +4385,11 @@ impl EggieApp {
     }
 
     fn prompt_rename_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
-        let Some(project) = self.projects.iter().find(|project| project.id == project_id) else {
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+        else {
             return;
         };
         let current_name = project.name.clone();
@@ -4555,11 +4634,9 @@ impl EggieApp {
         let profile = self.session_profile_appearance(session_id, cx);
         // The hover preview applies only while the settings window is previewing *this* session's
         // profile, so a preview never leaks into terminals from other profiles.
-        let preview = profile.as_ref().and_then(|(profile_id, _)| {
-            self.settings
-                .read(cx)
-                .profile_theme_preview(*profile_id)
-        });
+        let preview = profile
+            .as_ref()
+            .and_then(|(profile_id, _)| self.settings.read(cx).profile_theme_preview(*profile_id));
         crate::settings::resolve_appearance(
             self.settings.read(cx).config(),
             profile
@@ -4753,10 +4830,13 @@ impl EggieApp {
         };
         // Cmd/Ctrl+click opens a link. Explicit OSC 8 hyperlinks take priority; a bare
         // auto-detected URL under the cursor is the fallback.
-        let hyperlink = self.snapshots.get(&viewport.session_id).and_then(|snapshot| {
-            terminal_hyperlink_at(snapshot, point)
-                .or_else(|| detected_link_at(snapshot, point).map(|link| link.url.clone()))
-        });
+        let hyperlink = self
+            .snapshots
+            .get(&viewport.session_id)
+            .and_then(|snapshot| {
+                terminal_hyperlink_at(snapshot, point)
+                    .or_else(|| detected_link_at(snapshot, point).map(|link| link.url.clone()))
+            });
         if event.button == MouseButton::Left
             && event.modifiers.platform
             && let Some(url) = hyperlink
@@ -4826,9 +4906,11 @@ impl EggieApp {
         let preserve_without_drag = match event.click_count {
             0 | 1 if event.modifiers.shift => {
                 // Extend the existing selection's head to the clicked cell.
-                let _ = self
-                    .input_sender
-                    .send_selection_update(viewport.session_id, cell_position(point), side);
+                let _ = self.input_sender.send_selection_update(
+                    viewport.session_id,
+                    cell_position(point),
+                    side,
+                );
                 true
             }
             0 | 1 => {
@@ -5046,11 +5128,8 @@ impl EggieApp {
                 0
             };
             if lines != 0 {
-                let clamped_point =
-                    terminal_point_from_position(viewport, event.position).unwrap_or(TerminalPoint {
-                        line: 0,
-                        column: 0,
-                    });
+                let clamped_point = terminal_point_from_position(viewport, event.position)
+                    .unwrap_or(TerminalPoint { line: 0, column: 0 });
                 let _ = self.input_sender.send_scroll(
                     drag.session_id,
                     TerminalScrollEvent {
@@ -5070,9 +5149,9 @@ impl EggieApp {
             return;
         };
         let side = terminal_selection_side(viewport, event.position);
-        let _ = self
-            .input_sender
-            .send_selection_update(drag.session_id, cell_position(point), side);
+        let _ =
+            self.input_sender
+                .send_selection_update(drag.session_id, cell_position(point), side);
         drag.dragged = true;
         self.terminal_selection_drag = Some(drag);
         cx.notify();
@@ -5258,7 +5337,12 @@ impl EggieApp {
         true
     }
 
-    fn activate_relative_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn activate_relative_tab(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let group_id = self.workspace().active_group_id;
         let Some(group) = self.workspace().layout.find_group(group_id) else {
             return false;
@@ -5287,7 +5371,11 @@ impl EggieApp {
         self.enqueue_terminal_input(session_id, vec![0x0c])
     }
 
-    fn scroll_active_terminal(&mut self, command: TerminalScrollCommand, _cx: &mut Context<Self>) -> bool {
+    fn scroll_active_terminal(
+        &mut self,
+        command: TerminalScrollCommand,
+        _cx: &mut Context<Self>,
+    ) -> bool {
         let Some(session_id) = self.active_session_id() else {
             return false;
         };
@@ -5343,8 +5431,7 @@ impl EggieApp {
                     input.set_language(self.language);
                     input
                 });
-                let subscription =
-                    cx.subscribe_in(&input, window, Self::on_search_input_event);
+                let subscription = cx.subscribe_in(&input, window, Self::on_search_input_event);
                 self.terminal_search = Some(TerminalSearchUi {
                     session_id,
                     input,
@@ -5707,11 +5794,12 @@ impl EggieApp {
 
     /// The palette entries matching the current query, in display order.
     fn filtered_palette_entries(&self, cx: &App) -> Vec<PaletteEntry> {
-        let config = self.settings.read(cx).config();
+        let settings = self.settings.read(cx);
+        let config = settings.config();
         let query = self.command_palette_query(cx);
-        palette_entries(config)
+        palette_entries(config, &settings.lua_config().registered)
             .into_iter()
-            .filter(|entry| command_matches(entry.label, &query))
+            .filter(|entry| command_matches(&entry.label, &query))
             .collect()
     }
 
@@ -5844,7 +5932,8 @@ impl EggieApp {
                 // Store the built-in Default as `None` rather than as its id: "unset" and "explicitly
                 // the built-in Default" resolve identically, and `None` is the one that keeps following
                 // the built-in if a future release ever changes what that is.
-                let selected = (profile.id != eggie_domain::DEFAULT_PROFILE_ID).then_some(profile.id);
+                let selected =
+                    (profile.id != eggie_domain::DEFAULT_PROFILE_ID).then_some(profile.id);
                 self.project_store.update(cx, |store, cx| {
                     store.set_default_profile(project_id, selected, cx);
                 });
@@ -5924,11 +6013,7 @@ impl EggieApp {
                             .min_w_0()
                             // A profile's accent dot, so its identity is recognizable before launch.
                             .children(entry.badge_color.map(|color| {
-                                div()
-                                    .flex_none()
-                                    .size(px(8.))
-                                    .rounded_full()
-                                    .bg(rgb(color))
+                                div().flex_none().size(px(8.)).rounded_full().bg(rgb(color))
                             }))
                             .child(div().flex_1().min_w_0().truncate().child(entry.label)),
                     );
@@ -6215,12 +6300,7 @@ impl EggieApp {
         cx.stop_propagation();
     }
 
-    fn resize_split(
-        &mut self,
-        event: &MouseMoveEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn resize_split(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(split_id) = self.resizing_split else {
             return;
         };
@@ -6261,10 +6341,10 @@ impl EggieApp {
 
     /// Send an absolute scroll request for the scrollbar thumb drag / track click.
     fn scroll_terminal_to_offset(&self, session_id: SessionId, offset: u32) {
-        if let Err(error) = self.client.request(ClientRequest::TerminalScrollToOffset {
-            session_id,
-            offset,
-        }) {
+        if let Err(error) = self
+            .client
+            .request(ClientRequest::TerminalScrollToOffset { session_id, offset })
+        {
             eprintln!("failed to scroll terminal to offset: {error:#}");
         }
     }
@@ -6312,9 +6392,12 @@ impl EggieApp {
             return;
         };
         let track_height = f32::from(bounds.size.height);
-        let Some(thumb) =
-            scrollbar_thumb_geometry(track_height, snapshot.history_size, snapshot.size.rows, snapshot.display_offset)
-        else {
+        let Some(thumb) = scrollbar_thumb_geometry(
+            track_height,
+            snapshot.history_size,
+            snapshot.size.rows,
+            snapshot.display_offset,
+        ) else {
             return;
         };
         let click_y = f32::from(position.y) - f32::from(bounds.top());
@@ -6638,7 +6721,10 @@ impl EggieApp {
             return None;
         }
         let state = self.updates.read(cx).state().clone();
-        if matches!(state, UpdateState::Idle | UpdateState::Checking | UpdateState::Available(_)) {
+        if matches!(
+            state,
+            UpdateState::Idle | UpdateState::Checking | UpdateState::Available(_)
+        ) {
             return None;
         }
         let colors = self.colors;
@@ -6692,16 +6778,13 @@ impl EggieApp {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(rgb(colors.text))
-                            .child(if compatible {
-                                language.update_ready_restart()
-                            } else {
-                                language.update_ready_restart_with_daemon()
-                            }),
-                    )
+                    .child(div().text_size(px(13.)).text_color(rgb(colors.text)).child(
+                        if compatible {
+                            language.update_ready_restart()
+                        } else {
+                            language.update_ready_restart_with_daemon()
+                        },
+                    ))
                     .when(!compatible, |this| {
                         this.child(
                             div()
@@ -6720,19 +6803,17 @@ impl EggieApp {
                             .flex()
                             .justify_end()
                             .gap_2()
-                            .child(
-                                popover_button(
-                                    language.update_later(),
-                                    false,
-                                    colors,
-                                    cx.listener(|app, _, _, cx| {
-                                        app.update_popover_open = false;
-                                        app.updates
-                                            .update(cx, |controller, cx| controller.dismiss(cx));
-                                        cx.notify();
-                                    }),
-                                ),
-                            )
+                            .child(popover_button(
+                                language.update_later(),
+                                false,
+                                colors,
+                                cx.listener(|app, _, _, cx| {
+                                    app.update_popover_open = false;
+                                    app.updates
+                                        .update(cx, |controller, cx| controller.dismiss(cx));
+                                    cx.notify();
+                                }),
+                            ))
                             .child(popover_button(
                                 if compatible {
                                     language.update_restart()
@@ -6743,9 +6824,7 @@ impl EggieApp {
                                 colors,
                                 cx.listener(|app, _, _, cx| {
                                     app.updates.update(cx, |controller, cx| {
-                                        if let Err(error) =
-                                            controller.install_and_restart(cx)
-                                        {
+                                        if let Err(error) = controller.install_and_restart(cx) {
                                             controller.report_error(format!("{error:#}"), cx);
                                         }
                                     });
@@ -6766,25 +6845,18 @@ impl EggieApp {
                             .text_color(rgb(0xff6b6b))
                             .child(format!("{}: {message}", language.update_error_title())),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .child(popover_button(
-                                language.update_retry(),
-                                true,
-                                colors,
-                                cx.listener(|app, _, _, cx| {
-                                    app.update_popover_open = false;
-                                    let channel =
-                                        app.settings.read(cx).config().update_channel.slug();
-                                    app.updates.update(cx, |controller, cx| {
-                                        controller.check(false, channel, cx)
-                                    });
-                                    cx.notify();
-                                }),
-                            )),
-                    )
+                    .child(div().flex().justify_end().child(popover_button(
+                        language.update_retry(),
+                        true,
+                        colors,
+                        cx.listener(|app, _, _, cx| {
+                            app.update_popover_open = false;
+                            let channel = app.settings.read(cx).config().update_channel.slug();
+                            app.updates
+                                .update(cx, |controller, cx| controller.check(false, channel, cx));
+                            cx.notify();
+                        }),
+                    )))
                     .into_any_element()
             }
             UpdateState::UpToDate => div()
@@ -7094,12 +7166,7 @@ impl EggieApp {
     /// Open a native prompt to set or edit a tab's custom title. The field is prefilled with the
     /// tab's current display title (custom title if set, otherwise the process title). An empty
     /// result clears the override so the process title takes over again.
-    fn prompt_custom_title(
-        &mut self,
-        group_id: GroupId,
-        item_id: ItemId,
-        cx: &mut Context<Self>,
-    ) {
+    fn prompt_custom_title(&mut self, group_id: GroupId, item_id: ItemId, cx: &mut Context<Self>) {
         let language = self.language;
         let current = self
             .workspace()
@@ -7299,7 +7366,8 @@ impl EggieApp {
 
         // Stable sort keeps orphan sessions (rank = len) in their original relative order, appended
         // after everything the layout knows about.
-        sessions.sort_by_key(|session| layout_rank.get(&session.id).copied().unwrap_or(orphan_rank));
+        sessions
+            .sort_by_key(|session| layout_rank.get(&session.id).copied().unwrap_or(orphan_rank));
         sessions
     }
 
@@ -7715,7 +7783,11 @@ impl EggieApp {
                         cx.notify();
                     }))
                     .child(icon_sized(icon_for_open_with(option), 14.))
-                    .child(div().text_size(px(12.)).child(open_with_label(language, option))),
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .child(open_with_label(language, option)),
+                    ),
             );
         }
 
@@ -7765,10 +7837,7 @@ impl EggieApp {
             return;
         }
         self.settings.update(cx, |settings, cx| {
-            settings.update(
-                |config| config.open_directory_with = opener,
-                cx,
-            );
+            settings.update(|config| config.open_directory_with = opener, cx);
         });
     }
 
@@ -7794,12 +7863,14 @@ impl EggieApp {
         }
         let state = {
             let mut states = self.project_icon_states.borrow_mut();
-            let state = states.entry(project_id).or_insert_with(|| ProjectIconState {
-                icons: Vec::new(),
-                previous: Vec::new(),
-                revision: 0,
-                started_at: Instant::now(),
-            });
+            let state = states
+                .entry(project_id)
+                .or_insert_with(|| ProjectIconState {
+                    icons: Vec::new(),
+                    previous: Vec::new(),
+                    revision: 0,
+                    started_at: Instant::now(),
+                });
             if state.icons != desired {
                 state.previous = std::mem::replace(&mut state.icons, desired);
                 state.revision += 1;
@@ -7844,12 +7915,8 @@ impl EggieApp {
                     Animation::new(PROJECT_ICON_TRANSITION).with_easing(gpui::ease_in_out),
                     move |element, progress| {
                         let poses = project_card_poses(&state.previous, &state.icons, progress);
-                        let frame = process_icons::card_frame(
-                            &poses,
-                            dark,
-                            PROJECT_CARD_SIZE,
-                            image_width,
-                        );
+                        let frame =
+                            process_icons::card_frame(&poses, dark, PROJECT_CARD_SIZE, image_width);
                         element.child(
                             img(frame)
                                 .absolute()
@@ -7994,8 +8061,7 @@ impl EggieApp {
             );
             if !collapsed {
                 for session in self.sidebar_sessions_in_layout_order(project_id, view) {
-                    let active = is_active_project
-                        && self.active_session_id() == Some(session.id);
+                    let active = is_active_project && self.active_session_id() == Some(session.id);
                     let session_id = session.id;
                     // Prefer the tab's custom title (if any) so the sidebar stays consistent with
                     // the tab bar; fall back to the session's process title.
@@ -8531,35 +8597,32 @@ impl EggieApp {
         if touches_top_edge {
             tab_bar_drag_gap = Self::with_window_drag_handlers(tab_bar_drag_gap, cx);
         }
-        tabs = tabs
-            .child(scroll_wrapper)
-            .child(tab_bar_drag_gap)
-            .child(
-                // Right click on the "+" picks the profile the new tab runs, instead of the project
-                // default. The handler sits on this wrapper because `top_bar_icon_button` returns an
-                // opaque element that cannot take another method.
-                div()
-                    .flex()
-                    .flex_none()
-                    .h_full()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |app, _, window, cx| {
-                            app.show_profile_picker_menu(group_id, window, cx);
-                        }),
-                    )
-                    .child(top_bar_icon_button(
-                        IconName::Add,
-                        format!("new-terminal-{group_id}"),
-                        self.colors,
-                        false,
-                        false,
-                        Some(self.language.new_terminal_tooltip().into()),
-                        cx.listener(move |app, _, window, cx| {
-                            app.new_terminal(group_id, None, None, window, cx)
-                        }),
-                    )),
-            );
+        tabs = tabs.child(scroll_wrapper).child(tab_bar_drag_gap).child(
+            // Right click on the "+" picks the profile the new tab runs, instead of the project
+            // default. The handler sits on this wrapper because `top_bar_icon_button` returns an
+            // opaque element that cannot take another method.
+            div()
+                .flex()
+                .flex_none()
+                .h_full()
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |app, _, window, cx| {
+                        app.show_profile_picker_menu(group_id, window, cx);
+                    }),
+                )
+                .child(top_bar_icon_button(
+                    IconName::Add,
+                    format!("new-terminal-{group_id}"),
+                    self.colors,
+                    false,
+                    false,
+                    Some(self.language.new_terminal_tooltip().into()),
+                    cx.listener(move |app, _, window, cx| {
+                        app.new_terminal(group_id, None, None, window, cx)
+                    }),
+                )),
+        );
         if is_top_right_group {
             let right_sidebar_icon = if self.right_sidebar_collapsed {
                 IconName::PanelRightOpen
@@ -8673,38 +8736,40 @@ impl EggieApp {
                             .ok();
                         });
                     })
-                    .child(self.terminal_renderer.render(
-                        snapshot,
-                        TerminalRenderOptions::new(
-                            appearance.theme,
-                            // The accent tints the selection band and the URL-hover underline, both of
-                            // which are painted *inside* terminal cells — so it has to come from this
-                            // terminal's own resolved theme, not from `self.colors` (which is derived
-                            // from the interface theme). Reading the chrome accent here would paint a
-                            // light-interface selection over a dark terminal once the two layers differ.
-                            UiColors::from_theme(appearance.theme).accent,
-                            self.terminal_minimum_contrast,
-                            selection,
-                            ime,
-                            input,
-                            self.input_latency.clone(),
-                        )
-                        .with_search(search)
-                        .with_url_hover(url_hover)
-                        .with_cursor_visible(cursor_visible)
-                        .with_metric_adjustments(metric_adjustments)
-                        .with_font_families(appearance.families.clone())
-                        .with_font_features(
-                            self.terminal_font_features.clone(),
-                            self.terminal_ligatures,
-                            self.terminal_shaping_break_cursor,
-                        )
-                        .with_font_variations(
-                            self.terminal_font_variations.clone(),
-                            self.terminal_font_thicken,
-                        )
-                        .with_codepoint_map(self.terminal_font_codepoint_map.clone()),
-                    ))
+                    .child(
+                        self.terminal_renderer.render(
+                            snapshot,
+                            TerminalRenderOptions::new(
+                                appearance.theme,
+                                // The accent tints the selection band and the URL-hover underline, both of
+                                // which are painted *inside* terminal cells — so it has to come from this
+                                // terminal's own resolved theme, not from `self.colors` (which is derived
+                                // from the interface theme). Reading the chrome accent here would paint a
+                                // light-interface selection over a dark terminal once the two layers differ.
+                                UiColors::from_theme(appearance.theme).accent,
+                                self.terminal_minimum_contrast,
+                                selection,
+                                ime,
+                                input,
+                                self.input_latency.clone(),
+                            )
+                            .with_search(search)
+                            .with_url_hover(url_hover)
+                            .with_cursor_visible(cursor_visible)
+                            .with_metric_adjustments(metric_adjustments)
+                            .with_font_families(appearance.families.clone())
+                            .with_font_features(
+                                self.terminal_font_features.clone(),
+                                self.terminal_ligatures,
+                                self.terminal_shaping_break_cursor,
+                            )
+                            .with_font_variations(
+                                self.terminal_font_variations.clone(),
+                                self.terminal_font_thicken,
+                            )
+                            .with_codepoint_map(self.terminal_font_codepoint_map.clone()),
+                        ),
+                    )
                     .into_any_element()
             })
             .unwrap_or_else(|| {
@@ -8888,10 +8953,18 @@ impl EggieApp {
         // the content is forced to Notes; the user's right_tab choice is preserved and restored once a
         // live session is active again.
         let forced = self.notes_forced();
-        let active_tab = if forced { RightTab::Notes } else { self.right_tab };
+        let active_tab = if forced {
+            RightTab::Notes
+        } else {
+            self.right_tab
+        };
         let tabs = [
             (RightTab::Info, language.info_tab(), IconName::Info),
-            (RightTab::Commands, language.commands_tab(), IconName::Terminal),
+            (
+                RightTab::Commands,
+                language.commands_tab(),
+                IconName::Terminal,
+            ),
             (RightTab::Notes, language.notes_tab(), IconName::StickyNote),
         ]
         .into_iter()
@@ -8916,7 +8989,9 @@ impl EggieApp {
                         .justify_center()
                         .gap_1()
                         .rounded_lg()
-                        .when(disabled, |element| element.text_color(rgb(self.colors.muted)).opacity(0.5))
+                        .when(disabled, |element| {
+                            element.text_color(rgb(self.colors.muted)).opacity(0.5)
+                        })
                         .when(!disabled, |element| {
                             element
                                 .cursor_pointer()
@@ -9018,7 +9093,11 @@ impl EggieApp {
 
     fn render_right_content(&self, cx: &mut Context<Self>) -> AnyElement {
         // Forced Notes (exited / no session) overrides the selected tab's content.
-        let tab = if self.notes_forced() { RightTab::Notes } else { self.right_tab };
+        let tab = if self.notes_forced() {
+            RightTab::Notes
+        } else {
+            self.right_tab
+        };
         match tab {
             RightTab::Info => {
                 let session = self
@@ -9027,7 +9106,11 @@ impl EggieApp {
                 let mut content = div().flex().flex_col().gap_4();
                 if let Some(session) = session {
                     content = content
-                        .child(process_summary(&session.current_process, self.colors, self.language))
+                        .child(process_summary(
+                            &session.current_process,
+                            self.colors,
+                            self.language,
+                        ))
                         .child(
                             div()
                                 .flex()
@@ -9041,7 +9124,10 @@ impl EggieApp {
                                 // A remote path cannot be opened locally, so the Finder/VS Code
                                 // buttons are omitted for a remote session.
                                 .when(
-                                    session.reported_location.as_ref().is_none_or(|location| location.local),
+                                    session
+                                        .reported_location
+                                        .as_ref()
+                                        .is_none_or(|location| location.local),
                                     |element| {
                                         element.child(self.render_directory_actions(
                                             DirectoryField::Current,
@@ -9108,10 +9194,7 @@ impl EggieApp {
                                     .flex_col()
                                     .gap_2()
                                     .child(section_label(self.language.ports_label(), self.colors))
-                                    .child(placeholder(
-                                        self.language.loading_ports(),
-                                        self.colors,
-                                    )),
+                                    .child(placeholder(self.language.loading_ports(), self.colors)),
                             );
                     }
                 }
@@ -9152,7 +9235,11 @@ impl EggieApp {
             .cursor_pointer()
             .text_color(rgb(self.colors.muted))
             .child(icon_sized(
-                if collapsed { IconName::ArrowRight } else { IconName::ArrowDown },
+                if collapsed {
+                    IconName::ArrowRight
+                } else {
+                    IconName::ArrowDown
+                },
                 12.,
             ))
             .child(section_label(label, self.colors))
@@ -9164,13 +9251,17 @@ impl EggieApp {
     }
 
     fn render_command_history_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut section = div().flex().flex_col().gap_2().child(self.collapsible_header(
-            "command-history-header".into(),
-            self.language.command_history_label(),
-            self.command_history_collapsed,
-            cx,
-            |app, _| app.command_history_collapsed = !app.command_history_collapsed,
-        ));
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.collapsible_header(
+                "command-history-header".into(),
+                self.language.command_history_label(),
+                self.command_history_collapsed,
+                cx,
+                |app, _| app.command_history_collapsed = !app.command_history_collapsed,
+            ));
         if self.command_history_collapsed {
             return section.into_any_element();
         }
@@ -9205,7 +9296,10 @@ impl EggieApp {
                     any = true;
                     list = list.child(self.render_command_row(
                         session_id,
-                        { let s: SharedString = format!("cmd-{}", record.id).into(); s },
+                        {
+                            let s: SharedString = format!("cmd-{}", record.id).into();
+                            s
+                        },
                         record.command_line.clone(),
                         record.exit_code,
                         record.started_at_unix_ms,
@@ -9216,8 +9310,10 @@ impl EggieApp {
                 if any {
                     section = section.child(list);
                 } else {
-                    section =
-                        section.child(placeholder(self.language.command_history_empty(), self.colors));
+                    section = section.child(placeholder(
+                        self.language.command_history_empty(),
+                        self.colors,
+                    ));
                 }
             }
         }
@@ -9237,7 +9333,10 @@ impl EggieApp {
     ) -> AnyElement {
         let status = CommandStatus::from_exit_code(exit_code);
         let (dot_color, trailing): (u32, Option<String>) = match status {
-            CommandStatus::Running => (self.colors.muted, Some(self.language.command_running().to_owned())),
+            CommandStatus::Running => (
+                self.colors.muted,
+                Some(self.language.command_running().to_owned()),
+            ),
             CommandStatus::Success => (0x3fb950, None),
             CommandStatus::Failure(code) => (0xf85149, Some(code.to_string())),
         };
@@ -9249,7 +9348,10 @@ impl EggieApp {
         // Command history rows are single-line: collapse any embedded newlines (multi-line
         // commands) to spaces so the row keeps its flex layout and truncates cleanly.
         let command_text = if has_text {
-            raw.split(['\n', '\r']).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+            raw.split(['\n', '\r'])
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
         } else {
             self.language.command_no_text().to_owned()
         };
@@ -9350,7 +9452,12 @@ impl EggieApp {
         let short = id.simple().to_string();
         let row_id: SharedString = format!("snippet-{short}").into();
         let name = if snippet.name.trim().is_empty() {
-            snippet.content.lines().next().unwrap_or_default().to_owned()
+            snippet
+                .content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
         } else {
             snippet.name.clone()
         };
@@ -9381,7 +9488,12 @@ impl EggieApp {
             .into_any_element()
     }
 
-    fn show_snippet_context_menu(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_snippet_context_menu(
+        &mut self,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.stop_propagation();
         let Some(menu) = prepare_snippet_menu(window, self.language) else {
             return;
@@ -9439,8 +9551,14 @@ impl EggieApp {
                 .find(|s| s.id == id)
                 .cloned()
         });
-        let name_seed = existing.as_ref().map(|s| s.name.clone()).unwrap_or_default();
-        let content_seed = existing.as_ref().map(|s| s.content.clone()).unwrap_or_default();
+        let name_seed = existing
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let content_seed = existing
+            .as_ref()
+            .map(|s| s.content.clone())
+            .unwrap_or_default();
         let auto_run_seed = existing.as_ref().map(|s| s.auto_run).unwrap_or(false);
         let title = if editing.is_some() {
             language.edit_snippet()
@@ -9468,12 +9586,12 @@ impl EggieApp {
             }
             let _ = this.update(cx, |app, cx| {
                 match editing {
-                    Some(id) => app
-                        .snippet_store
-                        .update(cx, |store, cx| store.update(id, name, content, auto_run, cx)),
-                    None => app
-                        .snippet_store
-                        .update(cx, |store, cx| store.add(Snippet::new(name, content, auto_run), cx)),
+                    Some(id) => app.snippet_store.update(cx, |store, cx| {
+                        store.update(id, name, content, auto_run, cx)
+                    }),
+                    None => app.snippet_store.update(cx, |store, cx| {
+                        store.add(Snippet::new(name, content, auto_run), cx)
+                    }),
                 }
                 cx.notify();
             });
@@ -9481,7 +9599,12 @@ impl EggieApp {
         .detach();
     }
 
-    fn confirm_delete_snippet(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_delete_snippet(
+        &mut self,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let language = self.language;
         let prompt = window.prompt(
             PromptLevel::Warning,
@@ -9498,7 +9621,8 @@ impl EggieApp {
                 return;
             }
             let _ = this.update(cx, |app, cx| {
-                app.snippet_store.update(cx, |store, cx| store.remove(id, cx));
+                app.snippet_store
+                    .update(cx, |store, cx| store.remove(id, cx));
                 cx.notify();
             });
         })
@@ -9548,9 +9672,10 @@ impl EggieApp {
                         let thumb_height = (track_height * viewport_height / content_height)
                             .max(SIDEBAR_SCROLLBAR_MIN_THUMB_HEIGHT)
                             .min(track_height);
-                        let progress = (-f32::from(scroll_handle.offset().y) / max_offset).clamp(0., 1.);
-                        let thumb_top =
-                            f32::from(track_bounds.origin.y) + (track_height - thumb_height) * progress;
+                        let progress =
+                            (-f32::from(scroll_handle.offset().y) / max_offset).clamp(0., 1.);
+                        let thumb_top = f32::from(track_bounds.origin.y)
+                            + (track_height - thumb_height) * progress;
                         let thumb_bounds = Bounds::new(
                             point(track_bounds.origin.x, px(thumb_top)),
                             size(track_bounds.size.width, px(thumb_height)),
@@ -9602,7 +9727,8 @@ impl EggieApp {
                     return; // Superseded by a newer keystroke.
                 }
                 let text = editor.input.read(cx).content().to_owned();
-                app.notes_store.update(cx, |store, cx| store.set_text(text, cx));
+                app.notes_store
+                    .update(cx, |store, cx| store.set_text(text, cx));
             });
         })
         .detach();
@@ -9867,6 +9993,58 @@ impl gpui::Render for EggieApp {
                 app.toggle_command_palette(window, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|app, action: &LuaAction, window, cx| {
+                let request = ClientRequest::InvokeConfigAction {
+                    revision: app.settings.read(cx).lua_config().revision,
+                    name: action.name.clone(),
+                    context: eggie_config::ActionContext {
+                        cwd: Some(app.active_project_data().effective_root()),
+                        session_id: app.active_session_id().map(|id| id.to_string()),
+                        window_id: Some(app.window_id.to_string()),
+                    },
+                    args: action.args.clone(),
+                };
+                let client = app.client.clone();
+                let executor = cx.background_executor().clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    let result = executor.spawn(async move { client.request(request) }).await;
+                    match result {
+                        Ok(DaemonResponse::ConfigActionResult { actions }) => {
+                            let _ = cx.update(|window, cx| {
+                                for action in actions {
+                                    let built_in: Option<Box<dyn gpui::Action>> =
+                                        match action.name.as_str() {
+                                            "pane.split" => match action
+                                                .args
+                                                .get("direction")
+                                                .and_then(serde_json::Value::as_str)
+                                            {
+                                                Some("right") => Some(Box::new(SplitRight)),
+                                                Some("left") => Some(Box::new(SplitLeft)),
+                                                Some("up") => Some(Box::new(SplitUp)),
+                                                Some("down") => Some(Box::new(SplitDown)),
+                                                _ => None,
+                                            },
+                                            "tab.new" => Some(Box::new(NewTab)),
+                                            name => crate::keybindings::spec_by_id(name)
+                                                .map(|spec| (spec.make_action)()),
+                                        };
+                                    if let Some(built_in) = built_in {
+                                        window.dispatch_action(built_in, cx);
+                                    }
+                                }
+                            });
+                        }
+                        Ok(DaemonResponse::Error { message }) => {
+                            eprintln!("Lua action failed: {message}")
+                        }
+                        Ok(response) => eprintln!("unexpected Lua action response: {response:?}"),
+                        Err(error) => eprintln!("Lua action request failed: {error:#}"),
+                    }
+                })
+                .detach();
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(|app, _: &NewTabWithProfile, window, cx| {
                 app.open_profile_picker(window, cx);
                 cx.stop_propagation();
@@ -10115,7 +10293,12 @@ fn resolve_spawn_config(
         // Only meaningful for a remote profile; a local one's cwd already went into `cwd` above.
         remote_cwd: profile
             .is_remote()
-            .then(|| profile.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()))
+            .then(|| {
+                profile
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| cwd.to_string_lossy().into_owned())
+            })
             .flatten(),
     }
 }
@@ -10378,14 +10561,21 @@ struct ScrollbarThumb {
 /// scrollable rows. Viewport-top content index is `H - D`, mapped onto pixel travel `[0, travel]`:
 /// D = 0 → thumb flush bottom, D = H → thumb flush top. Returns `None` when there is no scrollback
 /// (`H == 0`) or the track is too short to be meaningful.
-fn scrollbar_thumb_geometry(track_height: f32, history: u32, rows: u16, offset: u32) -> Option<ScrollbarThumb> {
+fn scrollbar_thumb_geometry(
+    track_height: f32,
+    history: u32,
+    rows: u16,
+    offset: u32,
+) -> Option<ScrollbarThumb> {
     if history == 0 || track_height <= 0. {
         return None;
     }
     let h = history as f32;
     let r = (rows.max(1)) as f32;
     let frac = r / (h + r);
-    let thumb_height = (track_height * frac).max(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_height);
+    let thumb_height = (track_height * frac)
+        .max(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT)
+        .min(track_height);
     let travel = (track_height - thumb_height).max(0.);
     let d = (offset.min(history)) as f32;
     let top = ((h - d) / h) * travel;
@@ -10398,14 +10588,21 @@ fn scrollbar_thumb_geometry(track_height: f32, history: u32, rows: u16, offset: 
 /// Inverse of [`scrollbar_thumb_geometry`]: map a thumb-top pixel position back to a scroll offset D.
 /// `thumb_top` is clamped to `[0, travel]` by the caller's grab math; here we invert the linear map.
 /// Returns the current offset unchanged when there is no travel (thumb fills the track).
-fn scrollbar_offset_from_thumb_top(track_height: f32, history: u32, rows: u16, thumb_top: f32) -> u32 {
+fn scrollbar_offset_from_thumb_top(
+    track_height: f32,
+    history: u32,
+    rows: u16,
+    thumb_top: f32,
+) -> u32 {
     if history == 0 || track_height <= 0. {
         return 0;
     }
     let h = history as f32;
     let r = (rows.max(1)) as f32;
     let frac = r / (h + r);
-    let thumb_height = (track_height * frac).max(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT).min(track_height);
+    let thumb_height = (track_height * frac)
+        .max(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT)
+        .min(track_height);
     let travel = track_height - thumb_height;
     if travel <= 0. {
         return 0;
@@ -10485,7 +10682,10 @@ fn executable_path_for_pid(pid: u32) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn executable_path_for_pid(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()?.to_str().map(str::to_owned)
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()?
+        .to_str()
+        .map(str::to_owned)
 }
 
 fn process_tree_rows(processes: &[ProcessInfo]) -> Vec<ProcessTreeRow> {
@@ -10684,8 +10884,10 @@ fn parse_forward_spec(text: &str) -> Option<eggie_protocol::PortForwardSpec> {
     };
     let port = parts.next()?.parse::<u16>().ok()?;
     let destination = parts.next().map(str::to_owned);
-    if matches!(kind, eggie_protocol::PortForwardKind::Local | eggie_protocol::PortForwardKind::Remote)
-        && destination.is_none()
+    if matches!(
+        kind,
+        eggie_protocol::PortForwardKind::Local | eggie_protocol::PortForwardKind::Remote
+    ) && destination.is_none()
     {
         return None;
     }
@@ -10766,9 +10968,12 @@ fn process_info_row(
         content = content
             .cursor_pointer()
             .hover(|element| element.bg(rgb(colors.hover)))
-            .on_mouse_down(MouseButton::Right, cx.listener(move |app, _, window, cx| {
-                app.show_process_context_menu(pid, window, cx);
-            }));
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |app, _, window, cx| {
+                    app.show_process_context_menu(pid, window, cx);
+                }),
+            );
     }
 
     content = content
@@ -11072,7 +11277,11 @@ fn open_path_with(path: &Path, opener: OpenWith) {
         }
     }
     if let Err(error) = command.spawn() {
-        eprintln!("failed to open {} with {}: {error}", path.display(), opener.slug());
+        eprintln!(
+            "failed to open {} with {}: {error}",
+            path.display(),
+            opener.slug()
+        );
     }
 }
 
@@ -11254,8 +11463,14 @@ mod tests {
         let track = 400.;
         let (history, rows) = (100u32, 25u16);
         // Above the track → oldest line (full history). Below → live bottom (0).
-        assert_eq!(scrollbar_offset_from_thumb_top(track, history, rows, -50.), history);
-        assert_eq!(scrollbar_offset_from_thumb_top(track, history, rows, 10_000.), 0);
+        assert_eq!(
+            scrollbar_offset_from_thumb_top(track, history, rows, -50.),
+            history
+        );
+        assert_eq!(
+            scrollbar_offset_from_thumb_top(track, history, rows, 10_000.),
+            0
+        );
     }
 
     fn process(pid: u32, parent_pid: Option<u32>, name: &str) -> ProcessInfo {
@@ -11812,18 +12027,22 @@ mod tests {
             icon_indicator(Some(&status), Some(progress)),
             Some(IconIndicator::Working(None))
         );
-        assert!(icon_indicator(Some(&status), Some(progress))
-            .unwrap()
-            .is_animated());
+        assert!(
+            icon_indicator(Some(&status), Some(progress))
+                .unwrap()
+                .is_animated()
+        );
 
         status.state = TerminalProgramState::Blocked;
         assert_eq!(
             icon_indicator(Some(&status), Some(progress)),
             Some(IconIndicator::Attention(TerminalProgramState::Blocked))
         );
-        assert!(!icon_indicator(Some(&status), Some(progress))
-            .unwrap()
-            .is_animated());
+        assert!(
+            !icon_indicator(Some(&status), Some(progress))
+                .unwrap()
+                .is_animated()
+        );
 
         status.state = TerminalProgramState::Idle;
         assert_eq!(
@@ -11844,10 +12063,14 @@ mod tests {
             }
         }
 
-        let root = std::env::temp_dir()
-            .join(format!("eggie-cwd-inherit-test-{}-root", std::process::id()));
-        let live = std::env::temp_dir()
-            .join(format!("eggie-cwd-inherit-test-{}-live", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "eggie-cwd-inherit-test-{}-root",
+            std::process::id()
+        ));
+        let live = std::env::temp_dir().join(format!(
+            "eggie-cwd-inherit-test-{}-live",
+            std::process::id()
+        ));
         let _cleanup = Cleanup(vec![root.clone(), live.clone()]);
         let _ = std::fs::create_dir_all(&root);
         let _ = std::fs::create_dir_all(&live);
@@ -11909,13 +12132,18 @@ mod tests {
         let mut profile = Profile::new("Fish".to_owned());
         profile.shell_program = "/opt/homebrew/bin/fish".to_owned();
         profile.shell_args = vec!["-l".to_owned(), "-C".to_owned(), "echo hi".to_owned()];
-        profile.env.insert("AWS_PROFILE".to_owned(), "prod".to_owned());
+        profile
+            .env
+            .insert("AWS_PROFILE".to_owned(), "prod".to_owned());
 
         let root = PathBuf::from("/tmp");
         let spawn = resolve_spawn_config(&profile, None, &root);
         assert_eq!(spawn.shell_program, "/opt/homebrew/bin/fish");
         assert_eq!(spawn.shell_args, profile.shell_args);
-        assert_eq!(spawn.env.get("AWS_PROFILE").map(String::as_str), Some("prod"));
+        assert_eq!(
+            spawn.env.get("AWS_PROFILE").map(String::as_str),
+            Some("prod")
+        );
         // The `path` feature defaults on, so the assembled token list carries it.
         assert_eq!(spawn.shell_features, "path");
 
@@ -11951,10 +12179,7 @@ mod tests {
         let mut profile = Profile::new("P".to_owned());
 
         // No profile cwd: inherit the live directory (the step-1 behavior is preserved).
-        assert_eq!(
-            resolve_spawn_config(&profile, Some(&live), &root).cwd,
-            live
-        );
+        assert_eq!(resolve_spawn_config(&profile, Some(&live), &root).cwd, live);
 
         // An explicit profile cwd wins over inheritance — it names a fixed directory on purpose.
         profile.cwd = Some(pinned.clone());
@@ -11998,7 +12223,9 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp dir");
 
         let mut profile = Profile::new("Prod".to_owned());
-        profile.remote = Some(eggie_domain::RemoteTarget::new("prod.example.com".to_owned()));
+        profile.remote = Some(eggie_domain::RemoteTarget::new(
+            "prod.example.com".to_owned(),
+        ));
         // A path that means something on the remote host and (almost certainly) nothing here.
         profile.cwd = Some(PathBuf::from("/srv/www"));
 

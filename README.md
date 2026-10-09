@@ -39,8 +39,16 @@ domain and protocol tests.
 Open the independent settings window from **Eggie → Settings…** or with
 <kbd>⌘</kbd><kbd>,</kbd>. Appearance, the separate dark/light Ghostty themes,
 terminal font, font size, minimum contrast, and horizontal/vertical terminal
-padding are persisted in `~/Library/Application Support/Eggie/settings.json`.
+padding are persisted in `~/Library/Application Support/Eggie/preferences.json`.
 Every change is shown in the fixed preview and applied live to every Eggie window.
+
+Eggie also supports a Rex-inspired, API-style Lua configuration at
+`~/.config/eggie/init.lua`. Lua settings take precedence over the corresponding
+GUI controls; GUI preferences remain available when a Lua setting is removed.
+Use `eggie config check [path]` to validate a file and `eggie config reload`
+to apply changes. `eggie do script.lua` runs a separate event script. See the
+[Lua configuration guide](docs/architecture/lua-configuration.md) for examples
+and the current API.
 
 The interface palette carries each terminal theme's hue into its surfaces while
 deriving separate background, surface, hover, border, text, and accent colors.

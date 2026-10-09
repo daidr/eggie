@@ -10,6 +10,7 @@ alacritty_terminal.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 eggie-daemon.workspace = true
+eggie-config.workspace = true
 eggie-domain.workspace = true
 eggie-protocol.workspace = true
 eggie-update.workspace = true
@@ -19,6 +20,7 @@ gpui_platform.workspace = true
 image = { version = "0.25.10", default-features = false }
 libc.workspace = true
 memmap2.workspace = true
+mlua.workspace = true
 parking_lot.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true

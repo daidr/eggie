@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the
@@ -204,11 +204,34 @@ impl Default for TerminalProgressTimeouts {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRequest {
     Handshake {
         protocol_version: u32,
+    },
+    GetConfig,
+    GetPreferences,
+    GetEventCursor,
+    SetPreferences {
+        base_revision: u64,
+        value: serde_json::Value,
+    },
+    ReloadConfig,
+    WaitForConfig {
+        after_revision: u64,
+        timeout_ms: u32,
+    },
+    WaitForEvents {
+        after_sequence: u64,
+        session_id: Option<SessionId>,
+        timeout_ms: u32,
+    },
+    InvokeConfigAction {
+        revision: u64,
+        name: String,
+        context: eggie_config::ActionContext,
+        args: serde_json::Value,
     },
     CreateSession {
         project_id: ProjectId,
@@ -1084,7 +1107,6 @@ pub struct TerminalLinkRange {
     pub url: String,
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshotDelta {
     #[serde(rename = "id")]
@@ -1266,13 +1288,31 @@ impl TerminalSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
     HandshakeAccepted {
         protocol_version: u32,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         build_id: String,
+    },
+    Config {
+        snapshot: eggie_config::ConfigSnapshot,
+    },
+    Preferences {
+        snapshot: eggie_config::PreferencesSnapshot,
+    },
+    ConfigUnchanged {
+        revision: u64,
+    },
+    ConfigActionResult {
+        actions: Vec<eggie_config::QueuedAction>,
+    },
+    Events {
+        update: EventUpdate,
+    },
+    EventsUnchanged {
+        sequence: u64,
     },
     SessionCreated {
         session: SessionSummary,
@@ -1339,6 +1379,22 @@ pub enum DaemonResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EventRecord {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub name: String,
+    pub session_id: Option<SessionId>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EventUpdate {
+    pub sequence: u64,
+    pub gap: bool,
+    pub events: Vec<EventRecord>,
 }
 
 mod base64_bytes {
@@ -1476,7 +1532,7 @@ mod tests {
         // (columns, rows, per-row text). Each row's cells are built sparse (spaces omitted), so the
         // ` : / /` cases exercise the column-gap break that must NOT match `://`.
         let cases: &[(u16, u16, &[&str])] = &[
-            (20, 1, &["visit https://x.io"]),   // scheme separator present
+            (20, 1, &["visit https://x.io"]),    // scheme separator present
             (20, 1, &["plain text no urls"]),    // none
             (20, 1, &["mailto:me@example.com"]), // mailto needle
             (20, 1, &["scheme : // spaced"]),    // gaps between :,/,/ -> no match
@@ -1684,10 +1740,8 @@ mod tests {
                 request
             );
             assert_eq!(
-                rmp_serde::from_slice::<ClientRequest>(
-                    &rmp_serde::to_vec_named(&request).unwrap()
-                )
-                .unwrap(),
+                rmp_serde::from_slice::<ClientRequest>(&rmp_serde::to_vec_named(&request).unwrap())
+                    .unwrap(),
                 request
             );
         }
@@ -1862,7 +1916,10 @@ mod tests {
                 // A client that predates profiles sends no env; the shell gets Eggie's own only.
                 assert!(env.is_empty());
                 // And no remote fields: a local session, with consent absent rather than assumed.
-                assert!(remote.is_none(), "absent `remote` must mean a local session");
+                assert!(
+                    remote.is_none(),
+                    "absent `remote` must mean a local session"
+                );
                 assert!(
                     !remote_install_consented,
                     "consent must never default to true — it authorizes writing to another host"
@@ -1893,7 +1950,10 @@ mod tests {
 
     #[test]
     fn selection_side_and_kind_default_and_omitted_block_flag() {
-        assert_eq!(TerminalSelectionSide::default(), TerminalSelectionSide::Left);
+        assert_eq!(
+            TerminalSelectionSide::default(),
+            TerminalSelectionSide::Left
+        );
         assert_eq!(
             TerminalSelectionKind::default(),
             TerminalSelectionKind::Simple
