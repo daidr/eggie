@@ -21,7 +21,8 @@ use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Entity, Image, ImageFormat, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
-    actions, anchored, canvas, deferred, div, img, point, prelude::*, px, rgb, size,
+    actions, anchored, canvas, deferred, div, img, linear_color_stop, linear_gradient, point,
+    prelude::*, px, rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -4477,6 +4478,41 @@ impl SettingsWindow {
         for name in self.selector_names(kind).iter().filter(|name| *name != default) {
             strip = strip.child(self.render_theme_card(kind, name, name == selected, cx));
         }
+        let scroll_handle = &self.theme_gallery_scroll_handles[kind.index()];
+        let offset_x = -f32::from(scroll_handle.offset().x);
+        let max_offset_x = f32::from(scroll_handle.max_offset().x);
+        let panel_color = rgb(self.colors.panel);
+        let mut strip_wrapper = div().relative().min_w_0().w_full().child(strip);
+        if offset_x > 0.5 {
+            strip_wrapper = strip_wrapper.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(28.))
+                    .bg(linear_gradient(
+                        90.,
+                        linear_color_stop(panel_color, 0.),
+                        linear_color_stop(panel_color.opacity(0.), 1.),
+                    )),
+            );
+        }
+        if offset_x < max_offset_x - 0.5 {
+            strip_wrapper = strip_wrapper.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(28.))
+                    .bg(linear_gradient(
+                        270.,
+                        linear_color_stop(panel_color, 0.),
+                        linear_color_stop(panel_color.opacity(0.), 1.),
+                    )),
+            );
+        }
         div()
             .flex()
             .flex_col()
@@ -4501,7 +4537,7 @@ impl SettingsWindow {
                     )
                     .child(self.render_theme_search(kind, window, cx)),
             )
-            .child(strip)
+            .child(strip_wrapper)
             .into_any_element()
     }
 
