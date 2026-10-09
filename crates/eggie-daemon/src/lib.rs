@@ -3010,6 +3010,7 @@ impl TerminalSession {
                 current_process: ProcessSummary {
                     pid: shell_pid,
                     name: shell_name,
+                    command_line: None,
                 },
                 current_directory: cwd,
                 last_refresh: None,
@@ -3063,6 +3064,15 @@ impl TerminalSession {
             .filter(|location| location.local && !location.path.is_empty())
             .map(|location| PathBuf::from(&location.path))
             .unwrap_or_else(|| runtime_metadata.current_directory.clone());
+        let current_process = runtime_metadata.current_process.clone();
+        drop(runtime_metadata);
+        let active_command = self
+            .events
+            .shell_integration
+            .lock()
+            .current_command
+            .as_ref()
+            .and_then(|command| command.command_line.clone());
         SessionSummary {
             id: self.id,
             project_id: self.project_id,
@@ -3072,7 +3082,8 @@ impl TerminalSession {
             current_directory,
             reported_location,
             shell_pid: self.shell_pid,
-            current_process: runtime_metadata.current_process.clone(),
+            current_process,
+            active_command,
             status: self.events.status.read().clone(),
         }
     }
@@ -3220,7 +3231,8 @@ impl TerminalSession {
         };
         let refresh_kind = ProcessRefreshKind::new()
             .with_cwd(UpdateKind::Always)
-            .with_exe(UpdateKind::Always);
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always);
         metadata
             .system
             .refresh_processes_specifics(ProcessesToUpdate::Some(pids), refresh_kind);
@@ -3232,10 +3244,21 @@ impl TerminalSession {
             .map(|process| {
                 let name = process.name().to_string_lossy().into_owned();
                 let cwd = process.cwd().map(Path::to_path_buf);
-                (process.pid().as_u32(), name, cwd)
+                let command_line = Some(
+                    process
+                        .cmd()
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect(),
+                );
+                (process.pid().as_u32(), name, cwd, command_line)
             });
-        if let Some((pid, name, cwd)) = process_metadata {
-            metadata.current_process = ProcessSummary { pid, name };
+        if let Some((pid, name, cwd, command_line)) = process_metadata {
+            metadata.current_process = ProcessSummary {
+                pid,
+                name,
+                command_line,
+            };
             if let Some(cwd) = cwd.filter(|cwd| !cwd.as_os_str().is_empty()) {
                 metadata.current_directory = cwd;
             }

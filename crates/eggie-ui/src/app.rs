@@ -9,6 +9,7 @@ use crate::native_menu::{
 use crate::command_history::{CommandStatus, format_relative_time};
 use crate::notes_store::NotesStore;
 use crate::profile_store::ProfileStore;
+use crate::process_icons::{self, ProcessIcon};
 use crate::project_store::ProjectStore;
 use crate::snippet_store::{Snippet, SnippetStore};
 use crate::settings::{
@@ -51,12 +52,13 @@ use eggie_protocol::{
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, ClipboardString, Context, Div,
-    DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent, KeyUpEvent,
+    Animation, AnimationExt, DragMoveEvent, Entity, FocusHandle, Image, ImageFormat, KeyDownEvent,
+    KeyUpEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathPromptOptions,
     Pixels, Point, PromptLevel, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     Stateful, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
     TouchPhase, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, anchored,
-    canvas, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
+    canvas, deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, quad,
     relative, rgb, rgba, size,
 };
 use std::{
@@ -101,6 +103,8 @@ const TAB_DROP_INDICATOR_WIDTH: f32 = 2.;
 const TAB_DROP_INDICATOR_OFFSET: f32 = (TAB_GAP + TAB_DROP_INDICATOR_WIDTH) / 2.;
 const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 28.;
 const ITEM_ICON_SLOT_SIZE: f32 = 16.;
+const SIDEBAR_CARD_SIZE: f32 = 18.;
+const PROJECT_CARD_SIZE: f32 = 21.;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
 const CONTENT_SPLIT_EDGE_FACTOR: f32 = 0.1;
 const LEFT_SIDEBAR_MIN_WIDTH: f32 = 180.;
@@ -447,11 +451,28 @@ struct PaletteRow {
     badge_color: Option<u32>,
 }
 
+#[derive(Clone)]
+struct ProjectIconState {
+    icons: Vec<ProcessIcon>,
+    previous: Vec<ProcessIcon>,
+    revision: u64,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct TabIconState {
+    icon: ProcessIcon,
+    previous: Option<ProcessIcon>,
+    revision: u64,
+    started_at: Instant,
+}
+
 #[derive(Clone, Debug)]
 struct DraggedTab {
     source_group_id: GroupId,
     item_id: ItemId,
-    item_kind: ItemKind,
+    icon: ProcessIcon,
+    dark: bool,
     title: SharedString,
     active: bool,
     colors: UiColors,
@@ -483,11 +504,10 @@ impl DraggedTab {
             // Semi-transparent so the drop target and tabs underneath the cursor stay visible while
             // dragging.
             .opacity(0.7)
-            .child(
-                div()
-                    .flex_none()
-                    .child(icon(item_kind_icon(self.item_kind))),
-            )
+            .child(img(process_icons::bare_icon(self.icon, self.dark))
+                .flex_none()
+                .w(px(ITEM_ICON_SLOT_SIZE))
+                .h(px(ITEM_ICON_SLOT_SIZE)))
             .child(
                 div()
                     .flex_1()
@@ -720,6 +740,8 @@ pub struct EggieApp {
     /// can be reordered by another window, which would invalidate an index.
     active_project: ProjectId,
     collapsed_projects: HashSet<ProjectId>,
+    project_icon_states: RefCell<HashMap<ProjectId, ProjectIconState>>,
+    tab_icon_states: RefCell<HashMap<SessionId, TabIconState>>,
     /// Sessions owned by this window (daemon `window_id == self.window_id`), refreshed by polling.
     sessions: Vec<SessionSummary>,
     /// Detached sessions (daemon `window_id == None`): survive their closed window and are claimable
@@ -1915,6 +1937,8 @@ impl EggieApp {
             project_views,
             active_project,
             collapsed_projects: HashSet::new(),
+            project_icon_states: RefCell::new(HashMap::new()),
+            tab_icon_states: RefCell::new(HashMap::new()),
             sessions,
             detached_sessions: Vec::new(),
             detached_popover_open: false,
@@ -2559,25 +2583,115 @@ impl EggieApp {
         Some((profile.badge_color?, SharedString::from(profile.name.clone())))
     }
 
+    fn icon_for_item(&self, kind: ItemKind, session_id: Option<SessionId>) -> ProcessIcon {
+        match kind {
+            ItemKind::Terminal => session_id
+                .and_then(|id| self.sessions.iter().find(|session| session.id == id))
+                .map(|session| process_icons::for_session(session))
+                .unwrap_or(ProcessIcon::Terminal),
+            ItemKind::File => ProcessIcon::File,
+            ItemKind::Browser => ProcessIcon::Browser,
+            ItemKind::Settings => ProcessIcon::Settings,
+        }
+    }
+
     fn render_item_icon(
         &self,
         kind: ItemKind,
         session_id: Option<SessionId>,
         element_id: String,
+        sidebar: bool,
     ) -> AnyElement {
+        let icon_kind = self.icon_for_item(kind, session_id);
+        let transition = session_id.and_then(|id| {
+            let mut states = self.tab_icon_states.borrow_mut();
+            let state = states.entry(id).or_insert(TabIconState {
+                icon: icon_kind,
+                previous: None,
+                revision: 1,
+                started_at: Instant::now(),
+            });
+            if state.icon != icon_kind {
+                state.previous = Some(std::mem::replace(&mut state.icon, icon_kind));
+                state.revision += 1;
+                state.started_at = Instant::now();
+            }
+            if state.started_at.elapsed() < Duration::from_millis(220) {
+                Some((id, *state))
+            } else {
+                state.previous = None;
+                None
+            }
+        });
+        let image_for = |icon| {
+            if sidebar {
+                process_icons::card_stack(&[icon], self.use_dark, SIDEBAR_CARD_SIZE)
+                    .expect("single process card")
+            } else {
+                process_icons::bare_icon(icon, self.use_dark)
+            }
+        };
+        let image = image_for(icon_kind);
+        let width = if sidebar {
+            process_icons::stack_width(1, SIDEBAR_CARD_SIZE)
+        } else {
+            ITEM_ICON_SLOT_SIZE
+        };
+        let height = if sidebar {
+            SIDEBAR_CARD_SIZE + 5.
+        } else {
+            ITEM_ICON_SLOT_SIZE
+        };
+        let content: AnyElement = if let Some((id, state)) = transition {
+            let previous = state.previous.map(image_for);
+            div()
+                .relative()
+                .w(px(width))
+                .h(px(height))
+                .with_animation(
+                    format!("tab-icon-{id}-{sidebar}-{}", state.revision),
+                    Animation::new(Duration::from_millis(220)).with_easing(gpui::ease_in_out),
+                    move |mut element, progress| {
+                        if let Some(previous) = &previous {
+                            element = element.child(
+                                img(previous.clone())
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(width))
+                                    .h(px(height))
+                                    .opacity(1. - progress),
+                            );
+                        }
+                        element.child(
+                            img(image.clone())
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .w(px(width))
+                                .h(px(height))
+                                .opacity(progress),
+                        )
+                    },
+                )
+                .into_any_element()
+        } else {
+            img(image).w(px(width)).h(px(height)).into_any_element()
+        };
+        let base = div()
+            .flex()
+            .flex_none()
+            .relative()
+            .items_center()
+            .justify_center()
+            .w(px(width))
+            .h(px(height))
+            .child(content);
         let Some(progress) = session_id
             .and_then(|session_id| self.progress_updates.get(&session_id))
             .and_then(|update| update.progress)
         else {
-            return div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .w(px(ITEM_ICON_SLOT_SIZE))
-                .h(px(ITEM_ICON_SLOT_SIZE))
-                .child(icon(item_kind_icon(kind)))
-                .into_any_element();
+            return base.into_any_element();
         };
 
         let colors = self.colors;
@@ -2594,14 +2708,8 @@ impl EggieApp {
         let language = self.language;
         let accessibility_label: SharedString = progress_label(progress, language).into();
         let tooltip_progress = progress;
-        div()
+        base
             .id(element_id)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .w(px(ITEM_ICON_SLOT_SIZE))
-            .h(px(ITEM_ICON_SLOT_SIZE))
             .role(Role::Image)
             .aria_label(accessibility_label)
             .tooltip(move |_, cx| {
@@ -2618,7 +2726,10 @@ impl EggieApp {
                         paint_progress_ring(bounds, progress, phase, color, colors.border, window)
                     },
                 )
-                .size_full(),
+                .absolute()
+                .right_0()
+                .bottom_0()
+                .size(px(if sidebar { 10. } else { 9. })),
             )
             .into_any_element()
     }
@@ -3080,6 +3191,7 @@ impl EggieApp {
             self.terminal_ime_states.remove(&session_id);
             self.session_inspections.remove(&session_id);
             self.session_inspection_errors.remove(&session_id);
+            self.tab_icon_states.borrow_mut().remove(&session_id);
             self.shell_integration.remove(&session_id);
             self.notification_routes
                 .borrow_mut()
@@ -7454,6 +7566,99 @@ impl EggieApp {
         });
     }
 
+    fn render_project_icon_stack(
+        &self,
+        project_id: ProjectId,
+        view: &WindowProjectView,
+    ) -> Option<AnyElement> {
+        let desired: Vec<_> = view
+            .layout
+            .items()
+            .take(3)
+            .map(|item| self.icon_for_item(item.kind, item.session_id))
+            .collect();
+        let state = {
+            let mut states = self.project_icon_states.borrow_mut();
+            if desired.is_empty() && !states.contains_key(&project_id) {
+                return None;
+            }
+            let state = states.entry(project_id).or_insert_with(|| ProjectIconState {
+                icons: Vec::new(),
+                previous: Vec::new(),
+                revision: 0,
+                started_at: Instant::now(),
+            });
+            if state.icons != desired {
+                state.previous = std::mem::replace(&mut state.icons, desired);
+                state.revision += 1;
+                state.started_at = Instant::now();
+            }
+            state.clone()
+        };
+        if state.icons.is_empty() && state.started_at.elapsed() >= Duration::from_millis(300) {
+            return None;
+        }
+        let previous = process_icons::card_stack(&state.previous, self.use_dark, PROJECT_CARD_SIZE);
+        let current = process_icons::card_stack(&state.icons, self.use_dark, PROJECT_CARD_SIZE);
+        let width = |count| {
+            if count == 0 {
+                0.
+            } else {
+                process_icons::stack_width(count, PROJECT_CARD_SIZE) + 8.
+            }
+        };
+        let from_width = width(state.previous.len());
+        let to_width = width(state.icons.len());
+        let card_height = PROJECT_CARD_SIZE + 5.;
+        let from_height = if state.previous.is_empty() {
+            0.
+        } else {
+            card_height
+        };
+        let to_height = if state.icons.is_empty() {
+            0.
+        } else {
+            card_height
+        };
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .with_animation(
+                    format!("project-icons-{project_id}-{}", state.revision),
+                    Animation::new(Duration::from_millis(300)).with_easing(gpui::ease_in_out),
+                    move |mut element, progress| {
+                        element = element.w(px(from_width + (to_width - from_width) * progress));
+                        element = element.h(px(from_height + (to_height - from_height) * progress));
+                        if let Some(image) = &previous {
+                            element = element.child(
+                                img(image.clone())
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(from_width - 8.))
+                                    .h(px(card_height))
+                                    .opacity(1. - progress),
+                            );
+                        }
+                        if let Some(image) = &current {
+                            element = element.child(
+                                img(image.clone())
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(to_width - 8.))
+                                    .h(px(card_height))
+                                    .opacity(progress),
+                            );
+                        }
+                        element
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div()
             .flex()
@@ -7506,7 +7711,7 @@ impl EggieApp {
                     .items_center()
                     .min_w_0()
                     .overflow_hidden()
-                    .gap_2()
+                    .gap_0()
                     .mx_3()
                     .px_2()
                     .py_1()
@@ -7530,11 +7735,7 @@ impl EggieApp {
                             app.show_project_context_menu(project_id, window, cx)
                         }),
                     )
-                    .child(div().flex_none().child(icon(if collapsed {
-                        IconName::Folder
-                    } else {
-                        IconName::FolderOpen
-                    })))
+                    .children(self.render_project_icon_stack(project_id, view))
                     .child(
                         div()
                             .flex_1()
@@ -7545,6 +7746,7 @@ impl EggieApp {
                     .child(
                         div()
                             .flex_none()
+                            .ml_2()
                             .text_color(rgb(self.colors.muted))
                             .child(icon_sized(
                                 if collapsed {
@@ -7576,48 +7778,49 @@ impl EggieApp {
                             .items_center()
                             .min_w_0()
                             .overflow_hidden()
-                        .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
-                        .gap_2()
-                        .ml_5()
-                        .mr_3()
-                        .px_2()
-                        .rounded_md()
-                        .mb_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(if active {
-                            self.colors.text
-                        } else {
-                            self.colors.muted
-                        }))
-                        .when(active, |element| {
-                            element.bg(rgb(self.colors.panel_alt))
-                        })
-                        .when_some(self.bell_flash_tint(session_id), |element, tint| {
-                            element.bg(rgba(tint))
-                        })
-                        .hover({
-                            let colors = self.colors;
-                            move |element| element.bg(rgb(colors.hover))
-                        })
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |app, _, window, cx| {
-                            app.activate_session(project_id, session_id, window, cx)
-                        }))
-                        .child(self.render_item_icon(
-                            ItemKind::Terminal,
-                            Some(session_id),
-                            format!("sidebar-progress-{session_id}"),
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(session_title.clone()),
-                        ),
-                );
+                            .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+                            .gap_2()
+                            .ml_5()
+                            .mr_3()
+                            .px_2()
+                            .rounded_md()
+                            .mb_1()
+                            .text_size(px(12.))
+                            .text_color(rgb(if active {
+                                self.colors.text
+                            } else {
+                                self.colors.muted
+                            }))
+                            .when(active, |element| {
+                                element.bg(rgb(self.colors.panel_alt))
+                            })
+                            .when_some(self.bell_flash_tint(session_id), |element, tint| {
+                                element.bg(rgba(tint))
+                            })
+                            .hover({
+                                let colors = self.colors;
+                                move |element| element.bg(rgb(colors.hover))
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                app.activate_session(project_id, session_id, window, cx)
+                            }))
+                            .child(self.render_item_icon(
+                                ItemKind::Terminal,
+                                Some(session_id),
+                                format!("sidebar-progress-{session_id}"),
+                                true,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(session_title.clone()),
+                            ),
+                    );
+                }
             }
-        }
         }
         panel.into_any_element()
     }
@@ -7785,7 +7988,8 @@ impl EggieApp {
             let dragged_tab = DraggedTab {
                 source_group_id: group_id,
                 item_id,
-                item_kind: item.kind,
+                icon: self.icon_for_item(item.kind, item.session_id),
+                dark: self.use_dark,
                 title: item.display_title().to_owned().into(),
                 active,
                 colors: self.colors,
@@ -7839,6 +8043,7 @@ impl EggieApp {
                         item.kind,
                         item.session_id,
                         format!("tab-progress-{item_id}"),
+                        false,
                     ))
                     .when_some(
                         self.tab_profile_badge(item, cx),
@@ -10522,15 +10727,6 @@ fn top_bar_icon_button(
         .child(icon_button(icon_name, id, colors, tooltip, listener))
 }
 
-fn item_kind_icon(kind: ItemKind) -> IconName {
-    match kind {
-        ItemKind::Terminal => IconName::Terminal,
-        ItemKind::File => IconName::File,
-        ItemKind::Browser => IconName::Browser,
-        ItemKind::Settings => IconName::Settings,
-    }
-}
-
 /// The button glyph for a directory opener. A future custom opener falls back to
 /// [`IconName::AppWindow`].
 fn icon_for_open_with(opener: OpenWith) -> IconName {
@@ -10620,7 +10816,9 @@ mod tests {
             current_process: eggie_protocol::ProcessSummary {
                 pid: 0,
                 name: String::new(),
+                command_line: None,
             },
+            active_command: None,
             status: eggie_protocol::SessionStatus::Running,
         }
     }

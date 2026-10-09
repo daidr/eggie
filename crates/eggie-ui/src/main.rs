@@ -15,6 +15,7 @@ mod notes_store;
 mod persist;
 mod profile_editor;
 mod profile_store;
+mod process_icons;
 mod project_store;
 mod snippet_store;
 pub mod services;

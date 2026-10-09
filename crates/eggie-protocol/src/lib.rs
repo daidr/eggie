@@ -659,6 +659,9 @@ fn is_zero_u8(value: &u8) -> bool {
 pub struct ProcessSummary {
     pub pid: u32,
     pub name: String,
+    /// Executable and arguments, used to distinguish commands such as `git diff`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,6 +708,9 @@ pub struct SessionSummary {
     pub reported_location: Option<TerminalReportedLocation>,
     pub shell_pid: u32,
     pub current_process: ProcessSummary,
+    /// OSC 133 command currently running, when shell integration reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_command: Option<String>,
     pub status: SessionStatus,
 }
 
