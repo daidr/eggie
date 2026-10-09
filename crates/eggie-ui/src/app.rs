@@ -9,6 +9,7 @@ use crate::native_menu::{
     prepare_project_menu, prepare_snippet_menu, prepare_tab_menu,
 };
 use crate::notes_store::NotesStore;
+use crate::popup_window::{PopupPlacement, PopupWindow, PopupWindowOptions};
 use crate::process_icons::{self, ProcessIcon};
 use crate::profile_store::ProfileStore;
 use crate::project_store::ProjectStore;
@@ -108,6 +109,25 @@ const PROJECT_ICON_TRANSITION: Duration = Duration::from_millis(340);
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
 const SIDEBAR_STATUS_ROW_HEIGHT: f32 = 42.;
 const SIDEBAR_STATUS_TRANSITION: Duration = Duration::from_millis(260);
+const PROJECT_POPOVER_LEAVE_DELAY: Duration = Duration::from_millis(220);
+const PROJECT_POPOVER_ROW_HEIGHT: f32 = 40.;
+
+struct ProjectPopoverState {
+    project_id: ProjectId,
+    window: gpui::WindowHandle<PopupWindow>,
+    anchor_hovered: bool,
+    popup_hovered: bool,
+    leave_revision: u64,
+}
+
+struct ProjectPopoverTab {
+    group_id: GroupId,
+    item_id: ItemId,
+    title: String,
+    subtitle: Option<String>,
+    icon: ProcessIcon,
+    active: bool,
+}
 
 fn program_state_label(state: TerminalProgramState, language: Language) -> &'static str {
     match (state, language) {
@@ -872,6 +892,8 @@ pub struct EggieApp {
     /// can be reordered by another window, which would invalidate an index.
     active_project: ProjectId,
     collapsed_projects: HashSet<ProjectId>,
+    project_row_bounds: Rc<RefCell<HashMap<ProjectId, Bounds<Pixels>>>>,
+    project_popover: Option<ProjectPopoverState>,
     project_icon_states: RefCell<HashMap<ProjectId, ProjectIconState>>,
     tab_icon_states: RefCell<HashMap<SessionId, TabIconState>>,
     sidebar_status_rows: RefCell<HashMap<SessionId, SidebarStatusRowState>>,
@@ -2033,6 +2055,16 @@ impl EggieApp {
         .detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
+        cx.observe_window_bounds(window, |app, _, cx| {
+            app.dismiss_project_popover(cx);
+        })
+        .detach();
+        cx.observe_window_activation(window, |app, window, cx| {
+            if !window.is_window_active() {
+                app.dismiss_project_popover(cx);
+            }
+        })
+        .detach();
         let terminal_font_features: std::sync::Arc<[crate::settings::FontFeature]> =
             config.resolved_font_features().into();
         let terminal_font_variations: std::sync::Arc<[crate::settings::FontVariation]> =
@@ -2134,6 +2166,8 @@ impl EggieApp {
             project_views,
             active_project,
             collapsed_projects: HashSet::new(),
+            project_row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            project_popover: None,
             project_icon_states: RefCell::new(HashMap::new()),
             tab_icon_states: RefCell::new(HashMap::new()),
             sidebar_status_rows: RefCell::new(HashMap::new()),
@@ -3737,8 +3771,18 @@ impl EggieApp {
         }
         // Drop views for projects that no longer exist in the shared list.
         let live: HashSet<ProjectId> = self.projects.iter().map(|project| project.id).collect();
+        if self
+            .project_popover
+            .as_ref()
+            .is_some_and(|popover| !live.contains(&popover.project_id))
+        {
+            self.dismiss_project_popover(cx);
+        }
         self.project_views.retain(|id, _| live.contains(id));
         self.collapsed_projects.retain(|id| live.contains(id));
+        self.project_row_bounds
+            .borrow_mut()
+            .retain(|id, _| live.contains(id));
         // Keep the active project valid; fall back to the first project if it was removed.
         if !live.contains(&self.active_project)
             && let Some(first) = self.projects.first()
@@ -4244,12 +4288,250 @@ impl EggieApp {
     }
 
     fn toggle_project_collapsed(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        self.dismiss_project_popover(cx);
         if self.collapsed_projects.contains(&project_id) {
             self.collapsed_projects.remove(&project_id);
         } else {
             self.collapsed_projects.insert(project_id);
         }
         cx.notify();
+    }
+
+    fn create_terminal_in_project(
+        &mut self,
+        project_id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_project_popover(cx);
+        self.activate_project(project_id, cx);
+        self.collapsed_projects.remove(&project_id);
+        let group_id = self.workspace().active_group_id;
+        self.new_terminal(group_id, None, None, window, cx);
+        cx.notify();
+    }
+
+    fn dismiss_project_popover(&mut self, cx: &mut Context<Self>) {
+        if let Some(popover) = self.project_popover.take() {
+            popover
+                .window
+                .update(cx, |popup, window, cx| popup.dismiss(window, cx))
+                .ok();
+        }
+    }
+
+    fn project_popover_hover(
+        &mut self,
+        project_id: ProjectId,
+        over_anchor: bool,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if hovered && over_anchor {
+            if !self.collapsed_projects.contains(&project_id) {
+                return;
+            }
+            if self
+                .project_popover
+                .as_ref()
+                .map(|popover| popover.project_id)
+                != Some(project_id)
+            {
+                self.show_project_popover(project_id, window, cx);
+            }
+        }
+        let Some(popover) = self.project_popover.as_mut() else {
+            return;
+        };
+        if popover.project_id != project_id {
+            return;
+        }
+        if over_anchor {
+            popover.anchor_hovered = hovered;
+        } else {
+            popover.popup_hovered = hovered;
+        }
+        popover.leave_revision += 1;
+        if hovered {
+            popover
+                .window
+                .update(cx, |popup, _, cx| popup.restore(cx))
+                .ok();
+        } else if !popover.anchor_hovered && !popover.popup_hovered {
+            let revision = popover.leave_revision;
+            let executor = cx.background_executor().clone();
+            cx.spawn(async move |app, cx| {
+                executor.timer(PROJECT_POPOVER_LEAVE_DELAY).await;
+                app.update(cx, |app, cx| {
+                    if app.project_popover.as_ref().is_some_and(|popover| {
+                        popover.project_id == project_id
+                            && popover.leave_revision == revision
+                            && !popover.anchor_hovered
+                            && !popover.popup_hovered
+                    }) {
+                        app.dismiss_project_popover(cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn show_project_popover(
+        &mut self,
+        project_id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_project_popover(cx);
+        let Some(view) = self.project_views.get(&project_id) else {
+            return;
+        };
+        let Some(anchor) = self.project_row_bounds.borrow().get(&project_id).copied() else {
+            return;
+        };
+        let mut tabs = Vec::new();
+        for group_id in view.layout.group_ids() {
+            let Some(group) = view.layout.find_group(group_id) else {
+                continue;
+            };
+            for item in &group.items {
+                let status = item.session_id.and_then(|id| {
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == id)
+                        .and_then(|session| session.program_status.as_ref())
+                });
+                let title = item
+                    .custom_title
+                    .as_deref()
+                    .or_else(|| status.and_then(|status| status.title.as_deref()))
+                    .unwrap_or_else(|| item.display_title())
+                    .to_owned();
+                tabs.push(ProjectPopoverTab {
+                    group_id,
+                    item_id: item.id,
+                    title,
+                    subtitle: status.map(|status| {
+                        status.message.clone().unwrap_or_else(|| {
+                            program_state_label(status.state, self.language).into()
+                        })
+                    }),
+                    icon: self.icon_for_item(item.kind, item.session_id),
+                    active: self.active_project == project_id
+                        && view.active_group_id == group_id
+                        && group.active_item_id == Some(item.id),
+                });
+            }
+        }
+        if tabs.is_empty() {
+            return;
+        }
+        let colors = self.colors;
+        let dark = self.use_dark;
+        let parent = Window::window_handle(window)
+            .downcast::<Self>()
+            .expect("project popover belongs to an Eggie window");
+        let content_height = (tabs.len().min(8) as f32 * PROJECT_POPOVER_ROW_HEIGHT + 8.).max(48.);
+        let popup = PopupWindow::open(
+            cx,
+            window,
+            PopupWindowOptions {
+                anchor,
+                content_size: size(px(255.), px(content_height)),
+                placement: PopupPlacement::Beside,
+                background: colors.panel,
+                border: colors.border,
+            },
+            move |_, _| {
+                let mut list = div()
+                    .id("project-popover-tabs")
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .py_1()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.text));
+                for tab in &tabs {
+                    let group_id = tab.group_id;
+                    let item_id = tab.item_id;
+                    let icon = process_icons::card_stack(&[tab.icon], dark, SIDEBAR_CARD_SIZE)
+                        .expect("single process card");
+                    let mut title = div().flex_1().min_w_0().truncate().child(tab.title.clone());
+                    if let Some(subtitle) = &tab.subtitle {
+                        title = div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_col()
+                            .child(div().truncate().child(tab.title.clone()))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(colors.muted))
+                                    .child(subtitle.clone()),
+                            );
+                    }
+                    list = list.child(
+                        div()
+                            .id(format!("project-popover-tab-{item_id}"))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .h(px(PROJECT_POPOVER_ROW_HEIGHT))
+                            .mx_1()
+                            .px_2()
+                            .rounded_md()
+                            .when(tab.active, |row| row.bg(rgb(colors.panel_alt)))
+                            .hover(move |row| row.bg(rgb(colors.hover)))
+                            .cursor_pointer()
+                            .on_click(move |_, popup_window, cx| {
+                                parent
+                                    .update(cx, |app, parent_window, cx| {
+                                        app.active_project = project_id;
+                                        app.activate_item(group_id, item_id, parent_window, cx);
+                                        app.project_popover = None;
+                                        parent_window.activate_window();
+                                    })
+                                    .ok();
+                                popup_window.remove_window();
+                            })
+                            .child(
+                                img(icon)
+                                    .flex_none()
+                                    .w(px(process_icons::stack_width(1, SIDEBAR_CARD_SIZE)))
+                                    .h(px(SIDEBAR_CARD_SIZE + 5.)),
+                            )
+                            .child(title),
+                    );
+                }
+                list.into_any_element()
+            },
+            move |hovered, _, cx| {
+                parent
+                    .update(cx, |app, parent_window, cx| {
+                        app.project_popover_hover(project_id, false, hovered, parent_window, cx);
+                    })
+                    .ok();
+            },
+        );
+        match popup {
+            Ok(window) => {
+                self.project_popover = Some(ProjectPopoverState {
+                    project_id,
+                    window,
+                    anchor_hovered: true,
+                    popup_hovered: false,
+                    leave_revision: 0,
+                });
+            }
+            Err(error) => eprintln!("failed to open project popover: {error:#}"),
+        }
     }
 
     fn prompt_set_project_root(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
@@ -6229,6 +6511,7 @@ impl EggieApp {
     }
 
     fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_project_popover(cx);
         self.left_sidebar_collapsed = !self.left_sidebar_collapsed;
         self.resizing_sidebar = None;
         cx.notify();
@@ -8005,58 +8288,103 @@ impl EggieApp {
             };
             let collapsed = self.collapsed_projects.contains(&project_id);
             let is_active_project = project_id == self.active_project;
+            let has_terminals = view.layout.terminal_items().next().is_some();
+            let has_tabs = view.layout.items().next().is_some();
+            let row_bounds = self.project_row_bounds.clone();
             panel = panel.child(
                 div()
-                    .id(format!("project-{index}"))
-                    .flex()
-                    .items_center()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .gap_0()
-                    .mx_3()
-                    .pr_2()
-                    .py_1()
-                    .rounded_md()
-                    .mb_1()
-                    .when(is_active_project, |element| {
-                        element.bg(rgb(self.colors.panel_alt))
+                    .on_children_prepainted(move |children, _, _| {
+                        if let Some(bounds) = children.first().copied() {
+                            row_bounds.borrow_mut().insert(project_id, bounds);
+                        }
                     })
-                    .hover({
-                        let colors = self.colors;
-                        move |element| element.bg(rgb(colors.hover))
-                    })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        app.activate_project(project_id, cx);
-                        app.toggle_project_collapsed(project_id, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |app, _, window, cx| {
-                            app.show_project_context_menu(project_id, window, cx)
-                        }),
-                    )
-                    .children(self.render_project_icon_stack(project_id, view))
                     .child(
                         div()
-                            .flex_1()
+                            .id(format!("project-{index}"))
+                            .flex()
+                            .items_center()
                             .min_w_0()
-                            .truncate()
-                            .child(project.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .ml_2()
-                            .text_color(rgb(self.colors.muted))
-                            .child(icon_sized(
-                                if collapsed {
-                                    IconName::ArrowRight
+                            .overflow_hidden()
+                            .gap_0()
+                            .mx_3()
+                            .pr_2()
+                            .py_1()
+                            .rounded_md()
+                            .mb_1()
+                            .when(is_active_project, |element| {
+                                element.bg(rgb(self.colors.panel_alt))
+                            })
+                            .hover({
+                                let colors = self.colors;
+                                move |element| element.bg(rgb(colors.hover))
+                            })
+                            .cursor_pointer()
+                            .when(collapsed && has_tabs, |row| {
+                                row.on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
+                                    app.project_popover_hover(
+                                        project_id, true, *hovered, window, cx,
+                                    );
+                                }))
+                            })
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                let clicked_add = !has_terminals
+                                    && app.project_row_bounds.borrow().get(&project_id).is_some_and(
+                                        |bounds| window.mouse_position().x >= bounds.right() - px(32.),
+                                    );
+                                if clicked_add {
+                                    app.create_terminal_in_project(project_id, window, cx);
                                 } else {
-                                    IconName::ArrowDown
-                                },
-                                14.,
-                            )),
+                                    app.activate_project(project_id, cx);
+                                    app.toggle_project_collapsed(project_id, cx);
+                                }
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |app, _, window, cx| {
+                                    app.show_project_context_menu(project_id, window, cx)
+                                }),
+                            )
+                            .children(self.render_project_icon_stack(project_id, view))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(project.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("project-end-icon-{index}"))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(24.))
+                                    .h(px(24.))
+                                    .ml_2()
+                                    .rounded_md()
+                                    .text_color(rgb(self.colors.muted))
+                                    .when(!has_terminals, |end| {
+                                        end.cursor_pointer()
+                                            .hover({
+                                                let colors = self.colors;
+                                                move |end| {
+                                                    end.bg(rgb(colors.panel_alt))
+                                                        .text_color(rgb(colors.accent))
+                                                }
+                                            })
+                                    })
+                                    .child(icon_sized(
+                                        if !has_terminals {
+                                            IconName::Add
+                                        } else if collapsed {
+                                            IconName::ArrowRight
+                                        } else {
+                                            IconName::ArrowDown
+                                        },
+                                        14.,
+                                    )),
+                            ),
                     ),
             );
             if !collapsed {

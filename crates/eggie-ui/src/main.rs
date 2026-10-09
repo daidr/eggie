@@ -14,6 +14,7 @@ mod metal_terminal;
 mod native_menu;
 mod notes_store;
 mod persist;
+mod popup_window;
 mod profile_editor;
 mod profile_store;
 mod process_icons;
