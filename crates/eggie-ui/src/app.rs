@@ -95,6 +95,8 @@ const TAB_MIN_WIDTH: f32 = 140.;
 const TAB_MAX_WIDTH: f32 = 220.;
 const TAB_BAR_PADDING: f32 = 5.;
 const TAB_GAP: f32 = 5.;
+// The card artwork includes 2px of transparent space, so 1px keeps its visible inset even.
+const TAB_ICON_LEADING_PADDING: f32 = 1.;
 const TAB_TITLE_FONT_SIZE: f32 = 11.;
 const TAB_CLOSE_ICON_SIZE: f32 = 10.;
 /// Diameter of the profile badge dot on a tab. Small enough to read as a marker beside the title
@@ -633,7 +635,7 @@ impl DraggedTab {
             .max_w(px(TAB_MAX_WIDTH))
             .h(px(TAB_BAR_HEIGHT - TAB_BAR_PADDING * 2.))
             .overflow_hidden()
-            .pl_2()
+            .pl(px(TAB_ICON_LEADING_PADDING))
             .pr_1()
             .gap_2()
             .text_size(px(TAB_TITLE_FONT_SIZE))
@@ -8326,7 +8328,7 @@ impl EggieApp {
                     .min_w(px(TAB_MIN_WIDTH))
                     .max_w(px(TAB_MAX_WIDTH))
                     .h_full()
-                    .pl_2()
+                    .pl(px(TAB_ICON_LEADING_PADDING))
                     .pr_1()
                     .gap_2()
                     .text_size(px(TAB_TITLE_FONT_SIZE))
