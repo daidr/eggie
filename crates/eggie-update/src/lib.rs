@@ -75,19 +75,9 @@ pub fn select_update(current_version: &str, releases: &[ReleaseInfo]) -> Option<
 /// Per-user application data directory:
 /// `~/Library/Application Support/Eggie` on macOS, `~/.config/eggie` elsewhere.
 ///
-/// Shared with settings and project storage; keep in sync with the ad-hoc
-/// implementations in `eggie-ui` (settings.rs / project_store.rs).
+/// Shared with settings and project storage through `eggie-config`.
 pub fn app_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = home_dir() {
-            return home.join("Library/Application Support/Eggie");
-        }
-    }
-    if let Some(home) = home_dir() {
-        return home.join(".config/eggie");
-    }
-    PathBuf::from(".")
+    eggie_config::state_dir()
 }
 
 /// Working directory for update downloads and updater logs.
@@ -115,10 +105,6 @@ pub fn default_feed_url(channel: &str) -> Result<Url> {
     Ok(Url::parse(&format!("{FEED_BASE_URL}/{channel}.json"))?)
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,7 +112,7 @@ mod tests {
     fn release(version: &str) -> ReleaseInfo {
         ReleaseInfo {
             version: Version::parse(version).unwrap(),
-            protocol_version: 1,
+            protocol_version: eggie_protocol::PROTOCOL_VERSION,
             release_notes: String::new(),
             published_at: String::new(),
             download_url: Url::parse("file:///tmp/x.zip").unwrap(),
@@ -143,13 +129,19 @@ mod tests {
 
     #[test]
     fn compares_prerelease_versions() {
-        assert!(is_update_available("0.0.1-alpha.1", &release("0.0.1-alpha.2")));
+        assert!(is_update_available(
+            "0.0.1-alpha.1",
+            &release("0.0.1-alpha.2")
+        ));
         assert!(is_update_available("0.0.1-alpha.2", &release("0.0.1")));
         assert!(is_update_available("0.0.1", &release("0.0.2")));
         assert!(is_update_available("0.0.1", &release("0.1.0")));
         assert!(!is_update_available("0.0.2", &release("0.0.2")));
         assert!(!is_update_available("0.0.2", &release("0.0.1")));
-        assert!(!is_update_available("0.0.1-alpha.9", &release("0.0.1-alpha.1")));
+        assert!(!is_update_available(
+            "0.0.1-alpha.9",
+            &release("0.0.1-alpha.1")
+        ));
     }
 
     #[test]

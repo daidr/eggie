@@ -168,16 +168,27 @@ pub(crate) struct ProgramStatusTracker {
 }
 
 impl ProgramStatusTracker {
-    pub(crate) fn apply(&mut self, id: String, status: Option<TerminalProgramStatus>) {
+    pub(crate) fn apply(
+        &mut self,
+        id: String,
+        status: Option<TerminalProgramStatus>,
+    ) -> Vec<String> {
         let Some(status) = status else {
+            let before = self.records.keys().cloned().collect::<Vec<_>>();
             if id.is_empty() {
                 self.records.clear();
             } else {
                 self.records
                     .retain(|key, _| key != &id && !key.starts_with(&format!("{id}/")));
             }
-            return;
+            let mut removed = before
+                .into_iter()
+                .filter(|key| !self.records.contains_key(key))
+                .collect::<Vec<_>>();
+            removed.sort();
+            return removed;
         };
+        let mut removed = Vec::new();
         self.revision += 1;
         if !self.records.contains_key(&id) && self.records.len() >= MAX_RECORDS {
             if let Some(oldest) = self
@@ -187,6 +198,7 @@ impl ProgramStatusTracker {
                 .map(|(id, _)| id.clone())
             {
                 self.records.remove(&oldest);
+                removed.push(oldest);
             }
         }
         self.records.insert(
@@ -196,19 +208,30 @@ impl ProgramStatusTracker {
                 updated: self.revision,
             },
         );
+        removed
     }
 
-    pub(crate) fn clear_active(&mut self) {
+    pub(crate) fn clear_active(&mut self) -> Vec<String> {
+        let before = self.records.keys().cloned().collect::<Vec<_>>();
         self.records.retain(|_, entry| {
             matches!(
                 entry.status.state,
                 TerminalProgramState::Done | TerminalProgramState::Error
             )
         });
+        let mut removed = before
+            .into_iter()
+            .filter(|key| !self.records.contains_key(key))
+            .collect::<Vec<_>>();
+        removed.sort();
+        removed
     }
 
-    pub(crate) fn clear_all(&mut self) {
+    pub(crate) fn clear_all(&mut self) -> Vec<String> {
+        let mut removed = self.records.keys().cloned().collect::<Vec<_>>();
+        removed.sort();
         self.records.clear();
+        removed
     }
 
     pub(crate) fn display(&self) -> Option<TerminalProgramStatus> {

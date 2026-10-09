@@ -16,8 +16,8 @@ use gpui::Action;
 use crate::keybindings::{ACTION_SPECS, display_keystroke, effective_keystroke};
 use crate::settings::{AppSettings, Language};
 use crate::settings_window::{
-    About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, NewTabWithProfile, ShowAll,
-    SplitLeft, SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
+    About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, NewTabWithProfile,
+    ShowAll, SplitLeft, SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
 };
 
 /// A command that exists only in the menu bar (no configurable keybinding), surfaced in the palette
@@ -85,7 +85,7 @@ const MENU_ONLY_COMMANDS: &[MenuCommand] = &[
 
 /// One row in the command palette: a label, its shortcut (if any), and the action to dispatch.
 pub(crate) struct PaletteEntry {
-    pub(crate) label: &'static str,
+    pub(crate) label: String,
     /// The command's effective shortcut in display form (e.g. "⌘T"), or `None` for menu-only
     /// commands with no configurable keybinding.
     pub(crate) keystroke: Option<String>,
@@ -95,7 +95,10 @@ pub(crate) struct PaletteEntry {
 /// Build the full palette command list for the current language and keybindings. Configurable
 /// commands come first (each with its effective shortcut), then the menu-only commands. The palette
 /// itself (`command_palette`) is excluded so it never lists "open the command palette".
-pub(crate) fn palette_entries(config: &AppSettings) -> Vec<PaletteEntry> {
+pub(crate) fn palette_entries(
+    config: &AppSettings,
+    lua: &eggie_config::RegisteredConfig,
+) -> Vec<PaletteEntry> {
     let language = config.language;
     let mut entries = Vec::with_capacity(ACTION_SPECS.len() + MENU_ONLY_COMMANDS.len());
     for spec in ACTION_SPECS {
@@ -103,19 +106,57 @@ pub(crate) fn palette_entries(config: &AppSettings) -> Vec<PaletteEntry> {
             continue;
         }
         entries.push(PaletteEntry {
-            label: (spec.label)(language),
-            keystroke: effective_keystroke(config, spec.id).map(display_keystroke),
+            label: (spec.label)(language).to_owned(),
+            keystroke: display_binding(config, lua, spec.id),
             action: (spec.make_action)(),
         });
     }
     for command in MENU_ONLY_COMMANDS {
         entries.push(PaletteEntry {
-            label: (command.label)(language),
+            label: (command.label)(language).to_owned(),
             keystroke: None,
             action: (command.make_action)(),
         });
     }
+    for action in &lua.actions {
+        let keystroke = display_binding(config, lua, &action.name);
+        entries.push(PaletteEntry {
+            label: action.title.clone(),
+            keystroke,
+            action: Box::new(crate::keybindings::LuaAction {
+                name: action.name.clone(),
+                args: serde_json::Value::Null,
+            }),
+        });
+    }
     entries
+}
+
+pub(crate) fn display_binding(
+    config: &AppSettings,
+    lua: &eggie_config::RegisteredConfig,
+    name: &str,
+) -> Option<String> {
+    let mut keys = effective_keystroke(config, name)
+        .map(|key| vec![key.to_owned()])
+        .unwrap_or_default();
+    for operation in &lua.bindings {
+        match operation {
+            eggie_config::BindingOp::Unbind { key } => keys.retain(|existing| existing != key),
+            eggie_config::BindingOp::Bind { key, action, .. } => {
+                keys.retain(|existing| existing != key);
+                if action == name {
+                    keys.push(key.clone());
+                }
+            }
+        }
+    }
+    keys.last().map(|key| {
+        key.split('>')
+            .map(display_keystroke)
+            .collect::<Vec<_>>()
+            .join(" › ")
+    })
 }
 
 /// Whether `label` matches `query`: an empty query matches everything; otherwise a case-insensitive
@@ -139,7 +180,7 @@ mod tests {
     #[test]
     fn palette_lists_configurable_and_menu_only_commands() {
         let config = AppSettings::default();
-        let entries = palette_entries(&config);
+        let entries = palette_entries(&config, &Default::default());
 
         // 27 configurable commands (28 ACTION_SPECS minus command_palette) + the menu-only set.
         assert_eq!(
@@ -168,7 +209,7 @@ mod tests {
     #[test]
     fn palette_offers_the_profile_picker_as_a_menu_only_command() {
         let config = AppSettings::default();
-        let entries = palette_entries(&config);
+        let entries = palette_entries(&config, &Default::default());
         let label = Language::English.action_new_tab_with_profile();
         let entry = entries
             .iter()
@@ -177,6 +218,6 @@ mod tests {
         // No configurable shortcut: it opens a second-stage picker rather than acting immediately.
         assert_eq!(entry.keystroke, None);
         // Searchable by the word users would reach for.
-        assert!(command_matches(entry.label, "profile"));
+        assert!(command_matches(&entry.label, "profile"));
     }
 }

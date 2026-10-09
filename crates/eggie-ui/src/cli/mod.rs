@@ -6,6 +6,8 @@
 //! 实现分散在同目录的子模块里。
 
 mod colors;
+mod config;
+mod do_script;
 mod help;
 mod list_colors;
 mod list_themes;
@@ -91,6 +93,12 @@ enum CliError {
 /// 返回 `None` 表示没有 CLI action(继续走 GUI);`Some(code)` 表示 CLI 已经
 /// 处理(含出错),调用方应以该退出码结束进程。
 pub(crate) fn try_run_cli(arguments: &[String]) -> Option<i32> {
+    if arguments.get(1).map(String::as_str) == Some("config") {
+        return Some(config::run(&arguments[2..]));
+    }
+    if arguments.get(1).map(String::as_str) == Some("do") {
+        return Some(do_script::run(&arguments[2..]));
+    }
     match parse_invocation(arguments) {
         Invocation::None => None,
         Invocation::Run(action, flags) => Some(action.run(&flags)),

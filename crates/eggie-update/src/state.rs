@@ -64,7 +64,7 @@ mod tests {
     fn release() -> ReleaseInfo {
         ReleaseInfo {
             version: Version::new(0, 0, 2),
-            protocol_version: 1,
+            protocol_version: eggie_protocol::PROTOCOL_VERSION,
             release_notes: String::new(),
             published_at: String::new(),
             download_url: Url::parse("file:///tmp/x.zip").unwrap(),
@@ -77,11 +77,13 @@ mod tests {
         assert!(!UpdateState::Idle.is_update_pending());
         assert!(!UpdateState::Checking.is_update_pending());
         assert!(UpdateState::Available(release()).is_update_pending());
-        assert!(UpdateState::Ready {
-            release: release(),
-            package: PathBuf::from("/tmp/x.zip"),
-        }
-        .is_update_pending());
+        assert!(
+            UpdateState::Ready {
+                release: release(),
+                package: PathBuf::from("/tmp/x.zip"),
+            }
+            .is_update_pending()
+        );
         assert!(UpdateState::Error("boom".into()).release().is_none());
         assert_eq!(
             UpdateState::Available(release()).release().unwrap().version,

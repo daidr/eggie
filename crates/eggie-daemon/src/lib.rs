@@ -33,16 +33,14 @@ use eggie_protocol::{
     TerminalClipboardContent, TerminalClipboardSelection, TerminalColorOverride,
     TerminalCommandRecord, TerminalCursorShape, TerminalFileTransferOffer,
     TerminalFileTransferProtocol, TerminalImageDescriptor, TerminalImageKey,
-    TerminalImagePlacement, TerminalMouseAction,
-    TerminalMouseEvent, TerminalMousePosition,
-    TerminalNotification, TerminalOscEvent, TerminalOscEventPayload,
+    TerminalImagePlacement, TerminalLinkRange, TerminalMouseAction, TerminalMouseEvent,
+    TerminalMousePosition, TerminalNotification, TerminalOscEvent, TerminalOscEventPayload,
     TerminalOscEventUpdate, TerminalProgress, TerminalProgressState, TerminalProgressTimeouts,
     TerminalProgressUpdate, TerminalReportedLocation, TerminalScrollCommand, TerminalScrollEvent,
     TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection, TerminalSearchMatch,
-    TerminalSearchRequest,
-    TerminalSearchResult, TerminalSemanticPhase, TerminalSelectionKind, TerminalSelectionRange,
-    TerminalSelectionSide, TerminalShellIntegrationState, TerminalSize,
-    TerminalLinkRange, TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
+    TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind, TerminalSelectionRange,
+    TerminalSelectionSide, TerminalSemanticPhase, TerminalShellIntegrationState, TerminalSize,
+    TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
 };
 use flate2::write::ZlibDecoder;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -51,6 +49,7 @@ use std::{
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, Read, Write},
+    ops::RangeInclusive,
     os::{
         fd::AsRawFd,
         unix::{
@@ -61,7 +60,6 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
-    ops::RangeInclusive,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -72,12 +70,13 @@ use std::{
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+mod config_service;
+mod event_bus;
+mod preferences_service;
 mod process_monitor;
-use process_monitor::{descendant_processes, listening_ports, parse_remote_inspection};
 #[cfg(test)]
-use process_monitor::{
-    cpu_usage_tenths_percent, filter_descendant_processes, parse_lsof_ports,
-};
+use process_monitor::{cpu_usage_tenths_percent, filter_descendant_processes, parse_lsof_ports};
+use process_monitor::{descendant_processes, listening_ports, parse_remote_inspection};
 // Re-exported for the test module's `use super::*`; the daemon body no longer names these directly
 // since the process-monitor helpers moved out.
 #[cfg(test)]
@@ -250,8 +249,9 @@ fn pack_image_metadata(
 fn unpack_image_metadata(
     header: &[u8; RAW_TERMINAL_IMAGE_METADATA_SIZE],
 ) -> (TerminalImageKey, u32, u32, u32, u32) {
-    let read_u32 =
-        |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().expect("four bytes"));
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes(header[offset..offset + 4].try_into().expect("four bytes"))
+    };
     let key = TerminalImageKey {
         id: read_u32(0),
         generation: u64::from_le_bytes(header[4..12].try_into().expect("eight bytes")),
@@ -287,6 +287,7 @@ fn window_size(size: TerminalSize) -> WindowSize {
 
 struct ListenerState {
     session_id: SessionId,
+    event_bus: Option<Arc<event_bus::EventBus>>,
     title: RwLock<String>,
     size: RwLock<TerminalSize>,
     status: RwLock<SessionStatus>,
@@ -695,7 +696,9 @@ impl ShellIntegrationTracker {
         let _ = scrollback_limit;
         // The oldest visible-or-scrollback line has global coordinate `total_scrolled - history`.
         // Anything older has been evicted from the buffer and can never be jumped to again.
-        let oldest_live = self.total_scrolled_lines.saturating_sub(history_size as u64);
+        let oldest_live = self
+            .total_scrolled_lines
+            .saturating_sub(history_size as u64);
         while self
             .prompt_jump_points
             .front()
@@ -716,7 +719,11 @@ impl ShellIntegrationTracker {
     /// Pick the jump target relative to the line currently at the top of the viewport.
     /// `viewport_top_global` is that line's global coordinate. Returns the target's global
     /// coordinate, or `None` when there is no strictly-earlier / strictly-later prompt.
-    fn jump_target(&self, viewport_top_global: i64, direction: TerminalJumpDirection) -> Option<u64> {
+    fn jump_target(
+        &self,
+        viewport_top_global: i64,
+        direction: TerminalJumpDirection,
+    ) -> Option<u64> {
         match direction {
             TerminalJumpDirection::Up => self
                 .prompt_jump_points
@@ -962,9 +969,11 @@ impl ListenerState {
         size: TerminalSize,
         appearance: TerminalAppearance,
         last_input_sequence: Arc<AtomicU64>,
+        event_bus: Option<Arc<event_bus::EventBus>>,
     ) -> Self {
         Self {
             session_id,
+            event_bus,
             title: RwLock::new("shell".to_owned()),
             size: RwLock::new(size),
             status: RwLock::new(SessionStatus::Running),
@@ -995,6 +1004,12 @@ impl ListenerState {
             detect_urls: AtomicBool::new(true),
             url_regex: Mutex::new(None),
             last_bell: Mutex::new(None),
+        }
+    }
+
+    fn publish_event(&self, name: &str, payload: serde_json::Value) {
+        if let Some(bus) = &self.event_bus {
+            bus.publish(name, Some(self.session_id), payload);
         }
     }
 
@@ -1195,6 +1210,7 @@ impl ListenerState {
         *last = Some(now);
         drop(last);
         self.osc_events.push(TerminalOscEventPayload::Bell);
+        self.publish_event("terminal.bell", serde_json::Value::Null);
         true
     }
 
@@ -1421,7 +1437,19 @@ impl ListenerState {
                 self.write_to_pty(format!("\x1b]7501;?{terminator}").into_bytes());
             }
             Some(ProgramStatusCommand::Report { id, status }) => {
-                self.program_status.lock().apply(id, status);
+                let removed = self.program_status.lock().apply(id.clone(), status.clone());
+                for removed_id in removed {
+                    self.publish_event(
+                        "terminal.program_status_removed",
+                        serde_json::json!({ "id": removed_id }),
+                    );
+                }
+                if let Some(status) = status {
+                    self.publish_event(
+                        "terminal.program_status_changed",
+                        serde_json::json!({ "id": id, "status": status }),
+                    );
+                }
             }
             None => {}
         }
@@ -2706,18 +2734,50 @@ impl EventListener for DaemonEventListener {
     fn send_event(&self, event: Event) {
         match event {
             Event::Title(title) => {
-                *self.0.title.write() = title;
+                *self.0.title.write() = title.clone();
+                self.0.publish_event(
+                    "terminal.title_changed",
+                    serde_json::json!({ "title": title }),
+                );
             }
             Event::ResetTitle => {
                 *self.0.title.write() = "shell".to_owned();
+                self.0.publish_event(
+                    "terminal.title_changed",
+                    serde_json::json!({ "title": "shell" }),
+                );
             }
-            Event::ProgressReport(progress) => self.0.progress.report(progress),
+            Event::ProgressReport(progress) => {
+                self.0.progress.report(progress);
+                let state = progress.map(|report| match report.state {
+                    VteProgressState::Normal => "normal",
+                    VteProgressState::Error => "error",
+                    VteProgressState::Indeterminate => "indeterminate",
+                    VteProgressState::Paused => "paused",
+                });
+                self.0.publish_event(
+                    "terminal.progress_report",
+                    serde_json::json!({
+                        "state": state,
+                        "percent": progress.and_then(|report| report.percent),
+                    }),
+                );
+            }
             Event::WorkingDirectory(directory) => {
                 self.0.report_working_directory(&directory);
+                self.0.publish_event(
+                    "terminal.pwd_changed",
+                    serde_json::json!({ "pwd": directory }),
+                );
             }
             Event::SemanticPrompt(prompt, cursor_line, history_size) => {
                 if prompt.action == SemanticPromptAction::FreshLineAndPrompt {
-                    self.0.program_status.lock().clear_active();
+                    for id in self.0.program_status.lock().clear_active() {
+                        self.0.publish_event(
+                            "terminal.program_status_removed",
+                            serde_json::json!({ "id": id }),
+                        );
+                    }
                 }
                 self.0
                     .shell_integration
@@ -2727,7 +2787,14 @@ impl EventListener for DaemonEventListener {
             Event::ProgramStatus(payload, terminator) => {
                 self.0.handle_program_status(&payload, &terminator);
             }
-            Event::ProgramStatusReset => self.0.program_status.lock().clear_all(),
+            Event::ProgramStatusReset => {
+                for id in self.0.program_status.lock().clear_all() {
+                    self.0.publish_event(
+                        "terminal.program_status_removed",
+                        serde_json::json!({ "id": id }),
+                    );
+                }
+            }
             Event::DesktopNotification(notification) => {
                 self.0.handle_notification(notification);
             }
@@ -2757,12 +2824,30 @@ impl EventListener for DaemonEventListener {
                     code: status.code(),
                 };
                 self.0.progress.report(None);
-                self.0.program_status.lock().clear_active();
+                for id in self.0.program_status.lock().clear_active() {
+                    self.0.publish_event(
+                        "terminal.program_status_removed",
+                        serde_json::json!({ "id": id }),
+                    );
+                }
+                self.0.publish_event(
+                    "terminal.child_exited",
+                    serde_json::json!({ "exit_code": status.code() }),
+                );
             }
             Event::Exit => {
                 *self.0.status.write() = SessionStatus::Exited { code: None };
                 self.0.progress.report(None);
-                self.0.program_status.lock().clear_active();
+                for id in self.0.program_status.lock().clear_active() {
+                    self.0.publish_event(
+                        "terminal.program_status_removed",
+                        serde_json::json!({ "id": id }),
+                    );
+                }
+                self.0.publish_event(
+                    "terminal.child_exited",
+                    serde_json::json!({ "exit_code": null }),
+                );
             }
             Event::ClipboardStore(clipboard, text) => self.0.clipboard_store(clipboard, text),
             Event::ClipboardLoad(clipboard, formatter) => {
@@ -2875,6 +2960,7 @@ struct SessionSpawnConfig {
     /// Working directory on the remote host (profile-supplied). Local `cwd` still applies to the
     /// `ssh` process itself.
     remote_cwd: Option<String>,
+    event_bus: Option<Arc<event_bus::EventBus>>,
 }
 
 impl TerminalSession {
@@ -2893,6 +2979,7 @@ impl TerminalSession {
             remote,
             remote_install_consented,
             remote_cwd,
+            event_bus,
         } = config;
         let id = SessionId::new_v4();
         let last_input_sequence = Arc::new(AtomicU64::new(0));
@@ -2901,6 +2988,7 @@ impl TerminalSession {
             size,
             appearance,
             last_input_sequence.clone(),
+            event_bus,
         ));
         let listener = DaemonEventListener(state.clone());
         let config = terminal_config(CursorShape::default(), scrollback_limit);
@@ -3077,6 +3165,7 @@ impl TerminalSession {
             remote: None,
             remote_install_consented: false,
             remote_cwd: None,
+            event_bus: None,
         })
     }
 
@@ -3202,10 +3291,9 @@ impl TerminalSession {
 
     /// Run `ssh -O forward|cancel` with the spec's tunnel option.
     fn port_forward_command(&self, spec: &PortForwardSpec, operation: &str) -> Result<()> {
-        let control_path = self
-            .control_path
-            .as_ref()
-            .ok_or_else(|| anyhow!("port forwarding requires a session with multiplexing enabled"))?;
+        let control_path = self.control_path.as_ref().ok_or_else(|| {
+            anyhow!("port forwarding requires a session with multiplexing enabled")
+        })?;
         let destination = self
             .remote
             .as_ref()
@@ -3280,13 +3368,24 @@ impl TerminalSession {
                 (process.pid().as_u32(), name, cwd, command_line)
             });
         if let Some((pid, name, cwd, command_line)) = process_metadata {
-            metadata.current_process = ProcessSummary {
+            let next_process = ProcessSummary {
                 pid,
                 name,
                 command_line,
             };
+            if metadata.current_process != next_process {
+                self.events.publish_event(
+                    "terminal.process_changed",
+                    serde_json::to_value(&next_process).unwrap_or_default(),
+                );
+                metadata.current_process = next_process;
+            }
             if let Some(cwd) = cwd.filter(|cwd| !cwd.as_os_str().is_empty()) {
-                metadata.current_directory = cwd;
+                if metadata.current_directory != cwd {
+                    self.events
+                        .publish_event("terminal.pwd_changed", serde_json::json!({ "pwd": cwd }));
+                    metadata.current_directory = cwd;
+                }
             }
         }
     }
@@ -4478,8 +4577,7 @@ fn viewport_match_inner(
     screen_lines: usize,
     columns: usize,
 ) -> Option<TerminalSearchMatch> {
-    let (start, end) =
-        clamp_range_to_viewport(regex_match, display_offset, screen_lines, columns)?;
+    let (start, end) = clamp_range_to_viewport(regex_match, display_offset, screen_lines, columns)?;
     Some(TerminalSearchMatch { start, end })
 }
 
@@ -4503,10 +4601,12 @@ fn collect_viewport_matches<T>(
         .collect()
 }
 
-
 struct DaemonState {
     sessions: RwLock<HashMap<SessionId, Arc<TerminalSession>>>,
     build_id: Arc<str>,
+    config: config_service::ConfigService,
+    events: Arc<event_bus::EventBus>,
+    preferences: preferences_service::PreferencesService,
 }
 
 impl DaemonState {
@@ -4532,6 +4632,62 @@ impl DaemonState {
                     build_id: self.build_id.to_string(),
                 })
             }
+            ClientRequest::GetConfig => Ok(DaemonResponse::Config {
+                snapshot: self.config.snapshot(),
+            }),
+            ClientRequest::GetPreferences => Ok(DaemonResponse::Preferences {
+                snapshot: self.preferences.get(),
+            }),
+            ClientRequest::GetEventCursor => Ok(DaemonResponse::EventsUnchanged {
+                sequence: self.events.sequence(),
+            }),
+            ClientRequest::SetPreferences {
+                base_revision,
+                value,
+            } => Ok(DaemonResponse::Preferences {
+                snapshot: self.preferences.set(base_revision, value)?,
+            }),
+            ClientRequest::ReloadConfig => Ok(DaemonResponse::Config {
+                snapshot: self.config.reload()?,
+            }),
+            ClientRequest::WaitForConfig {
+                after_revision,
+                timeout_ms,
+            } => Ok(
+                match self.config.wait_after(
+                    after_revision,
+                    Duration::from_millis(u64::from(timeout_ms.min(30_000))),
+                ) {
+                    Some(snapshot) => DaemonResponse::Config { snapshot },
+                    None => DaemonResponse::ConfigUnchanged {
+                        revision: after_revision,
+                    },
+                },
+            ),
+            ClientRequest::WaitForEvents {
+                after_sequence,
+                session_id,
+                timeout_ms,
+            } => Ok(
+                match self.events.wait_after(
+                    after_sequence,
+                    session_id,
+                    Duration::from_millis(u64::from(timeout_ms.min(30_000))),
+                ) {
+                    Some(update) => DaemonResponse::Events { update },
+                    None => DaemonResponse::EventsUnchanged {
+                        sequence: after_sequence,
+                    },
+                },
+            ),
+            ClientRequest::InvokeConfigAction {
+                revision,
+                name,
+                context,
+                args,
+            } => Ok(DaemonResponse::ConfigActionResult {
+                actions: self.config.invoke(revision, &name, &context, &args)?,
+            }),
             ClientRequest::CreateSession {
                 project_id,
                 window_id,
@@ -4561,6 +4717,7 @@ impl DaemonState {
                     remote,
                     remote_install_consented,
                     remote_cwd,
+                    event_bus: Some(self.events.clone()),
                 })?);
                 let summary = session.summary();
                 self.sessions.write().insert(session.id, session);
@@ -4735,7 +4892,8 @@ impl DaemonState {
                 side,
                 kind,
             } => {
-                self.session(session_id)?.selection_start(point, side, kind)?;
+                self.session(session_id)?
+                    .selection_start(point, side, kind)?;
                 Ok(DaemonResponse::Ok)
             }
             ClientRequest::TerminalSelectionUpdate {
@@ -4967,10 +5125,7 @@ fn build_shell_env(
             dir.to_string_lossy().into_owned(),
         );
     }
-    env.insert(
-        "EGGIE_SHELL_FEATURES".to_owned(),
-        shell_features.to_owned(),
-    );
+    env.insert("EGGIE_SHELL_FEATURES".to_owned(), shell_features.to_owned());
 
     let custom = custom_args.is_some();
     let mut args = custom_args.unwrap_or_else(|| vec!["-l".to_owned()]);
@@ -5160,6 +5315,9 @@ pub fn run_daemon(socket_path: &Path, build_id: &str) -> Result<()> {
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::new()),
         build_id: Arc::from(build_id),
+        config: config_service::ConfigService::new(eggie_config::config_path()),
+        events: Arc::new(event_bus::EventBus::new()),
+        preferences: preferences_service::PreferencesService::new(),
     });
 
     for connection in listener.incoming() {
@@ -5499,7 +5657,9 @@ fn write_terminal_image_shm_wire(
         .and_then(|size| size.checked_add(segment_name.len()))
         .context("shm terminal image wire length overflow")?;
     if payload_length > MAX_WIRE_MESSAGE_SIZE {
-        bail!("shm terminal image wire message exceeds {MAX_WIRE_MESSAGE_SIZE} bytes: {payload_length}");
+        bail!(
+            "shm terminal image wire message exceeds {MAX_WIRE_MESSAGE_SIZE} bytes: {payload_length}"
+        );
     }
     let payload_length =
         u32::try_from(payload_length).context("shm terminal image name is too large")?;
@@ -5962,11 +6122,8 @@ impl DaemonConnection {
             WireFrameKind::Message => {}
         }
 
-        let response = read_message_body::<DaemonResponse>(
-            &mut self.stream,
-            &mut self.response,
-            length,
-        )?;
+        let response =
+            read_message_body::<DaemonResponse>(&mut self.stream, &mut self.response, length)?;
         match response {
             DaemonResponse::TerminalImage {
                 key,
@@ -6028,11 +6185,8 @@ impl DaemonConnection {
             }
             WireFrameKind::RawImage => {
                 let mut pixels = Vec::new();
-                let metadata = read_terminal_image_wire_into(
-                    &mut self.stream,
-                    payload_length,
-                    &mut pixels,
-                )?;
+                let metadata =
+                    read_terminal_image_wire_into(&mut self.stream, payload_length, &mut pixels)?;
                 if metadata.chunk_length != metadata.total_length {
                     // Only the first chunk arrived; the caller must walk the rest with
                     // append_terminal_image_chunk. Signal that with a typed variant, not an error.
@@ -6293,7 +6447,9 @@ impl DaemonClient {
                     PROTOCOL_VERSION,
                     &self.build_id,
                 ) {
-                    bail!("unexpected handshake response: protocol={protocol_version}, build_id={build_id}");
+                    bail!(
+                        "unexpected handshake response: protocol={protocol_version}, build_id={build_id}"
+                    );
                 }
                 if build_id != self.build_id.as_ref() {
                     // Release builds accept a daemon from a different build as long as the

@@ -119,7 +119,11 @@ impl ReleaseInfo {
     /// Cross-check fields that serde can't enforce on its own.
     fn validate(&self) -> Result<()> {
         if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bail!("release {} has invalid sha256: {:?}", self.version, self.sha256);
+            bail!(
+                "release {} has invalid sha256: {:?}",
+                self.version,
+                self.sha256
+            );
         }
         match self.download_url.scheme() {
             "file" | "http" | "https" => Ok(()),
@@ -152,7 +156,7 @@ mod tests {
     fn release_json(overrides: serde_json::Value) -> String {
         let mut value = json!({
             "version": "0.0.2",
-            "protocol_version": 1,
+            "protocol_version": eggie_protocol::PROTOCOL_VERSION,
             "release_notes": "- fix bugs",
             "published_at": "2026-08-13T10:00:00Z",
             "download_url": "file:///tmp/Eggie-0.0.2.zip",
@@ -170,7 +174,7 @@ mod tests {
     fn parses_full_release_info() {
         let release: ReleaseInfo = serde_json::from_str(&release_json(json!({}))).unwrap();
         assert_eq!(release.version, Version::new(0, 0, 2));
-        assert_eq!(release.protocol_version, 1);
+        assert_eq!(release.protocol_version, eggie_protocol::PROTOCOL_VERSION);
         assert!(release.daemon_compatible());
         assert!(release.validate().is_ok());
     }

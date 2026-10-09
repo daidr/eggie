@@ -130,8 +130,13 @@ impl CodepointMapEntry {
         }
         let range = range.trim();
         let parse_cp = |token: &str| -> Option<u32> {
-            let hex = token.trim().strip_prefix("U+").or_else(|| token.trim().strip_prefix("u+"))?;
-            u32::from_str_radix(hex, 16).ok().filter(|cp| char::from_u32(*cp).is_some())
+            let hex = token
+                .trim()
+                .strip_prefix("U+")
+                .or_else(|| token.trim().strip_prefix("u+"))?;
+            u32::from_str_radix(hex, 16)
+                .ok()
+                .filter(|cp| char::from_u32(*cp).is_some())
         };
         let (start, end) = match range.split_once('-') {
             Some((lo, hi)) => (parse_cp(lo)?, parse_cp(hi)?),
@@ -409,12 +414,7 @@ pub(crate) enum BellMode {
 }
 
 impl BellMode {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Silent,
-        Self::Flash,
-        Self::Sound,
-        Self::FlashAndSound,
-    ];
+    pub(crate) const ALL: [Self; 4] = [Self::Silent, Self::Flash, Self::Sound, Self::FlashAndSound];
 
     /// A stable ascii slug for element ids (not user-facing; display text comes from i18n).
     pub(crate) fn slug(self) -> &'static str {
@@ -648,10 +648,16 @@ pub(crate) struct AppSettings {
     /// Terminal theme for the dark appearance. Only consulted when `terminal_theme_source` is
     /// [`TerminalThemeSource::Custom`]; kept across a switch back to `FollowInterface` so toggling
     /// does not discard the choice.
-    #[serde(default = "default_dark_theme", skip_serializing_if = "is_default_dark_theme")]
+    #[serde(
+        default = "default_dark_theme",
+        skip_serializing_if = "is_default_dark_theme"
+    )]
     pub(crate) terminal_dark_theme: String,
     /// Terminal theme for the light appearance. See [`Self::terminal_dark_theme`].
-    #[serde(default = "default_light_theme", skip_serializing_if = "is_default_light_theme")]
+    #[serde(
+        default = "default_light_theme",
+        skip_serializing_if = "is_default_light_theme"
+    )]
     pub(crate) terminal_light_theme: String,
     pub(crate) font_family: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -683,7 +689,10 @@ pub(crate) struct AppSettings {
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) font_thicken: bool,
     /// Thickening strength 0–255 when `font_thicken` is on (matching `font-thicken-strength`).
-    #[serde(default = "default_thicken_strength", skip_serializing_if = "is_full_strength")]
+    #[serde(
+        default = "default_thicken_strength",
+        skip_serializing_if = "is_full_strength"
+    )]
     pub(crate) font_thicken_strength: u8,
     /// Per-codepoint-range font overrides, matching Ghostty's `font-codepoint-map`. Each entry is
     /// `U+XXXX-U+YYYY=Family` or `U+XXXX=Family`. Empty = no overrides.
@@ -718,7 +727,10 @@ pub(crate) struct AppSettings {
     pub(crate) keybindings: std::collections::BTreeMap<String, String>,
     /// Scrollback history depth in lines (`0` disables scrollback). Applies to all live sessions at
     /// runtime, matching Ghostty's `scrollback-limit`.
-    #[serde(default = "default_scrollback_lines", skip_serializing_if = "is_default_scrollback")]
+    #[serde(
+        default = "default_scrollback_lines",
+        skip_serializing_if = "is_default_scrollback"
+    )]
     pub(crate) scrollback_lines: usize,
     /// Shell executable to launch (matching Ghostty's `command`). Empty = fall back to `$SHELL`.
     /// Only takes effect for newly created terminals — the running shell can't be swapped.
@@ -1245,19 +1257,12 @@ pub(crate) enum PreviewSlot {
     ProfileTerminalLight(eggie_domain::ProfileId),
 }
 
-impl PreviewSlot {
-    /// Whether this slot belongs to the dark half of its pair. Used to label the slot in the UI;
-    /// the preview itself applies regardless of which half is currently in effect.
-    fn is_dark(self) -> bool {
-        matches!(
-            self,
-            Self::InterfaceDark | Self::TerminalDark | Self::ProfileTerminalDark(_)
-        )
-    }
-}
-
 pub(crate) struct SettingsStore {
+    preferences: AppSettings,
     config: AppSettings,
+    lua_config: eggie_config::ConfigSnapshot,
+    daemon: Option<eggie_daemon::DaemonClient>,
+    preference_revision: u64,
     path: PathBuf,
     /// Transient theme override driven by the settings window's hover preview, tagged with the picker
     /// it came from. Never persisted and never serialized — it only overrides what the `resolved_*`
@@ -1268,14 +1273,50 @@ pub(crate) struct SettingsStore {
 
 impl SettingsStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(crate::persist::data_file_path("settings.json"))
+        Self::load_from(crate::persist::data_file_path("preferences.json"))
+    }
+
+    pub(crate) fn load_with_daemon(
+        snapshot: eggie_config::ConfigSnapshot,
+        preferences: eggie_config::PreferencesSnapshot,
+        client: eggie_daemon::DaemonClient,
+    ) -> Self {
+        let mut store = Self::from_config(
+            AppSettings::default(),
+            crate::persist::data_file_path("preferences.json"),
+        );
+        store.preferences = serde_json::from_value(preferences.value).unwrap_or_else(|error| {
+            eprintln!("invalid daemon preferences: {error}");
+            AppSettings::default()
+        });
+        store.preferences.normalize();
+        store.preference_revision = preferences.revision;
+        store.daemon = Some(client);
+        store.apply_lua_snapshot(snapshot);
+        store
     }
 
     fn load_from(path: PathBuf) -> Self {
         let mut config = crate::persist::load_json::<AppSettings>(&path).unwrap_or_default();
         config.normalize();
+        Self::from_config(config, path)
+    }
+
+    fn from_config(config: AppSettings, path: PathBuf) -> Self {
+        let lua_config = eggie_config::ConfigSnapshot {
+            revision: 0,
+            status_revision: 0,
+            path: eggie_config::config_path(),
+            exists: false,
+            error: None,
+            registered: Default::default(),
+        };
         Self {
+            preferences: config.clone(),
             config,
+            lua_config,
+            daemon: None,
+            preference_revision: 0,
             path,
             theme_preview: None,
         }
@@ -1285,13 +1326,57 @@ impl SettingsStore {
         &self.config
     }
 
+    pub(crate) fn lua_config(&self) -> &eggie_config::ConfigSnapshot {
+        &self.lua_config
+    }
+
+    pub(crate) fn set_lua_snapshot(
+        &mut self,
+        snapshot: eggie_config::ConfigSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if snapshot.status_revision <= self.lua_config.status_revision {
+            return;
+        }
+        self.apply_lua_snapshot(snapshot);
+        cx.notify();
+    }
+
+    fn apply_lua_snapshot(&mut self, snapshot: eggie_config::ConfigSnapshot) {
+        self.lua_config = snapshot;
+        self.config = self.preferences.clone();
+        let registered = &self.lua_config.registered;
+        if let Some(name) = &registered.ui_light_theme {
+            self.config.interface_light_theme = name.clone();
+        }
+        if let Some(name) = &registered.ui_dark_theme {
+            self.config.interface_dark_theme = name.clone();
+        }
+        if let Some(name) = &registered.terminal_light_theme {
+            self.config.terminal_light_theme = name.clone();
+            self.config.terminal_theme_source = TerminalThemeSource::Custom;
+        }
+        if let Some(name) = &registered.terminal_dark_theme {
+            self.config.terminal_dark_theme = name.clone();
+            self.config.terminal_theme_source = TerminalThemeSource::Custom;
+        }
+        if let Some(font) = &registered.terminal_font {
+            self.config.font_family = font.family.clone();
+            self.config.font_size = font.size;
+        }
+        self.config.normalize();
+    }
+
     /// The interface theme actually in effect: the live hover preview if one is active on either
     /// interface slot, otherwise the persisted pair. Drives the app's chrome.
     pub(crate) fn resolved_interface_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
         // A hover preview is authoritative: it applies regardless of which half is in effect, so
         // hovering the light slot while the app is dark previews the light slot.
         if let Some((slot, theme)) = self.theme_preview
-            && matches!(slot, PreviewSlot::InterfaceDark | PreviewSlot::InterfaceLight)
+            && matches!(
+                slot,
+                PreviewSlot::InterfaceDark | PreviewSlot::InterfaceLight
+            )
         {
             return theme;
         }
@@ -1371,16 +1456,55 @@ impl SettingsStore {
     }
 
     pub(crate) fn update(&mut self, update: impl FnOnce(&mut AppSettings), cx: &mut Context<Self>) {
-        update(&mut self.config);
-        self.config.normalize();
+        let previous = self.preferences.clone();
+        update(&mut self.preferences);
+        let managed = &self.lua_config.registered;
+        if managed.ui_light_theme.is_some() {
+            self.preferences.interface_light_theme = previous.interface_light_theme;
+        }
+        if managed.ui_dark_theme.is_some() {
+            self.preferences.interface_dark_theme = previous.interface_dark_theme;
+        }
+        if managed.terminal_light_theme.is_some() {
+            self.preferences.terminal_light_theme = previous.terminal_light_theme;
+            self.preferences.terminal_theme_source = previous.terminal_theme_source;
+        }
+        if managed.terminal_dark_theme.is_some() {
+            self.preferences.terminal_dark_theme = previous.terminal_dark_theme;
+            self.preferences.terminal_theme_source = previous.terminal_theme_source;
+        }
+        if managed.terminal_font.is_some() {
+            self.preferences.font_family = previous.font_family;
+            self.preferences.font_size = previous.font_size;
+        }
+        self.preferences.normalize();
+        self.apply_lua_snapshot(self.lua_config.clone());
         if let Err(error) = self.save() {
             eprintln!("failed to persist Eggie settings: {error}");
         }
         cx.notify();
     }
 
-    fn save(&self) -> std::io::Result<()> {
-        crate::persist::save_json_atomic(&self.path, &self.config)
+    fn save(&mut self) -> anyhow::Result<()> {
+        if let Some(client) = &self.daemon {
+            let response = client.request(eggie_protocol::ClientRequest::SetPreferences {
+                base_revision: self.preference_revision,
+                value: serde_json::to_value(&self.preferences)?,
+            })?;
+            match response {
+                eggie_protocol::DaemonResponse::Preferences { snapshot } => {
+                    self.preference_revision = snapshot.revision;
+                    Ok(())
+                }
+                eggie_protocol::DaemonResponse::Error { message } => anyhow::bail!("{message}"),
+                response => anyhow::bail!("unexpected preferences response: {response:?}"),
+            }
+        } else {
+            Ok(crate::persist::save_json_atomic(
+                &self.path,
+                &self.preferences,
+            )?)
+        }
     }
 }
 
@@ -1565,7 +1689,11 @@ impl UiColors {
         let neutral = if dark { 0x171b20 } else { 0xf4f5f7 };
         let tinted_neutral = mix(
             neutral,
-            hsl_to_rgb(hue, if dark { 0.26 } else { 0.25 }, if dark { 0.12 } else { 0.95 }),
+            hsl_to_rgb(
+                hue,
+                if dark { 0.26 } else { 0.25 },
+                if dark { 0.12 } else { 0.95 },
+            ),
             0.4 * (saturation / 0.2).clamp(0., 1.),
         );
         let background = mix(
@@ -1603,16 +1731,19 @@ impl UiColors {
             muted = mix(muted, if dark { 0xffffff } else { 0x000000 }, 0.08);
         }
         let accent = ui_accent(theme.palette[4], [background, panel, panel_alt], dark);
-        let accent_foreground = if contrast_ratio_rgb(0xffffff, accent)
-            >= contrast_ratio_rgb(0x000000, accent)
-        {
-            0xffffff
-        } else {
-            0x000000
-        };
+        let accent_foreground =
+            if contrast_ratio_rgb(0xffffff, accent) >= contrast_ratio_rgb(0x000000, accent) {
+                0xffffff
+            } else {
+                0x000000
+            };
         let accent_hover = mix(
             accent,
-            if accent_foreground == 0xffffff { 0x000000 } else { 0xffffff },
+            if accent_foreground == 0xffffff {
+                0x000000
+            } else {
+                0xffffff
+            },
             0.1,
         );
         Self {
@@ -1680,8 +1811,7 @@ fn rgb_chroma(color: u32) -> f32 {
         ((color >> 8) & 0xff) as f32,
         (color & 0xff) as f32,
     ];
-    (channels.iter().copied().fold(0., f32::max)
-        - channels.iter().copied().fold(255., f32::min))
+    (channels.iter().copied().fold(0., f32::max) - channels.iter().copied().fold(255., f32::min))
         / 255.
 }
 
@@ -1740,8 +1870,13 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 </style><header><h1>Eggie UI palette audit</h1><span>Actual UiColors for every bundled theme; terminal colors shown unchanged.</span><input id="search" placeholder="Filter themes"></header><main>"#,
         );
         for (group, themes) in [("Light", &catalog.light), ("Dark", &catalog.dark)] {
-            write!(html, "<section id=\"{}\"><h2>{group} · {} themes</h2><div class=grid>", group.to_lowercase(), themes.len())
-                .unwrap();
+            write!(
+                html,
+                "<section id=\"{}\"><h2>{group} · {} themes</h2><div class=grid>",
+                group.to_lowercase(),
+                themes.len()
+            )
+            .unwrap();
             for theme in themes {
                 let ui = UiColors::from_theme(theme);
                 let (theme_hue, _, _) = rgb_to_hsl(theme.background);
@@ -1749,16 +1884,20 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
                 let theme_chroma = rgb_chroma(theme.background);
                 if theme_chroma > 0.05 {
                     let hue_distance = (theme_hue - ui_hue).abs();
-                    if hue_distance.min(1. - hue_distance) > 30. / 360.
-                        || ui_saturation < 0.08
-                    {
-                        failures.push(format!("{}: interface background lost theme hue", theme.name));
+                    if hue_distance.min(1. - hue_distance) > 30. / 360. || ui_saturation < 0.08 {
+                        failures.push(format!(
+                            "{}: interface background lost theme hue",
+                            theme.name
+                        ));
                     }
                 } else if theme_chroma < 0.025
                     && rgb_chroma(theme.palette[4]) < 0.025
                     && rgb_chroma(ui.background) > 0.06
                 {
-                    failures.push(format!("{}: neutral theme gained an unrelated hue", theme.name));
+                    failures.push(format!(
+                        "{}: neutral theme gained an unrelated hue",
+                        theme.name
+                    ));
                 }
                 let checks = [
                     ("text / background", ui.text, ui.background, 4.5),
@@ -1771,15 +1910,27 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
                     ("accent / panel alt", ui.accent, ui.panel_alt, 4.5),
                     ("accent / background", ui.accent, ui.background, 4.5),
                     ("button text / accent", ui.accent_foreground, ui.accent, 4.5),
-                    ("button text / hover", ui.accent_foreground, ui.accent_hover, 4.5),
+                    (
+                        "button text / hover",
+                        ui.accent_foreground,
+                        ui.accent_hover,
+                        4.5,
+                    ),
                 ];
                 for (label, foreground, background, minimum) in checks {
                     let ratio = contrast_ratio_rgb(foreground, background);
                     if ratio < minimum {
-                        failures.push(format!("{}: {label} contrast {ratio:.2} < {minimum}", theme.name));
+                        failures.push(format!(
+                            "{}: {label} contrast {ratio:.2} < {minimum}",
+                            theme.name
+                        ));
                     }
                 }
-                let name = theme.name.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
+                let name = theme
+                    .name
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('"', "&quot;");
                 write!(
                     html,
                     "<article class=theme data-name=\"{name}\" style=\"--bg:#{:06x};--panel:#{:06x};--panel-alt:#{:06x};--hover:#{:06x};--border:#{:06x};--text:#{:06x};--muted:#{:06x};--accent:#{:06x};--accent-text:#{:06x};--accent-hover:#{:06x};--term-bg:#{:06x};--term-fg:#{:06x}\"><div class=name>{name}</div><div class=window><div class=sidebar><strong>Projects</strong><div class='sideitem active'>Eggie</div><div class=sideitem>Workspace</div></div><div class=body><span class=tab>◉ &nbsp; Terminal</span><div class=sample>Readable sample <span class=muted>· Secondary text</span></div><span class=button>Active</span><span class=link>Accent link</span></div></div><div class=terminal>~/Eggie $ cargo run</div><div class=ratios>text {:.1}:1 · muted {:.1}:1 · accent {:.1}:1</div></article>",
@@ -1818,7 +1969,9 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         // A dark theme and a light theme both resolve through the unified lookup the hover preview
         // uses, and an unknown name yields None (so preview_theme becomes a no-op).
         assert_eq!(
-            catalog.theme_by_name("Catppuccin Mocha").map(|t| t.name.as_str()),
+            catalog
+                .theme_by_name("Catppuccin Mocha")
+                .map(|t| t.name.as_str()),
             Some("Catppuccin Mocha")
         );
         assert_eq!(
@@ -1830,11 +1983,7 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
     /// A store with no preview active, for the preview tests.
     fn store_with(config: AppSettings) -> SettingsStore {
-        SettingsStore {
-            config,
-            path: std::path::PathBuf::from("unused"),
-            theme_preview: None,
-        }
+        SettingsStore::from_config(config, std::path::PathBuf::from("unused"))
     }
 
     #[test]
@@ -1851,7 +2000,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
         let preview = catalog.theme_by_name("Catppuccin Mocha").unwrap();
         store.theme_preview = Some((PreviewSlot::InterfaceDark, preview));
-        assert_eq!(store.resolved_interface_theme(true).name, "Catppuccin Mocha");
+        assert_eq!(
+            store.resolved_interface_theme(true).name,
+            "Catppuccin Mocha"
+        );
 
         // The preview is authoritative: it applies even when the system is light, so the dark-slot
         // preview stays visible under a light appearance. Only clearing it falls back to the persisted
@@ -1904,13 +2056,19 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
         // Following the interface: the terminal rides along with the hover, exactly as it would once
         // the choice is committed.
-        assert_eq!(store.config.terminal_theme_source, TerminalThemeSource::FollowInterface);
+        assert_eq!(
+            store.config.terminal_theme_source,
+            TerminalThemeSource::FollowInterface
+        );
         assert_eq!(store.resolved_terminal_theme(true).name, "Catppuccin Mocha");
 
         // With its own pair, the terminal ignores an interface preview.
         store.config.use_custom_terminal_themes();
         store.config.terminal_dark_theme = "Builtin Dark".to_owned();
-        assert_eq!(store.resolved_interface_theme(true).name, "Catppuccin Mocha");
+        assert_eq!(
+            store.resolved_interface_theme(true).name,
+            "Catppuccin Mocha"
+        );
         assert_eq!(
             store.resolved_terminal_theme(true).name,
             "Builtin Dark",
@@ -1936,7 +2094,9 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         store.theme_preview = Some((PreviewSlot::ProfileTerminalDark(edited), preview));
 
         assert_eq!(
-            store.profile_theme_preview(edited).map(|theme| theme.name.as_str()),
+            store
+                .profile_theme_preview(edited)
+                .map(|theme| theme.name.as_str()),
             Some("Catppuccin Mocha")
         );
         assert!(
@@ -1957,7 +2117,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
             interface_light_theme: "Ayu Light".to_owned(),
             ..AppSettings::default()
         };
-        assert_eq!(config.terminal_theme_source, TerminalThemeSource::FollowInterface);
+        assert_eq!(
+            config.terminal_theme_source,
+            TerminalThemeSource::FollowInterface
+        );
         for mode in ThemeMode::ALL {
             for system_is_dark in [true, false] {
                 let config = AppSettings {
@@ -2137,7 +2300,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         assert_eq!(config.interface_light_theme, "iTerm2 Solarized Light");
         // An old file says nothing about the terminal layer, so it follows the interface — which is
         // exactly the behaviour that file was written under.
-        assert_eq!(config.terminal_theme_source, TerminalThemeSource::FollowInterface);
+        assert_eq!(
+            config.terminal_theme_source,
+            TerminalThemeSource::FollowInterface
+        );
     }
 
     #[test]
@@ -2200,7 +2366,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         // Remembered remote-install answers survive a round trip: being re-asked on every launch
         // would defeat the point of recording the decision.
         assert_eq!(
-            loaded.config.remote_install_consent.get("deploy@prod.example.com"),
+            loaded
+                .config
+                .remote_install_consent
+                .get("deploy@prod.example.com"),
             Some(&true)
         );
         assert_eq!(loaded.config.terminal_padding_x, MIN_TERMINAL_PADDING);
@@ -2231,7 +2400,11 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         assert_eq!(ShellFeatures { path: false }.to_env_string(), "");
         // The path feature ships on, so the value migrated into the Default profile carries it. (The
         // assembled env string now comes from the profile — see `resolve_spawn_config`.)
-        assert!(AppSettings::default().legacy_shell_settings().shell_integration_path);
+        assert!(
+            AppSettings::default()
+                .legacy_shell_settings()
+                .shell_integration_path
+        );
     }
 
     /// The global theme a terminal without an override inherits, for the merge tests.
@@ -2267,7 +2440,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
         // An all-inherit override behaves identically to no profile at all.
         let empty = eggie_domain::ProfileAppearance::default();
-        assert_eq!(resolve_appearance(&config, Some(&empty), global_layer(), None), resolved);
+        assert_eq!(
+            resolve_appearance(&config, Some(&empty), global_layer(), None),
+            resolved
+        );
     }
 
     #[test]
@@ -2355,9 +2531,13 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         let config = AppSettings::default();
         let stored = theme_catalog().dark_names().into_iter().next().unwrap();
         let preview = theme_catalog().theme_by_name("Catppuccin Mocha").unwrap();
-        assert_ne!(stored, preview.name, "the preview must differ from the stored value");
+        assert_ne!(
+            stored, preview.name,
+            "the preview must differ from the stored value"
+        );
         let appearance = both_halves(&stored);
-        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), Some(preview));
+        let resolved =
+            resolve_appearance(&config, Some(&appearance), global_layer(), Some(preview));
         assert_eq!(resolved.theme.name, preview.name);
     }
 
@@ -2478,7 +2658,11 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         };
         assert_eq!(resolve(1_000.), MAX_FONT_SIZE);
         assert_eq!(resolve(1.), MIN_FONT_SIZE);
-        assert_eq!(resolve(f32::NAN), config.font_size, "a non-finite override is ignored");
+        assert_eq!(
+            resolve(f32::NAN),
+            config.font_size,
+            "a non-finite override is ignored"
+        );
     }
 
     #[test]
@@ -2705,7 +2889,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
     #[test]
     fn metric_modifier_parses_percent_and_absolute() {
-        assert_eq!(MetricModifier::parse("2"), Some(MetricModifier::Absolute(2)));
+        assert_eq!(
+            MetricModifier::parse("2"),
+            Some(MetricModifier::Absolute(2))
+        );
         assert_eq!(
             MetricModifier::parse("-1"),
             Some(MetricModifier::Absolute(-1))
@@ -2739,10 +2926,7 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
     #[test]
     fn resolved_adjust_honors_floor_and_absence() {
-        assert_eq!(
-            ResolvedMetricAdjustments::adjust(None, 10., 1.),
-            10.
-        );
+        assert_eq!(ResolvedMetricAdjustments::adjust(None, 10., 1.), 10.);
         assert!(
             (ResolvedMetricAdjustments::adjust(Some(MetricModifier::Absolute(2)), 10., 1.) - 12.)
                 .abs()
@@ -2808,7 +2992,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         assert!(config.shell_program.is_empty());
         assert!(config.shell_args.is_empty());
         let json = serde_json::to_string(&config).unwrap();
-        assert!(!json.contains("scrollback_lines"), "default skipped: {json}");
+        assert!(
+            !json.contains("scrollback_lines"),
+            "default skipped: {json}"
+        );
         assert!(!json.contains("shell_program"));
         assert!(!json.contains("shell_args"));
 
@@ -2975,7 +3162,9 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
         assert_eq!(last_liga.value, 1);
         assert!(features.iter().any(|f| &f.tag == b"ss01" && f.value == 1));
         // Invalid entries are dropped.
-        assert!(features.len() == 3 /* liga,calt,dlig */ + 2 /* +liga, ss01 */);
+        assert!(
+            features.len() == 3 /* liga,calt,dlig */ + 2 /* +liga, ss01 */
+        );
     }
 
     #[test]
@@ -2996,7 +3185,10 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
     fn default_ligature_fields_are_not_serialized() {
         let config = AppSettings::default();
         let json = serde_json::to_string(&config).unwrap();
-        assert!(!json.contains("ligatures"), "default ligatures skipped: {json}");
+        assert!(
+            !json.contains("ligatures"),
+            "default ligatures skipped: {json}"
+        );
         assert!(!json.contains("font_shaping_break_cursor"));
         assert!(!json.contains("font_features"));
     }
@@ -3035,10 +3227,8 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
 
     #[test]
     fn legacy_settings_without_variation_or_thicken_use_defaults() {
-        let config: AppSettings = serde_json::from_str(
-            r#"{ "font_family": "Menlo", "font_size": 14 }"#,
-        )
-        .unwrap();
+        let config: AppSettings =
+            serde_json::from_str(r#"{ "font_family": "Menlo", "font_size": 14 }"#).unwrap();
         assert!(config.font_variations.is_empty());
         assert!(!config.font_thicken);
         assert_eq!(config.font_thicken_strength, 255);
@@ -3067,8 +3257,7 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
     #[test]
     fn resolved_codepoint_map_drops_invalid_entries() {
         let mut config = AppSettings::default();
-        config.font_codepoint_map =
-            vec!["U+E000-U+E0FF=Nerd".to_owned(), "garbage".to_owned()];
+        config.font_codepoint_map = vec!["U+E000-U+E0FF=Nerd".to_owned(), "garbage".to_owned()];
         let map = config.resolved_codepoint_map();
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].family, "Nerd");

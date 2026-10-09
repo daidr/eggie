@@ -4,6 +4,9 @@ use super::Action;
 
 pub(crate) fn run(_flags: &[String]) -> i32 {
     println!("用法: eggie [+action] [选项]");
+    println!("      eggie config check [path]");
+    println!("      eggie config reload");
+    println!("      eggie do <script.lua> [--session <id>] [args...]");
     println!();
     println!("不带 +action 时启动 Eggie 终端;带 +action 时执行对应的辅助命令。");
     println!();
