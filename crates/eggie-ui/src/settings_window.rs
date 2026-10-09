@@ -6,11 +6,11 @@ use crate::{
     icons::{IconName, icon, icon_sized},
     project_store::ProjectStore,
     settings::{
-        AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, MAX_FONT_SIZE,
-        MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING,
-        MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
-        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme,
-        TerminalThemeSource, ThemeMode,
+        AppSettings, BellMode, CursorBlink, CursorShapeSetting, Language, DEFAULT_DARK_THEME,
+        DEFAULT_LIGHT_THEME, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST, MAX_PROGRESS_TIMEOUT_SECS,
+        MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING, MIN_FONT_SIZE, MIN_MINIMUM_CONTRAST,
+        MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES, MIN_TERMINAL_PADDING,
+        SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme, TerminalThemeSource, ThemeMode,
         UiColors, UpdateChannel, minimum_contrast_rgb, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
@@ -98,7 +98,7 @@ const SELECTOR_DROPDOWN_GAP: f32 = 4.;
 const SELECTOR_WINDOW_MARGIN: f32 = 8.;
 const THEME_CARD_WIDTH: f32 = 154.;
 const THEME_CARD_HEIGHT: f32 = 98.;
-const THEME_CARD_RADIUS: f32 = 21.;
+const THEME_CARD_RADIUS: f32 = 34.;
 /// Width of the compact bell-mode dropdown (trigger and popover).
 const BELL_DROPDOWN_WIDTH: f32 = 180.;
 const BELL_DROPDOWN_ROW_HEIGHT: f32 = 30.;
@@ -1064,10 +1064,6 @@ impl SettingsWindow {
         choice: String,
         cx: &mut Context<Self>,
     ) {
-        if kind.is_theme() {
-            self.theme_gallery_scroll_handles[kind.index()]
-                .set_offset(point(px(0.), px(0.)));
-        }
         if kind.is_profile() {
             self.apply_profile_selector_choice(kind, Some(choice), cx);
             return;
@@ -4370,7 +4366,7 @@ impl SettingsWindow {
                                     .justify_between()
                                     .h(px(42.))
                                     .px_1()
-                                    .rounded_lg()
+                                    .rounded_xl()
                                     .bg(rgb(sample_fill))
                                     .child(
                                         div()
@@ -4466,9 +4462,14 @@ impl SettingsWindow {
                     settings.clear_theme_preview(cx);
                 }
             }));
-        if self.selector_names(kind).iter().any(|name| name == selected) {
+        let default = if kind.is_dark() {
+            DEFAULT_DARK_THEME
+        } else {
+            DEFAULT_LIGHT_THEME
+        };
+        if self.selector_names(kind).iter().any(|name| name == default) {
             strip = strip
-                .child(self.render_theme_card(kind, selected, true, cx))
+                .child(self.render_theme_card(kind, default, selected == default, cx))
                 .child(
                     div()
                         .flex_none()
@@ -4478,8 +4479,8 @@ impl SettingsWindow {
                         .bg(rgb(self.colors.border)),
                 );
         }
-        for name in self.selector_names(kind).iter().filter(|name| *name != selected) {
-            strip = strip.child(self.render_theme_card(kind, name, false, cx));
+        for name in self.selector_names(kind).iter().filter(|name| *name != default) {
+            strip = strip.child(self.render_theme_card(kind, name, name == selected, cx));
         }
         div()
             .flex()
