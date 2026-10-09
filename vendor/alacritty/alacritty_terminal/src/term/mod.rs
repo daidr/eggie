@@ -2522,6 +2522,7 @@ impl<T: EventListener> Handler for Term<T> {
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
         self.event_proxy.send_event(Event::ProgressReport(None));
+        self.event_proxy.send_event(Event::ProgramStatusReset);
         self.mark_fully_damaged();
     }
 
@@ -3043,6 +3044,12 @@ impl<T: EventListener> Handler for Term<T> {
     fn kitty_file_transfer(&mut self, payload: String, terminator: &str) {
         self.event_proxy
             .send_event(Event::KittyFileTransfer(payload, terminator.to_owned()));
+    }
+
+    #[inline]
+    fn program_status(&mut self, payload: String, terminator: &str) {
+        self.event_proxy
+            .send_event(Event::ProgramStatus(payload, terminator.to_owned()));
     }
 
     #[inline]

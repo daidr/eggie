@@ -150,6 +150,20 @@ pub(crate) fn for_process(process: &ProcessSummary) -> ProcessIcon {
 }
 
 pub(crate) fn for_session(session: &SessionSummary) -> ProcessIcon {
+    if let Some(app) = session
+        .program_status
+        .as_ref()
+        .and_then(|status| status.app.as_deref())
+    {
+        let icon = for_process(&ProcessSummary {
+            pid: 0,
+            name: app.to_owned(),
+            command_line: None,
+        });
+        if icon != ProcessIcon::Terminal {
+            return icon;
+        }
+    }
     let detected = for_process(&session.current_process);
     if detected != ProcessIcon::Terminal && detected != ProcessIcon::Git {
         return detected;
@@ -480,11 +494,23 @@ mod tests {
             shell_pid: 1,
             current_process: process("ssh", &["ssh", "example.com"]),
             active_command: Some("git diff --stat".into()),
+            program_status: None,
             status: eggie_protocol::SessionStatus::Running,
         };
         assert_eq!(for_session(&session), ProcessIcon::GitDiff);
         session.active_command = Some("claude".into());
         assert_eq!(for_session(&session), ProcessIcon::ClaudeCode);
+        session.active_command = None;
+        session.program_status = Some(eggie_protocol::TerminalProgramStatus {
+            state: eggie_protocol::TerminalProgramState::Working,
+            kind: None,
+            app: Some("claude-code".into()),
+            title: None,
+            message: None,
+            progress: None,
+        });
+        assert_eq!(for_session(&session), ProcessIcon::ClaudeCode);
+        session.program_status = None;
         session.current_process = process("node", &["node", "server.js"]);
         assert_eq!(for_session(&session), ProcessIcon::NodeJs);
     }

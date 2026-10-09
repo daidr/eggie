@@ -51,6 +51,12 @@ pub enum Event {
     /// Raw Kitty OSC 5113 file-transfer command and its original terminator.
     KittyFileTransfer(String, String),
 
+    /// Raw OSC 7501 report or support query and its original terminator.
+    ProgramStatus(String, String),
+
+    /// Full terminal reset (RIS) clears all OSC 7501 records.
+    ProgramStatusReset,
+
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
 
@@ -122,6 +128,8 @@ impl Debug for Event {
             Event::KittyFileTransfer(payload, _) => {
                 write!(f, "KittyFileTransfer({payload:?})")
             }
+            Event::ProgramStatus(payload, _) => write!(f, "ProgramStatus({payload:?})"),
+            Event::ProgramStatusReset => write!(f, "ProgramStatusReset"),
             Event::Wakeup => write!(f, "Wakeup"),
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),

@@ -573,6 +573,16 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
+        // OSC 7501 has a 4096-byte hard cap, including introducer and terminator. Reject excess
+        // input as it arrives instead of buffering a potentially huge status report.
+        if self.osc_num_params > 0
+            && self.osc_params[0] == (0, 4)
+            && self.osc_raw.starts_with(b"7501")
+            && self.osc_raw.len() + self.osc_num_params + 5 >= 4096
+        {
+            self.osc_overflowed = true;
+            return;
+        }
         #[cfg(not(feature = "std"))]
         {
             if self.osc_raw.is_full() {

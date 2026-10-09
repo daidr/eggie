@@ -874,6 +874,49 @@ fn pty_osc_progress_reaches_daemon_and_ris_clears_it() {
 }
 
 #[test]
+fn pty_osc_7501_status_survives_prompt_and_clears_on_ris() {
+    let _pty_guard = PTY_TEST_LOCK.lock();
+    let session = TerminalSession::spawn_default(
+        ProjectId::new_v4(),
+        std::env::current_dir().unwrap(),
+        TerminalSize::default(),
+        TerminalAppearance::default(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    session
+        .input(
+            b"printf '\\033]7501;state=done:app=claude-code:msg=RmluaXNoZWQ=\\033\\\\'\r".to_vec(),
+            1,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = session.summary().program_status {
+            assert_eq!(status.state, eggie_protocol::TerminalProgramState::Done);
+            assert_eq!(status.app.as_deref(), Some("claude-code"));
+            assert_eq!(status.message.as_deref(), Some("Finished"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "OSC 7501 status never reached daemon"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    session.input(b"printf '\\033c'\r".to_vec(), 2).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while session.summary().program_status.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "RIS did not clear OSC 7501 records"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    session.terminate();
+}
+
+#[test]
 fn terminal_input_to_snapshot_is_event_driven() {
     let _pty_guard = PTY_TEST_LOCK.lock();
     let session = TerminalSession::spawn_default(

@@ -44,7 +44,7 @@ use eggie_protocol::{
     TerminalImageDescriptor,
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
     TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
-    TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollCommand,
+    TerminalProgramState, TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollCommand,
     TerminalScrollDelta, TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit,
     TerminalSearchDirection,
     TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind,
@@ -106,6 +106,23 @@ const SIDEBAR_CARD_SIZE: f32 = 18.;
 const PROJECT_CARD_SIZE: f32 = 21.;
 const PROJECT_ICON_TRANSITION: Duration = Duration::from_millis(340);
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
+const SIDEBAR_STATUS_ROW_HEIGHT: f32 = 46.;
+const SIDEBAR_STATUS_TRANSITION: Duration = Duration::from_millis(260);
+
+fn program_state_label(state: TerminalProgramState, language: Language) -> &'static str {
+    match (state, language) {
+        (TerminalProgramState::Idle, Language::English) => "Idle",
+        (TerminalProgramState::Working, Language::English) => "Working",
+        (TerminalProgramState::Done, Language::English) => "Done",
+        (TerminalProgramState::Blocked, Language::English) => "Blocked",
+        (TerminalProgramState::Error, Language::English) => "Error",
+        (TerminalProgramState::Idle, Language::SimplifiedChinese) => "空闲",
+        (TerminalProgramState::Working, Language::SimplifiedChinese) => "工作中",
+        (TerminalProgramState::Done, Language::SimplifiedChinese) => "已完成",
+        (TerminalProgramState::Blocked, Language::SimplifiedChinese) => "等待操作",
+        (TerminalProgramState::Error, Language::SimplifiedChinese) => "出错",
+    }
+}
 const CONTENT_SPLIT_EDGE_FACTOR: f32 = 0.1;
 const LEFT_SIDEBAR_MIN_WIDTH: f32 = 180.;
 const LEFT_SIDEBAR_MAX_WIDTH: f32 = 420.;
@@ -530,6 +547,31 @@ struct TabIconState {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct SidebarStatusRowState {
+    expanded: bool,
+    from_height: f32,
+    revision: u64,
+    started_at: Instant,
+}
+
+impl SidebarStatusRowState {
+    fn target_height(self) -> f32 {
+        if self.expanded {
+            SIDEBAR_STATUS_ROW_HEIGHT
+        } else {
+            SIDEBAR_SESSION_ROW_HEIGHT
+        }
+    }
+
+    fn current_height(self, now: Instant) -> f32 {
+        let progress = (now.duration_since(self.started_at).as_secs_f32()
+            / SIDEBAR_STATUS_TRANSITION.as_secs_f32())
+        .clamp(0., 1.);
+        self.from_height + (self.target_height() - self.from_height) * gpui::ease_in_out(progress)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DraggedTab {
     source_group_id: GroupId,
@@ -810,6 +852,7 @@ pub struct EggieApp {
     collapsed_projects: HashSet<ProjectId>,
     project_icon_states: RefCell<HashMap<ProjectId, ProjectIconState>>,
     tab_icon_states: RefCell<HashMap<SessionId, TabIconState>>,
+    sidebar_status_rows: RefCell<HashMap<SessionId, SidebarStatusRowState>>,
     /// Sessions owned by this window (daemon `window_id == self.window_id`), refreshed by polling.
     sessions: Vec<SessionSummary>,
     /// Detached sessions (daemon `window_id == None`): survive their closed window and are claimable
@@ -2007,6 +2050,7 @@ impl EggieApp {
             collapsed_projects: HashSet::new(),
             project_icon_states: RefCell::new(HashMap::new()),
             tab_icon_states: RefCell::new(HashMap::new()),
+            sidebar_status_rows: RefCell::new(HashMap::new()),
             sessions,
             detached_sessions: Vec::new(),
             detached_popover_open: false,
@@ -3247,6 +3291,7 @@ impl EggieApp {
             self.session_inspections.remove(&session_id);
             self.session_inspection_errors.remove(&session_id);
             self.tab_icon_states.borrow_mut().remove(&session_id);
+            self.sidebar_status_rows.borrow_mut().remove(&session_id);
             self.shell_integration.remove(&session_id);
             self.notification_routes
                 .borrow_mut()
@@ -7723,6 +7768,35 @@ impl EggieApp {
         )
     }
 
+    fn sidebar_status_row_transition(
+        &self,
+        session_id: SessionId,
+        expanded: bool,
+    ) -> Option<(f32, f32, u64)> {
+        let now = Instant::now();
+        let target_height = if expanded {
+            SIDEBAR_STATUS_ROW_HEIGHT
+        } else {
+            SIDEBAR_SESSION_ROW_HEIGHT
+        };
+        let mut states = self.sidebar_status_rows.borrow_mut();
+        let state = states.entry(session_id).or_insert(SidebarStatusRowState {
+            expanded,
+            from_height: target_height,
+            revision: 0,
+            started_at: now,
+        });
+        if state.expanded != expanded {
+            state.from_height = state.current_height(now);
+            state.expanded = expanded;
+            state.revision += 1;
+            state.started_at = now;
+        }
+        (state.started_at.elapsed() < SIDEBAR_STATUS_TRANSITION
+            && (state.from_height - target_height).abs() > f32::EPSILON)
+            .then_some((state.from_height, target_height, state.revision))
+    }
+
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div()
             .flex()
@@ -7829,59 +7903,149 @@ impl EggieApp {
                     let session_id = session.id;
                     // Prefer the tab's custom title (if any) so the sidebar stays consistent with
                     // the tab bar; fall back to the session's process title.
-                    let session_title: SharedString = view
+                    let tab_title = view
                         .layout
                         .terminal_display_title(session_id)
-                        .unwrap_or(session.title.as_str())
-                        .to_owned()
-                        .into();
-                    panel = panel.child(
+                        .unwrap_or(session.title.as_str());
+                    let program_status = session.program_status.as_ref();
+                    let display_title = view
+                        .layout
+                        .terminal_custom_title(session_id)
+                        .or_else(|| program_status.and_then(|status| status.title.as_deref()))
+                        .unwrap_or(tab_title);
+                    let session_title: SharedString = display_title.to_owned().into();
+                    let label: AnyElement = if let Some(status) = program_status {
+                        let state_label = program_state_label(status.state, self.language);
+                        let mut subtitle = match (&status.title, &status.message) {
+                            (Some(title), Some(message)) if title != display_title => {
+                                format!("{title}: {message}")
+                            }
+                            (_, Some(message)) => message.clone(),
+                            (Some(title), None) if title != display_title => title.clone(),
+                            _ => state_label.to_owned(),
+                        };
+                        if let Some(progress) = status.progress {
+                            subtitle.push_str(&format!(" · {progress}%"));
+                        }
+                        let tag = matches!(
+                            status.state,
+                            TerminalProgramState::Blocked
+                                | TerminalProgramState::Done
+                                | TerminalProgramState::Error
+                        )
+                        .then_some((status.state, state_label));
                         div()
-                            .id(format!("sidebar-session-{session_id}"))
                             .flex()
-                            .items_center()
+                            .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
-                            .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
-                            .gap_2()
-                            .ml_5()
-                            .mr_3()
-                            .px_2()
-                            .rounded_md()
-                            .mb_1()
-                            .text_size(px(12.))
-                            .text_color(rgb(if active {
-                                self.colors.text
-                            } else {
-                                self.colors.muted
-                            }))
-                            .when(active, |element| {
-                                element.bg(rgb(self.colors.panel_alt))
-                            })
-                            .when_some(self.bell_flash_tint(session_id), |element, tint| {
-                                element.bg(rgba(tint))
-                            })
-                            .hover({
-                                let colors = self.colors;
-                                move |element| element.bg(rgb(colors.hover))
-                            })
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |app, _, window, cx| {
-                                app.activate_session(project_id, session_id, window, cx)
-                            }))
-                            .child(self.render_item_icon(
-                                ItemKind::Terminal,
-                                Some(session_id),
-                                format!("sidebar-progress-{session_id}"),
-                            ))
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(session_title.clone()),
+                                    )
+                                    .when_some(tag, |row, (state, label)| {
+                                        let tint = match state {
+                                            TerminalProgramState::Blocked => {
+                                                self.interface_theme.palette[3]
+                                            }
+                                            TerminalProgramState::Error => {
+                                                self.interface_theme.palette[1]
+                                            }
+                                            _ => self.interface_theme.palette[2],
+                                        };
+                                        row.child(
+                                            div()
+                                                .flex_none()
+                                                .h(px(16.))
+                                                .px_1()
+                                                .rounded_full()
+                                                .bg(rgba((tint << 8) | 0x30))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(self.colors.text))
+                                                .child(label),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
                                     .min_w_0()
                                     .truncate()
-                                    .child(session_title.clone()),
-                            ),
-                    );
+                                    .text_size(px(11.))
+                                    .text_color(rgb(self.colors.muted))
+                                    .child(subtitle),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(session_title.clone())
+                            .into_any_element()
+                    };
+                    let height_transition =
+                        self.sidebar_status_row_transition(session_id, program_status.is_some());
+                    let row = div()
+                        .id(format!("sidebar-session-{session_id}"))
+                        .flex()
+                        .items_center()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .gap_2()
+                        .ml_5()
+                        .mr_3()
+                        .px_2()
+                        .rounded_md()
+                        .mb_1()
+                        .text_size(px(12.))
+                        .text_color(rgb(if active {
+                            self.colors.text
+                        } else {
+                            self.colors.muted
+                        }))
+                        .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
+                        .when_some(self.bell_flash_tint(session_id), |element, tint| {
+                            element.bg(rgba(tint))
+                        })
+                        .hover({
+                            let colors = self.colors;
+                            move |element| element.bg(rgb(colors.hover))
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |app, _, window, cx| {
+                            app.activate_session(project_id, session_id, window, cx)
+                        }))
+                        .child(self.render_item_icon(
+                            ItemKind::Terminal,
+                            Some(session_id),
+                            format!("sidebar-progress-{session_id}"),
+                        ))
+                        .child(label);
+                    panel = panel.child(if let Some((from, to, revision)) = height_transition {
+                        row.with_animation(
+                            format!("sidebar-status-height-{session_id}-{revision}"),
+                            Animation::new(SIDEBAR_STATUS_TRANSITION)
+                                .with_easing(gpui::ease_in_out),
+                            move |element, progress| element.h(px(from + (to - from) * progress)),
+                        )
+                        .into_any_element()
+                    } else {
+                        row.h(px(if program_status.is_some() {
+                            SIDEBAR_STATUS_ROW_HEIGHT
+                        } else {
+                            SIDEBAR_SESSION_ROW_HEIGHT
+                        }))
+                        .into_any_element()
+                    });
                 }
             }
         }
@@ -10906,6 +11070,7 @@ mod tests {
                 command_line: None,
             },
             active_command: None,
+            program_status: None,
             status: eggie_protocol::SessionStatus::Running,
         }
     }
