@@ -1,6 +1,83 @@
 use super::*;
 
-static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes tests that are sensitive to machine load: those driving a real PTY (their assertions
+/// depend on the child shell producing output within a timeout) and those spawning subprocesses.
+/// Visible to sibling modules so `remote_bootstrap`'s executing test can take it too — without that,
+/// its shell spawns run concurrently with the PTY tests and starve them into intermittent failure.
+pub(crate) static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// [`super::build_shell_env`] with an empty profile environment, which is what almost every test
+/// wants. Shadows the real function for this module (`use super::*` brings it in, this definition
+/// wins); the profile-env tests bypass it by calling `super::build_shell_env` directly.
+///
+/// HAZARD: because this absorbs one argument, a future signature change to the real function is
+/// reported at this body alone — the ~15 tests calling it keep compiling. When you add a parameter
+/// here, audit those call sites rather than defaulting it; a silently-defaulted parameter means those
+/// tests stop covering it. `shim_matches_the_real_function` guards the one thing a compiler cannot:
+/// that the arguments are still forwarded in the right order (the two `Option<String>` parameters
+/// have identical types, so swapping them compiles clean and misconfigures integration).
+#[allow(clippy::too_many_arguments)]
+fn build_shell_env(
+    shell_name: &str,
+    shell_path: &str,
+    terminfo: &Path,
+    integration_root: Option<&Path>,
+    user_zdotdir: Option<String>,
+    user_env_var: Option<String>,
+    custom_args: Option<Vec<String>>,
+    bin_dir: Option<&Path>,
+    shell_features: &str,
+) -> ShellLaunch {
+    super::build_shell_env(
+        shell_name,
+        shell_path,
+        terminfo,
+        integration_root,
+        user_zdotdir,
+        user_env_var,
+        custom_args,
+        bin_dir,
+        shell_features,
+        &BTreeMap::new(),
+    )
+}
+
+#[test]
+fn shim_matches_the_real_function() {
+    let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let bin_dir = PathBuf::from("/tmp/eggie-bin");
+    // Distinguishable values in every position, so a forwarding mistake shows up as a mismatch rather
+    // than as two identically-wrong results. zsh + bash cover both `Option<String>` parameters.
+    for shell in ["zsh", "/opt/homebrew/bin/bash"] {
+        let name = Path::new(shell).file_name().unwrap().to_str().unwrap();
+        let shimmed = build_shell_env(
+            name,
+            shell,
+            &terminfo,
+            Some(&root),
+            Some("/home/user/.zsh".to_owned()),
+            Some("/home/user/env.sh".to_owned()),
+            Some(vec!["-i".to_owned()]),
+            Some(&bin_dir),
+            "path",
+        );
+        let direct = super::build_shell_env(
+            name,
+            shell,
+            &terminfo,
+            Some(&root),
+            Some("/home/user/.zsh".to_owned()),
+            Some("/home/user/env.sh".to_owned()),
+            Some(vec!["-i".to_owned()]),
+            Some(&bin_dir),
+            "path",
+            &BTreeMap::new(),
+        );
+        assert_eq!(shimmed.args, direct.args, "{name}: args must match");
+        assert_eq!(shimmed.env, direct.env, "{name}: env must match");
+    }
+}
 
 #[test]
 fn command_line_from_options_prefers_base64_then_url_then_raw() {
@@ -1387,6 +1464,10 @@ fn runtime_scrollback_and_cursor_changes_do_not_clobber_each_other() {
         shell_program: None,
         shell_args: None,
         shell_features: "path".to_owned(),
+        profile_env: BTreeMap::new(),
+        remote: None,
+        remote_install_consented: false,
+        remote_cwd: None,
     })
     .unwrap();
 
@@ -1471,6 +1552,10 @@ fn custom_shell_program_drives_the_session_shell() {
         shell_program: Some("/bin/sh".to_owned()),
         shell_args: None,
         shell_features: "path".to_owned(),
+        profile_env: BTreeMap::new(),
+        remote: None,
+        remote_install_consented: false,
+        remote_cwd: None,
     })
     .unwrap();
     // The configured shell's basename becomes the session's initial process name.
@@ -2221,6 +2306,258 @@ fn fish_integration_uses_xdg_data_dirs() {
     assert!(!launch.env.contains_key("ZDOTDIR"));
     assert!(!launch.env.contains_key("ENV"));
     // Base environment is still populated.
+    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+}
+
+/// The daemon must turn a remote spawn config into an `ssh` invocation carrying the bootstrap, and a
+/// local one into the configured shell — the seam between `SessionSpawnConfig` and the PTY.
+///
+/// Asserted at the `remote_launch` boundary rather than by spawning a PTY: a real `ssh` needs a
+/// reachable host. The payload itself is covered by `remote_bootstrap`'s tests, including one that
+/// executes the generated script against a scratch `$HOME`.
+#[test]
+fn a_remote_spawn_config_produces_an_ssh_invocation_carrying_the_bootstrap() {
+    let scripts = crate::remote_bootstrap::RemoteScripts {
+        zsh_zshenv: BUNDLED_ZSH_ZSHENV,
+        zsh_integration: BUNDLED_ZSH_INTEGRATION,
+        bash: BUNDLED_BASH_INTEGRATION,
+        fish: BUNDLED_FISH_INTEGRATION,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    let target = eggie_domain::RemoteTarget {
+        host: "prod.example.com".to_owned(),
+        user: Some("deploy".to_owned()),
+        port: Some(2222),
+    };
+    let launch = crate::remote_bootstrap::remote_launch(
+        &target,
+        &scripts,
+        &BTreeMap::from([("AWS_PROFILE".to_owned(), "prod".to_owned())]),
+        Some("/srv/www"),
+        true,
+        None,
+    );
+    assert_eq!(launch.program, "ssh", "a remote profile must exec ssh, not a local shell");
+    assert!(launch.args.contains(&"-t".to_owned()));
+    assert!(launch.args.contains(&"deploy@prod.example.com".to_owned()));
+    // The bundled scripts — the same bytes installed locally — ride along in the payload.
+    let command = launch.args.last().expect("remote command");
+    assert!(command.starts_with("sh -c '"));
+    assert!(
+        command.len() > BUNDLED_ZSH_INTEGRATION.len(),
+        "the payload must actually carry the integration scripts"
+    );
+}
+
+/// Declining the install must still produce a session, and must not carry any script bytes.
+#[test]
+fn a_declined_remote_install_still_produces_an_ssh_invocation() {
+    let scripts = crate::remote_bootstrap::RemoteScripts {
+        zsh_zshenv: BUNDLED_ZSH_ZSHENV,
+        zsh_integration: BUNDLED_ZSH_INTEGRATION,
+        bash: BUNDLED_BASH_INTEGRATION,
+        fish: BUNDLED_FISH_INTEGRATION,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    let declined = crate::remote_bootstrap::remote_launch(
+        &eggie_domain::RemoteTarget::new("host".to_owned()),
+        &scripts,
+        &BTreeMap::new(),
+        None,
+        false,
+        None,
+    );
+    let consented = crate::remote_bootstrap::remote_launch(
+        &eggie_domain::RemoteTarget::new("host".to_owned()),
+        &scripts,
+        &BTreeMap::new(),
+        None,
+        true,
+        None,
+    );
+    assert_eq!(declined.program, "ssh");
+    assert!(
+        declined.args.last().unwrap().len() < consented.args.last().unwrap().len() / 4,
+        "a declined install must not ship the integration scripts"
+    );
+}
+
+#[test]
+fn profile_env_is_injected_but_never_shadows_eggie_variables() {
+    let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let bin_dir = PathBuf::from("/Applications/Eggie.app/Contents/MacOS");
+    let profile_env = BTreeMap::from([
+        // Variables Eggie does not own: these must reach the shell verbatim — the whole point of
+        // per-profile environments.
+        ("AWS_PROFILE".to_owned(), "prod".to_owned()),
+        ("DOCKER_HOST".to_owned(), "tcp://10.0.0.1:2375".to_owned()),
+        // Variables Eggie owns: a profile naming these must NOT be able to break integration,
+        // terminfo lookup, or the shell-feature plumbing.
+        ("TERM".to_owned(), "dumb".to_owned()),
+        ("TERMINFO".to_owned(), "/nowhere".to_owned()),
+        ("ZDOTDIR".to_owned(), "/tmp/hijack".to_owned()),
+        ("EGGIE_BIN_DIR".to_owned(), "/tmp/hijack".to_owned()),
+        ("EGGIE_SHELL_FEATURES".to_owned(), "".to_owned()),
+        // The dangerous ones: Eggie sets these only *conditionally* (or, for BASH_RCFILE and the
+        // run-once guards, never from Rust at all), so insert order alone would let a profile through.
+        // `zsh/.zshenv` exports EGGIE_ZDOTDIR_ORIG as ZDOTDIR and sources startup files from it, so a
+        // profile that set it would gain arbitrary code execution in every zsh of that profile.
+        ("EGGIE_ZDOTDIR_ORIG".to_owned(), "/tmp/hijack".to_owned()),
+        ("EGGIE_BASH_ENV".to_owned(), "/tmp/hijack/env.sh".to_owned()),
+        ("EGGIE_BASH_RCFILE".to_owned(), "/tmp/hijack/rc.sh".to_owned()),
+        ("EGGIE_BASH_INJECT".to_owned(), "0".to_owned()),
+        ("EGGIE_FISH_INTEGRATION".to_owned(), "1".to_owned()),
+        ("_eggie_state".to_owned(), "1".to_owned()),
+    ]);
+    // `user_zdotdir: None` is the shipped configuration — a GUI launch has no ZDOTDIR of its own, so
+    // this is exactly the case where Eggie never inserts EGGIE_ZDOTDIR_ORIG to overwrite a profile's.
+    let launch = super::build_shell_env(
+        "zsh",
+        "/bin/zsh",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        Some(&bin_dir),
+        "path",
+        &profile_env,
+    );
+
+    // Profile-only variables pass through.
+    assert_eq!(launch.env.get("AWS_PROFILE").map(String::as_str), Some("prod"));
+    assert_eq!(
+        launch.env.get("DOCKER_HOST").map(String::as_str),
+        Some("tcp://10.0.0.1:2375")
+    );
+    // Eggie's own values win over the profile's attempt to set them.
+    assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
+    assert_eq!(
+        launch.env.get("TERMINFO").map(String::as_str),
+        Some(terminfo.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        launch.env.get("ZDOTDIR").map(String::as_str),
+        Some(root.join("zsh").to_string_lossy().as_ref()),
+        "a profile must not be able to redirect ZDOTDIR and break shell integration"
+    );
+    assert_eq!(
+        launch.env.get("EGGIE_BIN_DIR").map(String::as_str),
+        Some(bin_dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        launch.env.get("EGGIE_SHELL_FEATURES").map(String::as_str),
+        Some("path")
+    );
+    // The conditionally-set and never-set variables must be absent entirely, not merely overwritten:
+    // there is no Eggie value to overwrite them with in this configuration.
+    for key in [
+        "EGGIE_ZDOTDIR_ORIG",
+        "EGGIE_BASH_ENV",
+        "EGGIE_BASH_RCFILE",
+        "EGGIE_FISH_INTEGRATION",
+        "_eggie_state",
+    ] {
+        assert!(
+            !launch.env.contains_key(key),
+            "a profile must not be able to set {key} — the integration scripts trust it"
+        );
+    }
+    // zsh gets no bash injection marker at all, profile or otherwise.
+    assert!(!launch.env.contains_key("EGGIE_BASH_INJECT"));
+}
+
+#[test]
+fn profile_env_cannot_forge_the_bash_integration_variables() {
+    let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let profile_env = BTreeMap::from([
+        // `eggie.bash` sources EGGIE_BASH_RCFILE and exports EGGIE_BASH_ENV as ENV; Rust never sets
+        // the former and sets the latter only when the daemon has its own ENV.
+        ("EGGIE_BASH_RCFILE".to_owned(), "/tmp/hijack/rc.sh".to_owned()),
+        ("EGGIE_BASH_ENV".to_owned(), "/tmp/hijack/env.sh".to_owned()),
+        ("EGGIE_BASH_INJECT".to_owned(), "0".to_owned()),
+        ("KEEP_ME".to_owned(), "yes".to_owned()),
+    ]);
+    let launch = super::build_shell_env(
+        "bash",
+        "/opt/homebrew/bin/bash",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        None,
+        "path",
+        &profile_env,
+    );
+    assert!(!launch.env.contains_key("EGGIE_BASH_RCFILE"));
+    assert!(!launch.env.contains_key("EGGIE_BASH_ENV"));
+    // Eggie's own marker survives at its real value, not the profile's "0".
+    assert_eq!(
+        launch.env.get("EGGIE_BASH_INJECT").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        launch.env.get("ENV").map(String::as_str),
+        Some(root.join("bash").join("eggie.bash").to_string_lossy().as_ref())
+    );
+    assert_eq!(launch.env.get("KEEP_ME").map(String::as_str), Some("yes"));
+}
+
+#[test]
+fn profile_env_cannot_disable_the_fish_run_once_guard() {
+    let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+    let root = PathBuf::from("/tmp/eggie-integration");
+    let profile_env = BTreeMap::from([
+        // The fish script returns early when this is set, which would silently disable integration.
+        ("EGGIE_FISH_INTEGRATION".to_owned(), "1".to_owned()),
+        // Overwriting XDG_DATA_DIRS would stop fish from finding our vendor_conf.d at all.
+        ("XDG_DATA_DIRS".to_owned(), "/tmp/hijack".to_owned()),
+    ]);
+    let launch = super::build_shell_env(
+        "fish",
+        "/opt/homebrew/bin/fish",
+        &terminfo,
+        Some(&root),
+        None,
+        None,
+        None,
+        None,
+        "path",
+        &profile_env,
+    );
+    assert!(!launch.env.contains_key("EGGIE_FISH_INTEGRATION"));
+    let dirs = launch
+        .env
+        .get("XDG_DATA_DIRS")
+        .expect("fish still gets XDG_DATA_DIRS");
+    assert_eq!(
+        dirs.split(':').next(),
+        Some(root.to_string_lossy().as_ref()),
+        "the integration root must stay first despite the profile's attempt"
+    );
+}
+
+#[test]
+fn profile_env_reaches_shells_without_integration() {
+    let terminfo = PathBuf::from("/tmp/eggie-terminfo");
+    let profile_env = BTreeMap::from([("MY_VAR".to_owned(), "value".to_owned())]);
+    // No integration root: the shell gets no injection, but the profile's environment still applies.
+    let launch = super::build_shell_env(
+        "elvish",
+        "/usr/bin/elvish",
+        &terminfo,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "",
+        &profile_env,
+    );
+    assert_eq!(launch.env.get("MY_VAR").map(String::as_str), Some("value"));
     assert_eq!(launch.env.get("TERM").map(String::as_str), Some("alacritty"));
 }
 

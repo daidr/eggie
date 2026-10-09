@@ -13,6 +13,7 @@ pub(crate) enum NativeTabMenuCommand {
 pub(crate) enum NativeProjectMenuCommand {
     EditName,
     SetRoot,
+    SetDefaultProfile,
     CloseTabs,
     DeleteProject,
 }
@@ -40,9 +41,17 @@ pub(crate) enum NativeEditMenuCommand {
     SelectAll,
 }
 
+/// Picking a profile from the "+" button's right-click menu. The index is into the profile list as
+/// it was when the menu opened, so the profile is re-fetched by id after the menu closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeProfileMenuCommand {
+    PickProfile(usize),
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    NativeEditMenu, NativeProcessMenu, NativeProjectMenu, NativeSnippetMenu, NativeTabMenu,
+    NativeEditMenu, NativeProcessMenu, NativeProfileMenu, NativeProjectMenu, NativeSnippetMenu,
+    NativeTabMenu,
 };
 
 #[cfg(target_os = "macos")]
@@ -87,6 +96,15 @@ pub(crate) fn prepare_edit_menu(
     language: crate::settings::Language,
 ) -> Option<NativeEditMenu> {
     macos::NativeEditMenu::prepare(window, enabled, language)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_profile_menu(
+    window: &Window,
+    profiles: Vec<(String, bool)>,
+    language: crate::settings::Language,
+) -> Option<NativeProfileMenu> {
+    macos::NativeProfileMenu::prepare(window, profiles, language)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -177,11 +195,30 @@ pub(crate) fn prepare_edit_menu(
     None
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeProfileMenu;
+
+#[cfg(not(target_os = "macos"))]
+impl NativeProfileMenu {
+    pub(crate) fn show(self) -> Option<NativeProfileMenuCommand> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_profile_menu(
+    _: &Window,
+    _: Vec<(String, bool)>,
+    _: crate::settings::Language,
+) -> Option<NativeProfileMenu> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{
-        NativeEditMenuCommand, NativeProcessMenuCommand, NativeProjectMenuCommand,
-        NativeSnippetMenuCommand, NativeTabMenuCommand,
+        NativeEditMenuCommand, NativeProcessMenuCommand, NativeProfileMenuCommand,
+        NativeProjectMenuCommand, NativeSnippetMenuCommand, NativeTabMenuCommand,
     };
     use cocoa::{
         appkit::{NSApp, NSMenu, NSMenuItem},
@@ -479,6 +516,7 @@ mod macos {
 
             menu.addItem_(menu_item(language.edit_name(), 0, true, target));
             menu.addItem_(menu_item(language.set_root(), 1, true, target));
+            menu.addItem_(menu_item(language.set_default_profile(), 4, true, target));
             menu.addItem_(NSMenuItem::separatorItem(nil));
             let close_label = language.close_tabs(tab_count);
             menu.addItem_(menu_item(&close_label, 2, tab_count > 0, target));
@@ -501,6 +539,9 @@ mod macos {
             1 => Some(NativeProjectMenuCommand::SetRoot),
             2 => Some(NativeProjectMenuCommand::CloseTabs),
             3 => Some(NativeProjectMenuCommand::DeleteProject),
+            // 4, not 2: tags are the menu's wire format, so a new item takes the next free number
+            // rather than renumbering the existing ones (which would silently remap every tag).
+            4 => Some(NativeProjectMenuCommand::SetDefaultProfile),
             _ => None,
         }
     }
@@ -584,6 +625,96 @@ mod macos {
             3 => Some(NativeProcessMenuCommand::CopyExecutablePath),
             _ => None,
         }
+    }
+
+    // --- Profile picker menu (the "+" button's right click) ---------------------------------
+
+    pub(crate) struct NativeProfileMenu {
+        view: id,
+        event: id,
+        profiles: Vec<(String, bool)>,
+        language: crate::settings::Language,
+    }
+
+    impl NativeProfileMenu {
+        pub(super) fn prepare(
+            window: &Window,
+            profiles: Vec<(String, bool)>,
+            language: crate::settings::Language,
+        ) -> Option<Self> {
+            let window_handle = HasWindowHandle::window_handle(window).ok()?;
+            let RawWindowHandle::AppKit(appkit_handle) = window_handle.as_raw() else {
+                return None;
+            };
+            let view = appkit_handle.ns_view.as_ptr() as id;
+            let event: id = unsafe { msg_send![NSApp(), currentEvent] };
+            if view == nil || event == nil {
+                return None;
+            }
+            unsafe {
+                let _: id = msg_send![view, retain];
+                let _: id = msg_send![event, retain];
+            }
+            Some(Self {
+                view,
+                event,
+                profiles,
+                language,
+            })
+        }
+
+        pub(crate) fn show(self) -> Option<NativeProfileMenuCommand> {
+            show_profile_menu(self.view, self.event, &self.profiles, self.language)
+        }
+    }
+
+    impl Drop for NativeProfileMenu {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.event, release];
+                let _: () = msg_send![self.view, release];
+            }
+        }
+    }
+
+    fn show_profile_menu(
+        view: id,
+        event: id,
+        profiles: &[(String, bool)],
+        language: crate::settings::Language,
+    ) -> Option<NativeProfileMenuCommand> {
+        let selected = unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let target: id = msg_send![menu_target_class(), new];
+            (*target).set_ivar(SELECTED_COMMAND_IVAR, NO_SELECTION);
+            let menu = NSMenu::new(nil).autorelease();
+            menu.setAutoenablesItems(NO);
+
+            // Tags are the list index at open time; the profile is re-fetched by id after the menu
+            // closes, so a profile added or removed while the menu is open cannot be picked by the
+            // wrong row.
+            for (index, (name, is_default)) in profiles.iter().enumerate() {
+                let label = if *is_default {
+                    format!("{name}  ({})", language.profile_picker_project_default())
+                } else {
+                    name.clone()
+                };
+                menu.addItem_(menu_item(&label, index as isize, true, target));
+            }
+
+            pop_up_menu(menu, event, view);
+            let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
+            let _: () = msg_send![target, release];
+            pool.drain();
+            selected
+        };
+
+        profile_command_from_tag(selected)
+    }
+
+    fn profile_command_from_tag(tag: isize) -> Option<NativeProfileMenuCommand> {
+        // A negative tag means the menu closed without a selection; anything else is a list index.
+        (tag >= 0).then(|| NativeProfileMenuCommand::PickProfile(tag as usize))
     }
 
 
@@ -766,7 +897,10 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use super::{command_from_tag, edit_command_from_tag, NativeEditMenuCommand};
+        use super::{
+            command_from_tag, edit_command_from_tag, profile_command_from_tag, NativeEditMenuCommand,
+            NativeProfileMenuCommand,
+        };
         use crate::native_menu::NativeTabMenuCommand;
         use eggie_domain::Direction;
 
@@ -802,6 +936,21 @@ mod macos {
             // NO_SELECTION(-1)与越界 tag 解码为 None(用户点空白/关闭菜单)。
             assert_eq!(edit_command_from_tag(-1), None);
             assert_eq!(edit_command_from_tag(4), None);
+        }
+
+        #[test]
+        fn profile_command_from_tag_decodes_a_list_index_and_rejects_a_closed_menu() {
+            assert_eq!(
+                profile_command_from_tag(0),
+                Some(NativeProfileMenuCommand::PickProfile(0))
+            );
+            assert_eq!(
+                profile_command_from_tag(7),
+                Some(NativeProfileMenuCommand::PickProfile(7))
+            );
+            // A negative tag is how the menu reports "closed without a selection"; it must not be
+            // cast to a huge unsigned index.
+            assert_eq!(profile_command_from_tag(-1), None);
         }
     }
 }

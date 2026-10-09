@@ -259,6 +259,20 @@ impl Language {
         }
     }
 
+    pub(crate) fn forward_port(self) -> &'static str {
+        match self {
+            Self::English => "Forward Port…",
+            Self::SimplifiedChinese => "端口映射…",
+        }
+    }
+
+    pub(crate) fn forward_port_prompt(self) -> &'static str {
+        match self {
+            Self::English => "Enter a port forward: L 8080 localhost:80, R 8080 localhost:80, or D 1080",
+            Self::SimplifiedChinese => "输入端口映射：L 8080 localhost:80（本地）、R 8080 localhost:80（远程）或 D 1080（动态）",
+        }
+    }
+
     pub(crate) fn processes_label(self) -> &'static str {
         match self {
             Self::English => "PROCESSES",
@@ -1203,8 +1217,8 @@ impl Language {
 
     pub(crate) fn theme_row(self) -> &'static str {
         match self {
-            Self::English => "Theme",
-            Self::SimplifiedChinese => "主题",
+            Self::English => "Interface theme",
+            Self::SimplifiedChinese => "界面主题",
         }
     }
 
@@ -1215,31 +1229,96 @@ impl Language {
         }
     }
 
-    pub(crate) fn dark_theme_row(self) -> &'static str {
+    pub(crate) fn interface_dark_theme_row(self) -> &'static str {
         match self {
-            Self::English => "Dark theme",
-            Self::SimplifiedChinese => "深色主题",
+            Self::English => "Interface dark theme",
+            Self::SimplifiedChinese => "界面深色主题",
         }
     }
 
-    pub(crate) fn dark_theme_description(self) -> &'static str {
+    pub(crate) fn interface_dark_theme_description(self) -> &'static str {
         match self {
-            Self::English => "Used in Dark mode and when the system appearance is dark.",
-            Self::SimplifiedChinese => "在深色模式和系统外观为深色时使用。",
+            Self::English => {
+                "Colors for Eggie's own interface in Dark mode, and when the system appearance is dark."
+            }
+            Self::SimplifiedChinese => "深色模式和系统外观为深色时，Eggie 界面自身的配色。",
         }
     }
 
-    pub(crate) fn light_theme_row(self) -> &'static str {
+    pub(crate) fn interface_light_theme_row(self) -> &'static str {
         match self {
-            Self::English => "Light theme",
-            Self::SimplifiedChinese => "浅色主题",
+            Self::English => "Interface light theme",
+            Self::SimplifiedChinese => "界面浅色主题",
         }
     }
 
-    pub(crate) fn light_theme_description(self) -> &'static str {
+    pub(crate) fn interface_light_theme_description(self) -> &'static str {
         match self {
-            Self::English => "Used in Light mode and when the system appearance is light.",
-            Self::SimplifiedChinese => "在浅色模式和系统外观为浅色时使用。",
+            Self::English => {
+                "Colors for Eggie's own interface in Light mode, and when the system appearance is light."
+            }
+            Self::SimplifiedChinese => "浅色模式和系统外观为浅色时，Eggie 界面自身的配色。",
+        }
+    }
+
+    pub(crate) fn terminal_theme_source_row(self) -> &'static str {
+        match self {
+            Self::English => "Terminal theme",
+            Self::SimplifiedChinese => "终端主题",
+        }
+    }
+
+    pub(crate) fn terminal_theme_source_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Whether terminal colors follow the interface theme or use their own pair. \
+                 Individual profiles can override the terminal theme either way."
+            }
+            Self::SimplifiedChinese => {
+                "终端配色是跟随界面主题，还是使用自己的一对主题。无论哪种，单个配置都可以覆写终端主题。"
+            }
+        }
+    }
+
+    pub(crate) fn terminal_theme_follow_interface(self) -> &'static str {
+        match self {
+            Self::English => "Follow interface",
+            Self::SimplifiedChinese => "跟随界面",
+        }
+    }
+
+    pub(crate) fn terminal_theme_custom(self) -> &'static str {
+        match self {
+            Self::English => "Custom",
+            Self::SimplifiedChinese => "自定义",
+        }
+    }
+
+    pub(crate) fn terminal_dark_theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Terminal dark theme",
+            Self::SimplifiedChinese => "终端深色主题",
+        }
+    }
+
+    pub(crate) fn terminal_dark_theme_description(self) -> &'static str {
+        match self {
+            Self::English => "Terminal colors when the dark appearance is in effect.",
+            Self::SimplifiedChinese => "深色外观生效时的终端配色。",
+        }
+    }
+
+    pub(crate) fn terminal_light_theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Terminal light theme",
+            Self::SimplifiedChinese => "终端浅色主题",
+        }
+    }
+
+    pub(crate) fn terminal_light_theme_description(self) -> &'static str {
+        match self {
+            Self::English => "Terminal colors when the light appearance is in effect.",
+            Self::SimplifiedChinese => "浅色外观生效时的终端配色。",
         }
     }
 
@@ -2278,6 +2357,430 @@ impl Language {
         match self {
             Self::English => "No matching commands",
             Self::SimplifiedChinese => "无匹配的命令",
+        }
+    }
+
+    // --- Profiles ---------------------------------------------------------------------------
+
+    /// Palette command that opens the profile picker.
+    pub(crate) fn action_new_tab_with_profile(self) -> &'static str {
+        match self {
+            Self::English => "New Terminal with Profile…",
+            Self::SimplifiedChinese => "使用配置新建终端…",
+        }
+    }
+
+    pub(crate) fn profile_picker_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Choose a profile…",
+            Self::SimplifiedChinese => "选择配置…",
+        }
+    }
+
+    pub(crate) fn profile_picker_empty(self) -> &'static str {
+        match self {
+            Self::English => "No matching profiles",
+            Self::SimplifiedChinese => "无匹配的配置",
+        }
+    }
+
+    /// Suffix marking the project's default profile in the picker.
+    pub(crate) fn profile_picker_project_default(self) -> &'static str {
+        match self {
+            Self::English => "project default",
+            Self::SimplifiedChinese => "项目默认",
+        }
+    }
+
+    // --- Profiles settings pane ---------------------------------------------------------------
+
+    pub(crate) fn profiles_sidebar(self) -> &'static str {
+        match self {
+            Self::English => "Profiles",
+            Self::SimplifiedChinese => "配置",
+        }
+    }
+
+    pub(crate) fn profiles_section(self) -> &'static str {
+        match self {
+            Self::English => "Profiles",
+            Self::SimplifiedChinese => "配置",
+        }
+    }
+
+    /// Name given to a newly created profile (the user renames it right after).
+    pub(crate) fn new_profile_name(self) -> &'static str {
+        match self {
+            Self::English => "New Profile",
+            Self::SimplifiedChinese => "新配置",
+        }
+    }
+
+    pub(crate) fn add_profile_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "New profile",
+            Self::SimplifiedChinese => "新建配置",
+        }
+    }
+
+    pub(crate) fn delete_profile_tooltip(self) -> &'static str {
+        match self {
+            Self::English => "Delete profile",
+            Self::SimplifiedChinese => "删除配置",
+        }
+    }
+
+    /// Marks the built-in Default profile in the list, which cannot be deleted.
+    pub(crate) fn builtin_profile_marker(self) -> &'static str {
+        match self {
+            Self::English => "built-in",
+            Self::SimplifiedChinese => "内置",
+        }
+    }
+
+    pub(crate) fn delete_profile_title(self) -> &'static str {
+        match self {
+            Self::English => "Delete this profile?",
+            Self::SimplifiedChinese => "删除此配置？",
+        }
+    }
+
+    /// Body of the delete confirmation. Names what survives deletion, because running terminals
+    /// launched from this profile keep running — only their appearance overrides fall away.
+    pub(crate) fn delete_profile_message(self, name: &str) -> String {
+        match self {
+            Self::English => format!(
+                "“{name}” will be removed. Terminals already launched from it keep running, \
+                 but fall back to the global appearance. Projects using it as their default \
+                 fall back to the built-in Default profile."
+            ),
+            Self::SimplifiedChinese => format!(
+                "将删除“{name}”。已经从它启动的终端会继续运行，但外观回落到全局设置；\
+                 以它为默认配置的项目会回落到内置 Default 配置。"
+            ),
+        }
+    }
+
+    pub(crate) fn profile_name_row(self) -> &'static str {
+        match self {
+            Self::English => "Name",
+            Self::SimplifiedChinese => "名称",
+        }
+    }
+
+    pub(crate) fn profile_name_description(self) -> &'static str {
+        match self {
+            Self::English => "Shown in the profile picker and as this profile's tab badge tooltip.",
+            Self::SimplifiedChinese => "显示在配置选择器中，也作为该配置的标签徽章提示。",
+        }
+    }
+
+    pub(crate) fn profile_launch_section(self) -> &'static str {
+        match self {
+            Self::English => "Launch",
+            Self::SimplifiedChinese => "启动",
+        }
+    }
+
+    pub(crate) fn profile_cwd_row(self) -> &'static str {
+        match self {
+            Self::English => "Working directory",
+            Self::SimplifiedChinese => "工作目录",
+        }
+    }
+
+    pub(crate) fn profile_cwd_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Directory new terminals start in. Leave empty to inherit the active terminal's directory, \
+                 then the project root. For a remote profile this is a path on the remote host."
+            }
+            Self::SimplifiedChinese => {
+                "新终端的起始目录。留空则继承当前终端的目录，其次是项目根目录。远程配置下这是远端主机上的路径。"
+            }
+        }
+    }
+
+    pub(crate) fn profile_cwd_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "e.g. /Users/me/work",
+            Self::SimplifiedChinese => "例如 /Users/me/work",
+        }
+    }
+
+    pub(crate) fn profile_env_row(self) -> &'static str {
+        match self {
+            Self::English => "Environment variables",
+            Self::SimplifiedChinese => "环境变量",
+        }
+    }
+
+    pub(crate) fn profile_env_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "One NAME=value per line. Names must match [A-Za-z_][A-Za-z0-9_]*; other lines are ignored. \
+                 Eggie's own integration variables always win."
+            }
+            Self::SimplifiedChinese => {
+                "每行一条 NAME=value。名称须匹配 [A-Za-z_][A-Za-z0-9_]*，其余行会被忽略。Eggie 自身的集成变量始终优先。"
+            }
+        }
+    }
+
+    pub(crate) fn profile_env_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "AWS_PROFILE=prod",
+            Self::SimplifiedChinese => "AWS_PROFILE=prod",
+        }
+    }
+
+    /// Warning shown under the env editor when some lines were dropped. Names the count so a typo
+    /// is visible rather than silently discarded.
+    pub(crate) fn profile_env_rejected(self, count: usize) -> String {
+        match self {
+            Self::English => {
+                format!("{count} line(s) ignored: a variable name must match [A-Za-z_][A-Za-z0-9_]*")
+            }
+            Self::SimplifiedChinese => {
+                format!("已忽略 {count} 行：变量名必须匹配 [A-Za-z_][A-Za-z0-9_]*")
+            }
+        }
+    }
+
+    pub(crate) fn profile_remote_section(self) -> &'static str {
+        match self {
+            Self::English => "Remote",
+            Self::SimplifiedChinese => "远程",
+        }
+    }
+
+    pub(crate) fn profile_remote_host_row(self) -> &'static str {
+        match self {
+            Self::English => "Host",
+            Self::SimplifiedChinese => "主机",
+        }
+    }
+
+    pub(crate) fn profile_remote_host_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Connect over ssh instead of running a local shell. Leave empty for a local profile. \
+                 Eggie offers to install its shell integration on first connect."
+            }
+            Self::SimplifiedChinese => {
+                "通过 ssh 连接，而非启动本地 shell。留空则为本地配置。首次连接时 Eggie 会询问是否安装 shell 集成。"
+            }
+        }
+    }
+
+    pub(crate) fn profile_remote_host_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "e.g. prod.example.com",
+            Self::SimplifiedChinese => "例如 prod.example.com",
+        }
+    }
+
+    pub(crate) fn profile_remote_user_row(self) -> &'static str {
+        match self {
+            Self::English => "User",
+            Self::SimplifiedChinese => "用户",
+        }
+    }
+
+    pub(crate) fn profile_remote_user_description(self) -> &'static str {
+        match self {
+            Self::English => "Leave empty to let ssh pick (your ssh config, then your local username).",
+            Self::SimplifiedChinese => "留空则由 ssh 决定（先读 ssh 配置，再用本地用户名）。",
+        }
+    }
+
+    pub(crate) fn profile_remote_port_row(self) -> &'static str {
+        match self {
+            Self::English => "Port",
+            Self::SimplifiedChinese => "端口",
+        }
+    }
+
+    pub(crate) fn profile_remote_port_description(self) -> &'static str {
+        match self {
+            Self::English => "Leave empty for the ssh default (22).",
+            Self::SimplifiedChinese => "留空则使用 ssh 默认端口（22）。",
+        }
+    }
+
+    /// Shown when host/user would be parsed by ssh as an option rather than a destination. This is a
+    /// refusal, not a cosmetic hint: such a target is dropped at launch.
+    pub(crate) fn profile_remote_invalid(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Ignored: a host or user cannot be empty, start with “-”, or contain spaces."
+            }
+            Self::SimplifiedChinese => {
+                "已忽略：主机或用户不能为空、不能以“-”开头，也不能含空格。"
+            }
+        }
+    }
+
+    pub(crate) fn profile_appearance_section(self) -> &'static str {
+        match self {
+            Self::English => "Appearance overrides",
+            Self::SimplifiedChinese => "外观覆盖",
+        }
+    }
+
+    pub(crate) fn profile_terminal_dark_theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Terminal dark theme",
+            Self::SimplifiedChinese => "终端深色主题",
+        }
+    }
+
+    pub(crate) fn profile_terminal_dark_theme_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Terminal colors for this profile when the dark appearance is in effect. Set both \
+                 slots to the same theme to keep a production host marked either way. Applies live \
+                 to this profile's terminals."
+            }
+            Self::SimplifiedChinese => {
+                "深色外观生效时，该配置终端的配色。两个槽填同一个主题，即可让生产主机在两种外观下都保持标记。对该配置的终端实时生效。"
+            }
+        }
+    }
+
+    pub(crate) fn profile_terminal_light_theme_row(self) -> &'static str {
+        match self {
+            Self::English => "Terminal light theme",
+            Self::SimplifiedChinese => "终端浅色主题",
+        }
+    }
+
+    pub(crate) fn profile_terminal_light_theme_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Terminal colors for this profile when the light appearance is in effect. Applies \
+                 live to this profile's terminals."
+            }
+            Self::SimplifiedChinese => {
+                "浅色外观生效时，该配置终端的配色。对该配置的终端实时生效。"
+            }
+        }
+    }
+
+    pub(crate) fn profile_font_row(self) -> &'static str {
+        match self {
+            Self::English => "Font",
+            Self::SimplifiedChinese => "字体",
+        }
+    }
+
+    pub(crate) fn profile_font_description(self) -> &'static str {
+        match self {
+            Self::English => "Applies live to this profile's terminals.",
+            Self::SimplifiedChinese => "对该配置的终端实时生效。",
+        }
+    }
+
+    pub(crate) fn profile_font_size_row(self) -> &'static str {
+        match self {
+            Self::English => "Font size",
+            Self::SimplifiedChinese => "字号",
+        }
+    }
+
+    pub(crate) fn profile_font_size_description(self) -> &'static str {
+        match self {
+            Self::English => "Applies live to this profile's terminals.",
+            Self::SimplifiedChinese => "对该配置的终端实时生效。",
+        }
+    }
+
+    pub(crate) fn profile_badge_row(self) -> &'static str {
+        match self {
+            Self::English => "Tab badge",
+            Self::SimplifiedChinese => "标签徽章",
+        }
+    }
+
+    pub(crate) fn profile_badge_description(self) -> &'static str {
+        match self {
+            Self::English => "A colored dot on the tabs of terminals launched from this profile.",
+            Self::SimplifiedChinese => "在从该配置启动的终端标签上显示一个彩色圆点。",
+        }
+    }
+
+    /// The "inherit the global setting" choice in a per-profile appearance selector.
+    pub(crate) fn profile_appearance_inherit(self) -> &'static str {
+        match self {
+            Self::English => "Follow global setting",
+            Self::SimplifiedChinese => "跟随全局设置",
+        }
+    }
+
+    /// The "no badge" choice in the badge color picker.
+    pub(crate) fn profile_badge_none(self) -> &'static str {
+        match self {
+            Self::English => "None",
+            Self::SimplifiedChinese => "无",
+        }
+    }
+
+    // --- Project default profile ---------------------------------------------------------------
+
+    /// Project context-menu item opening the default-profile picker.
+    pub(crate) fn set_default_profile(self) -> &'static str {
+        match self {
+            Self::English => "Default Profile…",
+            Self::SimplifiedChinese => "默认配置…",
+        }
+    }
+
+    pub(crate) fn project_default_profile_placeholder(self) -> &'static str {
+        match self {
+            Self::English => "Default profile for this project…",
+            Self::SimplifiedChinese => "此项目的默认配置…",
+        }
+    }
+
+    // --- Remote shell integration -------------------------------------------------------------
+
+    pub(crate) fn remote_install_title(self) -> &'static str {
+        match self {
+            Self::English => "Install Eggie shell integration?",
+            Self::SimplifiedChinese => "安装 Eggie shell 集成？",
+        }
+    }
+
+    /// Body of the consent prompt. Names the destination and what will be written, because this is
+    /// Eggie writing files into someone else's machine.
+    pub(crate) fn remote_install_message(self, destination: &str) -> String {
+        match self {
+            Self::English => format!(
+                "Eggie can install its shell integration on {destination} \
+                 (in ~/.eggie/) so this terminal reports the working directory, \
+                 command history and prompt positions.\n\n\
+                 Without it the session still works, just without those features. \
+                 Your choice is remembered for {destination}."
+            ),
+            Self::SimplifiedChinese => format!(
+                "Eggie 可以在 {destination} 上安装 shell 集成（位于 ~/.eggie/），\
+                 这样该终端就能报告工作目录、命令历史和提示符位置。\n\n\
+                 不安装也能正常使用，只是没有这些功能。此选择会为 {destination} 记住。"
+            ),
+        }
+    }
+
+    pub(crate) fn remote_install_allow(self) -> &'static str {
+        match self {
+            Self::English => "Install",
+            Self::SimplifiedChinese => "安装",
+        }
+    }
+
+    pub(crate) fn remote_install_skip(self) -> &'static str {
+        match self {
+            Self::English => "Connect Without",
+            Self::SimplifiedChinese => "不安装并连接",
         }
     }
 

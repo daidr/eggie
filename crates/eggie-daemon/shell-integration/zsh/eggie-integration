@@ -63,6 +63,11 @@ eggie-integration() {
         # on the prompt's first line. Eggie records this line and clears from it on
         # resize. `cl=line` marks the region as clear-and-redraw-safe.
         builtin print -nu $_eggie_fd '\e]133;A;cl=line\a'
+
+        # Report the working directory on every prompt, so a remote session's cwd is not mistaken for
+        # a local path. Only literal `%` needs encoding (as %25) to survive the round-trip.
+        builtin local encoded_pwd="${PWD//\%/%25}"
+        builtin printf '\e]7;file://%s%s\a' "$(hostname)" "$encoded_pwd" >&$_eggie_fd
     }
 
     eggie_preexec() {

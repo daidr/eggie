@@ -2264,11 +2264,11 @@ mod tests {
             .find(|name| name == "Catppuccin Mocha")
             .unwrap();
         AppSettings {
-            dark_theme: name,
+            interface_dark_theme: name,
             theme_mode: ThemeMode::Dark,
             ..Default::default()
         }
-        .effective_theme(true)
+        .terminal_theme(true)
     }
 
     fn snapshot(cells: Vec<TerminalCell>) -> TerminalSnapshot {

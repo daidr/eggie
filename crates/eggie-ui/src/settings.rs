@@ -44,6 +44,22 @@ fn default_scrollback_lines() -> usize {
     DEFAULT_SCROLLBACK_LINES
 }
 
+fn default_dark_theme() -> String {
+    DEFAULT_DARK_THEME.to_owned()
+}
+
+fn default_light_theme() -> String {
+    DEFAULT_LIGHT_THEME.to_owned()
+}
+
+fn is_default_dark_theme(value: &str) -> bool {
+    value == DEFAULT_DARK_THEME
+}
+
+fn is_default_light_theme(value: &str) -> bool {
+    value == DEFAULT_LIGHT_THEME
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_scrollback(value: &usize) -> bool {
     *value == DEFAULT_SCROLLBACK_LINES
@@ -332,6 +348,32 @@ impl ThemeMode {
     }
 }
 
+/// Where the terminal's colors come from, independently of the interface theme.
+///
+/// The interface theme always decides the app's own chrome. This chooses whether the terminal cells
+/// ride along with it or use their own dark/light pair — which is what makes "dark interface, light
+/// terminal" (and any other combination) expressible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalThemeSource {
+    /// Terminal cells use whichever interface theme is in effect. The default, and what Eggie did
+    /// before the two layers were separable.
+    #[default]
+    FollowInterface,
+    /// Terminal cells use [`AppSettings::terminal_dark_theme`] / `terminal_light_theme`, selected by
+    /// the same dark/light decision that drives the interface.
+    Custom,
+}
+
+impl TerminalThemeSource {
+    pub(crate) const ALL: [Self; 2] = [Self::FollowInterface, Self::Custom];
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(crate) fn is_default(&self) -> bool {
+        matches!(self, Self::FollowInterface)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Language {
@@ -589,8 +631,28 @@ impl ResolvedFontFamilies {
 pub(crate) struct AppSettings {
     pub(crate) language: Language,
     pub(crate) theme_mode: ThemeMode,
-    pub(crate) dark_theme: String,
-    pub(crate) light_theme: String,
+    /// Interface theme used when the resolved appearance is dark. Drives the app's own chrome
+    /// ([`UiColors::from_theme`]) and, when [`Self::terminal_theme_source`] is
+    /// [`TerminalThemeSource::FollowInterface`], the terminal cells too.
+    ///
+    /// The `dark_theme` alias is what this field was called when one theme drove both layers; it is
+    /// kept so an existing `settings.json` does not silently lose the user's choice.
+    #[serde(alias = "dark_theme")]
+    pub(crate) interface_dark_theme: String,
+    /// Interface theme used when the resolved appearance is light. See [`Self::interface_dark_theme`].
+    #[serde(alias = "light_theme")]
+    pub(crate) interface_light_theme: String,
+    /// Whether the terminal follows the interface theme or picks from its own pair below.
+    #[serde(default, skip_serializing_if = "TerminalThemeSource::is_default")]
+    pub(crate) terminal_theme_source: TerminalThemeSource,
+    /// Terminal theme for the dark appearance. Only consulted when `terminal_theme_source` is
+    /// [`TerminalThemeSource::Custom`]; kept across a switch back to `FollowInterface` so toggling
+    /// does not discard the choice.
+    #[serde(default = "default_dark_theme", skip_serializing_if = "is_default_dark_theme")]
+    pub(crate) terminal_dark_theme: String,
+    /// Terminal theme for the light appearance. See [`Self::terminal_dark_theme`].
+    #[serde(default = "default_light_theme", skip_serializing_if = "is_default_light_theme")]
+    pub(crate) terminal_light_theme: String,
     pub(crate) font_family: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) font_family_bold: String,
@@ -671,6 +733,13 @@ pub(crate) struct AppSettings {
     /// `path` feature). Default on. New terminals only.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) shell_integration_path: bool,
+    /// Hosts the user has agreed Eggie may install its shell integration on, keyed by the profile's
+    /// `user@host` destination (per account, because the install lands in that account's home
+    /// directory). Asked once per destination; a `false` entry is a remembered refusal, so declining
+    /// is not re-asked either. A `BTreeSet`-like map rather than a list so the persisted order is
+    /// stable and lookups are cheap.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) remote_install_consent: std::collections::BTreeMap<String, bool>,
 }
 
 /// Per-metric adjustments matching Ghostty's `adjust-*` config keys. Each is an optional
@@ -738,8 +807,11 @@ impl Default for AppSettings {
         Self {
             language: Language::default(),
             theme_mode: ThemeMode::System,
-            dark_theme: DEFAULT_DARK_THEME.to_owned(),
-            light_theme: DEFAULT_LIGHT_THEME.to_owned(),
+            interface_dark_theme: DEFAULT_DARK_THEME.to_owned(),
+            interface_light_theme: DEFAULT_LIGHT_THEME.to_owned(),
+            terminal_theme_source: TerminalThemeSource::default(),
+            terminal_dark_theme: DEFAULT_DARK_THEME.to_owned(),
+            terminal_light_theme: DEFAULT_LIGHT_THEME.to_owned(),
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_family_bold: String::new(),
             font_family_italic: String::new(),
@@ -773,6 +845,7 @@ impl Default for AppSettings {
             shell_program: String::new(),
             shell_args: Vec::new(),
             shell_integration_path: true,
+            remote_install_consent: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -798,21 +871,33 @@ impl ShellFeatures {
 }
 
 impl AppSettings {
-    /// Assemble the `EGGIE_SHELL_FEATURES` string from the enabled feature toggles.
-    pub(crate) fn shell_features_string(&self) -> String {
-        ShellFeatures {
-            path: self.shell_integration_path,
+    /// Snapshot of the shell launch fields for the one-time migration into the built-in Default
+    /// profile. Read only when `profiles.json` does not yet exist; afterwards the profile owns these
+    /// values and these fields are vestigial (kept so downgrading to an older build still works).
+    pub(crate) fn legacy_shell_settings(&self) -> crate::profile_store::LegacyShellSettings {
+        crate::profile_store::LegacyShellSettings {
+            shell_program: self.shell_program.clone(),
+            shell_args: self.shell_args.clone(),
+            shell_integration_path: self.shell_integration_path,
         }
-        .to_env_string()
     }
 
     fn normalize(&mut self) {
         let catalog = theme_catalog();
-        if catalog.dark_theme(&self.dark_theme).is_none() {
-            self.dark_theme = DEFAULT_DARK_THEME.to_owned();
+        if catalog.dark_theme(&self.interface_dark_theme).is_none() {
+            self.interface_dark_theme = DEFAULT_DARK_THEME.to_owned();
         }
-        if catalog.light_theme(&self.light_theme).is_none() {
-            self.light_theme = DEFAULT_LIGHT_THEME.to_owned();
+        if catalog.light_theme(&self.interface_light_theme).is_none() {
+            self.interface_light_theme = DEFAULT_LIGHT_THEME.to_owned();
+        }
+        // The terminal pair is validated against the same half of the catalog as the interface pair:
+        // a dark slot only accepts a theme that measures dark. That is what lets each picker offer
+        // one half of the catalog rather than all of it.
+        if catalog.dark_theme(&self.terminal_dark_theme).is_none() {
+            self.terminal_dark_theme = DEFAULT_DARK_THEME.to_owned();
+        }
+        if catalog.light_theme(&self.terminal_light_theme).is_none() {
+            self.terminal_light_theme = DEFAULT_LIGHT_THEME.to_owned();
         }
         if self.font_family.trim().is_empty() {
             self.font_family = DEFAULT_FONT_FAMILY.to_owned();
@@ -934,24 +1019,178 @@ impl AppSettings {
             .collect()
     }
 
-    pub(crate) fn effective_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
-        let use_dark = match self.theme_mode {
+    /// Whether the dark half of every theme pair is in effect. The single dark/light decision both
+    /// layers share: `theme_mode` pins it, or `System` defers to the OS appearance.
+    pub(crate) fn use_dark(&self, system_is_dark: bool) -> bool {
+        match self.theme_mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
             ThemeMode::System => system_is_dark,
-        };
+        }
+    }
+
+    /// The theme driving the app's own chrome. Also the terminal's theme when
+    /// [`TerminalThemeSource::FollowInterface`] is set — see [`Self::terminal_theme`].
+    pub(crate) fn interface_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
+        Self::pick_theme(
+            self.use_dark(system_is_dark),
+            &self.interface_dark_theme,
+            &self.interface_light_theme,
+        )
+    }
+
+    /// The theme driving terminal cells. `FollowInterface` delegates to [`Self::interface_theme`], so
+    /// the two layers stay identical unless the user opts into the custom pair.
+    pub(crate) fn terminal_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
+        match self.terminal_theme_source {
+            TerminalThemeSource::FollowInterface => self.interface_theme(system_is_dark),
+            TerminalThemeSource::Custom => Self::pick_theme(
+                self.use_dark(system_is_dark),
+                &self.terminal_dark_theme,
+                &self.terminal_light_theme,
+            ),
+        }
+    }
+
+    /// Resolve one half of a dark/light theme pair against the catalog, falling back to the built-in
+    /// default for that half (and finally to the catalog's first entry, which cannot be empty).
+    fn pick_theme(use_dark: bool, dark: &str, light: &str) -> &'static TerminalTheme {
         let catalog = theme_catalog();
         if use_dark {
             catalog
-                .dark_theme(&self.dark_theme)
+                .dark_theme(dark)
                 .or_else(|| catalog.dark_theme(DEFAULT_DARK_THEME))
                 .unwrap_or(&catalog.dark[0])
         } else {
             catalog
-                .light_theme(&self.light_theme)
+                .light_theme(light)
                 .or_else(|| catalog.light_theme(DEFAULT_LIGHT_THEME))
                 .unwrap_or(&catalog.light[0])
         }
+    }
+
+    /// Switch the terminal onto its own theme pair, seeded from whatever the interface currently
+    /// specifies so the toggle itself changes nothing on screen. Without this, opting into `Custom`
+    /// would jump the terminal to the built-in defaults and read as a bug.
+    ///
+    /// Lives here rather than in the settings window so the seeding is unit-testable.
+    pub(crate) fn use_custom_terminal_themes(&mut self) {
+        self.terminal_theme_source = TerminalThemeSource::Custom;
+        self.terminal_dark_theme = self.interface_dark_theme.clone();
+        self.terminal_light_theme = self.interface_light_theme.clone();
+    }
+}
+
+/// The global terminal layer a profile's overrides merge over, together with the dark/light decision
+/// the profile layer has to repeat.
+///
+/// These two always travel together — resolving a profile override needs both the fallback theme and
+/// which half of the profile's own pair to read — so they are one value rather than two parameters
+/// threaded side by side through the spawn paths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GlobalTerminalLayer {
+    pub(crate) theme: &'static TerminalTheme,
+    pub(crate) use_dark: bool,
+}
+
+impl GlobalTerminalLayer {
+    pub(crate) fn new(config: &AppSettings, system_is_dark: bool) -> Self {
+        Self {
+            theme: config.terminal_theme(system_is_dark),
+            use_dark: config.use_dark(system_is_dark),
+        }
+    }
+}
+
+/// A terminal's appearance after merging its profile's overrides over the global settings.
+///
+/// One of these is resolved per terminal on every render pass, so a change to either layer moves the
+/// terminals it applies to and leaves the rest alone.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResolvedAppearance {
+    pub(crate) theme: &'static TerminalTheme,
+    pub(crate) font_family: std::sync::Arc<str>,
+    pub(crate) font_size: f32,
+    /// Per-style families, with the profile's family (when it overrides one) as the regular slot.
+    pub(crate) families: ResolvedFontFamilies,
+}
+
+/// Merge a profile's appearance overrides over the global settings: profile → global → built-in
+/// default, one field at a time.
+///
+/// `global` is the already-resolved global *terminal* layer plus the dark/light decision (see
+/// [`GlobalTerminalLayer`] and [`AppSettings::terminal_theme`] — a profile never overrides the
+/// interface, because chrome is window-level while one window can show tabs from several profiles at
+/// once).
+///
+/// The dark/light decision cannot be folded into the resolved theme the way it once was: the profile
+/// layer has to make the same choice again, so a system flip moves a profile-themed terminal even when
+/// the global palette is unchanged. An unknown theme name falls back to `global.theme` rather than to
+/// an arbitrary catalog entry, so a typo degrades to "no override".
+///
+/// `profile_theme_preview` is the settings window's live hover preview when it applies to *this*
+/// profile. The caller decides applicability, because it knows which profile the session belongs to and
+/// this module deliberately stays profile-id agnostic.
+///
+/// `font_size` is clamped to the app's supported range, matching what `AppSettings::normalize` does to
+/// the global value; a non-finite override is ignored.
+pub(crate) fn resolve_appearance(
+    config: &AppSettings,
+    appearance: Option<&eggie_domain::ProfileAppearance>,
+    global: GlobalTerminalLayer,
+    profile_theme_preview: Option<&'static TerminalTheme>,
+) -> ResolvedAppearance {
+    let theme = profile_theme_preview
+        .or_else(|| {
+            appearance
+                .and_then(|appearance| appearance.terminal_theme(global.use_dark))
+                .and_then(|name| theme_catalog().theme_by_name(name))
+        })
+        .unwrap_or(global.theme);
+
+    let mut families = config.resolved_font_families();
+    let font_family: std::sync::Arc<str> = match appearance
+        .and_then(|appearance| appearance.font_family.as_deref())
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+    {
+        Some(family) => {
+            // Overriding the regular family must also move every per-style slot that merely inherited
+            // it, or a profile's font would apply to regular text and leave bold/italic on the global
+            // family. Slots with their own explicit family keep it.
+            //
+            // Inheritance is read from the *source* config, not from the resolved strings:
+            // `resolved_font_families` already collapsed "unset" and "explicitly set to the regular
+            // family" into the same value, so comparing resolved names would move a slot the user had
+            // deliberately pinned.
+            let overridden: std::sync::Arc<str> = std::sync::Arc::from(family);
+            let inherits = |explicit: &str| explicit.trim().is_empty();
+            if inherits(&config.font_family_bold) {
+                families.bold = std::sync::Arc::clone(&overridden);
+            }
+            if inherits(&config.font_family_italic) {
+                families.italic = std::sync::Arc::clone(&overridden);
+            }
+            if inherits(&config.font_family_bold_italic) {
+                families.bold_italic = std::sync::Arc::clone(&overridden);
+            }
+            families.regular = std::sync::Arc::clone(&overridden);
+            overridden
+        }
+        None => std::sync::Arc::clone(&families.regular),
+    };
+
+    let font_size = appearance
+        .and_then(|appearance| appearance.font_size)
+        .filter(|size| size.is_finite())
+        .map(|size| size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE))
+        .unwrap_or(config.font_size);
+
+    ResolvedAppearance {
+        theme,
+        font_family,
+        font_size,
+        families,
     }
 }
 
@@ -990,13 +1229,41 @@ fn relative_luminance_rgb(color: u32) -> f32 {
     0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
 }
 
+/// Which theme picker a hover preview came from. Recorded alongside the previewed theme so the
+/// preview resolves through the *same* layering as the real setting: previewing an interface theme
+/// moves the terminal too when it follows the interface, and leaves it alone when it does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreviewSlot {
+    InterfaceDark,
+    InterfaceLight,
+    TerminalDark,
+    TerminalLight,
+    /// A profile's terminal override, carrying the profile being edited. The identity travels with the
+    /// slot because the main window — which has to decide whether a given terminal is affected — cannot
+    /// see the settings window's selection.
+    ProfileTerminalDark(eggie_domain::ProfileId),
+    ProfileTerminalLight(eggie_domain::ProfileId),
+}
+
+impl PreviewSlot {
+    /// Whether this slot belongs to the dark half of its pair. Used to label the slot in the UI;
+    /// the preview itself applies regardless of which half is currently in effect.
+    fn is_dark(self) -> bool {
+        matches!(
+            self,
+            Self::InterfaceDark | Self::TerminalDark | Self::ProfileTerminalDark(_)
+        )
+    }
+}
+
 pub(crate) struct SettingsStore {
     config: AppSettings,
     path: PathBuf,
-    /// Transient theme override driven by the settings window's hover preview. Never persisted and
-    /// never serialized — it only overrides what `resolved_theme` returns while the pointer rests on
-    /// a theme option. Cleared when the pointer leaves, the dropdown closes, or the window closes.
-    theme_preview: Option<&'static TerminalTheme>,
+    /// Transient theme override driven by the settings window's hover preview, tagged with the picker
+    /// it came from. Never persisted and never serialized — it only overrides what the `resolved_*`
+    /// methods return while the pointer rests on a theme option. Cleared when the pointer leaves, the
+    /// dropdown closes, or the window closes.
+    theme_preview: Option<(PreviewSlot, &'static TerminalTheme)>,
 }
 
 impl SettingsStore {
@@ -1018,28 +1285,81 @@ impl SettingsStore {
         &self.config
     }
 
-    /// The terminal theme actually in effect: the live hover preview if one is active, otherwise the
-    /// persisted `effective_theme`. Both the main window's terminals and the settings preview read
-    /// through here so a hovered theme lights up everywhere at once.
-    pub(crate) fn resolved_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
-        self.theme_preview
-            .unwrap_or_else(|| self.config.effective_theme(system_is_dark))
+    /// The interface theme actually in effect: the live hover preview if one is active on either
+    /// interface slot, otherwise the persisted pair. Drives the app's chrome.
+    pub(crate) fn resolved_interface_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
+        // A hover preview is authoritative: it applies regardless of which half is in effect, so
+        // hovering the light slot while the app is dark previews the light slot.
+        if let Some((slot, theme)) = self.theme_preview
+            && matches!(slot, PreviewSlot::InterfaceDark | PreviewSlot::InterfaceLight)
+        {
+            return theme;
+        }
+        self.config.interface_theme(system_is_dark)
     }
 
-    /// Set the transient hover preview to `theme`. No-op (and no notify) if it is already the active
-    /// preview, so a stream of repeated hover events over the same option doesn't churn renders.
+    /// The global terminal theme actually in effect. Under
+    /// [`TerminalThemeSource::FollowInterface`] this delegates to [`Self::resolved_interface_theme`] —
+    /// that one line is what makes hovering an interface theme move the terminals along with the
+    /// chrome, exactly as committing it would.
+    pub(crate) fn resolved_terminal_theme(&self, system_is_dark: bool) -> &'static TerminalTheme {
+        match self.config.terminal_theme_source {
+            TerminalThemeSource::FollowInterface => self.resolved_interface_theme(system_is_dark),
+            TerminalThemeSource::Custom => {
+                if let Some((slot, theme)) = self.theme_preview
+                    && matches!(slot, PreviewSlot::TerminalDark | PreviewSlot::TerminalLight)
+                {
+                    return theme;
+                }
+                self.config.terminal_theme(system_is_dark)
+            }
+        }
+    }
+
+    /// The hover preview for `profile_id`'s terminal override, when one is active on the half currently
+    /// in effect. Returns `None` for any other profile, so previewing one profile's theme never repaints
+    /// terminals belonging to another.
+    pub(crate) fn profile_theme_preview(
+        &self,
+        profile_id: eggie_domain::ProfileId,
+    ) -> Option<&'static TerminalTheme> {
+        // A hover preview applies regardless of which half is in effect, but only for the profile
+        // being edited — previewing one profile's theme never repaints another's terminals.
+        if let Some((slot, theme)) = self.theme_preview
+            && match slot {
+                PreviewSlot::ProfileTerminalDark(id) | PreviewSlot::ProfileTerminalLight(id) => {
+                    id == profile_id
+                }
+                _ => false,
+            }
+        {
+            return Some(theme);
+        }
+        None
+    }
+
+    /// Whether any hover preview is active, and on which slot. Feeds the main window's reconcile gate:
+    /// a profile preview changes no global palette, so without this the reconcile would skip it.
+    pub(crate) fn theme_preview_key(&self) -> Option<(PreviewSlot, usize)> {
+        self.theme_preview
+            .map(|(slot, theme)| (slot, theme as *const TerminalTheme as usize))
+    }
+
+    /// Set the transient hover preview to `theme` on `slot`. No-op (and no notify) if it is already the
+    /// active preview, so a stream of repeated hover events over the same option doesn't churn renders.
     pub(crate) fn set_theme_preview(
         &mut self,
+        slot: PreviewSlot,
         theme: &'static TerminalTheme,
         cx: &mut Context<Self>,
     ) {
         if self
             .theme_preview
-            .is_some_and(|current| std::ptr::eq(current, theme))
+            .is_some_and(|(active, current)| active == slot && std::ptr::eq(current, theme))
         {
             return;
         }
-        self.theme_preview = Some(theme);
+        self.theme_preview = Some((slot, theme));
         cx.notify();
     }
 
@@ -1304,31 +1624,316 @@ mod tests {
         assert!(catalog.theme_by_name("No Such Theme").is_none());
     }
 
-    #[test]
-    fn resolved_theme_prefers_the_hover_preview_then_falls_back() {
-        let catalog = theme_catalog();
-        let mut store = SettingsStore {
-            config: AppSettings {
-                theme_mode: ThemeMode::Dark,
-                dark_theme: "Builtin Dark".to_owned(),
-                ..AppSettings::default()
-            },
+    /// A store with no preview active, for the preview tests.
+    fn store_with(config: AppSettings) -> SettingsStore {
+        SettingsStore {
+            config,
             path: std::path::PathBuf::from("unused"),
             theme_preview: None,
+        }
+    }
+
+    #[test]
+    fn a_preview_overrides_the_persisted_pair_regardless_of_the_appearance() {
+        let catalog = theme_catalog();
+        let mut store = store_with(AppSettings {
+            theme_mode: ThemeMode::Dark,
+            interface_dark_theme: "Builtin Dark".to_owned(),
+            ..AppSettings::default()
+        });
+
+        // No preview active: resolves to the persisted pair.
+        assert_eq!(store.resolved_interface_theme(true).name, "Builtin Dark");
+
+        let preview = catalog.theme_by_name("Catppuccin Mocha").unwrap();
+        store.theme_preview = Some((PreviewSlot::InterfaceDark, preview));
+        assert_eq!(store.resolved_interface_theme(true).name, "Catppuccin Mocha");
+
+        // The preview is authoritative: it applies even when the system is light, so the dark-slot
+        // preview stays visible under a light appearance. Only clearing it falls back to the persisted
+        // pair, which then resolves light.
+        store.config.theme_mode = ThemeMode::System;
+        assert_eq!(
+            store.resolved_interface_theme(false).name,
+            "Catppuccin Mocha",
+            "a preview applies regardless of the current appearance"
+        );
+
+        // Clearing restores the persisted pair, now resolving light.
+        store.theme_preview = None;
+        assert_eq!(
+            store.resolved_interface_theme(false).name,
+            AppSettings::default().interface_light_theme
+        );
+    }
+
+    #[test]
+    fn a_light_slot_preview_applies_while_the_app_is_dark() {
+        let catalog = theme_catalog();
+        let mut store = store_with(AppSettings {
+            theme_mode: ThemeMode::Dark,
+            interface_dark_theme: "Builtin Dark".to_owned(),
+            ..AppSettings::default()
+        });
+
+        // Hovering the light slot while the app is dark must preview the light slot. Before the fix,
+        // the preview was filtered out because the light slot's half did not match the dark mode.
+        let preview = catalog.theme_by_name("Catppuccin Latte").unwrap();
+        store.theme_preview = Some((PreviewSlot::InterfaceLight, preview));
+        assert_eq!(
+            store.resolved_interface_theme(true).name,
+            "Catppuccin Latte",
+            "a light-slot preview applies regardless of the current dark appearance"
+        );
+    }
+
+    #[test]
+    fn previewing_an_interface_theme_moves_the_terminal_only_when_it_follows() {
+        let catalog = theme_catalog();
+        let preview = catalog.theme_by_name("Catppuccin Mocha").unwrap();
+        let mut store = store_with(AppSettings {
+            theme_mode: ThemeMode::Dark,
+            interface_dark_theme: "Builtin Dark".to_owned(),
+            ..AppSettings::default()
+        });
+        store.theme_preview = Some((PreviewSlot::InterfaceDark, preview));
+
+        // Following the interface: the terminal rides along with the hover, exactly as it would once
+        // the choice is committed.
+        assert_eq!(store.config.terminal_theme_source, TerminalThemeSource::FollowInterface);
+        assert_eq!(store.resolved_terminal_theme(true).name, "Catppuccin Mocha");
+
+        // With its own pair, the terminal ignores an interface preview.
+        store.config.use_custom_terminal_themes();
+        store.config.terminal_dark_theme = "Builtin Dark".to_owned();
+        assert_eq!(store.resolved_interface_theme(true).name, "Catppuccin Mocha");
+        assert_eq!(
+            store.resolved_terminal_theme(true).name,
+            "Builtin Dark",
+            "a custom terminal pair must not follow an interface preview"
+        );
+
+        // And a terminal preview moves only the terminal, never the chrome.
+        store.theme_preview = Some((PreviewSlot::TerminalDark, preview));
+        assert_eq!(store.resolved_terminal_theme(true).name, "Catppuccin Mocha");
+        assert_eq!(store.resolved_interface_theme(true).name, "Builtin Dark");
+    }
+
+    #[test]
+    fn a_profile_preview_is_scoped_to_the_profile_being_edited() {
+        let catalog = theme_catalog();
+        let preview = catalog.theme_by_name("Catppuccin Mocha").unwrap();
+        let edited = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut store = store_with(AppSettings {
+            theme_mode: ThemeMode::Dark,
+            ..AppSettings::default()
+        });
+        store.theme_preview = Some((PreviewSlot::ProfileTerminalDark(edited), preview));
+
+        assert_eq!(
+            store.profile_theme_preview(edited).map(|theme| theme.name.as_str()),
+            Some("Catppuccin Mocha")
+        );
+        assert!(
+            store.profile_theme_preview(other).is_none(),
+            "previewing one profile's theme must not repaint another profile's terminals"
+        );
+        // A profile preview is also not a global one.
+        assert_eq!(store.resolved_interface_theme(true).name, "Builtin Dark");
+        assert_eq!(store.resolved_terminal_theme(true).name, "Builtin Dark");
+    }
+
+    #[test]
+    fn the_terminal_layer_equals_the_interface_layer_while_it_follows() {
+        // The default (and pre-split) behaviour: one theme drives both layers, in every combination of
+        // theme_mode and system appearance.
+        let config = AppSettings {
+            interface_dark_theme: "Catppuccin Mocha".to_owned(),
+            interface_light_theme: "Ayu Light".to_owned(),
+            ..AppSettings::default()
+        };
+        assert_eq!(config.terminal_theme_source, TerminalThemeSource::FollowInterface);
+        for mode in ThemeMode::ALL {
+            for system_is_dark in [true, false] {
+                let config = AppSettings {
+                    theme_mode: mode,
+                    ..config.clone()
+                };
+                assert!(
+                    std::ptr::eq(
+                        config.interface_theme(system_is_dark),
+                        config.terminal_theme(system_is_dark)
+                    ),
+                    "{mode:?} / system_is_dark={system_is_dark}: the terminal must follow the interface"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_custom_terminal_pair_is_independent_of_the_interface_pair() {
+        // The point of the split: a dark interface with a light terminal, and vice versa.
+        let config = AppSettings {
+            theme_mode: ThemeMode::Dark,
+            interface_dark_theme: "Catppuccin Mocha".to_owned(),
+            terminal_theme_source: TerminalThemeSource::Custom,
+            terminal_dark_theme: "Builtin Dark".to_owned(),
+            ..AppSettings::default()
+        };
+        assert_eq!(config.interface_theme(true).name, "Catppuccin Mocha");
+        assert_eq!(config.terminal_theme(true).name, "Builtin Dark");
+
+        // Each layer picks its own half with the same dark/light decision.
+        let config = AppSettings {
+            theme_mode: ThemeMode::Light,
+            interface_light_theme: "Ayu Light".to_owned(),
+            terminal_light_theme: "Builtin Light".to_owned(),
+            ..config
+        };
+        assert_eq!(config.interface_theme(true).name, "Ayu Light");
+        assert_eq!(config.terminal_theme(true).name, "Builtin Light");
+    }
+
+    #[test]
+    fn opting_into_a_custom_terminal_pair_changes_nothing_on_screen() {
+        // Seeding from the interface pair is what keeps the toggle from reading as a bug: without it,
+        // switching to Custom would jump the terminal to the built-in defaults.
+        let mut config = AppSettings {
+            interface_dark_theme: "Catppuccin Mocha".to_owned(),
+            interface_light_theme: "Ayu Light".to_owned(),
+            ..AppSettings::default()
+        };
+        let before = [config.terminal_theme(true), config.terminal_theme(false)];
+        config.use_custom_terminal_themes();
+        assert_eq!(config.terminal_theme_source, TerminalThemeSource::Custom);
+        for (index, system_is_dark) in [true, false].into_iter().enumerate() {
+            assert!(
+                std::ptr::eq(config.terminal_theme(system_is_dark), before[index]),
+                "system_is_dark={system_is_dark}: the toggle must be visually inert"
+            );
+        }
+    }
+
+    #[test]
+    fn a_light_theme_cannot_be_persisted_into_a_dark_slot() {
+        // Each slot is validated against its own half of the catalog, which is what lets each picker
+        // offer one half rather than all of it.
+        let mut config = AppSettings {
+            interface_dark_theme: "Ayu Light".to_owned(),
+            terminal_dark_theme: "Ayu Light".to_owned(),
+            interface_light_theme: "Catppuccin Mocha".to_owned(),
+            terminal_light_theme: "Catppuccin Mocha".to_owned(),
+            ..AppSettings::default()
+        };
+        config.normalize();
+        assert_eq!(config.interface_dark_theme, DEFAULT_DARK_THEME);
+        assert_eq!(config.terminal_dark_theme, DEFAULT_DARK_THEME);
+        assert_eq!(config.interface_light_theme, DEFAULT_LIGHT_THEME);
+        assert_eq!(config.terminal_light_theme, DEFAULT_LIGHT_THEME);
+    }
+
+    #[test]
+    fn the_global_palette_alone_cannot_detect_an_appearance_flip() {
+        // This is why the main window's reconcile gate carries `use_dark` as an input of its own.
+        //
+        // Pin the global terminal theme so a system flip leaves it byte-identical (a light/dark pair
+        // naming the same theme does this; so does `theme_mode` pinned to Dark or Light). A profile with
+        // a per-half override still has to re-resolve, so a gate keyed only on the global palette would
+        // skip the reconcile and leave that terminal painting the wrong half.
+        let config = AppSettings {
+            terminal_theme_source: TerminalThemeSource::Custom,
+            terminal_dark_theme: DEFAULT_DARK_THEME.to_owned(),
+            terminal_light_theme: DEFAULT_LIGHT_THEME.to_owned(),
+            theme_mode: ThemeMode::Dark,
+            ..AppSettings::default()
+        };
+        // `theme_mode: Dark` pins the global layer: both system appearances resolve to the same theme.
+        let pinned = config.terminal_theme(true);
+        assert!(
+            std::ptr::eq(pinned, config.terminal_theme(false)),
+            "the global palette must be unchanged across the flip for this test to mean anything"
+        );
+
+        let dark_name = theme_catalog().dark_names().into_iter().next().unwrap();
+        let light_name = theme_catalog().light_names().into_iter().next().unwrap();
+        let appearance = eggie_domain::ProfileAppearance {
+            terminal_dark_theme: Some(dark_name.clone()),
+            terminal_light_theme: Some(light_name.clone()),
+            ..Default::default()
         };
 
-        // No preview active: resolves to the persisted effective theme.
-        assert_eq!(store.resolved_theme(true).name, "Builtin Dark");
+        // Same global layer, same profile, different half in effect → different resolved palette.
+        let resolved_dark = resolve_appearance(
+            &config,
+            Some(&appearance),
+            GlobalTerminalLayer {
+                theme: pinned,
+                use_dark: true,
+            },
+            None,
+        );
+        let resolved_light = resolve_appearance(
+            &config,
+            Some(&appearance),
+            GlobalTerminalLayer {
+                theme: pinned,
+                use_dark: false,
+            },
+            None,
+        );
+        assert_eq!(resolved_dark.theme.name, dark_name);
+        assert_eq!(resolved_light.theme.name, light_name);
+        assert_ne!(
+            resolved_dark.theme.appearance(),
+            resolved_light.theme.appearance(),
+            "the flip changes what the daemon must be told, while the global palette says nothing"
+        );
+    }
 
-        // A preview override wins over the persisted theme, regardless of light/dark or system mode.
-        let preview = catalog.theme_by_name("Catppuccin Mocha").unwrap();
-        store.theme_preview = Some(preview);
-        assert_eq!(store.resolved_theme(true).name, "Catppuccin Mocha");
-        assert_eq!(store.resolved_theme(false).name, "Catppuccin Mocha");
+    #[test]
+    fn a_preview_key_distinguishes_slots_and_themes() {
+        // The gate's other new input. A profile preview changes no global palette, so without a key the
+        // reconcile would skip the repaint the preview exists to show.
+        let catalog = theme_catalog();
+        let first = catalog.theme_by_name("Catppuccin Mocha").unwrap();
+        let second = catalog.theme_by_name("Builtin Dark").unwrap();
+        let profile = uuid::Uuid::new_v4();
+        let mut store = store_with(AppSettings::default());
+        assert!(store.theme_preview_key().is_none());
 
-        // Clearing the override restores the persisted theme.
+        store.theme_preview = Some((PreviewSlot::ProfileTerminalDark(profile), first));
+        let armed = store.theme_preview_key();
+        assert!(armed.is_some());
+
+        // Moving to another option on the same slot changes the key.
+        store.theme_preview = Some((PreviewSlot::ProfileTerminalDark(profile), second));
+        assert_ne!(armed, store.theme_preview_key());
+
+        // So does the same theme on a different slot.
+        store.theme_preview = Some((PreviewSlot::TerminalDark, second));
+        let terminal_slot = store.theme_preview_key();
+        store.theme_preview = Some((PreviewSlot::InterfaceDark, second));
+        assert_ne!(terminal_slot, store.theme_preview_key());
+
+        // And clearing it returns to "nothing armed", so the gate notices the restore.
         store.theme_preview = None;
-        assert_eq!(store.resolved_theme(true).name, "Builtin Dark");
+        assert!(store.theme_preview_key().is_none());
+    }
+
+    #[test]
+    fn an_existing_settings_file_keeps_its_chosen_themes() {
+        // The rename would otherwise silently reset both themes to the built-in defaults on first launch,
+        // because serde ignores unknown keys. The aliases are what make that a non-event.
+        let config: AppSettings = serde_json::from_str(
+            r#"{"dark_theme":"Atom One Dark","light_theme":"iTerm2 Solarized Light"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.interface_dark_theme, "Atom One Dark");
+        assert_eq!(config.interface_light_theme, "iTerm2 Solarized Light");
+        // An old file says nothing about the terminal layer, so it follows the interface — which is
+        // exactly the behaviour that file was written under.
+        assert_eq!(config.terminal_theme_source, TerminalThemeSource::FollowInterface);
     }
 
     #[test]
@@ -1339,8 +1944,11 @@ mod tests {
         let mut config = AppSettings {
             language: Language::English,
             theme_mode: ThemeMode::Light,
-            dark_theme: "Catppuccin Mocha".to_owned(),
-            light_theme: "Ayu Light".to_owned(),
+            interface_dark_theme: "Catppuccin Mocha".to_owned(),
+            interface_light_theme: "Ayu Light".to_owned(),
+            terminal_theme_source: TerminalThemeSource::default(),
+            terminal_dark_theme: DEFAULT_DARK_THEME.to_owned(),
+            terminal_light_theme: DEFAULT_LIGHT_THEME.to_owned(),
             font_family: "Menlo".to_owned(),
             font_family_bold: String::new(),
             font_family_italic: String::new(),
@@ -1374,6 +1982,10 @@ mod tests {
             shell_program: "  /bin/fish  ".to_owned(),
             shell_args: vec!["-l".to_owned(), "  ".to_owned()],
             shell_integration_path: false,
+            remote_install_consent: std::collections::BTreeMap::from([(
+                "deploy@prod.example.com".to_owned(),
+                true,
+            )]),
         };
         config.normalize();
         fs::create_dir_all(&directory).unwrap();
@@ -1381,6 +1993,12 @@ mod tests {
 
         let loaded = SettingsStore::load_from(path);
         assert_eq!(loaded.config.font_size, MAX_FONT_SIZE);
+        // Remembered remote-install answers survive a round trip: being re-asked on every launch
+        // would defeat the point of recording the decision.
+        assert_eq!(
+            loaded.config.remote_install_consent.get("deploy@prod.example.com"),
+            Some(&true)
+        );
         assert_eq!(loaded.config.terminal_padding_x, MIN_TERMINAL_PADDING);
         assert_eq!(loaded.config.terminal_padding_y, DEFAULT_TERMINAL_PADDING_Y);
         assert_eq!(loaded.config.minimum_contrast, MAX_MINIMUM_CONTRAST);
@@ -1399,7 +2017,7 @@ mod tests {
             loaded.config.progress_stale_timeout_secs,
             MAX_PROGRESS_TIMEOUT_SECS
         );
-        assert_eq!(loaded.config.light_theme, "Ayu Light");
+        assert_eq!(loaded.config.interface_light_theme, "Ayu Light");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1407,8 +2025,272 @@ mod tests {
     fn shell_features_assemble_into_the_env_string() {
         assert_eq!(ShellFeatures { path: true }.to_env_string(), "path");
         assert_eq!(ShellFeatures { path: false }.to_env_string(), "");
-        // Default settings enable the path feature.
-        assert_eq!(AppSettings::default().shell_features_string(), "path");
+        // The path feature ships on, so the value migrated into the Default profile carries it. (The
+        // assembled env string now comes from the profile — see `resolve_spawn_config`.)
+        assert!(AppSettings::default().legacy_shell_settings().shell_integration_path);
+    }
+
+    /// The global theme a terminal without an override inherits, for the merge tests.
+    fn global_theme() -> &'static TerminalTheme {
+        AppSettings::default().terminal_theme(true)
+    }
+
+    /// The global terminal layer for the merge tests, with the dark half in effect.
+    fn global_layer() -> GlobalTerminalLayer {
+        GlobalTerminalLayer {
+            theme: global_theme(),
+            use_dark: true,
+        }
+    }
+
+    /// A profile appearance overriding both terminal halves with the same name — the "looks the same in
+    /// either appearance" shape the single `theme` slot used to express.
+    fn both_halves(name: &str) -> eggie_domain::ProfileAppearance {
+        eggie_domain::ProfileAppearance {
+            terminal_dark_theme: Some(name.to_owned()),
+            terminal_light_theme: Some(name.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn appearance_without_overrides_is_the_global_layer() {
+        let config = AppSettings::default();
+        let resolved = resolve_appearance(&config, None, global_layer(), None);
+        assert_eq!(resolved.theme.name, global_theme().name);
+        assert_eq!(resolved.font_family.as_ref(), config.font_family.as_str());
+        assert_eq!(resolved.font_size, config.font_size);
+
+        // An all-inherit override behaves identically to no profile at all.
+        let empty = eggie_domain::ProfileAppearance::default();
+        assert_eq!(resolve_appearance(&config, Some(&empty), global_layer(), None), resolved);
+    }
+
+    #[test]
+    fn profile_overrides_win_field_by_field() {
+        let mut config = AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        config.font_size = 14.;
+
+        // Only the size is overridden: family and theme still come from the global layer.
+        let appearance = eggie_domain::ProfileAppearance {
+            font_size: Some(18.),
+            ..Default::default()
+        };
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), None);
+        assert_eq!(resolved.font_size, 18.);
+        assert_eq!(resolved.font_family.as_ref(), "Menlo");
+        assert_eq!(resolved.theme.name, global_theme().name);
+
+        // Filling both halves with one name is how a "prod is red" profile keeps its marking when the
+        // system flips — the single-slot behaviour, now stated explicitly rather than implied.
+        let named = theme_catalog().dark_names().into_iter().next().unwrap();
+        // Guard the test itself: if the catalog ever ships a theme that sorts first AND is the global
+        // default, the assertions below would degenerate into `global == global` and pass vacuously.
+        assert_ne!(
+            named,
+            global_theme().name,
+            "the override must name a theme that differs from the global one"
+        );
+        let appearance = both_halves(&named);
+        for use_dark in [true, false] {
+            let global = GlobalTerminalLayer {
+                theme: config.terminal_theme(use_dark),
+                use_dark,
+            };
+            let resolved = resolve_appearance(&config, Some(&appearance), global, None);
+            assert_eq!(
+                resolved.theme.name, named,
+                "with both halves set, the override must hold in both appearances"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_override_follows_the_appearance_half_by_half() {
+        // What the split buys: a profile can mark itself differently (or not at all) per appearance.
+        let config = AppSettings::default();
+        let dark_name = theme_catalog().dark_names().into_iter().next().unwrap();
+        let appearance = eggie_domain::ProfileAppearance {
+            terminal_dark_theme: Some(dark_name.clone()),
+            terminal_light_theme: None,
+            ..Default::default()
+        };
+
+        // Dark half: the override applies.
+        let resolved = resolve_appearance(
+            &config,
+            Some(&appearance),
+            GlobalTerminalLayer {
+                theme: config.terminal_theme(true),
+                use_dark: true,
+            },
+            None,
+        );
+        assert_eq!(resolved.theme.name, dark_name);
+
+        // Light half: only the dark slot is set, so this one inherits the global terminal theme. This is
+        // the case the old single-slot model could not express.
+        let light_global = config.terminal_theme(false);
+        let resolved = resolve_appearance(
+            &config,
+            Some(&appearance),
+            GlobalTerminalLayer {
+                theme: light_global,
+                use_dark: false,
+            },
+            None,
+        );
+        assert_eq!(resolved.theme.name, light_global.name);
+    }
+
+    #[test]
+    fn a_profile_preview_overrides_the_stored_slot() {
+        // The hover preview has to win over the profile's own stored value, or hovering an option on a
+        // profile that already has one would show nothing.
+        let config = AppSettings::default();
+        let stored = theme_catalog().dark_names().into_iter().next().unwrap();
+        let preview = theme_catalog().theme_by_name("Catppuccin Mocha").unwrap();
+        assert_ne!(stored, preview.name, "the preview must differ from the stored value");
+        let appearance = both_halves(&stored);
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), Some(preview));
+        assert_eq!(resolved.theme.name, preview.name);
+    }
+
+    #[test]
+    fn two_terminals_in_one_window_resolve_independently() {
+        // The central premise: one window, one global layer, two terminals that must not agree.
+        let mut config = AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        config.font_size = 14.;
+        let global = global_theme();
+
+        let themed = eggie_domain::ProfileAppearance {
+            // A light theme in the dark half is fine here: the profile layer resolves by name across the
+            // whole catalog, and the point of this test is only that the two terminals disagree.
+            terminal_dark_theme: theme_catalog().light_names().into_iter().next(),
+            font_family: Some("SF Mono".to_owned()),
+            font_size: Some(20.),
+            ..Default::default()
+        };
+        let overridden = resolve_appearance(&config, Some(&themed), global_layer(), None);
+        // A terminal with no profile (adopted/restored, or a profile with no overrides) follows global.
+        let inherited = resolve_appearance(&config, None, global_layer(), None);
+
+        assert_ne!(
+            overridden.theme.name, inherited.theme.name,
+            "the themed terminal must not share the other's palette"
+        );
+        assert_eq!(inherited.theme.name, global.name);
+        assert_eq!(overridden.font_size, 20.);
+        assert_eq!(inherited.font_size, 14.);
+        assert_eq!(overridden.font_family.as_ref(), "SF Mono");
+        assert_eq!(inherited.font_family.as_ref(), "Menlo");
+    }
+
+    #[test]
+    fn an_override_matching_the_global_theme_resolves_to_the_same_palette() {
+        // Worth pinning because the daemon push is diffed on the resolved palette: a profile that names
+        // the theme already in effect must produce no change, hence no redundant SetAppearance.
+        let config = AppSettings::default();
+        let global = global_theme();
+        let appearance = both_halves(&global.name);
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), None);
+        assert_eq!(resolved.theme.appearance(), global.appearance());
+    }
+
+    #[test]
+    fn an_unknown_theme_name_falls_back_to_the_global_theme() {
+        let config = AppSettings::default();
+        let appearance = both_halves("No Such Theme");
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), None);
+        assert_eq!(
+            resolved.theme.name,
+            global_theme().name,
+            "a typo must degrade to no override, not to an arbitrary theme"
+        );
+    }
+
+    #[test]
+    fn a_profile_font_family_moves_the_styles_that_inherited_it() {
+        let mut config = AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        // Italic has its own family; bold and bold-italic inherit the regular one.
+        config.font_family_italic = "Courier New".to_owned();
+
+        let appearance = eggie_domain::ProfileAppearance {
+            font_family: Some("SF Mono".to_owned()),
+            ..Default::default()
+        };
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), None);
+        assert_eq!(resolved.font_family.as_ref(), "SF Mono");
+        assert_eq!(resolved.families.regular.as_ref(), "SF Mono");
+        assert_eq!(
+            resolved.families.bold.as_ref(),
+            "SF Mono",
+            "a slot that inherited the regular family must follow the override"
+        );
+        assert_eq!(resolved.families.bold_italic.as_ref(), "SF Mono");
+        assert_eq!(
+            resolved.families.italic.as_ref(),
+            "Courier New",
+            "a slot with its own explicit family keeps it"
+        );
+    }
+
+    #[test]
+    fn a_style_pinned_to_the_regular_family_is_still_treated_as_explicit() {
+        let mut config = AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        // Deliberately pinning bold to the same name as regular: `resolved_font_families` collapses
+        // this into the same string as "unset", so inheritance must be read from the source config.
+        config.font_family_bold = "Menlo".to_owned();
+
+        let appearance = eggie_domain::ProfileAppearance {
+            font_family: Some("SF Mono".to_owned()),
+            ..Default::default()
+        };
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), None);
+        assert_eq!(resolved.families.regular.as_ref(), "SF Mono");
+        assert_eq!(
+            resolved.families.bold.as_ref(),
+            "Menlo",
+            "an explicitly pinned style must not follow the profile's family override"
+        );
+        // The genuinely-unset styles do follow it.
+        assert_eq!(resolved.families.italic.as_ref(), "SF Mono");
+        assert_eq!(resolved.families.bold_italic.as_ref(), "SF Mono");
+    }
+
+    #[test]
+    fn a_profile_font_size_is_clamped_and_sanitized() {
+        let config = AppSettings::default();
+        let resolve = |size: f32| {
+            let appearance = eggie_domain::ProfileAppearance {
+                font_size: Some(size),
+                ..Default::default()
+            };
+            resolve_appearance(&config, Some(&appearance), global_layer(), None).font_size
+        };
+        assert_eq!(resolve(1_000.), MAX_FONT_SIZE);
+        assert_eq!(resolve(1.), MIN_FONT_SIZE);
+        assert_eq!(resolve(f32::NAN), config.font_size, "a non-finite override is ignored");
+    }
+
+    #[test]
+    fn a_blank_profile_font_family_is_not_an_override() {
+        let mut config = AppSettings::default();
+        config.font_family = "Menlo".to_owned();
+        let appearance = eggie_domain::ProfileAppearance {
+            font_family: Some("   ".to_owned()),
+            ..Default::default()
+        };
+        let resolved = resolve_appearance(&config, Some(&appearance), global_layer(), None);
+        assert_eq!(
+            resolved.font_family.as_ref(),
+            "Menlo",
+            "whitespace must mean inherit, matching how the global per-style families behave"
+        );
     }
 
     #[test]

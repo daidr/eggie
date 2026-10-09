@@ -13,6 +13,8 @@ mod metal_terminal;
 mod native_menu;
 mod notes_store;
 mod persist;
+mod profile_editor;
+mod profile_store;
 mod project_store;
 mod snippet_store;
 pub mod services;

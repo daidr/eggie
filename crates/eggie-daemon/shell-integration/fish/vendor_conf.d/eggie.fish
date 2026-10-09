@@ -96,9 +96,8 @@ end
 # the shell's cwd changes (cd, pushd, ...). The initial cwd is already known to
 # Eggie (it spawned us there), so no startup emit is needed.
 function __eggie_report_cwd --on-variable PWD
-    # Three slashes => empty host => Eggie parses this as a local location,
-    # avoiding any hostname-mismatch ambiguity. Eggie's OSC 7 decoder passes
-    # non-%XX bytes through verbatim, so only literal `%` needs encoding (as
-    # %25) to survive the round-trip; spaces and other punctuation are fine raw.
-    printf '\e]7;file://%s\a' (string replace -a '%' '%25' -- $PWD)
+    # Send the real hostname so a remote session's cwd is not mistaken for a local path. Eggie's OSC 7
+    # decoder passes non-%XX bytes through verbatim, so only literal `%` needs encoding (as %25) to
+    # survive the round-trip; spaces and other punctuation are fine raw.
+    printf '\e]7;file://%s%s\a' (hostname | string trim) (string replace -a '%' '%25' -- $PWD)
 end

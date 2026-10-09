@@ -86,6 +86,11 @@ if [[ -n "${EGGIE_BASH_INJECT-}" && "$-" == *i* ]]; then
         PS2='\[\e]133;P;k=s\a\]'"$PS2"'\[\e]133;B\a\]'
 
         _eggie_marked_ps1="$PS1"
+
+        # Report the working directory on every prompt, so a remote session's cwd is not mistaken for
+        # a local path. Only literal `%` needs encoding (as %25) to survive the round-trip.
+        local encoded_pwd="${PWD//\%/%25}"
+        printf '\e]7;file://%s%s\a' "$(hostname)" "$encoded_pwd" >&$_eggie_fd
     }
 
     # PS0 is expanded after reading a command, just before it runs: mark output
