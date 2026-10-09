@@ -80,7 +80,7 @@ impl ProcessIcon {
             Self::BunJs => 0xf8f1e0,
             Self::Zig => 0xffedc7,
             Self::Codex => 0xeeeef8,
-            Self::ClaudeCode => 0xfbe3d5,
+            Self::ClaudeCode => 0xd97757,
             Self::OpenCode => 0xe5ebec,
             Self::File => 0xe6effb,
             Self::Browser => 0xe1f4f5,
