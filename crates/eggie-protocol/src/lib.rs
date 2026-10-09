@@ -693,6 +693,34 @@ pub struct SessionInspection {
     pub ports: Vec<ListeningPort>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalProgramBlockKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalProgramStatus {
+    pub state: TerminalProgramState,
+    pub kind: Option<TerminalProgramBlockKind>,
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub message: Option<String>,
+    pub progress: Option<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
@@ -711,6 +739,9 @@ pub struct SessionSummary {
     /// OSC 133 command currently running, when shell integration reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_command: Option<String>,
+    /// Most relevant OSC 7501 record for this terminal, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<TerminalProgramStatus>,
     pub status: SessionStatus,
 }
 

@@ -595,6 +595,20 @@ impl LayoutNode {
         }
     }
 
+    /// Returns a user's title override for the terminal, when one is set.
+    pub fn terminal_custom_title(&self, session_id: SessionId) -> Option<&str> {
+        match self {
+            Self::Group { group } => group
+                .items
+                .iter()
+                .find(|item| item.session_id == Some(session_id))
+                .and_then(|item| item.custom_title.as_deref()),
+            Self::Split { first, second, .. } => first
+                .terminal_custom_title(session_id)
+                .or_else(|| second.terminal_custom_title(session_id)),
+        }
+    }
+
     /// Sets (or clears, with `None`) the user's custom title override for a single tab, identified
     /// by its group and item id. Returns `true` if the override actually changed.
     ///
@@ -1350,12 +1364,14 @@ mod tests {
             layout.terminal_display_title(session_id),
             Some("process title")
         );
+        assert_eq!(layout.terminal_custom_title(session_id), None);
         // An unknown session id has no tab.
         assert_eq!(layout.terminal_display_title(Uuid::new_v4()), None);
 
         // A custom title wins, keyed off the session id (what the sidebar uses).
         layout.set_custom_title(group_id, item_id, Some("Custom".to_owned()));
         assert_eq!(layout.terminal_display_title(session_id), Some("Custom"));
+        assert_eq!(layout.terminal_custom_title(session_id), Some("Custom"));
     }
 
     #[test]

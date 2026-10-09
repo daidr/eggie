@@ -85,6 +85,8 @@ use eggie_protocol::{ListeningPort, ProcessInfo};
 
 mod osc_util;
 use osc_util::*;
+mod program_status;
+use program_status::{ProgramStatusCommand, ProgramStatusTracker};
 
 mod remote_bootstrap;
 use remote_bootstrap::{RemoteScripts, control_path, remote_launch};
@@ -299,6 +301,7 @@ struct ListenerState {
     progress: ProgressTracker,
     reported_location: RwLock<Option<TerminalReportedLocation>>,
     shell_integration: Mutex<ShellIntegrationTracker>,
+    program_status: Mutex<ProgramStatusTracker>,
     osc_events: OscEventTracker,
     next_osc_request_id: AtomicU64,
     pending_clipboard_reads: Mutex<HashMap<u64, ClipboardReadResponder>>,
@@ -976,6 +979,7 @@ impl ListenerState {
             progress: ProgressTracker::new(session_id),
             reported_location: RwLock::new(None),
             shell_integration: Mutex::new(ShellIntegrationTracker::default()),
+            program_status: Mutex::new(ProgramStatusTracker::default()),
             osc_events: OscEventTracker::new(session_id),
             next_osc_request_id: AtomicU64::new(1),
             pending_clipboard_reads: Mutex::new(HashMap::new()),
@@ -1408,6 +1412,18 @@ impl ListenerState {
             }
             99 => self.handle_kitty_notification(&notification.payload, notification.terminator),
             _ => {}
+        }
+    }
+
+    fn handle_program_status(&self, payload: &str, terminator: &str) {
+        match program_status::parse(payload) {
+            Some(ProgramStatusCommand::Query) => {
+                self.write_to_pty(format!("\x1b]7501;?{terminator}").into_bytes());
+            }
+            Some(ProgramStatusCommand::Report { id, status }) => {
+                self.program_status.lock().apply(id, status);
+            }
+            None => {}
         }
     }
 
@@ -2700,11 +2716,18 @@ impl EventListener for DaemonEventListener {
                 self.0.report_working_directory(&directory);
             }
             Event::SemanticPrompt(prompt, cursor_line, history_size) => {
+                if prompt.action == SemanticPromptAction::FreshLineAndPrompt {
+                    self.0.program_status.lock().clear_active();
+                }
                 self.0
                     .shell_integration
                     .lock()
                     .update(prompt, cursor_line, history_size);
             }
+            Event::ProgramStatus(payload, terminator) => {
+                self.0.handle_program_status(&payload, &terminator);
+            }
+            Event::ProgramStatusReset => self.0.program_status.lock().clear_all(),
             Event::DesktopNotification(notification) => {
                 self.0.handle_notification(notification);
             }
@@ -2734,10 +2757,12 @@ impl EventListener for DaemonEventListener {
                     code: status.code(),
                 };
                 self.0.progress.report(None);
+                self.0.program_status.lock().clear_active();
             }
             Event::Exit => {
                 *self.0.status.write() = SessionStatus::Exited { code: None };
                 self.0.progress.report(None);
+                self.0.program_status.lock().clear_active();
             }
             Event::ClipboardStore(clipboard, text) => self.0.clipboard_store(clipboard, text),
             Event::ClipboardLoad(clipboard, formatter) => {
@@ -3084,6 +3109,7 @@ impl TerminalSession {
             shell_pid: self.shell_pid,
             current_process,
             active_command,
+            program_status: self.events.program_status.lock().display(),
             status: self.events.status.read().clone(),
         }
     }

@@ -517,6 +517,9 @@ pub trait Handler {
     /// Kitty file-transfer protocol (OSC 5113).
     fn kitty_file_transfer(&mut self, _: String, _: &str) {}
 
+    /// Program Status Protocol (OSC 7501), including the support query.
+    fn program_status(&mut self, _: String, _: &str) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1699,6 +1702,15 @@ where
                 self.handler.kitty_clipboard(joined(&params[1..]), terminator);
             },
 
+            b"7501" if params.len() >= 2 => {
+                // The protocol caps the entire sequence at 4096 bytes. Check before allocating.
+                let body_len =
+                    params[1..].iter().map(|part| part.len()).sum::<usize>() + params.len() - 2;
+                if body_len <= 4096 - b"\x1b]7501;\x1b\\".len() {
+                    self.handler.program_status(joined(&params[1..]), terminator);
+                }
+            },
+
             // Reset color index.
             b"104" => {
                 // Reset all color indexes when no parameters are given.
@@ -2261,6 +2273,7 @@ mod tests {
         iterm2_commands: Vec<(String, String)>,
         kitty_clipboard_commands: Vec<(String, String)>,
         kitty_file_transfers: Vec<(String, String)>,
+        program_status_commands: Vec<(String, String)>,
         hyperlinks: Vec<Option<Hyperlink>>,
         dynamic_color_queries: Vec<(String, usize, String)>,
     }
@@ -2327,6 +2340,10 @@ mod tests {
             self.kitty_file_transfers.push((payload, terminator.to_owned()));
         }
 
+        fn program_status(&mut self, payload: String, terminator: &str) {
+            self.program_status_commands.push((payload, terminator.to_owned()));
+        }
+
         fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
             self.hyperlinks.push(hyperlink);
         }
@@ -2353,6 +2370,7 @@ mod tests {
                 iterm2_commands: Vec::new(),
                 kitty_clipboard_commands: Vec::new(),
                 kitty_file_transfers: Vec::new(),
+                program_status_commands: Vec::new(),
                 hyperlinks: Vec::new(),
                 dynamic_color_queries: Vec::new(),
             }
@@ -2421,6 +2439,8 @@ mod tests {
         parser.advance(&mut handler, b"\x1b]1337;RemoteHost=me@host\x1b\\");
         parser.advance(&mut handler, b"\x1b]5113;ac=send;id=t1\x1b\\");
         parser.advance(&mut handler, b"\x1b]5522;type=read;Lg==\x1b\\");
+        parser.advance(&mut handler, b"\x1b]7501;?\x1b\\");
+        parser.advance(&mut handler, b"\x1b]7501;state=blocked:kind=question\x07");
 
         assert_eq!(handler.titles, vec![Some("tab title".to_owned())]);
         assert_eq!(handler.working_directories, vec!["file://user@example.test/tmp/a%20b"]);
@@ -2453,6 +2473,16 @@ mod tests {
             handler.kitty_clipboard_commands,
             vec![("type=read;Lg==".to_owned(), "\x1b\\".to_owned())]
         );
+        assert_eq!(
+            handler.program_status_commands,
+            vec![
+                ("?".to_owned(), "\x1b\\".to_owned()),
+                ("state=blocked:kind=question".to_owned(), "\x07".to_owned()),
+            ]
+        );
+        let oversized = format!("\x1b]7501;state=working:msg={}\x1b\\", "A".repeat(4090));
+        parser.advance(&mut handler, oversized.as_bytes());
+        assert_eq!(handler.program_status_commands.len(), 2);
     }
 
     #[test]
