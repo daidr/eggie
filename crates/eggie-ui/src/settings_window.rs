@@ -738,6 +738,15 @@ fn monospace_font_names_uncached(cx: &App) -> Vec<String> {
     names
 }
 
+fn settings_input_style(colors: UiColors) -> TextInputStyle {
+    TextInputStyle {
+        text_color: (colors.text << 8) | 0xff,
+        placeholder_color: (colors.muted << 8) | 0xff,
+        cursor_color: (colors.accent << 8) | 0xff,
+        selection_color: (colors.accent << 8) | 0x55,
+    }
+}
+
 struct SettingsWindow {
     settings: Entity<SettingsStore>,
     updates: Entity<crate::update_controller::UpdateController>,
@@ -754,6 +763,7 @@ struct SettingsWindow {
     light_theme_names: Vec<String>,
     font_names: Vec<String>,
     colors: UiColors,
+    colors_for_theme: &'static TerminalTheme,
     open_selector: Option<SelectorKind>,
     selector_search_input: Entity<TextInput>,
     /// Persistent inputs for the shell override (Advanced → Shell). Seeded once from config; edits
@@ -840,26 +850,10 @@ impl SettingsWindow {
         // preview: no hover can be active while the window is being constructed.
         let theme = settings.read(cx).config().interface_theme(system_is_dark);
         let colors = UiColors::from_theme(theme);
-        let selector_search_input = cx.new(|cx| {
-            TextInput::new(
-                window,
-                cx,
-                TextInputStyle {
-                    text_color: (colors.text << 8) | 0xff,
-                    placeholder_color: (colors.muted << 8) | 0xff,
-                    cursor_color: (colors.accent << 8) | 0xff,
-                    selection_color: (colors.accent << 8) | 0x55,
-                },
-            )
-        });
+        let input_style = settings_input_style(colors);
+        let selector_search_input = cx.new(|cx| TextInput::new(window, cx, input_style));
         cx.subscribe_in(&selector_search_input, window, Self::on_selector_search_event)
             .detach();
-        let input_style = TextInputStyle {
-            text_color: (colors.text << 8) | 0xff,
-            placeholder_color: (colors.muted << 8) | 0xff,
-            cursor_color: (colors.accent << 8) | 0xff,
-            selection_color: (colors.accent << 8) | 0x55,
-        };
         let shell_program_input = cx.new(|cx| TextInput::new(window, cx, input_style));
         let shell_args_input = cx.new(|cx| TextInput::new(window, cx, input_style));
         // The Profiles pane's inputs. Created here (not lazily on first open) so the subscriptions are
@@ -928,6 +922,7 @@ impl SettingsWindow {
             light_theme_names: theme_catalog().light_names(),
             font_names,
             colors,
+            colors_for_theme: theme,
             open_selector: None,
             selector_search_input,
             shell_program_input,
@@ -4443,44 +4438,87 @@ impl SettingsWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut strip = div()
-            .id(format!("theme-gallery-{}", kind.index()))
-            .flex()
-            .items_start()
-            .gap_3()
-            .min_w_0()
-            .w_full()
-            .overflow_x_scroll()
-            .track_scroll(&self.theme_gallery_scroll_handles[kind.index()])
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .on_hover(cx.listener(|settings, hovered: &bool, _, cx| {
-                if !*hovered {
-                    settings.clear_theme_preview(cx);
-                }
-            }));
+        let scroll_handle = &self.theme_gallery_scroll_handles[kind.index()];
+        let offset_x = -f32::from(scroll_handle.offset().x);
+        let max_offset_x = f32::from(scroll_handle.max_offset().x);
+        let viewport_width = match f32::from(scroll_handle.bounds().size.width) {
+            width if width > 0. => width,
+            _ => 720.,
+        };
+        let card_step = THEME_CARD_WIDTH + 12.;
+        let preload = card_step * 2.;
+        let visible_start = (offset_x - preload).max(0.);
+        let visible_end = offset_x + viewport_width + preload;
         let default = if kind.is_dark() {
             DEFAULT_DARK_THEME
         } else {
             DEFAULT_LIGHT_THEME
         };
-        if self.selector_names(kind).iter().any(|name| name == default) {
-            strip = strip
-                .child(self.render_theme_card(kind, default, selected == default, cx))
-                .child(
+        let names = self.selector_names(kind);
+        let has_default = names.iter().any(|name| name == default);
+        let total_width = names.len() as f32 * card_step
+            + if has_default { 13. } else { 0. }
+            - 12.;
+        let mut visible_items = Vec::new();
+        let mut item_x = 0.;
+        if has_default {
+            if item_x + THEME_CARD_WIDTH >= visible_start && item_x <= visible_end {
+                visible_items.push((
+                    item_x,
+                    self.render_theme_card(kind, default, selected == default, cx),
+                ));
+            }
+            item_x += card_step;
+            if item_x + 1. >= visible_start && item_x <= visible_end {
+                visible_items.push((
+                    item_x,
                     div()
                         .flex_none()
                         .w(px(1.))
                         .h(px(THEME_CARD_HEIGHT - 8.))
                         .mt_1()
-                        .bg(rgb(self.colors.border)),
-                );
+                        .bg(rgb(self.colors.border))
+                        .into_any_element(),
+                ));
+            }
+            item_x += 13.;
         }
-        for name in self.selector_names(kind).iter().filter(|name| *name != default) {
-            strip = strip.child(self.render_theme_card(kind, name, name == selected, cx));
+        for name in names.iter().filter(|name| *name != default) {
+            if item_x + THEME_CARD_WIDTH >= visible_start && item_x <= visible_end {
+                visible_items.push((
+                    item_x,
+                    self.render_theme_card(kind, name, name == selected, cx),
+                ));
+            }
+            item_x += card_step;
         }
-        let scroll_handle = &self.theme_gallery_scroll_handles[kind.index()];
-        let offset_x = -f32::from(scroll_handle.offset().x);
-        let max_offset_x = f32::from(scroll_handle.max_offset().x);
+        let mut content = div()
+            .flex()
+            .flex_none()
+            .items_start()
+            .gap(px(12.))
+            .w(px(total_width));
+        if let Some((first_x, _)) = visible_items.first()
+            && *first_x > 0.
+        {
+            content = content.child(div().flex_none().w(px(first_x - 12.)).h(px(1.)));
+        }
+        for (_, item) in visible_items {
+            content = content.child(item);
+        }
+        let strip = div()
+            .id(format!("theme-gallery-{}", kind.index()))
+            .min_w_0()
+            .w_full()
+            .overflow_x_scroll()
+            .track_scroll(scroll_handle)
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_hover(cx.listener(|settings, hovered: &bool, _, cx| {
+                if !*hovered {
+                    settings.clear_theme_preview(cx);
+                }
+            }))
+            .child(content);
         let panel_color = rgb(self.colors.panel);
         let mut strip_wrapper = div().relative().min_w_0().w_full().child(strip);
         if offset_x > 0.5 {
@@ -4596,7 +4634,21 @@ impl gpui::Render for SettingsWindow {
         // exactly what committing it would do.
         let interface_theme = self.settings.read(cx).resolved_interface_theme(system_is_dark);
         let terminal_theme = self.settings.read(cx).resolved_terminal_theme(system_is_dark);
-        self.colors = UiColors::from_theme(interface_theme);
+        if !std::ptr::eq(self.colors_for_theme, interface_theme) {
+            let colors = UiColors::from_theme(interface_theme);
+            let style = settings_input_style(colors);
+            self.selector_search_input
+                .update(cx, |input, cx| input.set_style(style, cx));
+            self.shell_program_input
+                .update(cx, |input, cx| input.set_style(style, cx));
+            self.shell_args_input
+                .update(cx, |input, cx| input.set_style(style, cx));
+            for input in self.profile_input_list() {
+                input.update(cx, |input, cx| input.set_style(style, cx));
+            }
+            self.colors = colors;
+            self.colors_for_theme = interface_theme;
+        }
 
         let language = config.language;
         // Keep every input field's edit-menu labels in sync with the current language.

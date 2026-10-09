@@ -10992,8 +10992,8 @@ fn popover_button(
         .cursor_pointer()
         .when(primary, |this| {
             this.bg(rgb(colors.accent))
-                .text_color(rgb(0xffffff))
-                .hover(move |element| element.bg(mix_toward_black(colors.accent, 0.12)))
+                .text_color(rgb(colors.accent_foreground))
+                .hover(move |element| element.bg(rgb(colors.accent_hover)))
         })
         .when(!primary, |this| {
             this.bg(rgb(colors.panel_alt))
@@ -11005,15 +11005,6 @@ fn popover_button(
         .on_click(on_click)
         .child(label.to_string())
         .into_any_element()
-}
-
-/// Darken a packed 0xRRGGBB color toward black by `amount` (0..1), for button hover states.
-fn mix_toward_black(color: u32, amount: f32) -> gpui::Rgba {
-    let channel = |shift: u32| {
-        let value = ((color >> shift) & 0xff) as f32;
-        (value * (1. - amount)).round().clamp(0., 255.) as u32
-    };
-    rgb((channel(16) << 16) | (channel(8) << 8) | channel(0))
 }
 
 fn format_update_speed(bytes_per_sec: u64) -> String {
@@ -11545,6 +11536,8 @@ mod tests {
             text: 0,
             muted: 0,
             accent: 0,
+            accent_foreground: 0,
+            accent_hover: 0,
         };
 
         assert!(ports_section(&inspection, colors, Language::English).is_none());
