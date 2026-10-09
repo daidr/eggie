@@ -526,7 +526,7 @@ fn project_card_poses(
 ) -> Vec<process_icons::CardPose> {
     let at = |icon, index, count| process_icons::CardPose {
         icon,
-        offset_x: (PROJECT_MAX_ICON_COUNT.saturating_sub(count) + index) as f32 * 5.,
+        offset_x: index as f32 * 5.,
         angle: process_icons::stack_angle(index, count),
         opacity: 1.,
     };
@@ -7807,6 +7807,8 @@ impl EggieApp {
         };
         let animating = state.started_at.elapsed() < PROJECT_ICON_TRANSITION;
         let image_width = process_icons::stack_width(PROJECT_MAX_ICON_COUNT, PROJECT_CARD_SIZE);
+        // Keep the first card at the same left edge as a single icon.
+        let image_left = image_width - process_icons::stack_width(1, PROJECT_CARD_SIZE);
         let slot_width = image_width + 16.;
         let card_height = PROJECT_CARD_SIZE + 5.;
         if !animating {
@@ -7820,7 +7822,7 @@ impl EggieApp {
                     .h(px(card_height))
                     .child(
                         img(image)
-                            .ml(px(image_width - content_width))
+                            .ml(px(image_left))
                             .w(px(content_width))
                             .h(px(card_height)),
                     )
@@ -7849,7 +7851,7 @@ impl EggieApp {
                         element.child(
                             img(frame)
                                 .absolute()
-                                .left_0()
+                                .left(px(image_left))
                                 .top_0()
                                 .w(px(image_width))
                                 .h(px(card_height)),
@@ -11100,17 +11102,17 @@ mod tests {
         let adding = project_card_poses(&[first], &[first, second], 0.5);
         assert_eq!(adding.len(), 2);
         assert_eq!(adding[0].icon, ProcessIcon::BunJs);
-        assert_eq!(adding[0].offset_x, 10.);
+        assert_eq!(adding[0].offset_x, 2.5);
         assert_eq!(adding[0].angle, 3.5);
         assert_eq!(adding[0].opacity, 0.5);
-        assert_eq!(adding[1].offset_x, 7.5);
+        assert_eq!(adding[1].offset_x, 0.);
         assert_eq!(adding[1].angle, -3.5);
         let removing = project_card_poses(&[first, second], &[first], 0.5);
         assert_eq!(removing.len(), 2);
-        assert_eq!(removing[0].offset_x, 10.);
+        assert_eq!(removing[0].offset_x, 2.5);
         assert_eq!(removing[0].angle, 3.5);
         assert_eq!(removing[0].opacity, 0.5);
-        assert_eq!(removing[1].offset_x, 7.5);
+        assert_eq!(removing[1].offset_x, 0.);
         assert_eq!(removing[1].angle, -3.5);
     }
 
@@ -11129,7 +11131,7 @@ mod tests {
             project_card_poses(&[terminal], &[placeholder], 0.5),
         ] {
             assert_eq!(poses.len(), 2);
-            assert!(poses.iter().all(|pose| pose.offset_x == 10.));
+            assert!(poses.iter().all(|pose| pose.offset_x == 0.));
             assert!(poses.iter().all(|pose| pose.angle == 0.));
             assert!(poses.iter().all(|pose| pose.opacity == 0.5));
         }
