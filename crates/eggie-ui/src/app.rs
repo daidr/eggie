@@ -108,7 +108,7 @@ const PROJECT_CARD_SIZE: f32 = 21.;
 const PROJECT_MAX_ICON_COUNT: usize = 3;
 const PROJECT_ICON_TRANSITION: Duration = Duration::from_millis(340);
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
-const SIDEBAR_STATUS_ROW_HEIGHT: f32 = 46.;
+const SIDEBAR_STATUS_ROW_HEIGHT: f32 = 42.;
 const SIDEBAR_STATUS_TRANSITION: Duration = Duration::from_millis(260);
 
 fn program_state_label(state: TerminalProgramState, language: Language) -> &'static str {
@@ -8031,7 +8031,7 @@ impl EggieApp {
                             .flex_1()
                             .min_w_0()
                             .flex_col()
-                            .gap_1()
+                            .gap(px(2.))
                             .child(
                                 div()
                                     .flex()
