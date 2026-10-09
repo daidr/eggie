@@ -902,25 +902,26 @@ impl LayoutNode {
         }
     }
 
-    /// Iterate over all terminal items across all groups.
-    pub fn terminal_items(&self) -> impl Iterator<Item = &TabItem> {
+    /// Iterate over all tab items across all groups, in layout order.
+    pub fn items(&self) -> impl Iterator<Item = &TabItem> {
         let mut items = Vec::new();
-        self.collect_terminal_items(&mut items);
+        self.collect_items(&mut items);
         items.into_iter()
     }
 
-    fn collect_terminal_items<'a>(&'a self, items: &mut Vec<&'a TabItem>) {
+    /// Iterate over terminal tabs across all groups.
+    pub fn terminal_items(&self) -> impl Iterator<Item = &TabItem> {
+        self.items().filter(|item| matches!(item.kind, ItemKind::Terminal))
+    }
+
+    fn collect_items<'a>(&'a self, items: &mut Vec<&'a TabItem>) {
         match self {
             Self::Group { group } => {
-                for item in &group.items {
-                    if matches!(item.kind, ItemKind::Terminal) {
-                        items.push(item);
-                    }
-                }
+                items.extend(&group.items);
             }
             Self::Split { first, second, .. } => {
-                first.collect_terminal_items(items);
-                second.collect_terminal_items(items);
+                first.collect_items(items);
+                second.collect_items(items);
             }
         }
     }
