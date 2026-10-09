@@ -2,6 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::{
     app::{EggieApp, NewWindowInit, NotificationRoutes, tooltip_text},
+    continuous_corners::paint_continuous_rect,
     icons::{IconName, icon, icon_sized},
     project_store::ProjectStore,
     settings::{
@@ -20,7 +21,7 @@ use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Entity, Image, ImageFormat, Menu,
     MenuItem, MouseButton, OsAction, Pixels, ScrollHandle, SharedString, SystemMenuType,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions,
-    actions, anchored, deferred, div, img, point, prelude::*, px, rgb, size,
+    actions, anchored, canvas, deferred, div, img, point, prelude::*, px, rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -81,7 +82,8 @@ actions!(
 // TODO: point at the real Eggie docs/repo once one exists (Cargo.toml has no `repository`).
 const EGGIE_HELP_URL: &str = "https://github.com/daidr/eggie";
 
-const SETTINGS_WIDTH: f32 = 680.;const SETTINGS_HEIGHT: f32 = 540.;
+const SETTINGS_WIDTH: f32 = 920.;
+const SETTINGS_HEIGHT: f32 = 740.;
 const SETTINGS_MIN_WIDTH: f32 = 640.;
 const SETTINGS_MIN_HEIGHT: f32 = 420.;
 const SETTINGS_TITLEBAR_HEIGHT: f32 = 52.;
@@ -94,6 +96,9 @@ const SELECTOR_WIDTH: f32 = 270.;
 const SELECTOR_DROPDOWN_HEIGHT: f32 = 208.;
 const SELECTOR_DROPDOWN_GAP: f32 = 4.;
 const SELECTOR_WINDOW_MARGIN: f32 = 8.;
+const THEME_CARD_WIDTH: f32 = 154.;
+const THEME_CARD_HEIGHT: f32 = 98.;
+const THEME_CARD_RADIUS: f32 = 21.;
 /// Width of the compact bell-mode dropdown (trigger and popover).
 const BELL_DROPDOWN_WIDTH: f32 = 180.;
 const BELL_DROPDOWN_ROW_HEIGHT: f32 = 30.;
@@ -755,6 +760,7 @@ struct SettingsWindow {
     shell_args_input: Entity<TextInput>,
     selector_scroll_handle: ScrollHandle,
     settings_scroll_handle: ScrollHandle,
+    theme_gallery_scroll_handles: [ScrollHandle; SelectorKind::ALL.len()],
     selector_bounds: [Option<Bounds<Pixels>>; SelectorKind::ALL.len()],
     moving_window: bool,
     selected_section: SettingsSection,
@@ -926,6 +932,7 @@ impl SettingsWindow {
             shell_args_input,
             selector_scroll_handle: ScrollHandle::new(),
             settings_scroll_handle: ScrollHandle::new(),
+            theme_gallery_scroll_handles: std::array::from_fn(|_| ScrollHandle::new()),
             selector_bounds: [None; SelectorKind::ALL.len()],
             moving_window: false,
             selected_section: SettingsSection::default(),
@@ -1057,6 +1064,10 @@ impl SettingsWindow {
         choice: String,
         cx: &mut Context<Self>,
     ) {
+        if kind.is_theme() {
+            self.theme_gallery_scroll_handles[kind.index()]
+                .set_offset(point(px(0.), px(0.)));
+        }
         if kind.is_profile() {
             self.apply_profile_selector_choice(kind, Some(choice), cx);
             return;
@@ -2479,19 +2490,7 @@ impl SettingsWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let dropdown_position = self.selector_bounds[kind.index()].map(|bounds| {
-            let dropdown_height = px(SELECTOR_DROPDOWN_HEIGHT);
-            let gap = px(SELECTOR_DROPDOWN_GAP);
-            let margin = px(SELECTOR_WINDOW_MARGIN);
-            let y = if window.viewport_size().height - bounds.bottom()
-                >= dropdown_height + gap + margin
-            {
-                bounds.bottom() + gap
-            } else {
-                bounds.top() - dropdown_height - gap
-            };
-            point(bounds.left(), y)
-        });
+        let dropdown_position = self.selector_dropdown_position(kind, window);
         let selector = cx.entity().downgrade();
         div()
             .on_children_prepainted(move |children, _, cx| {
@@ -2603,6 +2602,26 @@ impl SettingsWindow {
                 )
             })
             .into_any_element()
+    }
+
+    fn selector_dropdown_position(
+        &self,
+        kind: SelectorKind,
+        window: &Window,
+    ) -> Option<gpui::Point<Pixels>> {
+        self.selector_bounds[kind.index()].map(|bounds| {
+            let dropdown_height = px(SELECTOR_DROPDOWN_HEIGHT);
+            let gap = px(SELECTOR_DROPDOWN_GAP);
+            let margin = px(SELECTOR_WINDOW_MARGIN);
+            let y = if window.viewport_size().height - bounds.bottom()
+                >= dropdown_height + gap + margin
+            {
+                bounds.bottom() + gap
+            } else {
+                bounds.top() - dropdown_height - gap
+            };
+            point(bounds.left(), y)
+        })
     }
 
     fn render_selector_dropdown(
@@ -4157,6 +4176,339 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn render_theme_search(
+        &self,
+        kind: SelectorKind,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let dropdown_position = self.selector_dropdown_position(kind, window);
+        let selector = cx.entity().downgrade();
+        let language = self.settings.read(cx).config().language;
+        let search_label = if kind.is_dark() {
+            language.search_dark_themes()
+        } else {
+            language.search_light_themes()
+        };
+        div()
+            .on_children_prepainted(move |children, _, cx| {
+                let Some(bounds) = children.first().copied() else {
+                    return;
+                };
+                let selector = selector.clone();
+                cx.defer(move |cx| {
+                    selector
+                        .update(cx, |settings, cx| {
+                            let stored = &mut settings.selector_bounds[kind.index()];
+                            if *stored != Some(bounds) {
+                                *stored = Some(bounds);
+                                if settings.open_selector == Some(kind) {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                });
+            })
+            .id(format!("theme-search-container-{}", kind.index()))
+            .relative()
+            .flex_none()
+            .size(px(26.))
+            .child(
+                div()
+                    .id(format!("theme-search-{}", kind.index()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_full()
+                    .rounded_md()
+                    .text_color(rgb(self.colors.muted))
+                    .cursor_pointer()
+                    .hover(|element| element.bg(rgb(self.colors.panel_alt)))
+                    .tooltip(tooltip_text(search_label, self.colors))
+                    .on_click(cx.listener(move |settings, _, window, cx| {
+                        if settings.open_selector == Some(kind) {
+                            settings.open_selector = None;
+                            settings.clear_theme_preview(cx);
+                        } else {
+                            settings.open_selector = Some(kind);
+                            settings.selector_search_input.update(cx, |input, cx| {
+                                input.set_placeholder(search_label);
+                                input.set_content("", cx);
+                            });
+                            settings
+                                .selector_scroll_handle
+                                .set_offset(point(px(0.), px(0.)));
+                            settings
+                                .selector_search_input
+                                .read(cx)
+                                .focus_handle()
+                                .focus(window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .child(icon_sized(IconName::Search, 14.)),
+            )
+            .when(self.open_selector == Some(kind), |element| {
+                let mut dropdown = anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(SELECTOR_WINDOW_MARGIN));
+                if let Some(position) = dropdown_position {
+                    dropdown = dropdown.position(position);
+                }
+                element.child(
+                    deferred(dropdown.child(self.render_selector_dropdown(kind, window, cx)))
+                        .priority(2),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_theme_card(
+        &self,
+        kind: SelectorKind,
+        name: &str,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = theme_catalog()
+            .theme_by_name(name)
+            .expect("catalog name must resolve to a theme");
+        let colors = self.colors;
+        let card_fill = theme.background;
+        let card_edge = blend_rgb(card_fill, theme.foreground, 0.2);
+        let sample_fill = blend_rgb(card_fill, theme.foreground, 0.055);
+        let chip_fill = theme.palette[0];
+        let chip_text = readable_on(chip_fill);
+        let name_owned = name.to_owned();
+        let hover_name = name_owned.clone();
+        let selected_name = name_owned.clone();
+        div()
+            .id(format!("theme-card-{}-{name}", kind.index()))
+            .flex()
+            .flex_none()
+            .flex_col()
+            .gap_2()
+            .w(px(THEME_CARD_WIDTH))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |settings, hovered: &bool, _, cx| {
+                if *hovered {
+                    settings.preview_theme(kind, &hover_name, cx);
+                }
+            }))
+            .on_click(cx.listener(move |settings, _, _, cx| {
+                settings.clear_theme_preview(cx);
+                settings.commit_selector_choice(kind, selected_name.clone(), cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .relative()
+                    .w(px(THEME_CARD_WIDTH))
+                    .h(px(THEME_CARD_HEIGHT))
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                if selected {
+                                    paint_continuous_rect(
+                                        window,
+                                        bounds,
+                                        0.,
+                                        THEME_CARD_RADIUS,
+                                        colors.accent,
+                                    );
+                                    paint_continuous_rect(
+                                        window,
+                                        bounds,
+                                        3.,
+                                        THEME_CARD_RADIUS,
+                                        colors.panel,
+                                    );
+                                    paint_continuous_rect(
+                                        window,
+                                        bounds,
+                                        5.,
+                                        THEME_CARD_RADIUS,
+                                        card_fill,
+                                    );
+                                } else {
+                                    paint_continuous_rect(
+                                        window,
+                                        bounds,
+                                        0.,
+                                        THEME_CARD_RADIUS,
+                                        card_edge,
+                                    );
+                                    paint_continuous_rect(
+                                        window,
+                                        bounds,
+                                        1.,
+                                        THEME_CARD_RADIUS,
+                                        card_fill,
+                                    );
+                                }
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .justify_between()
+                            .absolute()
+                            .top(px(11.))
+                            .bottom(px(11.))
+                            .left(px(12.))
+                            .right(px(12.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .h(px(42.))
+                                    .px_1()
+                                    .rounded_lg()
+                                    .bg(rgb(sample_fill))
+                                    .child(
+                                        div()
+                                            .text_size(px(26.))
+                                            .text_color(rgb(theme.foreground))
+                                            .child("Aa"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(34.))
+                                            .h(px(29.))
+                                            .rounded_md()
+                                            .bg(rgb(chip_fill))
+                                            .font_family("Menlo")
+                                            .text_size(px(14.))
+                                            .text_color(rgb(chip_text))
+                                            .child("~/"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_end()
+                                            .justify_center()
+                                            .w(px(15.))
+                                            .h(px(29.))
+                                            .pb(px(3.))
+                                            .rounded_md()
+                                            .bg(rgb(theme.cursor))
+                                            .child(
+                                                div()
+                                                    .w(px(7.))
+                                                    .h(px(2.))
+                                                    .bg(rgb(theme.cursor_text)),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .children(theme.palette[..9].iter().enumerate().map(|(index, color)| {
+                                        div()
+                                            .flex_none()
+                                            .size(px(15.))
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(rgb(card_fill))
+                                            .bg(rgb(*color))
+                                            .when(index > 0, |element| element.ml(px(-2.)))
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_center()
+                    .text_size(px(12.))
+                    .text_color(rgb(if selected { colors.text } else { colors.muted }))
+                    .when(selected, |element| {
+                        element.font_weight(gpui::FontWeight::SEMIBOLD)
+                    })
+                    .child(name_owned),
+            )
+            .into_any_element()
+    }
+
+    fn render_theme_gallery(
+        &self,
+        kind: SelectorKind,
+        label: &'static str,
+        description: &'static str,
+        selected: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut strip = div()
+            .id(format!("theme-gallery-{}", kind.index()))
+            .flex()
+            .items_start()
+            .gap_3()
+            .min_w_0()
+            .w_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.theme_gallery_scroll_handles[kind.index()])
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_hover(cx.listener(|settings, hovered: &bool, _, cx| {
+                if !*hovered {
+                    settings.clear_theme_preview(cx);
+                }
+            }));
+        if self.selector_names(kind).iter().any(|name| name == selected) {
+            strip = strip
+                .child(self.render_theme_card(kind, selected, true, cx))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(1.))
+                        .h(px(THEME_CARD_HEIGHT - 8.))
+                        .mt_1()
+                        .bg(rgb(self.colors.border)),
+                );
+        }
+        for name in self.selector_names(kind).iter().filter(|name| *name != selected) {
+            strip = strip.child(self.render_theme_card(kind, name, false, cx));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_w_0()
+            .w_full()
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .child(
+                        div()
+                            .id(format!("theme-gallery-label-{}", kind.index()))
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .tooltip(tooltip_text(description, self.colors))
+                            .child(label),
+                    )
+                    .child(self.render_theme_search(kind, window, cx)),
+            )
+            .child(strip)
+            .into_any_element()
+    }
+
     fn render_terminal_preview(&self, config: &AppSettings, theme: &TerminalTheme) -> AnyElement {
         let language = config.language;
         let foreground =
@@ -4232,19 +4584,19 @@ impl gpui::Render for SettingsWindow {
         let language_control = self.render_language_control(language, cx);
         let bell_control = self.render_bell_control(config.bell_mode, window, cx);
         let mode_control = self.render_mode_control(config.theme_mode, cx);
-        let interface_dark_selector = self.render_selector(
-            "interface-dark-theme-selector",
-            config.interface_dark_theme.clone(),
-            None,
-            SelectorKind::InterfaceDark,
+        let interface_light_gallery = self.render_theme_gallery(
+            SelectorKind::InterfaceLight,
+            language.interface_light_theme_row(),
+            language.interface_light_theme_description(),
+            &config.interface_light_theme,
             window,
             cx,
         );
-        let interface_light_selector = self.render_selector(
-            "interface-light-theme-selector",
-            config.interface_light_theme.clone(),
-            None,
-            SelectorKind::InterfaceLight,
+        let interface_dark_gallery = self.render_theme_gallery(
+            SelectorKind::InterfaceDark,
+            language.interface_dark_theme_row(),
+            language.interface_dark_theme_description(),
+            &config.interface_dark_theme,
             window,
             cx,
         );
@@ -4252,23 +4604,23 @@ impl gpui::Render for SettingsWindow {
             self.render_terminal_theme_source_control(config.terminal_theme_source, cx);
         // Only built when the terminal uses its own pair: under `FollowInterface` these two rows are
         // omitted entirely rather than shown disabled, so the panel states what is actually in effect.
-        let terminal_theme_selectors = (config.terminal_theme_source
+        let terminal_theme_galleries = (config.terminal_theme_source
             == TerminalThemeSource::Custom)
             .then(|| {
                 (
-                    self.render_selector(
-                        "terminal-dark-theme-selector",
-                        config.terminal_dark_theme.clone(),
-                        None,
-                        SelectorKind::TerminalDark,
+                    self.render_theme_gallery(
+                        SelectorKind::TerminalLight,
+                        language.terminal_light_theme_row(),
+                        language.terminal_light_theme_description(),
+                        &config.terminal_light_theme,
                         window,
                         cx,
                     ),
-                    self.render_selector(
-                        "terminal-light-theme-selector",
-                        config.terminal_light_theme.clone(),
-                        None,
-                        SelectorKind::TerminalLight,
+                    self.render_theme_gallery(
+                        SelectorKind::TerminalDark,
+                        language.terminal_dark_theme_row(),
+                        language.terminal_dark_theme_description(),
+                        &config.terminal_dark_theme,
                         window,
                         cx,
                     ),
@@ -4366,18 +4718,8 @@ impl gpui::Render for SettingsWindow {
                 mode_control,
                 self.colors,
             ),
-            settings_row(
-                language.interface_dark_theme_row(),
-                language.interface_dark_theme_description(),
-                interface_dark_selector,
-                self.colors,
-            ),
-            settings_row(
-                language.interface_light_theme_row(),
-                language.interface_light_theme_description(),
-                interface_light_selector,
-                self.colors,
-            ),
+            interface_light_gallery,
+            interface_dark_gallery,
             settings_row(
                 language.terminal_theme_source_row(),
                 language.terminal_theme_source_description(),
@@ -4385,19 +4727,9 @@ impl gpui::Render for SettingsWindow {
                 self.colors,
             ),
         ];
-        if let Some((terminal_dark_selector, terminal_light_selector)) = terminal_theme_selectors {
-            theme_rows.push(settings_row(
-                language.terminal_dark_theme_row(),
-                language.terminal_dark_theme_description(),
-                terminal_dark_selector,
-                self.colors,
-            ));
-            theme_rows.push(settings_row(
-                language.terminal_light_theme_row(),
-                language.terminal_light_theme_description(),
-                terminal_light_selector,
-                self.colors,
-            ));
+        if let Some((terminal_light_gallery, terminal_dark_gallery)) = terminal_theme_galleries {
+            theme_rows.push(terminal_light_gallery);
+            theme_rows.push(terminal_dark_gallery);
         }
         theme_rows.push(settings_row(
             language.minimum_contrast_row(),
@@ -4882,6 +5214,26 @@ impl gpui::Render for SettingsWindow {
                             }),
                     ),
             )
+    }
+}
+
+fn blend_rgb(a: u32, b: u32, amount: f32) -> u32 {
+    let channel = |shift: u32| {
+        let a = ((a >> shift) & 0xff) as f32;
+        let b = ((b >> shift) & 0xff) as f32;
+        (a + (b - a) * amount).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
+fn readable_on(color: u32) -> u32 {
+    let red = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = color & 0xff;
+    if (red * 299 + green * 587 + blue * 114) / 1000 < 140 {
+        0xffffff
+    } else {
+        0x171c20
     }
 }
 

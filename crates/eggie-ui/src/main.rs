@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod command_history;
 mod command_palette;
+mod continuous_corners;
 mod gui_ipc;
 mod i18n;
 mod icons;
