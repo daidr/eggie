@@ -1554,22 +1554,24 @@ pub(crate) struct UiColors {
 impl UiColors {
     pub(crate) fn from_theme(theme: &TerminalTheme) -> Self {
         let dark = theme.is_dark();
-        let channels = [
-            ((theme.background >> 16) & 0xff) as f32,
-            ((theme.background >> 8) & 0xff) as f32,
-            (theme.background & 0xff) as f32,
-        ];
-        let chroma = (channels.iter().copied().fold(0., f32::max)
-            - channels.iter().copied().fold(255., f32::min))
-            / 255.;
+        let chroma = rgb_chroma(theme.background);
+        // Near-neutral terminal backgrounds borrow a hue from their own palette.
+        let tint_source = if chroma > 0.025 {
+            theme.background
+        } else {
+            theme.palette[4]
+        };
+        let (hue, saturation, _) = rgb_to_hsl(tint_source);
+        let neutral = if dark { 0x171b20 } else { 0xf4f5f7 };
+        let tinted_neutral = mix(
+            neutral,
+            hsl_to_rgb(hue, if dark { 0.26 } else { 0.25 }, if dark { 0.12 } else { 0.95 }),
+            0.4 * (saturation / 0.2).clamp(0., 1.),
+        );
         let background = mix(
-            if dark { 0x171b20 } else { 0xf4f5f7 },
+            tinted_neutral,
             theme.background,
-            if dark {
-                0.12 + 0.27 * chroma
-            } else {
-                0.12 + 0.22 * chroma
-            },
+            if dark { 0.43 } else { 0.48 },
         );
         let (panel, panel_alt, hover, border, text, muted) = if dark {
             (
@@ -1582,7 +1584,7 @@ impl UiColors {
             )
         } else {
             (
-                mix(background, 0xffffff, 0.64),
+                mix(background, 0xffffff, 0.5),
                 mix(background, 0x000000, 0.04),
                 mix(background, 0x000000, 0.08),
                 mix(background, 0x000000, 0.15),
@@ -1672,6 +1674,17 @@ fn rgb_to_hsl(color: u32) -> (f32, f32, f32) {
     (hue, saturation, lightness)
 }
 
+fn rgb_chroma(color: u32) -> f32 {
+    let channels = [
+        ((color >> 16) & 0xff) as f32,
+        ((color >> 8) & 0xff) as f32,
+        (color & 0xff) as f32,
+    ];
+    (channels.iter().copied().fold(0., f32::max)
+        - channels.iter().copied().fold(255., f32::min))
+        / 255.
+}
+
 fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> u32 {
     let chroma = (1. - (2. * lightness - 1.).abs()) * saturation;
     let segment = (hue * 6.).rem_euclid(6.);
@@ -1731,6 +1744,22 @@ main{padding:24px}h2{margin:30px 0 18px;font-size:18px}.grid{display:grid;grid-t
                 .unwrap();
             for theme in themes {
                 let ui = UiColors::from_theme(theme);
+                let (theme_hue, _, _) = rgb_to_hsl(theme.background);
+                let (ui_hue, ui_saturation, _) = rgb_to_hsl(ui.background);
+                let theme_chroma = rgb_chroma(theme.background);
+                if theme_chroma > 0.05 {
+                    let hue_distance = (theme_hue - ui_hue).abs();
+                    if hue_distance.min(1. - hue_distance) > 30. / 360.
+                        || ui_saturation < 0.08
+                    {
+                        failures.push(format!("{}: interface background lost theme hue", theme.name));
+                    }
+                } else if theme_chroma < 0.025
+                    && rgb_chroma(theme.palette[4]) < 0.025
+                    && rgb_chroma(ui.background) > 0.06
+                {
+                    failures.push(format!("{}: neutral theme gained an unrelated hue", theme.name));
+                }
                 let checks = [
                     ("text / background", ui.text, ui.background, 4.5),
                     ("text / panel", ui.text, ui.panel, 4.5),

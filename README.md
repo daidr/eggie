@@ -42,10 +42,10 @@ terminal font, font size, minimum contrast, and horizontal/vertical terminal
 padding are persisted in `~/Library/Application Support/Eggie/settings.json`.
 Every change is shown in the fixed preview and applied live to every Eggie window.
 
-The interface palette keeps each terminal theme's hue while deriving separate
-background, surface, hover, border, text, and accent colors. Terminal colors are
-never rewritten. To preview every bundled theme side by side and check UI text,
-muted text, accent, and button contrast, run:
+The interface palette carries each terminal theme's hue into its surfaces while
+deriving separate background, surface, hover, border, text, and accent colors.
+Terminal colors are never rewritten. To preview every bundled theme side by side
+and check UI text, muted text, accent, button contrast, and hue retention, run:
 
 ```sh
 scripts/theme-palette-audit.sh
