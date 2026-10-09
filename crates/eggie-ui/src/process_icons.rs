@@ -7,9 +7,11 @@ use std::{
 };
 use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
-/// The icon follows the session's foreground process, never the tab title (which users can edit).
+/// Terminal icons follow the session's foreground process, never the editable tab title.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ProcessIcon {
+    /// Blank card for a project with no tabs; never used as a terminal process icon.
+    ProjectPlaceholder,
     Terminal,
     NodeJs,
     Python,
@@ -30,6 +32,7 @@ pub(crate) enum ProcessIcon {
 impl ProcessIcon {
     fn source(self) -> &'static str {
         match self {
+            Self::ProjectPlaceholder => include_str!("../assets/process-icons/project-placeholder.svg"),
             Self::Terminal => include_str!("../assets/process-icons/terminal-mark.svg"),
             Self::NodeJs => include_str!("../assets/process-icons/nodejs.svg"),
             Self::Python => include_str!("../assets/process-icons/python.svg"),
@@ -50,6 +53,7 @@ impl ProcessIcon {
 
     fn foreground(self, dark: bool, in_card: bool) -> u32 {
         match self {
+            Self::ProjectPlaceholder => 0xffffff,
             Self::Terminal if dark && !in_card => 0xe9ecf2,
             Self::Terminal => 0x000000,
             Self::GitDiff | Self::ClaudeCode | Self::File | Self::Browser | Self::Settings => {
@@ -68,8 +72,10 @@ impl ProcessIcon {
         }
     }
 
-    fn background(self) -> u32 {
+    fn background(self, dark: bool) -> u32 {
         match self {
+            Self::ProjectPlaceholder if dark => 0x46504e,
+            Self::ProjectPlaceholder => 0xece8dd,
             Self::Terminal => 0x253030,
             Self::NodeJs => 0xd8edcf,
             Self::Python => 0xe4effb,
@@ -403,7 +409,7 @@ fn card_markup(poses: &[CardPose], dark: bool, card_size: f32, width: f32) -> St
         let art_y = y + 1.15;
         let art_width = card_width - 2.3;
         let art_height = card_size - 2.3;
-        let background = hex(icon.background());
+        let background = hex(icon.background(dark));
         let foreground = hex(icon.foreground(dark, true));
         let artwork = svg_body(icon);
         body.push_str(&format!(
@@ -535,6 +541,7 @@ mod tests {
     fn embedded_icons_render_with_gpui_svg_renderer() {
         let renderer = gpui::SvgRenderer::new(Arc::new(()));
         let icons = [
+            ProcessIcon::ProjectPlaceholder,
             ProcessIcon::Terminal,
             ProcessIcon::NodeJs,
             ProcessIcon::Python,
@@ -557,10 +564,14 @@ mod tests {
                 .render_single_frame(card.bytes(), 1.)
                 .expect("card renders");
         }
-        let stack = card_stack(&icons[..3], false, 21.).unwrap();
+        let stack = card_stack(&icons[1..4], false, 21.).unwrap();
         renderer
             .render_single_frame(stack.bytes(), 1.)
             .expect("stack renders");
+        for dark in [false, true] {
+            let empty = card_stack_frame(&[ProcessIcon::ProjectPlaceholder], dark, 21.).unwrap();
+            assert!(!empty.as_bytes(0).unwrap().is_empty());
+        }
         let moving = card_frame(
             &[
                 CardPose {
