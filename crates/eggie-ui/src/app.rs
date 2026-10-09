@@ -7807,7 +7807,7 @@ impl EggieApp {
         };
         let animating = state.started_at.elapsed() < PROJECT_ICON_TRANSITION;
         let image_width = process_icons::stack_width(PROJECT_MAX_ICON_COUNT, PROJECT_CARD_SIZE);
-        let slot_width = image_width + 12.;
+        let slot_width = image_width + 16.;
         let card_height = PROJECT_CARD_SIZE + 5.;
         if !animating {
             let icons = state.icons.iter().map(|card| card.icon).collect::<Vec<_>>();
@@ -7943,7 +7943,6 @@ impl EggieApp {
                     .overflow_hidden()
                     .gap_0()
                     .mx_3()
-                    .pl_1()
                     .pr_2()
                     .py_1()
                     .rounded_md()
