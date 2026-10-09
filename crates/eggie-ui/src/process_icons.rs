@@ -5,6 +5,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex, OnceLock},
 };
+use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
 /// The icon follows the session's foreground process, never the tab title (which users can edit).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -49,12 +50,11 @@ impl ProcessIcon {
 
     fn foreground(self, dark: bool, in_card: bool) -> u32 {
         match self {
-            Self::Terminal
-            | Self::GitDiff
-            | Self::ClaudeCode
-            | Self::File
-            | Self::Browser
-            | Self::Settings => 0xffffff,
+            Self::Terminal if dark && !in_card => 0xe9ecf2,
+            Self::Terminal => 0x000000,
+            Self::GitDiff | Self::ClaudeCode | Self::File | Self::Browser | Self::Settings => {
+                0xffffff
+            }
             Self::NodeJs => 0x3c873a,
             Self::Python => 0x3776ab,
             Self::Git => 0xf05032,
@@ -204,12 +204,22 @@ pub(crate) fn bare_icon(icon: ProcessIcon, dark: bool) -> Arc<Image> {
     static CACHE: OnceLock<Mutex<HashMap<(ProcessIcon, bool), Arc<Image>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().expect("process icon cache poisoned");
-    cache.entry((icon, dark)).or_insert_with(|| {
-        svg_image(format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"{}\">{}</svg>",
-            hex(icon.foreground(dark, false)), svg_body(icon),
-        ))
-    }).clone()
+    cache
+        .entry((icon, dark))
+        .or_insert_with(|| {
+            let color = hex(icon.foreground(dark, false));
+            let artwork = svg_body(icon);
+            if icon == ProcessIcon::Terminal {
+                svg_image(format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"{color}\">{artwork}</svg>",
+                ))
+            } else {
+                svg_image(format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"{color}\">{artwork}</svg>",
+                ))
+            }
+        })
+        .clone()
 }
 
 pub(crate) fn stack_width(count: usize, card_size: f32) -> f32 {
@@ -218,6 +228,27 @@ pub(crate) fn stack_width(count: usize, card_size: f32) -> f32 {
     } else {
         card_size * 1.28 + 4. + (count.min(3) - 1) as f32 * 5.
     }
+}
+
+pub(crate) fn stack_angle(index: usize, count: usize) -> f32 {
+    if count == 1 {
+        0.
+    } else {
+        match index {
+            0 => -7.,
+            1 if count == 2 => 7.,
+            1 => 2.,
+            _ => 9.,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CardPose {
+    pub icon: ProcessIcon,
+    pub offset_x: f32,
+    pub angle: f32,
+    pub opacity: f32,
 }
 
 /// One card for a sidebar tab, or up to three cards for a project's icon group.
@@ -232,38 +263,168 @@ pub(crate) fn card_stack(icons: &[ProcessIcon], dark: bool, card_size: f32) -> O
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().expect("process card cache poisoned");
-    Some(cache.entry(key).or_insert_with(|| {
-        let width = stack_width(icons.len(), card_size);
-        let height = card_size + 5.;
-        let card_width = card_size * 1.28;
-        let mut body = String::new();
-        for index in (0..icons.len()).rev() {
-            let icon = icons[index];
-            let x = 2. + index as f32 * 5.;
-            let y = 2.;
-            let angle = if icons.len() == 1 {
-                0.
-            } else {
-                match index {
-                    0 => -7.,
-                    1 if icons.len() == 2 => 7.,
-                    1 => 2.,
-                    _ => 9.,
-                }
-            };
-            let radius = (card_size * 0.28).min(6.);
-            let glyph_size = card_size * 0.78;
-            let glyph_x = x + (card_width - glyph_size) / 2.;
-            let glyph_y = y + (card_size - glyph_size) / 2.;
-            let art_x = x + 1.15;
-            let art_y = y + 1.15;
-            let art_width = card_width - 2.3;
-            let art_height = card_size - 2.3;
-            let background = hex(icon.background());
-            let foreground = hex(icon.foreground(dark, true));
-            let artwork = card_body(icon);
-            body.push_str(&format!(
-                r##"<g transform="rotate({angle} {center_x} {center_y})">
+    Some(
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                let poses = (0..icons.len())
+                    .rev()
+                    .map(|index| CardPose {
+                        icon: icons[index],
+                        offset_x: index as f32 * 5.,
+                        angle: stack_angle(index, icons.len()),
+                        opacity: 1.,
+                    })
+                    .collect::<Vec<_>>();
+                svg_image(card_markup(
+                    &poses,
+                    dark,
+                    card_size,
+                    stack_width(icons.len(), card_size),
+                ))
+            })
+            .clone(),
+    )
+}
+
+/// Compose cached card artwork as the cards move; this keeps SVG parsing off the animation path.
+pub(crate) fn card_frame(
+    poses: &[CardPose],
+    dark: bool,
+    card_size: f32,
+    width: f32,
+) -> Arc<gpui::RenderImage> {
+    let pixel_width = (width * 2.).ceil().max(1.) as u32;
+    let pixel_height = ((card_size + 5.) * 2.).ceil() as u32;
+    let mut frame = Pixmap::new(pixel_width, pixel_height).expect("process card canvas");
+    let center_x = (2. + card_size * 1.28 / 2.) * 2.;
+    let center_y = (2. + card_size / 2.) * 2.;
+    for pose in poses {
+        if pose.opacity <= 0. {
+            continue;
+        }
+        let tile = card_tile(pose.icon, dark, card_size);
+        let transform = Transform::from_translate(pose.offset_x * 2., 0.)
+            .pre_rotate_at(pose.angle, center_x, center_y);
+        frame.draw_pixmap(
+            0,
+            0,
+            tile.as_ref().as_ref(),
+            &PixmapPaint {
+                opacity: pose.opacity,
+                quality: FilterQuality::Bilinear,
+                ..PixmapPaint::default()
+            },
+            transform,
+            None,
+        );
+    }
+    let mut pixels = frame.take();
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::ImageBuffer::from_raw(pixel_width, pixel_height, pixels)
+        .expect("process card pixels");
+    Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
+pub(crate) fn card_stack_frame(
+    icons: &[ProcessIcon],
+    dark: bool,
+    card_size: f32,
+) -> Option<Arc<gpui::RenderImage>> {
+    if icons.is_empty() {
+        return None;
+    }
+    let icons = &icons[..icons.len().min(3)];
+    let key = (icons.to_vec(), dark, card_size.to_bits());
+    static CACHE: OnceLock<Mutex<HashMap<(Vec<ProcessIcon>, bool, u32), Arc<gpui::RenderImage>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("process stack frame cache poisoned");
+    Some(
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                let poses = (0..icons.len())
+                    .rev()
+                    .map(|index| CardPose {
+                        icon: icons[index],
+                        offset_x: index as f32 * 5.,
+                        angle: stack_angle(index, icons.len()),
+                        opacity: 1.,
+                    })
+                    .collect::<Vec<_>>();
+                card_frame(&poses, dark, card_size, stack_width(icons.len(), card_size))
+            })
+            .clone(),
+    )
+}
+
+fn card_tile(icon: ProcessIcon, dark: bool, card_size: f32) -> Arc<Pixmap> {
+    let key = (icon, dark, card_size.to_bits());
+    static CACHE: OnceLock<Mutex<HashMap<(ProcessIcon, bool, u32), Arc<Pixmap>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("process card tile cache poisoned");
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            static RENDERER: OnceLock<gpui::SvgRenderer> = OnceLock::new();
+            let renderer = RENDERER.get_or_init(|| gpui::SvgRenderer::new(Arc::new(())));
+            let markup = card_markup(
+                &[CardPose {
+                    icon,
+                    offset_x: 0.,
+                    angle: 0.,
+                    opacity: 1.,
+                }],
+                dark,
+                card_size,
+                stack_width(1, card_size),
+            );
+            let image = renderer
+                .render_single_frame(markup.as_bytes(), 1.)
+                .expect("embedded process card renders");
+            let size = image.size(0);
+            let mut pixels = image.as_bytes(0).expect("process card pixels").to_vec();
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            Arc::new(
+                Pixmap::from_vec(
+                    pixels,
+                    IntSize::from_wh(size.width.0 as u32, size.height.0 as u32)
+                        .expect("process card dimensions"),
+                )
+                .expect("process card pixmap"),
+            )
+        })
+        .clone()
+}
+
+fn card_markup(poses: &[CardPose], dark: bool, card_size: f32, width: f32) -> String {
+    let height = card_size + 5.;
+    let card_width = card_size * 1.28;
+    let mut body = String::new();
+    for pose in poses {
+        let icon = pose.icon;
+        let x = 2. + pose.offset_x;
+        let y = 2.;
+        let angle = pose.angle;
+        let opacity = pose.opacity;
+        let radius = (card_size * 0.28).min(6.);
+        let glyph_size = card_size * 0.78;
+        let glyph_x = x + (card_width - glyph_size) / 2.;
+        let glyph_y = y + (card_size - glyph_size) / 2.;
+        let art_x = x + 1.15;
+        let art_y = y + 1.15;
+        let art_width = card_width - 2.3;
+        let art_height = card_size - 2.3;
+        let background = hex(icon.background());
+        let foreground = hex(icon.foreground(dark, true));
+        let artwork = card_body(icon);
+        body.push_str(&format!(
+                r##"<g opacity="{opacity}" transform="rotate({angle} {center_x} {center_y})">
   <rect x="{x}" y="{shadow_y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#111820" fill-opacity=".16" filter="url(#softShadow)"/>
   <rect x="{x}" y="{y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#172025" fill-opacity=".32" filter="url(#edgeShadow)"/>
   <rect x="{x}" y="{y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#FFFFFF"/>
@@ -278,9 +439,9 @@ pub(crate) fn card_stack(icons: &[ProcessIcon], dark: bool, card_size: f32) -> O
                 shadow_y = y + 1.5,
                 art_radius = radius - 1.15,
             ));
-        }
-        svg_image(format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+    }
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
 <defs>
   <radialGradient id="spotlight" cx="50%" cy="-10%" r="85%">
     <stop offset="0" stop-color="#FFFFFF" stop-opacity=".32"/>
@@ -298,8 +459,7 @@ pub(crate) fn card_stack(icons: &[ProcessIcon], dark: bool, card_size: f32) -> O
 </defs>
 {body}
 </svg>"##
-        ))
-    }).clone())
+    )
 }
 
 #[cfg(test)]
@@ -377,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn tabbar_terminal_icon_is_only_a_prompt() {
+        let light = bare_icon(ProcessIcon::Terminal, false);
+        let light = std::str::from_utf8(light.bytes()).unwrap();
+        assert!(light.contains("stroke=\"#000000\""));
+        assert!(!light.contains("<rect"));
+        let dark = bare_icon(ProcessIcon::Terminal, true);
+        let dark = std::str::from_utf8(dark.bytes()).unwrap();
+        assert!(dark.contains("stroke=\"#E9ECF2\""));
+        assert!(!dark.contains("<rect"));
+    }
+
+    #[test]
     fn embedded_icons_render_with_gpui_svg_renderer() {
         let renderer = gpui::SvgRenderer::new(Arc::new(()));
         let icons = [
@@ -410,5 +582,25 @@ mod tests {
         renderer
             .render_single_frame(stack.bytes(), 1.)
             .expect("stack renders");
+        let moving = card_frame(
+            &[
+                CardPose {
+                    icon: ProcessIcon::BunJs,
+                    offset_x: 2.5,
+                    angle: 3.5,
+                    opacity: 0.5,
+                },
+                CardPose {
+                    icon: ProcessIcon::Terminal,
+                    offset_x: 0.,
+                    angle: -3.5,
+                    opacity: 1.,
+                },
+            ],
+            false,
+            21.,
+            stack_width(2, 21.),
+        );
+        assert!(!moving.as_bytes(0).unwrap().is_empty());
     }
 }
