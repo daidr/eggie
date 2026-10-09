@@ -62,7 +62,7 @@ actions!(
 const CARET_BLINK_PERIOD: f32 = 1.06;
 
 /// Colors for a [`TextInput`]. RGBA values are packed as `(rgb << 8) | alpha`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TextInputStyle {
     pub(crate) text_color: u32,
     pub(crate) placeholder_color: u32,
@@ -232,6 +232,13 @@ impl TextInput {
     /// Attach the parent scroll handle so edge-drag auto-scroll works (multi-line editors).
     pub(crate) fn set_scroll_handle(&mut self, handle: ScrollHandle) {
         self.scroll_handle = Some(handle);
+    }
+
+    pub(crate) fn set_style(&mut self, style: TextInputStyle, cx: &mut Context<Self>) {
+        if self.style != style {
+            self.style = style;
+            cx.notify();
+        }
     }
 
     /// Enable multi-line editing. Builder-style so existing single-line call sites

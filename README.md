@@ -42,6 +42,18 @@ terminal font, font size, minimum contrast, and horizontal/vertical terminal
 padding are persisted in `~/Library/Application Support/Eggie/settings.json`.
 Every change is shown in the fixed preview and applied live to every Eggie window.
 
+The interface palette keeps each terminal theme's hue while deriving separate
+background, surface, hover, border, text, and accent colors. Terminal colors are
+never rewritten. To preview every bundled theme side by side and check UI text,
+muted text, accent, and button contrast, run:
+
+```sh
+scripts/theme-palette-audit.sh
+```
+
+The generated preview is `target/theme-palette-audit.html`. Its search field
+filters themes by name.
+
 To measure interactive terminal latency, launch with
 `EGGIE_INPUT_LATENCY=1 cargo run -p eggie-ui`. Eggie reports rolling p50/p95
 timings for input-to-snapshot, snapshot-to-Metal, terminal preparation, Metal
