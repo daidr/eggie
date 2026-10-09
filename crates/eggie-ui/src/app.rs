@@ -102,7 +102,6 @@ const TAB_BADGE_SIZE: f32 = 6.;
 const TAB_DROP_INDICATOR_WIDTH: f32 = 2.;
 const TAB_DROP_INDICATOR_OFFSET: f32 = (TAB_GAP + TAB_DROP_INDICATOR_WIDTH) / 2.;
 const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 28.;
-const ITEM_ICON_SLOT_SIZE: f32 = 16.;
 const SIDEBAR_CARD_SIZE: f32 = 18.;
 const PROJECT_CARD_SIZE: f32 = 21.;
 const PROJECT_ICON_TRANSITION: Duration = Duration::from_millis(340);
@@ -568,10 +567,15 @@ impl DraggedTab {
             // Semi-transparent so the drop target and tabs underneath the cursor stay visible while
             // dragging.
             .opacity(0.7)
-            .child(img(process_icons::bare_icon(self.icon, self.dark))
-                .flex_none()
-                .w(px(ITEM_ICON_SLOT_SIZE))
-                .h(px(ITEM_ICON_SLOT_SIZE)))
+            .child(
+                img(
+                    process_icons::card_stack(&[self.icon], self.dark, SIDEBAR_CARD_SIZE)
+                        .expect("single process card"),
+                )
+                    .flex_none()
+                    .w(px(process_icons::stack_width(1, SIDEBAR_CARD_SIZE)))
+                    .h(px(SIDEBAR_CARD_SIZE + 5.)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -2664,7 +2668,6 @@ impl EggieApp {
         kind: ItemKind,
         session_id: Option<SessionId>,
         element_id: String,
-        sidebar: bool,
     ) -> AnyElement {
         let icon_kind = self.icon_for_item(kind, session_id);
         let transition = session_id.and_then(|id| {
@@ -2688,24 +2691,12 @@ impl EggieApp {
             }
         });
         let image_for = |icon| {
-            if sidebar {
-                process_icons::card_stack(&[icon], self.use_dark, SIDEBAR_CARD_SIZE)
-                    .expect("single process card")
-            } else {
-                process_icons::bare_icon(icon, self.use_dark)
-            }
+            process_icons::card_stack(&[icon], self.use_dark, SIDEBAR_CARD_SIZE)
+                .expect("single process card")
         };
         let image = image_for(icon_kind);
-        let width = if sidebar {
-            process_icons::stack_width(1, SIDEBAR_CARD_SIZE)
-        } else {
-            ITEM_ICON_SLOT_SIZE
-        };
-        let height = if sidebar {
-            SIDEBAR_CARD_SIZE + 5.
-        } else {
-            ITEM_ICON_SLOT_SIZE
-        };
+        let width = process_icons::stack_width(1, SIDEBAR_CARD_SIZE);
+        let height = SIDEBAR_CARD_SIZE + 5.;
         let content: AnyElement = if let Some((id, state)) = transition {
             let previous = state.previous.map(image_for);
             div()
@@ -2713,7 +2704,7 @@ impl EggieApp {
                 .w(px(width))
                 .h(px(height))
                 .with_animation(
-                    format!("tab-icon-{id}-{sidebar}-{}", state.revision),
+                    format!("tab-icon-{id}-{element_id}-{}", state.revision),
                     Animation::new(Duration::from_millis(220)).with_easing(gpui::ease_in_out),
                     move |mut element, progress| {
                         if let Some(previous) = &previous {
@@ -2793,7 +2784,7 @@ impl EggieApp {
                 .absolute()
                 .right_0()
                 .bottom_0()
-                .size(px(if sidebar { 10. } else { 9. })),
+                .size(px(10.)),
             )
             .into_any_element()
     }
@@ -7882,7 +7873,6 @@ impl EggieApp {
                                 ItemKind::Terminal,
                                 Some(session_id),
                                 format!("sidebar-progress-{session_id}"),
-                                true,
                             ))
                             .child(
                                 div()
@@ -8116,7 +8106,6 @@ impl EggieApp {
                         item.kind,
                         item.session_id,
                         format!("tab-progress-{item_id}"),
-                        false,
                     ))
                     .when_some(
                         self.tab_profile_badge(item, cx),

@@ -30,7 +30,7 @@ pub(crate) enum ProcessIcon {
 impl ProcessIcon {
     fn source(self) -> &'static str {
         match self {
-            Self::Terminal => include_str!("../assets/process-icons/terminal.svg"),
+            Self::Terminal => include_str!("../assets/process-icons/terminal-mark.svg"),
             Self::NodeJs => include_str!("../assets/process-icons/nodejs.svg"),
             Self::Python => include_str!("../assets/process-icons/python.svg"),
             Self::Git => include_str!("../assets/process-icons/git.svg"),
@@ -183,43 +183,12 @@ fn svg_inner(source: &'static str) -> &'static str {
     &source[start..end]
 }
 
-fn card_body(icon: ProcessIcon) -> &'static str {
-    if icon == ProcessIcon::Terminal {
-        svg_inner(include_str!("../assets/process-icons/terminal-mark.svg"))
-    } else {
-        svg_body(icon)
-    }
-}
-
 fn hex(color: u32) -> String {
     format!("#{color:06X}")
 }
 
 fn svg_image(markup: String) -> Arc<Image> {
     Arc::new(Image::from_bytes(ImageFormat::Svg, markup.into_bytes()))
-}
-
-/// A bare glyph for the main tab strip; there is no tile or backdrop here.
-pub(crate) fn bare_icon(icon: ProcessIcon, dark: bool) -> Arc<Image> {
-    static CACHE: OnceLock<Mutex<HashMap<(ProcessIcon, bool), Arc<Image>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().expect("process icon cache poisoned");
-    cache
-        .entry((icon, dark))
-        .or_insert_with(|| {
-            let color = hex(icon.foreground(dark, false));
-            let artwork = svg_body(icon);
-            if icon == ProcessIcon::Terminal {
-                svg_image(format!(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"{color}\">{artwork}</svg>",
-                ))
-            } else {
-                svg_image(format!(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"{color}\">{artwork}</svg>",
-                ))
-            }
-        })
-        .clone()
 }
 
 pub(crate) fn stack_width(count: usize, card_size: f32) -> f32 {
@@ -422,7 +391,7 @@ fn card_markup(poses: &[CardPose], dark: bool, card_size: f32, width: f32) -> St
         let art_height = card_size - 2.3;
         let background = hex(icon.background());
         let foreground = hex(icon.foreground(dark, true));
-        let artwork = card_body(icon);
+        let artwork = svg_body(icon);
         body.push_str(&format!(
                 r##"<g opacity="{opacity}" transform="rotate({angle} {center_x} {center_y})">
   <rect x="{x}" y="{shadow_y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#111820" fill-opacity=".16" filter="url(#softShadow)"/>
@@ -537,18 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn tabbar_terminal_icon_is_only_a_prompt() {
-        let light = bare_icon(ProcessIcon::Terminal, false);
-        let light = std::str::from_utf8(light.bytes()).unwrap();
-        assert!(light.contains("stroke=\"#000000\""));
-        assert!(!light.contains("<rect"));
-        let dark = bare_icon(ProcessIcon::Terminal, true);
-        let dark = std::str::from_utf8(dark.bytes()).unwrap();
-        assert!(dark.contains("stroke=\"#E9ECF2\""));
-        assert!(!dark.contains("<rect"));
-    }
-
-    #[test]
     fn embedded_icons_render_with_gpui_svg_renderer() {
         let renderer = gpui::SvgRenderer::new(Arc::new(()));
         let icons = [
@@ -569,10 +526,6 @@ mod tests {
             ProcessIcon::Settings,
         ];
         for icon in icons {
-            let bare = bare_icon(icon, false);
-            renderer
-                .render_single_frame(bare.bytes(), 1.)
-                .expect("bare icon renders");
             let card = card_stack(&[icon], false, 18.).unwrap();
             renderer
                 .render_single_frame(card.bytes(), 1.)
