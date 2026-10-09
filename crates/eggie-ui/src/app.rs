@@ -105,6 +105,7 @@ const TOP_BAR_ACTION_SLOT_WIDTH: f32 = 28.;
 const ITEM_ICON_SLOT_SIZE: f32 = 16.;
 const SIDEBAR_CARD_SIZE: f32 = 18.;
 const PROJECT_CARD_SIZE: f32 = 21.;
+const PROJECT_ICON_TRANSITION: Duration = Duration::from_millis(340);
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 24.;
 const CONTENT_SPLIT_EDGE_FACTOR: f32 = 0.1;
 const LEFT_SIDEBAR_MIN_WIDTH: f32 = 180.;
@@ -451,12 +452,75 @@ struct PaletteRow {
     badge_color: Option<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProjectIconCard {
+    id: ItemId,
+    icon: ProcessIcon,
+}
+
 #[derive(Clone)]
 struct ProjectIconState {
-    icons: Vec<ProcessIcon>,
-    previous: Vec<ProcessIcon>,
+    icons: Vec<ProjectIconCard>,
+    previous: Vec<ProjectIconCard>,
     revision: u64,
     started_at: Instant,
+}
+
+fn project_card_poses(
+    previous: &[ProjectIconCard],
+    current: &[ProjectIconCard],
+    progress: f32,
+) -> Vec<process_icons::CardPose> {
+    let at = |icon, index, count| process_icons::CardPose {
+        icon,
+        offset_x: index as f32 * 5.,
+        angle: process_icons::stack_angle(index, count),
+        opacity: 1.,
+    };
+    let tween = |from: process_icons::CardPose, to: process_icons::CardPose| {
+        process_icons::CardPose {
+            icon: to.icon,
+            offset_x: from.offset_x + (to.offset_x - from.offset_x) * progress,
+            angle: from.angle + (to.angle - from.angle) * progress,
+            opacity: from.opacity + (to.opacity - from.opacity) * progress,
+        }
+    };
+    let mut poses = Vec::with_capacity(previous.len() + current.len());
+    for (index, card) in previous.iter().enumerate().rev() {
+        let target = current.iter().position(|next| next.id == card.id);
+        if target.is_some_and(|target| current[target].icon == card.icon) {
+            continue;
+        }
+        let from = at(card.icon, index, previous.len());
+        let to = if let Some(target) = target {
+            at(card.icon, target, current.len())
+        } else if current.is_empty() {
+            at(card.icon, 0, 1)
+        } else {
+            at(card.icon, current.len() - 1, current.len())
+        };
+        poses.push(tween(from, process_icons::CardPose { opacity: 0., ..to }));
+    }
+    for (index, card) in current.iter().enumerate().rev() {
+        let target = at(card.icon, index, current.len());
+        let from = if let Some(previous_index) = previous.iter().position(|old| old.id == card.id) {
+            let previous_card = previous[previous_index];
+            let mut from = at(card.icon, previous_index, previous.len());
+            if previous_card.icon != card.icon {
+                from.opacity = 0.;
+            }
+            from
+        } else if previous.is_empty() {
+            process_icons::CardPose { opacity: 0., ..target }
+        } else {
+            process_icons::CardPose {
+                opacity: 0.,
+                ..at(card.icon, previous.len() - 1, previous.len())
+            }
+        };
+        poses.push(tween(from, target));
+    }
+    poses
 }
 
 #[derive(Clone, Copy)]
@@ -7575,7 +7639,10 @@ impl EggieApp {
             .layout
             .items()
             .take(3)
-            .map(|item| self.icon_for_item(item.kind, item.session_id))
+            .map(|item| ProjectIconCard {
+                id: item.id,
+                icon: self.icon_for_item(item.kind, item.session_id),
+            })
             .collect();
         let state = {
             let mut states = self.project_icon_states.borrow_mut();
@@ -7595,11 +7662,10 @@ impl EggieApp {
             }
             state.clone()
         };
-        if state.icons.is_empty() && state.started_at.elapsed() >= Duration::from_millis(300) {
+        let animating = state.started_at.elapsed() < PROJECT_ICON_TRANSITION;
+        if state.icons.is_empty() && !animating {
             return None;
         }
-        let previous = process_icons::card_stack(&state.previous, self.use_dark, PROJECT_CARD_SIZE);
-        let current = process_icons::card_stack(&state.icons, self.use_dark, PROJECT_CARD_SIZE);
         let width = |count| {
             if count == 0 {
                 0.
@@ -7610,6 +7676,18 @@ impl EggieApp {
         let from_width = width(state.previous.len());
         let to_width = width(state.icons.len());
         let card_height = PROJECT_CARD_SIZE + 5.;
+        if !animating {
+            let icons = state.icons.iter().map(|card| card.icon).collect::<Vec<_>>();
+            let image = process_icons::card_stack_frame(&icons, self.use_dark, PROJECT_CARD_SIZE)?;
+            return Some(
+                div()
+                    .flex_none()
+                    .w(px(to_width))
+                    .h(px(card_height))
+                    .child(img(image).w(px(to_width - 8.)).h(px(card_height)))
+                    .into_any_element(),
+            );
+        }
         let from_height = if state.previous.is_empty() {
             0.
         } else {
@@ -7620,39 +7698,34 @@ impl EggieApp {
         } else {
             card_height
         };
+        let image_width = (from_width.max(to_width) - 8.).max(1.);
+        let dark = self.use_dark;
         Some(
             div()
                 .relative()
                 .flex_none()
+                .overflow_hidden()
                 .with_animation(
                     format!("project-icons-{project_id}-{}", state.revision),
-                    Animation::new(Duration::from_millis(300)).with_easing(gpui::ease_in_out),
+                    Animation::new(PROJECT_ICON_TRANSITION).with_easing(gpui::ease_in_out),
                     move |mut element, progress| {
                         element = element.w(px(from_width + (to_width - from_width) * progress));
                         element = element.h(px(from_height + (to_height - from_height) * progress));
-                        if let Some(image) = &previous {
-                            element = element.child(
-                                img(image.clone())
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(from_width - 8.))
-                                    .h(px(card_height))
-                                    .opacity(1. - progress),
-                            );
-                        }
-                        if let Some(image) = &current {
-                            element = element.child(
-                                img(image.clone())
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(to_width - 8.))
-                                    .h(px(card_height))
-                                    .opacity(progress),
-                            );
-                        }
-                        element
+                        let poses = project_card_poses(&state.previous, &state.icons, progress);
+                        let frame = process_icons::card_frame(
+                            &poses,
+                            dark,
+                            PROJECT_CARD_SIZE,
+                            image_width,
+                        );
+                        element.child(
+                            img(frame)
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .w(px(image_width))
+                                .h(px(card_height)),
+                        )
                     },
                 )
                 .into_any_element(),
@@ -10766,6 +10839,31 @@ mod tests {
     use super::*;
     use gpui::{Keystroke, Modifiers};
     use uuid::Uuid;
+
+    #[test]
+    fn adding_and_removing_project_cards_moves_and_rotates_them() {
+        let first = ProjectIconCard {
+            id: Uuid::from_u128(1),
+            icon: ProcessIcon::Terminal,
+        };
+        let second = ProjectIconCard {
+            id: Uuid::from_u128(2),
+            icon: ProcessIcon::BunJs,
+        };
+        let adding = project_card_poses(&[first], &[first, second], 0.5);
+        assert_eq!(adding.len(), 2);
+        assert_eq!(adding[0].icon, ProcessIcon::BunJs);
+        assert_eq!(adding[0].offset_x, 2.5);
+        assert_eq!(adding[0].angle, 3.5);
+        assert_eq!(adding[0].opacity, 0.5);
+        assert_eq!(adding[1].angle, -3.5);
+        let removing = project_card_poses(&[first, second], &[first], 0.5);
+        assert_eq!(removing.len(), 2);
+        assert_eq!(removing[0].offset_x, 2.5);
+        assert_eq!(removing[0].angle, 3.5);
+        assert_eq!(removing[0].opacity, 0.5);
+        assert_eq!(removing[1].angle, -3.5);
+    }
 
     #[test]
     fn scrollbar_thumb_hidden_without_scrollback() {

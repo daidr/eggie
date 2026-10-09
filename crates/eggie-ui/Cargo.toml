@@ -16,6 +16,7 @@ eggie-update.workspace = true
 futures = "0.3"
 gpui.workspace = true
 gpui_platform.workspace = true
+image = { version = "0.25.10", default-features = false }
 libc.workspace = true
 memmap2.workspace = true
 parking_lot.workspace = true
@@ -26,6 +27,7 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
+tiny-skia = "0.11.4"
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true
