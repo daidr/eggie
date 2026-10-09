@@ -96,9 +96,10 @@ const SELECTOR_WIDTH: f32 = 270.;
 const SELECTOR_DROPDOWN_HEIGHT: f32 = 208.;
 const SELECTOR_DROPDOWN_GAP: f32 = 4.;
 const SELECTOR_WINDOW_MARGIN: f32 = 8.;
-const THEME_CARD_WIDTH: f32 = 154.;
-const THEME_CARD_HEIGHT: f32 = 98.;
-const THEME_CARD_RADIUS: f32 = 34.;
+const THEME_CARD_WIDTH: f32 = 166.;
+const THEME_CARD_HEIGHT: f32 = 110.;
+const THEME_CARD_RADIUS: f32 = 40.;
+const THEME_CARD_BASE_INSET: f32 = 6.;
 /// Width of the compact bell-mode dropdown (trigger and popover).
 const BELL_DROPDOWN_WIDTH: f32 = 180.;
 const BELL_DROPDOWN_ROW_HEIGHT: f32 = 30.;
@@ -4321,29 +4322,21 @@ impl SettingsWindow {
                                         THEME_CARD_RADIUS,
                                         colors.panel,
                                     );
-                                    paint_continuous_rect(
-                                        window,
-                                        bounds,
-                                        5.,
-                                        THEME_CARD_RADIUS,
-                                        card_fill,
-                                    );
-                                } else {
-                                    paint_continuous_rect(
-                                        window,
-                                        bounds,
-                                        0.,
-                                        THEME_CARD_RADIUS,
-                                        card_edge,
-                                    );
-                                    paint_continuous_rect(
-                                        window,
-                                        bounds,
-                                        1.,
-                                        THEME_CARD_RADIUS,
-                                        card_fill,
-                                    );
                                 }
+                                paint_continuous_rect(
+                                    window,
+                                    bounds,
+                                    THEME_CARD_BASE_INSET,
+                                    THEME_CARD_RADIUS,
+                                    card_edge,
+                                );
+                                paint_continuous_rect(
+                                    window,
+                                    bounds,
+                                    THEME_CARD_BASE_INSET + 1.,
+                                    THEME_CARD_RADIUS,
+                                    card_fill,
+                                );
                             },
                         )
                         .absolute()
@@ -4355,10 +4348,10 @@ impl SettingsWindow {
                             .flex_col()
                             .justify_between()
                             .absolute()
-                            .top(px(11.))
-                            .bottom(px(11.))
-                            .left(px(12.))
-                            .right(px(12.))
+                            .top(px(THEME_CARD_BASE_INSET + 11.))
+                            .bottom(px(THEME_CARD_BASE_INSET + 11.))
+                            .left(px(THEME_CARD_BASE_INSET + 8.))
+                            .right(px(THEME_CARD_BASE_INSET + 8.))
                             .child(
                                 div()
                                     .flex()
@@ -4410,16 +4403,18 @@ impl SettingsWindow {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .children(theme.palette[..9].iter().enumerate().map(|(index, color)| {
-                                        div()
-                                            .flex_none()
-                                            .size(px(15.))
-                                            .rounded_full()
-                                            .border_1()
-                                            .border_color(rgb(card_fill))
-                                            .bg(rgb(*color))
-                                            .when(index > 0, |element| element.ml(px(-2.)))
-                                    })),
+                                    .children(
+                                        theme.palette[..8].iter().enumerate().map(|(index, color)| {
+                                            div()
+                                                .flex_none()
+                                                .size(px(21.))
+                                                .rounded_full()
+                                                .border_1()
+                                                .border_color(rgb(card_fill))
+                                                .bg(rgb(*color))
+                                                .when(index > 0, |element| element.ml(px(-5.)))
+                                        }),
+                                    ),
                             ),
                     ),
             )
