@@ -44,7 +44,8 @@ use eggie_protocol::{
     TerminalImageDescriptor,
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
     TerminalMouseTracking, TerminalOscEventPayload, TerminalProgress,
-    TerminalProgramState, TerminalProgressState, TerminalProgressTimeouts, TerminalProgressUpdate, TerminalScrollCommand,
+    TerminalProgramState, TerminalProgramStatus, TerminalProgressState, TerminalProgressTimeouts,
+    TerminalProgressUpdate, TerminalScrollCommand,
     TerminalScrollDelta, TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit,
     TerminalSearchDirection,
     TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind,
@@ -121,6 +122,41 @@ fn program_state_label(state: TerminalProgramState, language: Language) -> &'sta
         (TerminalProgramState::Done, Language::SimplifiedChinese) => "已完成",
         (TerminalProgramState::Blocked, Language::SimplifiedChinese) => "等待操作",
         (TerminalProgramState::Error, Language::SimplifiedChinese) => "出错",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IconIndicator {
+    Working(Option<u8>),
+    Attention(TerminalProgramState),
+    Progress(TerminalProgress),
+}
+
+impl IconIndicator {
+    fn is_animated(self) -> bool {
+        matches!(
+            self,
+            Self::Working(None)
+                | Self::Progress(TerminalProgress {
+                    state: TerminalProgressState::Indeterminate,
+                    ..
+                })
+        )
+    }
+}
+
+fn icon_indicator(
+    status: Option<&TerminalProgramStatus>,
+    progress: Option<TerminalProgress>,
+) -> Option<IconIndicator> {
+    match status {
+        Some(status) if status.state == TerminalProgramState::Working => {
+            Some(IconIndicator::Working(status.progress))
+        }
+        Some(status) if status.state != TerminalProgramState::Idle => {
+            Some(IconIndicator::Attention(status.state))
+        }
+        _ => progress.map(IconIndicator::Progress),
     }
 }
 const CONTENT_SPLIT_EDGE_FACTOR: f32 = 0.1;
@@ -648,29 +684,7 @@ struct TerminalContainerBorders {
     bottom: bool,
 }
 
-struct ProgressTooltip {
-    text: SharedString,
-    colors: UiColors,
-}
-
-impl gpui::Render for ProgressTooltip {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(self.colors.border))
-            .bg(rgb(self.colors.panel_alt))
-            .text_color(rgb(self.colors.text))
-            .text_size(px(11.))
-            .shadow_md()
-            .child(self.text.clone())
-    }
-}
-
-/// A reusable single-line text tooltip. Shares [`ProgressTooltip`]'s styling but is generic over any
-/// label, so buttons can attach a hover hint with [`tooltip_text`].
+/// A reusable single-line text tooltip for controls and icon indicators.
 struct TextTooltip {
     text: SharedString,
     colors: UiColors,
@@ -2551,25 +2565,27 @@ impl EggieApp {
         window.refresh();
     }
 
+    fn has_animated_icon_indicator(&self) -> bool {
+        self.sessions.iter().any(|session| {
+            icon_indicator(
+                session.program_status.as_ref(),
+                self.progress_updates
+                    .get(&session.id)
+                    .and_then(|update| update.progress),
+            )
+            .is_some_and(IconIndicator::is_animated)
+        })
+    }
+
     fn ensure_progress_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let has_indeterminate = self.progress_updates.values().any(|update| {
-            update
-                .progress
-                .is_some_and(|progress| progress.state == TerminalProgressState::Indeterminate)
-        });
-        if !has_indeterminate || self.progress_animation_scheduled {
+        if !self.has_animated_icon_indicator() || self.progress_animation_scheduled {
             return;
         }
 
         self.progress_animation_scheduled = true;
         cx.on_next_frame(window, |app, window, cx| {
             app.progress_animation_scheduled = false;
-            let has_indeterminate = app.progress_updates.values().any(|update| {
-                update
-                    .progress
-                    .is_some_and(|progress| progress.state == TerminalProgressState::Indeterminate)
-            });
-            if has_indeterminate {
+            if app.has_animated_icon_indicator() {
                 cx.notify();
                 app.ensure_progress_animation(window, cx);
             }
@@ -2777,6 +2793,13 @@ impl EggieApp {
         } else {
             img(image).w(px(width)).h(px(height)).into_any_element()
         };
+        let program_status = session_id
+            .and_then(|id| self.sessions.iter().find(|session| session.id == id))
+            .and_then(|session| session.program_status.as_ref());
+        let progress = session_id
+            .and_then(|id| self.progress_updates.get(&id))
+            .and_then(|update| update.progress);
+        let indicator = icon_indicator(program_status, progress);
         let base = div()
             .flex()
             .flex_none()
@@ -2786,51 +2809,126 @@ impl EggieApp {
             .w(px(width))
             .h(px(height))
             .child(content);
-        let Some(progress) = session_id
-            .and_then(|session_id| self.progress_updates.get(&session_id))
-            .and_then(|update| update.progress)
-        else {
+        let Some(indicator) = indicator else {
             return base.into_any_element();
         };
-
-        let colors = self.colors;
-        // The ring is chrome (it sits in the tab strip and the sidebar), so its semantic red/yellow
-        // come from the *interface* theme's palette — the same source `colors` is derived from. Reading
-        // the terminal theme here would tint the sidebar with a profile-independent terminal palette
-        // the surrounding chrome knows nothing about.
-        let color = match progress.state {
-            TerminalProgressState::Error => self.interface_theme.palette[1],
-            TerminalProgressState::Paused => self.interface_theme.palette[3],
-            TerminalProgressState::Normal | TerminalProgressState::Indeterminate => colors.accent,
+        let label = match indicator {
+            IconIndicator::Working(percent) => {
+                let mut label =
+                    program_state_label(TerminalProgramState::Working, self.language).to_owned();
+                if let Some(percent) = percent {
+                    label.push_str(&format!(" · {percent}%"));
+                }
+                label
+            }
+            IconIndicator::Attention(state) => {
+                program_state_label(state, self.language).to_owned()
+            }
+            IconIndicator::Progress(progress) => progress_label(progress, self.language),
         };
-        let phase = (self.progress_animation_epoch.elapsed().as_secs_f32() * 0.8).fract();
-        let language = self.language;
-        let accessibility_label: SharedString = progress_label(progress, language).into();
-        let tooltip_progress = progress;
-        base
-            .id(element_id)
+        let base = base
+            .id(element_id.clone())
             .role(Role::Image)
-            .aria_label(accessibility_label)
-            .tooltip(move |_, cx| {
-                cx.new(|_| ProgressTooltip {
-                    text: progress_label(tooltip_progress, language).into(),
-                    colors,
-                })
-                .into()
-            })
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, _| {
-                        paint_progress_ring(bounds, progress, phase, color, colors.border, window)
-                    },
+            .aria_label(SharedString::from(label.clone()))
+            .tooltip({
+                let colors = self.colors;
+                let language = self.language;
+                move |_, cx| {
+                    let text = match indicator {
+                        IconIndicator::Progress(progress) => progress_label(progress, language),
+                        _ => label.clone(),
+                    };
+                    cx.new(|_| TextTooltip {
+                        text: text.into(),
+                        colors,
+                    })
+                    .into()
+                }
+            });
+
+        let ring = match indicator {
+            IconIndicator::Working(percent) => Some((
+                if percent.is_some() {
+                    TerminalProgressState::Normal
+                } else {
+                    TerminalProgressState::Indeterminate
+                },
+                percent,
+                0x74aaf4,
+            )),
+            IconIndicator::Progress(progress) => Some((
+                progress.state,
+                progress.percent,
+                match progress.state {
+                    TerminalProgressState::Error => self.interface_theme.palette[1],
+                    TerminalProgressState::Paused => self.interface_theme.palette[3],
+                    TerminalProgressState::Normal | TerminalProgressState::Indeterminate => {
+                        self.colors.accent
+                    }
+                },
+            )),
+            IconIndicator::Attention(_) => None,
+        };
+        if let Some((state, percent, color)) = ring {
+            let phase = (self.progress_animation_epoch.elapsed().as_secs_f32() * 0.8).fract();
+            let track_color = self.colors.border;
+            return base
+                .child(
+                    div()
+                        .id(format!("{element_id}-indicator"))
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(12.))
+                        .rounded_full()
+                        .bg(rgb(self.colors.panel))
+                        .shadow_sm()
+                        .child(
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    paint_indicator_ring(
+                                        bounds,
+                                        state,
+                                        percent,
+                                        phase,
+                                        color,
+                                        track_color,
+                                        window,
+                                    )
+                                },
+                            )
+                            .size(px(10.)),
+                        ),
                 )
+                .into_any_element();
+        }
+
+        let IconIndicator::Attention(state) = indicator else {
+            return base.into_any_element();
+        };
+        let color = if state == TerminalProgramState::Error {
+            0xe98279
+        } else {
+            0x83b5f5
+        };
+        base.child(
+            div()
+                .id(format!("{element_id}-indicator"))
                 .absolute()
+                .top_0()
                 .right_0()
-                .bottom_0()
-                .size(px(10.)),
-            )
-            .into_any_element()
+                .size(px(9.))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(self.colors.panel))
+                .bg(rgb(color))
+                .shadow_sm(),
+        )
+        .into_any_element()
     }
 
     fn schedule_terminal_images(&mut self, snapshot: &TerminalSnapshot, cx: &mut Context<Self>) {
@@ -3187,9 +3285,10 @@ impl EggieApp {
                 let result = executor
                     .spawn(async move { request_client.request(ClientRequest::ListSessions) })
                     .await;
-                let update = this.update_in(cx, |app, _window, cx| match result {
+                let update = this.update_in(cx, |app, window, cx| match result {
                     Ok(DaemonResponse::Sessions { sessions }) => {
                         app.apply_session_list(sessions, cx);
+                        app.ensure_progress_animation(window, cx);
                     }
                     Ok(response) => eprintln!("unexpected sessions response: {response:?}"),
                     Err(error) => eprintln!("session polling failed: {error:#}"),
@@ -10050,9 +10149,10 @@ fn progress_label(progress: TerminalProgress, language: Language) -> String {
     format!("{status}{percent} · {recency}")
 }
 
-fn paint_progress_ring(
+fn paint_indicator_ring(
     bounds: Bounds<Pixels>,
-    progress: TerminalProgress,
+    state: TerminalProgressState,
+    percent: Option<u8>,
     phase: f32,
     color: u32,
     track_color: u32,
@@ -10075,9 +10175,9 @@ fn paint_progress_ring(
         window.paint_path(path, rgb(track_color));
     }
 
-    let (start_turn, fraction) = match progress.state {
+    let (start_turn, fraction) = match state {
         TerminalProgressState::Indeterminate => (phase, 0.28),
-        _ => (0., f32::from(progress.percent.unwrap_or(100)) / 100.),
+        _ => (0., f32::from(percent.unwrap_or(100)) / 100.),
     };
     if fraction <= 0. {
         return;
@@ -11673,6 +11773,49 @@ mod tests {
             Language::English,
         );
         assert!(completed.starts_with("Complete · 100% · updated"));
+    }
+
+    #[test]
+    fn program_status_uses_the_single_icon_indicator_before_osc_progress() {
+        let progress = TerminalProgress {
+            state: TerminalProgressState::Indeterminate,
+            percent: None,
+            updated_at_unix_ms: 0,
+        };
+        let mut status = TerminalProgramStatus {
+            state: TerminalProgramState::Working,
+            kind: None,
+            app: None,
+            title: None,
+            message: None,
+            progress: None,
+        };
+        assert_eq!(
+            icon_indicator(None, Some(progress)),
+            Some(IconIndicator::Progress(progress))
+        );
+        assert_eq!(
+            icon_indicator(Some(&status), Some(progress)),
+            Some(IconIndicator::Working(None))
+        );
+        assert!(icon_indicator(Some(&status), Some(progress))
+            .unwrap()
+            .is_animated());
+
+        status.state = TerminalProgramState::Blocked;
+        assert_eq!(
+            icon_indicator(Some(&status), Some(progress)),
+            Some(IconIndicator::Attention(TerminalProgramState::Blocked))
+        );
+        assert!(!icon_indicator(Some(&status), Some(progress))
+            .unwrap()
+            .is_animated());
+
+        status.state = TerminalProgramState::Idle;
+        assert_eq!(
+            icon_indicator(Some(&status), Some(progress)),
+            Some(IconIndicator::Progress(progress))
+        );
     }
 
     #[test]
