@@ -823,7 +823,10 @@ impl MacWindow {
                 // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
                 // for exhaustiveness.
                 WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
-                    style_mask |= NSWindowStyleMaskNonactivatingPanel;
+                    // Transient panels render their own surface; a titled style adds inactive
+                    // traffic lights and a titlebar above that surface.
+                    style_mask = NSWindowStyleMask::NSBorderlessWindowMask
+                        | NSWindowStyleMaskNonactivatingPanel;
                     msg_send![PANEL_CLASS, alloc]
                 }
                 WindowKind::Floating | WindowKind::Dialog => {
