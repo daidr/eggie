@@ -111,6 +111,46 @@ const SIDEBAR_STATUS_ROW_HEIGHT: f32 = 42.;
 const SIDEBAR_STATUS_TRANSITION: Duration = Duration::from_millis(260);
 const PROJECT_POPOVER_LEAVE_DELAY: Duration = Duration::from_millis(220);
 const PROJECT_POPOVER_ROW_HEIGHT: f32 = 40.;
+const SIDEBAR_PREVIEW_HOVER_DELAY: Duration = Duration::from_millis(850);
+const SIDEBAR_PREVIEW_LEAVE_DELAY: Duration = Duration::from_millis(180);
+
+#[derive(Clone, Copy, Default)]
+struct MarqueeState {
+    overflow: f32,
+    hovered: bool,
+    ever_hovered: bool,
+    from: f32,
+    to: f32,
+    started_at: Option<Instant>,
+    duration: Duration,
+    revision: u64,
+}
+
+fn marquee_duration(distance: f32, hovered: bool) -> Duration {
+    if hovered {
+        Duration::from_millis(((distance / 28.).clamp(0.7, 8.) * 1000.) as u64)
+    } else {
+        Duration::from_millis(260)
+    }
+}
+
+fn marquee_offset(state: MarqueeState, now: Instant) -> f32 {
+    let Some(started_at) = state.started_at else {
+        return state.to;
+    };
+    let progress = (now.saturating_duration_since(started_at).as_secs_f32()
+        / state.duration.as_secs_f32())
+    .clamp(0., 1.);
+    state.from + (state.to - state.from) * gpui::ease_in_out(progress)
+}
+
+struct SidebarPreviewState {
+    session_id: SessionId,
+    window: gpui::WindowHandle<PopupWindow>,
+    anchor_hovered: bool,
+    popup_hovered: bool,
+    leave_revision: u64,
+}
 
 struct ProjectPopoverState {
     project_id: ProjectId,
@@ -894,6 +934,11 @@ pub struct EggieApp {
     collapsed_projects: HashSet<ProjectId>,
     project_row_bounds: Rc<RefCell<HashMap<ProjectId, Bounds<Pixels>>>>,
     project_popover: Option<ProjectPopoverState>,
+    sidebar_row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
+    sidebar_preview: Option<SidebarPreviewState>,
+    hovered_sidebar_session: Option<SessionId>,
+    sidebar_preview_revision: u64,
+    marquee_states: Rc<RefCell<HashMap<String, MarqueeState>>>,
     project_icon_states: RefCell<HashMap<ProjectId, ProjectIconState>>,
     tab_icon_states: RefCell<HashMap<SessionId, TabIconState>>,
     sidebar_status_rows: RefCell<HashMap<SessionId, SidebarStatusRowState>>,
@@ -2057,11 +2102,13 @@ impl EggieApp {
             .detach();
         cx.observe_window_bounds(window, |app, _, cx| {
             app.dismiss_project_popover(cx);
+            app.dismiss_sidebar_preview(cx);
         })
         .detach();
         cx.observe_window_activation(window, |app, window, cx| {
             if !window.is_window_active() {
                 app.dismiss_project_popover(cx);
+                app.dismiss_sidebar_preview(cx);
             }
         })
         .detach();
@@ -2168,6 +2215,11 @@ impl EggieApp {
             collapsed_projects: HashSet::new(),
             project_row_bounds: Rc::new(RefCell::new(HashMap::new())),
             project_popover: None,
+            sidebar_row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            sidebar_preview: None,
+            hovered_sidebar_session: None,
+            sidebar_preview_revision: 0,
+            marquee_states: Rc::new(RefCell::new(HashMap::new())),
             project_icon_states: RefCell::new(HashMap::new()),
             tab_icon_states: RefCell::new(HashMap::new()),
             sidebar_status_rows: RefCell::new(HashMap::new()),
@@ -3447,6 +3499,14 @@ impl EggieApp {
             .map(|session| session.id)
             .collect();
         for session_id in vanished {
+            if self
+                .sidebar_preview
+                .as_ref()
+                .map(|preview| preview.session_id)
+                == Some(session_id)
+            {
+                self.dismiss_sidebar_preview(cx);
+            }
             changed |= self.prune_session_from_layouts(session_id);
         }
 
@@ -3485,6 +3545,9 @@ impl EggieApp {
         for (project_id, group_id, item_id) in targets {
             if let Some(view) = self.project_views.get_mut(&project_id) {
                 view.layout.close_item(group_id, item_id);
+                self.marquee_states
+                    .borrow_mut()
+                    .remove(&format!("tab-title-{item_id}"));
                 if view.layout.find_group(group_id).is_none() {
                     view.active_group_id = view.layout.first_group_id();
                 }
@@ -3503,6 +3566,13 @@ impl EggieApp {
             self.session_inspection_errors.remove(&session_id);
             self.tab_icon_states.borrow_mut().remove(&session_id);
             self.sidebar_status_rows.borrow_mut().remove(&session_id);
+            self.sidebar_row_bounds.borrow_mut().remove(&session_id);
+            self.marquee_states
+                .borrow_mut()
+                .remove(&format!("sidebar-title-{session_id}"));
+            self.marquee_states
+                .borrow_mut()
+                .remove(&format!("sidebar-subtitle-{session_id}"));
             self.shell_integration.remove(&session_id);
             self.notification_routes
                 .borrow_mut()
@@ -4311,6 +4381,560 @@ impl EggieApp {
         cx.notify();
     }
 
+    fn set_marquee_hover(&mut self, keys: &[String], hovered: bool, cx: &mut Context<Self>) {
+        let mut states = self.marquee_states.borrow_mut();
+        let mut changed = false;
+        for key in keys {
+            let state = states.entry(key.clone()).or_default();
+            if state.hovered != hovered {
+                let now = Instant::now();
+                state.from = marquee_offset(*state, now);
+                state.hovered = hovered;
+                state.ever_hovered |= hovered && state.overflow > 0.5;
+                state.to = if hovered { state.overflow } else { 0. };
+                state.started_at = Some(now);
+                state.duration = marquee_duration((state.to - state.from).abs(), hovered);
+                state.revision += 1;
+                changed = true;
+            }
+        }
+        drop(states);
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn render_marquee(
+        &self,
+        key: String,
+        title: String,
+        font_size: f32,
+        height: f32,
+        background: u32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let state = self
+            .marquee_states
+            .borrow()
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
+        let app = cx.entity().downgrade();
+        let states = self.marquee_states.clone();
+        let measured_key = key.clone();
+        let measured_title = title.clone();
+        let mut viewport = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h(px(height))
+            .overflow_hidden()
+            .text_size(px(font_size))
+            .on_children_prepainted(move |children, window, cx| {
+                let Some(bounds) = children.first() else {
+                    return;
+                };
+                let text_width = window
+                    .text_system()
+                    .layout_line(
+                        &measured_title,
+                        px(font_size),
+                        &[window.text_style().to_run(measured_title.len())],
+                        None,
+                    )
+                    .width;
+                let overflow = (f32::from(text_width) - f32::from(bounds.size.width)).max(0.);
+                if states
+                    .borrow()
+                    .get(&measured_key)
+                    .is_some_and(|state| (state.overflow - overflow).abs() <= 0.5)
+                {
+                    return;
+                }
+                let key = measured_key.clone();
+                let app = app.clone();
+                cx.defer(move |cx| {
+                    app.update(cx, |app, cx| {
+                        let mut states = app.marquee_states.borrow_mut();
+                        let state = states.entry(key).or_default();
+                        if (state.overflow - overflow).abs() > 0.5 {
+                            let now = Instant::now();
+                            state.from = marquee_offset(*state, now).min(overflow);
+                            state.overflow = overflow;
+                            state.ever_hovered |= state.hovered && overflow > 0.5;
+                            state.to = if state.hovered { overflow } else { 0. };
+                            state.started_at = Some(now);
+                            state.duration =
+                                marquee_duration((state.to - state.from).abs(), state.hovered);
+                            state.revision += 1;
+                            drop(states);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+            })
+            // This child has the exact viewport width, even when the following text overflows.
+            .child(div().w_full().h(px(0.)));
+        let text = div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .whitespace_nowrap()
+            .child(title);
+        if state.overflow <= 0.5 {
+            return viewport.child(text).into_any_element();
+        }
+        if !state.ever_hovered {
+            return viewport
+                .child(text)
+                .child(div().absolute().right_0().top_0().bottom_0().w(px(16.)).bg(
+                    linear_gradient(
+                        270.,
+                        linear_color_stop(rgb(background), 0.),
+                        linear_color_stop(rgb(background).opacity(0.), 1.),
+                    ),
+                ))
+                .into_any_element();
+        }
+        let offset = move |p: f32| state.from + (state.to - state.from) * p;
+        viewport = viewport.child(text.with_animation(
+            format!("marquee-text-{key}-{}", state.revision),
+            Animation::new(state.duration).with_easing(gpui::ease_in_out),
+            move |text, p| text.ml(px(-offset(p))),
+        ));
+        let color = rgb(background);
+        viewport
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(16.))
+                    .bg(linear_gradient(
+                        90.,
+                        linear_color_stop(color, 0.),
+                        linear_color_stop(color.opacity(0.), 1.),
+                    ))
+                    .with_animation(
+                        format!("marquee-left-{key}-{}", state.revision),
+                        Animation::new(state.duration).with_easing(gpui::ease_in_out),
+                        move |mask, p| mask.opacity(offset(p) / state.overflow),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(16.))
+                    .bg(linear_gradient(
+                        270.,
+                        linear_color_stop(color, 0.),
+                        linear_color_stop(color.opacity(0.), 1.),
+                    ))
+                    .with_animation(
+                        format!("marquee-right-{key}-{}", state.revision),
+                        Animation::new(state.duration).with_easing(gpui::ease_in_out),
+                        move |mask, p| mask.opacity(1. - offset(p) / state.overflow),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn dismiss_sidebar_preview(&mut self, cx: &mut Context<Self>) {
+        self.hovered_sidebar_session = None;
+        self.sidebar_preview_revision += 1;
+        if let Some(preview) = self.sidebar_preview.take() {
+            preview
+                .window
+                .update(cx, |popup, window, cx| popup.dismiss(window, cx))
+                .ok();
+        }
+    }
+
+    fn sidebar_preview_hover(
+        &mut self,
+        session_id: SessionId,
+        hovered: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if hovered {
+            self.hovered_sidebar_session = Some(session_id);
+            self.sidebar_preview_revision += 1;
+            if self
+                .sidebar_preview
+                .as_ref()
+                .map(|preview| preview.session_id)
+                != Some(session_id)
+            {
+                if let Some(preview) = self.sidebar_preview.take() {
+                    preview
+                        .window
+                        .update(cx, |popup, window, cx| popup.dismiss(window, cx))
+                        .ok();
+                }
+                let revision = self.sidebar_preview_revision;
+                let executor = cx.background_executor().clone();
+                cx.spawn(async move |app, cx| {
+                    executor.timer(SIDEBAR_PREVIEW_HOVER_DELAY).await;
+                    app.update_in(cx, |app, window, cx| {
+                        if app.hovered_sidebar_session == Some(session_id)
+                            && app.sidebar_preview_revision == revision
+                        {
+                            app.show_sidebar_preview(session_id, window, cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        } else if self.hovered_sidebar_session == Some(session_id) {
+            self.hovered_sidebar_session = None;
+            self.sidebar_preview_revision += 1;
+        }
+        self.sidebar_preview_pointer(session_id, true, hovered, cx);
+    }
+
+    fn sidebar_preview_pointer(
+        &mut self,
+        session_id: SessionId,
+        anchor: bool,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self.sidebar_preview.as_mut() else {
+            return;
+        };
+        if preview.session_id != session_id {
+            return;
+        }
+        if anchor {
+            preview.anchor_hovered = hovered;
+        } else {
+            preview.popup_hovered = hovered;
+        }
+        preview.leave_revision += 1;
+        if hovered {
+            preview
+                .window
+                .update(cx, |popup, _, cx| popup.restore(cx))
+                .ok();
+        } else if !preview.anchor_hovered && !preview.popup_hovered {
+            let revision = preview.leave_revision;
+            let executor = cx.background_executor().clone();
+            cx.spawn(async move |app, cx| {
+                executor.timer(SIDEBAR_PREVIEW_LEAVE_DELAY).await;
+                app.update(cx, |app, cx| {
+                    if app.sidebar_preview.as_ref().is_some_and(|preview| {
+                        preview.session_id == session_id
+                            && preview.leave_revision == revision
+                            && !preview.anchor_hovered
+                            && !preview.popup_hovered
+                    }) {
+                        app.dismiss_sidebar_preview(cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn show_sidebar_preview(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(anchor) = self.sidebar_row_bounds.borrow().get(&session_id).copied() else {
+            return;
+        };
+        self.dismiss_project_popover(cx);
+        let title = self
+            .project_views
+            .get(&session.project_id)
+            .and_then(|view| {
+                view.layout.terminal_custom_title(session_id).or_else(|| {
+                    session
+                        .program_status
+                        .as_ref()
+                        .and_then(|status| status.title.as_deref())
+                })
+            })
+            .unwrap_or(&session.title)
+            .to_owned();
+        let colors = self.colors;
+        let language = self.language;
+        let dark = self.use_dark;
+        let icon = process_icons::card_stack(
+            &[self.icon_for_item(ItemKind::Terminal, Some(session_id))],
+            dark,
+            SIDEBAR_CARD_SIZE,
+        );
+        let snapshot = self.snapshots.get(&session_id).cloned();
+        let appearance = self.resolved_session_appearance(session_id, cx);
+        let theme = appearance.theme;
+        let font_family: SharedString = appearance.font_family.to_string().into();
+        let thumbnail_font_size = snapshot.as_ref().map_or(7., |snapshot| {
+            (286. / snapshot.size.columns.max(1) as f32 / 0.62)
+                .min(116. / snapshot.size.rows.max(1) as f32 / 1.35)
+                .clamp(3.5, 9.)
+        });
+        let renderer = MetalTerminalRenderer::default();
+        let inspection = Rc::new(RefCell::new(
+            self.session_inspections.get(&session_id).cloned(),
+        ));
+        let inspection_for_popup = inspection.clone();
+        let parent = Window::window_handle(window)
+            .downcast::<Self>()
+            .expect("sidebar preview belongs to an Eggie window");
+        let status = session.program_status.clone();
+        let osc_progress = self
+            .progress_updates
+            .get(&session_id)
+            .and_then(|update| update.progress);
+        let status_label = status
+            .as_ref()
+            .map(|status| program_state_label(status.state, language).to_owned())
+            .or_else(|| {
+                osc_progress.map(|progress| {
+                    let label = match (progress.state, language) {
+                        (TerminalProgressState::Normal, Language::English) => "Progress",
+                        (TerminalProgressState::Normal, Language::SimplifiedChinese) => "进度",
+                        (TerminalProgressState::Error, Language::English) => "Error",
+                        (TerminalProgressState::Error, Language::SimplifiedChinese) => "出错",
+                        (TerminalProgressState::Indeterminate, Language::English) => "Working",
+                        (TerminalProgressState::Indeterminate, Language::SimplifiedChinese) => {
+                            "进行中"
+                        }
+                        (TerminalProgressState::Paused, Language::English) => "Paused",
+                        (TerminalProgressState::Paused, Language::SimplifiedChinese) => "已暂停",
+                    };
+                    progress
+                        .percent
+                        .map_or_else(|| label.to_owned(), |value| format!("{label} {value}%"))
+                })
+            })
+            .unwrap_or_else(|| match (&session.status, language) {
+                (SessionStatus::Running, Language::English) => "Running".to_owned(),
+                (SessionStatus::Running, Language::SimplifiedChinese) => "运行中".to_owned(),
+                (SessionStatus::Exited { .. }, Language::English) => "Exited".to_owned(),
+                (SessionStatus::Exited { .. }, Language::SimplifiedChinese) => "已退出".to_owned(),
+            });
+        let status_tint = status
+            .as_ref()
+            .map(|status| match status.state {
+                TerminalProgramState::Blocked => self.interface_theme.palette[3],
+                TerminalProgramState::Error => self.interface_theme.palette[1],
+                TerminalProgramState::Working => colors.accent,
+                TerminalProgramState::Done => self.interface_theme.palette[2],
+                TerminalProgramState::Idle => colors.muted,
+            })
+            .or_else(|| {
+                osc_progress.map(|progress| match progress.state {
+                    TerminalProgressState::Error => self.interface_theme.palette[1],
+                    TerminalProgressState::Paused => self.interface_theme.palette[3],
+                    _ => colors.accent,
+                })
+            });
+        let mut status_detail = status
+            .as_ref()
+            .and_then(|status| status.message.clone())
+            .or_else(|| session.active_command.clone())
+            .unwrap_or_else(|| session.current_directory.display().to_string());
+        if let Some(progress) = status.as_ref().and_then(|status| status.progress) {
+            status_detail.push_str(&format!(" · {progress}%"));
+        }
+        let memory_label = if language == Language::English {
+            "Process memory"
+        } else {
+            "进程内存"
+        };
+        let popup = PopupWindow::open(
+            cx,
+            window,
+            PopupWindowOptions {
+                anchor,
+                content_size: size(px(318.), px(236.)),
+                placement: PopupPlacement::Beside,
+                background: colors.panel,
+                border: colors.border,
+            },
+            move |_, _| {
+                let memory = inspection_for_popup
+                    .borrow()
+                    .as_ref()
+                    .and_then(|inspection| {
+                        inspection
+                            .processes
+                            .iter()
+                            .filter_map(|process| process.memory_bytes)
+                            .reduce(u64::saturating_add)
+                    });
+                let thumbnail: AnyElement = if let Some(snapshot) = &snapshot {
+                    div()
+                        .size_full()
+                        .bg(rgba(terminal_background(snapshot, theme)))
+                        .font_family(font_family.clone())
+                        .text_size(px(thumbnail_font_size))
+                        .child(
+                            renderer.render(
+                                snapshot.clone(),
+                                TerminalRenderOptions::new(
+                                    theme,
+                                    colors.accent,
+                                    0.,
+                                    None,
+                                    None,
+                                    None,
+                                    InputLatencyTracker::default(),
+                                )
+                                .with_cursor_visible(false),
+                            ),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size_full()
+                        .bg(rgb(theme.background))
+                        .text_color(rgb(theme.foreground))
+                        .text_size(px(11.))
+                        .child(if language == Language::English {
+                            "Waiting for terminal output"
+                        } else {
+                            "等待终端画面"
+                        })
+                        .into_any_element()
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .p_3()
+                    .gap_2()
+                    .text_color(rgb(colors.text))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when_some(icon.clone(), |row, icon| {
+                                row.child(
+                                    img(icon)
+                                        .flex_none()
+                                        .w(px(process_icons::stack_width(1, SIDEBAR_CARD_SIZE)))
+                                        .h(px(SIDEBAR_CARD_SIZE + 5.)),
+                                )
+                            })
+                            .child(div().flex_1().min_w_0().truncate().child(title.clone()))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .when_some(status_tint, |tag, tint| {
+                                        tag.bg(rgba((tint << 8) | 0x28))
+                                    })
+                                    .text_size(px(10.))
+                                    .text_color(rgb(status_tint.unwrap_or(colors.muted)))
+                                    .child(status_label.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.muted))
+                            .child(status_detail.clone()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(120.))
+                            .overflow_hidden()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(colors.border))
+                            .child(thumbnail),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.muted))
+                            .child(session.current_process.name.clone())
+                            .child(format!("{memory_label} {}", format_memory_usage(memory))),
+                    )
+                    .into_any_element()
+            },
+            move |hovered, _, cx| {
+                cx.defer(move |cx| {
+                    parent
+                        .update(cx, |app, _, cx| {
+                            app.sidebar_preview_pointer(session_id, false, hovered, cx);
+                        })
+                        .ok();
+                });
+            },
+        );
+        let Ok(popup) = popup else {
+            return;
+        };
+        self.sidebar_preview = Some(SidebarPreviewState {
+            session_id,
+            window: popup,
+            anchor_hovered: true,
+            popup_hovered: false,
+            leave_revision: 0,
+        });
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |app, cx| {
+            let result = executor
+                .spawn(async move { client.request(ClientRequest::InspectSession { session_id }) })
+                .await;
+            app.update(cx, |app, cx| {
+                if !app
+                    .sidebar_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.session_id == session_id)
+                {
+                    return;
+                }
+                if let Ok(DaemonResponse::SessionInspection {
+                    inspection: mut current,
+                }) = result
+                {
+                    app.fill_missing_process_metrics(&mut current);
+                    *inspection.borrow_mut() = Some(current.clone());
+                    app.session_inspections.insert(session_id, current);
+                    popup.update(cx, |_, _, cx| cx.notify()).ok();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn dismiss_project_popover(&mut self, cx: &mut Context<Self>) {
         if let Some(popover) = self.project_popover.take() {
             popover
@@ -4981,11 +5605,29 @@ impl EggieApp {
         cx: &mut Context<Self>,
     ) {
         let removed = self.workspace_mut().layout.close_item(group_id, item_id);
+        self.marquee_states
+            .borrow_mut()
+            .remove(&format!("tab-title-{item_id}"));
         let workspace = self.workspace_mut();
         if workspace.layout.find_group(group_id).is_none() {
             workspace.active_group_id = workspace.layout.first_group_id();
         }
         if let Some(session_id) = removed.and_then(|item| item.session_id) {
+            if self
+                .sidebar_preview
+                .as_ref()
+                .map(|preview| preview.session_id)
+                == Some(session_id)
+            {
+                self.dismiss_sidebar_preview(cx);
+            }
+            self.sidebar_row_bounds.borrow_mut().remove(&session_id);
+            self.marquee_states
+                .borrow_mut()
+                .remove(&format!("sidebar-title-{session_id}"));
+            self.marquee_states
+                .borrow_mut()
+                .remove(&format!("sidebar-subtitle-{session_id}"));
             if self.terminal_focused_session == Some(session_id) {
                 self.terminal_focused_session = None;
             }
@@ -8412,7 +9054,20 @@ impl EggieApp {
                         .terminal_custom_title(session_id)
                         .or_else(|| program_status.and_then(|status| status.title.as_deref()))
                         .unwrap_or(tab_title);
-                    let session_title: SharedString = display_title.to_owned().into();
+                    let title_key = format!("sidebar-title-{session_id}");
+                    let subtitle_key = format!("sidebar-subtitle-{session_id}");
+                    let marquee_hovered = self
+                        .marquee_states
+                        .borrow()
+                        .get(&title_key)
+                        .is_some_and(|state| state.hovered);
+                    let label_background = if marquee_hovered {
+                        self.colors.hover
+                    } else if active {
+                        self.colors.panel_alt
+                    } else {
+                        self.colors.panel
+                    };
                     let label: AnyElement = if let Some(status) = program_status {
                         let state_label = program_state_label(status.state, self.language);
                         let mut subtitle = match (&status.title, &status.message) {
@@ -8444,13 +9099,14 @@ impl EggieApp {
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(session_title.clone()),
-                                    )
+                                    .child(self.render_marquee(
+                                        title_key.clone(),
+                                        display_title.to_owned(),
+                                        12.,
+                                        17.,
+                                        label_background,
+                                        cx,
+                                    ))
                                     .when_some(tag, |row, (state, label)| {
                                         let tint = match state {
                                             TerminalProgramState::Blocked => {
@@ -8476,20 +9132,29 @@ impl EggieApp {
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .w_full()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_size(px(11.))
                                     .text_color(rgb(self.colors.muted))
-                                    .child(subtitle),
+                                    .child(self.render_marquee(
+                                        subtitle_key.clone(),
+                                        subtitle,
+                                        11.,
+                                        15.,
+                                        label_background,
+                                        cx,
+                                    )),
                             )
                             .into_any_element()
                     } else {
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(session_title.clone())
-                            .into_any_element()
+                        self.render_marquee(
+                            title_key.clone(),
+                            display_title.to_owned(),
+                            12.,
+                            17.,
+                            label_background,
+                            cx,
+                        )
                     };
                     let height_transition =
                         self.sidebar_status_row_transition(session_id, program_status.is_some());
@@ -8520,8 +9185,20 @@ impl EggieApp {
                             let colors = self.colors;
                             move |element| element.bg(rgb(colors.hover))
                         })
+                        .on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
+                            app.set_marquee_hover(
+                                &[
+                                    format!("sidebar-title-{session_id}"),
+                                    format!("sidebar-subtitle-{session_id}"),
+                                ],
+                                *hovered,
+                                cx,
+                            );
+                            app.sidebar_preview_hover(session_id, *hovered, window, cx);
+                        }))
                         .cursor_pointer()
                         .on_click(cx.listener(move |app, _, window, cx| {
+                            app.dismiss_sidebar_preview(cx);
                             app.activate_session(project_id, session_id, window, cx)
                         }))
                         .child(self.render_item_icon(
@@ -8530,22 +9207,33 @@ impl EggieApp {
                             format!("sidebar-progress-{session_id}"),
                         ))
                         .child(label);
-                    panel = panel.child(if let Some((from, to, revision)) = height_transition {
-                        row.with_animation(
-                            format!("sidebar-status-height-{session_id}-{revision}"),
-                            Animation::new(SIDEBAR_STATUS_TRANSITION)
-                                .with_easing(gpui::ease_in_out),
-                            move |element, progress| element.h(px(from + (to - from) * progress)),
-                        )
-                        .into_any_element()
-                    } else {
-                        row.h(px(if program_status.is_some() {
-                            SIDEBAR_STATUS_ROW_HEIGHT
-                        } else {
-                            SIDEBAR_SESSION_ROW_HEIGHT
-                        }))
-                        .into_any_element()
-                    });
+                    let row_bounds = self.sidebar_row_bounds.clone();
+                    panel = panel.child(
+                        div()
+                            .on_children_prepainted(move |children, _, _| {
+                                if let Some(bounds) = children.first().copied() {
+                                    row_bounds.borrow_mut().insert(session_id, bounds);
+                                }
+                            })
+                            .child(if let Some((from, to, revision)) = height_transition {
+                                row.with_animation(
+                                    format!("sidebar-status-height-{session_id}-{revision}"),
+                                    Animation::new(SIDEBAR_STATUS_TRANSITION)
+                                        .with_easing(gpui::ease_in_out),
+                                    move |element, progress| {
+                                        element.h(px(from + (to - from) * progress))
+                                    },
+                                )
+                                .into_any_element()
+                            } else {
+                                row.h(px(if program_status.is_some() {
+                                    SIDEBAR_STATUS_ROW_HEIGHT
+                                } else {
+                                    SIDEBAR_SESSION_ROW_HEIGHT
+                                }))
+                                .into_any_element()
+                            }),
+                    );
                 }
             }
         }
@@ -8706,6 +9394,12 @@ impl EggieApp {
         for (tab_index, item) in group.items.iter().enumerate() {
             let item_id = item.id;
             let active = group.active_item_id == Some(item.id);
+            let title_key = format!("tab-title-{item_id}");
+            let label_background = if active {
+                self.colors.panel_alt
+            } else {
+                self.colors.panel
+            };
             // The first tab's "before" indicator sits at a negative offset that the scroll strip's
             // overflow would clip, so it is drawn once on the non-clipping scroll wrapper instead
             // (see below). Every other tab draws its own indicator in the preceding gap.
@@ -8747,6 +9441,9 @@ impl EggieApp {
                         |element, tint| element.bg(rgba(tint)),
                     )
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |app, hovered: &bool, _, cx| {
+                        app.set_marquee_hover(&[format!("tab-title-{item_id}")], *hovered, cx);
+                    }))
                     .on_click(cx.listener(move |app, _, window, cx| {
                         app.activate_item(group_id, item_id, window, cx)
                     }))
@@ -8788,13 +9485,14 @@ impl EggieApp {
                             )
                         },
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(SharedString::from(item.display_title().to_owned())),
-                    )
+                    .child(self.render_marquee(
+                        title_key,
+                        item.display_title().to_owned(),
+                        TAB_TITLE_FONT_SIZE,
+                        16.,
+                        label_background,
+                        cx,
+                    ))
                     .child(
                         div()
                             .id(format!("close-tab-{item_id}"))
@@ -11627,6 +12325,28 @@ mod tests {
     use super::*;
     use gpui::{Keystroke, Modifiers};
     use uuid::Uuid;
+
+    #[test]
+    fn marquee_reverses_from_its_current_position() {
+        let now = Instant::now();
+        let returning = MarqueeState {
+            from: 80.,
+            to: 0.,
+            started_at: Some(now - Duration::from_millis(130)),
+            duration: Duration::from_millis(260),
+            ..Default::default()
+        };
+        let current = marquee_offset(returning, now);
+        assert!(current > 0. && current < 80.);
+        let resuming = MarqueeState {
+            from: current,
+            to: 80.,
+            started_at: Some(now),
+            duration: marquee_duration(80. - current, true),
+            ..Default::default()
+        };
+        assert_eq!(marquee_offset(resuming, now), current);
+    }
 
     #[test]
     fn adding_and_removing_project_cards_moves_and_rotates_them() {
