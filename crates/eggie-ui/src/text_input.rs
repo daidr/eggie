@@ -13,6 +13,7 @@
 //! The structure follows GPUI's official `examples/input.rs`, extended with a blinking caret, a
 //! pluggable style, and an event channel.
 
+use eggie_ui_kit::continuous_corners::div;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -22,7 +23,7 @@ use gpui::{
     ScrollHandle,
     InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style,
-    TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
+    TextRun, UTF16Selection, UnderlineStyle, Window, actions, fill, point, prelude::*, px,
     relative, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;

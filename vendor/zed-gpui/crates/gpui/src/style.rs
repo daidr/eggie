@@ -288,6 +288,12 @@ pub struct Style {
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
+    /// Use a continuous superellipse curve for corners, retaining circular caps at full radius.
+    pub continuous_corners: bool,
+
+    /// Cover child output outside the corner curve with the enclosing surface's color.
+    pub corner_mask_color: Option<Hsla>,
+
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
@@ -708,7 +714,12 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows_with_corners(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.continuous_corners,
+        );
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -727,32 +738,55 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background_color.unwrap_or_default(),
+                    Edges::default(),
+                    border_color,
+                    self.border_style,
+                )
+                .continuous_corners(self.continuous_corners),
+            );
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows_with_corners(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.continuous_corners,
+        );
 
         continuation(window, cx);
+
+        if let Some(color) = self
+            .corner_mask_color
+            .filter(|_| corner_radii != Corners::default())
+        {
+            window.paint_quad(
+                crate::fill(bounds, color)
+                    .corner_radii(corner_radii)
+                    .continuous_corners(self.continuous_corners)
+                    .corner_mask(),
+            );
+        }
 
         if self.is_border_visible() {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_color.unwrap_or_default(),
+                    self.border_style,
+                )
+                .continuous_corners(self.continuous_corners),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -805,6 +839,8 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            continuous_corners: false,
+            corner_mask_color: None,
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

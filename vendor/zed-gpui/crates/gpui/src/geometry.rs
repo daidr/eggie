@@ -20,6 +20,10 @@ use taffy::prelude::{TaffyGridLine, TaffyGridSpan};
 
 use crate::{App, DisplayId};
 
+/// Expands fourth-order corner extents to preserve a circular radius's diagonal cut.
+/// `(1 - 2^-1/2) / (1 - 2^-1/4)`. Keep shader constants in sync.
+pub const CONTINUOUS_CORNER_RADIUS_SCALE: f32 = 1.8408964;
+
 /// Axis in a 2D cartesian space.
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum Axis {

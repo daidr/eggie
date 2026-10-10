@@ -1,3 +1,4 @@
+use eggie_ui_kit::continuous_corners::div;
 mod about;
 mod controls;
 mod editing;
@@ -27,7 +28,7 @@ use eggie_update::UpdateState;
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Entity, Image, ImageFormat, MouseButton, Pixels,
     ScrollHandle, SharedString, TitlebarOptions, Window, WindowBounds, WindowControlArea,
-    WindowOptions, anchored, canvas, deferred, div, img, linear_color_stop, linear_gradient, point,
+    WindowOptions, anchored, canvas, deferred, img, linear_color_stop, linear_gradient, point,
     prelude::*, px, rgb, size,
 };
 

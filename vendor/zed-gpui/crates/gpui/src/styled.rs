@@ -20,6 +20,18 @@ const ELLIPSIS: SharedString = SharedString::new_static("…");
     gpui_macros::derive_inspector_reflection
 )]
 pub trait Styled: Sized {
+    /// Render rounded corners with a continuous curve rather than a circular arc.
+    fn continuous_corners(mut self) -> Self {
+        self.style().continuous_corners = Some(true);
+        self
+    }
+
+    /// Cover child and custom-renderer overflow beyond the corner curve, before painting borders.
+    fn mask_corners(mut self, enclosing_color: impl Into<Hsla>) -> Self {
+        self.style().corner_mask_color = Some(enclosing_color.into());
+        self
+    }
+
     /// Returns a reference to the style memory of this element.
     fn style(&mut self) -> &mut StyleRefinement;
 

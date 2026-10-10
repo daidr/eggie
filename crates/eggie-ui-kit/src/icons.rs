@@ -1,4 +1,5 @@
-use gpui::{IntoElement, div, prelude::*, px};
+use crate::continuous_corners::div;
+use gpui::{IntoElement, prelude::*, px};
 
 pub const FONT_FAMILY: &str = "Hugeicons Stroke Rounded";
 

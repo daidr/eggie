@@ -701,6 +701,8 @@ impl PrimitiveBatch {
 pub struct Quad {
     pub order: DrawOrder,
     pub border_style: BorderStyle,
+    pub corner_shape: u32,
+    pub corner_mask: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Background,
@@ -748,7 +750,8 @@ pub struct Shadow {
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
-    pub pad: u32, // align to 8 bytes
+    /// 0 = circular, 1 = continuous corners.
+    pub corner_shape: u32,
 }
 
 impl From<Shadow> for Primitive {
@@ -914,7 +917,7 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    pub corner_shape: u32,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,

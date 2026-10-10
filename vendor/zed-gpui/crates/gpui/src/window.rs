@@ -3895,6 +3895,17 @@ impl Window {
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
     ) {
+        self.paint_drop_shadows_with_corners(bounds, corner_radii, shadows, false);
+    }
+
+    /// Paint drop shadows using the same corner curve as their surface.
+    pub fn paint_drop_shadows_with_corners(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        continuous: bool,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -3917,7 +3928,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                corner_shape: continuous.into(),
             });
         }
     }
@@ -3930,6 +3941,17 @@ impl Window {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
+    ) {
+        self.paint_inset_shadows_with_corners(bounds, corner_radii, shadows, false);
+    }
+
+    /// Paint inset shadows using the same corner curve as their surface.
+    pub fn paint_inset_shadows_with_corners(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        continuous: bool,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -3962,7 +3984,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                corner_shape: continuous.into(),
             });
         }
     }
@@ -3991,19 +4013,30 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            corner_shape: quad.continuous_corners.into(),
+            corner_mask: quad.corner_mask.into(),
         };
 
-        if !quad.background.is_transparent() {
+        if !quad.background.is_transparent() && quad.corner_mask == 0 {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
 
-        // We're drawing a quad with a border but no fill color. Painting this quad would run the quad shader for every
-        // transparent interior pixel, which is especially costly when the quad is large.
-        // Instead, split it into four non-overlapping strips that cover the regions where borders are painted:
-        // the side strips own the straight left and right edges, while the top and bottom strips own the horizontal
-        // edges and the rounded corners.
-        let radii = &quad.corner_radii;
+        // Borders and corner masks only need edge strips, avoiding transparent interior fragments.
+        let corner_extent = |radius: ScaledPixels| {
+            if quad.corner_shape != 0 {
+                (radius * crate::CONTINUOUS_CORNER_RADIUS_SCALE)
+                    .min(quad.bounds.size.width.min(quad.bounds.size.height) / 2.)
+            } else {
+                radius
+            }
+        };
+        let radii = Corners {
+            top_left: corner_extent(quad.corner_radii.top_left),
+            top_right: corner_extent(quad.corner_radii.top_right),
+            bottom_left: corner_extent(quad.corner_radii.bottom_left),
+            bottom_right: corner_extent(quad.corner_radii.bottom_right),
+        };
         let widths = &quad.border_widths;
 
         let antialias_slack = point(ScaledPixels(1.0), ScaledPixels(1.0));
@@ -4300,7 +4333,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                corner_shape: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -4394,6 +4427,28 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_corners(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            false,
+        )
+    }
+
+    /// Paint an image with the requested corner curve applied to its visible bounds.
+    pub fn paint_image_with_corners(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        continuous: bool,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -4472,7 +4527,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            corner_shape: continuous.into(),
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
@@ -6685,6 +6740,10 @@ impl From<[u8; 20]> for ElementId {
 /// Passed as an argument [`Window::paint_quad`].
 #[derive(Clone)]
 pub struct PaintQuad {
+    /// Whether rounded corners follow a continuous superellipse curve.
+    pub continuous_corners: bool,
+    /// Paint only the area outside the rounded shape, within the quad bounds.
+    pub corner_mask: bool,
     /// The bounds of the quad within the window.
     pub bounds: Bounds<Pixels>,
     /// The radii of the quad's corners.
@@ -6700,6 +6759,18 @@ pub struct PaintQuad {
 }
 
 impl PaintQuad {
+    /// Choose continuous corners; full-radius circles and capsules retain circular caps.
+    pub fn continuous_corners(mut self, continuous: bool) -> Self {
+        self.continuous_corners = continuous;
+        self
+    }
+
+    /// Cover the pixels outside the corner curve without painting the surface interior.
+    pub fn corner_mask(mut self) -> Self {
+        self.corner_mask = true;
+        self
+    }
+
     /// Sets the corner radii of the quad.
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         PaintQuad {
@@ -6743,6 +6814,8 @@ pub fn quad(
     border_style: BorderStyle,
 ) -> PaintQuad {
     PaintQuad {
+        continuous_corners: false,
+        corner_mask: false,
         bounds,
         corner_radii: corner_radii.into(),
         background: background.into(),
@@ -6755,6 +6828,8 @@ pub fn quad(
 /// Creates a filled quad with the given bounds and background color.
 pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>) -> PaintQuad {
     PaintQuad {
+        continuous_corners: false,
+        corner_mask: false,
         bounds: bounds.into(),
         corner_radii: (0.).into(),
         background: background.into(),
@@ -6771,6 +6846,8 @@ pub fn outline(
     border_style: BorderStyle,
 ) -> PaintQuad {
     PaintQuad {
+        continuous_corners: false,
+        corner_mask: false,
         bounds: bounds.into(),
         corner_radii: (0.).into(),
         background: transparent_black().into(),

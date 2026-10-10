@@ -8,9 +8,10 @@
 //! native `setFrame:display:animate:` so the transition is smooth, matching
 //! the behavior of first-party macOS apps.
 
+use eggie_ui_kit::continuous_corners::div;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, MouseButton, TitlebarOptions, Window,
-    WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px, relative, rgb, rgba, size,
+    WindowBounds, WindowControlArea, WindowOptions, prelude::*, px, relative, rgb, rgba, size,
 };
 
 use crate::settings::{SettingsStore, UiColors};

@@ -1,3 +1,4 @@
+use eggie_ui_kit::continuous_corners::div;
 use eggie_ui_kit::is_dark_appearance;
 mod view_state;
 use view_state::*;
@@ -79,7 +80,7 @@ use gpui::{
     PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Role, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, SharedString, Stateful, Subscription, SystemNotification,
     SystemNotificationAction, TitlebarOptions, TouchPhase, WeakEntity, Window, WindowBounds,
-    WindowControlArea, WindowOptions, anchored, canvas, deferred, div, img, linear_color_stop,
+    WindowControlArea, WindowOptions, anchored, canvas, deferred, img, linear_color_stop,
     linear_gradient, point, prelude::*, px, quad, relative, rgb, rgba, size,
 };
 use std::{

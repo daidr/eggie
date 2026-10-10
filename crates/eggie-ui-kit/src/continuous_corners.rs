@@ -1,6 +1,13 @@
 //! Continuous rounded rectangles for surfaces that need the flatter Apple-style corner curve.
 
-use gpui::{Bounds, PathBuilder, Pixels, Window, point, px, rgb};
+use gpui::{
+    Bounds, CONTINUOUS_CORNER_RADIUS_SCALE, Div, Pixels, Styled, Window, fill, point, px, rgb,
+};
+
+/// The standard UI surface; radius helpers also apply to hover, focus, borders and shadows.
+pub fn div() -> Div {
+    gpui::div().continuous_corners()
+}
 
 fn corner_point(
     cx: f32,
@@ -19,13 +26,7 @@ fn corner_point(
     point(px(cx + u * radius), px(cy + v * radius))
 }
 
-fn add_corner(path: &mut PathBuilder, cx: f32, cy: f32, radius: f32, quarter: usize) {
-    let at = |u, v| corner_point(cx, cy, radius, quarter, u, v);
-    // A circular quarter uses 0.552 here; 0.91 gives the flatter continuous curve.
-    path.cubic_bezier_to(at(1., 0.), at(0.91, -1.), at(1., -0.91));
-}
-
-/// Paint a continuous rounded rectangle. Paint nested insets for a matching border or focus ring.
+/// Paint a continuous rectangle with an explicit corner extent, including matching nested insets.
 pub fn paint_continuous_rect(
     window: &mut Window,
     bounds: Bounds<Pixels>,
@@ -43,25 +44,80 @@ pub fn paint_continuous_rect(
         return;
     }
     let radius = (radius - inset).clamp(0., width.min(height) / 2.);
-    let mut path = PathBuilder::fill();
-    path.move_to(point(px(left + radius), px(top)));
-    path.line_to(point(px(right - radius), px(top)));
-    add_corner(&mut path, right - radius, top + radius, radius, 0);
-    path.line_to(point(px(right), px(bottom - radius)));
-    add_corner(&mut path, right - radius, bottom - radius, radius, 1);
-    path.line_to(point(px(left + radius), px(bottom)));
-    add_corner(&mut path, left + radius, bottom - radius, radius, 2);
-    path.line_to(point(px(left), px(top + radius)));
-    add_corner(&mut path, left + radius, top + radius, radius, 3);
-    path.close();
-    if let Ok(path) = path.build() {
-        window.paint_path(path, rgb(color));
+    window.paint_quad(
+        fill(
+            Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom))),
+            rgb(color),
+        )
+        .corner_radii(px(radius / CONTINUOUS_CORNER_RADIUS_SCALE))
+        .continuous_corners(true),
+    );
+}
+
+/// Cubic approximation of the continuous curve for SVG-backed icon cards.
+pub fn svg_rect_path(x: f32, y: f32, width: f32, height: f32, radius: f32) -> String {
+    let limit = width.min(height) / 2.;
+    let radius = radius.clamp(0., limit);
+    let circular = radius >= limit;
+    let radius = if circular {
+        radius
+    } else {
+        (radius * CONTINUOUS_CORNER_RADIUS_SCALE).min(limit)
+    };
+    let coefficient = if circular { 0.5522848 } else { 0.91 };
+    let right = x + width;
+    let bottom = y + height;
+    let mut path = format!("M {} {y} L {} {y}", x + radius, right - radius);
+    for (quarter, cx, cy, next_x, next_y) in [
+        (0, right - radius, y + radius, right, bottom - radius),
+        (1, right - radius, bottom - radius, x + radius, bottom),
+        (2, x + radius, bottom - radius, x, y + radius),
+        (3, x + radius, y + radius, x + radius, y),
+    ] {
+        let at = |u, v| corner_point(cx, cy, radius, quarter, u, v);
+        let first = at(coefficient, -1.);
+        let second = at(1., -coefficient);
+        let end = at(1., 0.);
+        path.push_str(&format!(
+            " C {} {} {} {} {} {} L {next_x} {next_y}",
+            f32::from(first.x),
+            f32::from(first.y),
+            f32::from(second.x),
+            f32::from(second.y),
+            f32::from(end.x),
+            f32::from(end.y)
+        ));
     }
+    path.push_str(" Z");
+    path
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_radius_preserves_the_previous_diagonal_cut() {
+        let circular_cut = 1. - 2_f32.powf(-0.5);
+        let continuous_cut = CONTINUOUS_CORNER_RADIUS_SCALE * (1. - 2_f32.powf(-0.25));
+        assert!((circular_cut - continuous_cut).abs() < 0.000001);
+    }
+
+    #[test]
+    fn gpu_corner_instance_layout_matches_shader_contract() {
+        use gpui::{PolychromeSprite, Quad, Shadow};
+        use std::mem::{offset_of, size_of};
+
+        // These offsets also describe the WGSL/HLSL storage arrays; Metal generates its header.
+        assert_eq!(size_of::<Quad>(), 168);
+        assert_eq!(offset_of!(Quad, corner_shape), 8);
+        assert_eq!(offset_of!(Quad, corner_mask), 12);
+        assert_eq!(offset_of!(Quad, bounds), 16);
+        assert_eq!(size_of::<Shadow>(), 112);
+        assert_eq!(offset_of!(Shadow, corner_shape), 108);
+        assert_eq!(size_of::<PolychromeSprite>(), 96);
+        assert_eq!(offset_of!(PolychromeSprite, corner_shape), 4);
+    }
 
     #[test]
     fn corner_rotation_keeps_each_quarter_on_its_side() {
