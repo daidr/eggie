@@ -18,6 +18,7 @@ mod popup_window;
 mod profile_editor;
 mod profile_store;
 mod process_icons;
+mod project_drag;
 mod project_store;
 mod snippet_store;
 pub mod services;

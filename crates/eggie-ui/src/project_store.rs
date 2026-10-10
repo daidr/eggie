@@ -61,6 +61,18 @@ impl ProjectStore {
         }
     }
 
+    /// Move a project before another project, or to the end when `before` is `None`.
+    pub(crate) fn move_before(
+        &mut self,
+        id: ProjectId,
+        before: Option<ProjectId>,
+        cx: &mut Context<Self>,
+    ) {
+        if reorder_projects(&mut self.projects, id, before) {
+            self.persist(cx);
+        }
+    }
+
     /// 改名并落盘。id 不存在则无操作。
     pub(crate) fn rename(&mut self, id: ProjectId, name: String, cx: &mut Context<Self>) {
         if let Some(project) = self.projects.iter_mut().find(|project| project.id == id) {
@@ -150,6 +162,26 @@ impl ProjectStore {
     }
 }
 
+fn reorder_projects(projects: &mut Vec<Project>, id: ProjectId, before: Option<ProjectId>) -> bool {
+    let Some(source) = projects.iter().position(|project| project.id == id) else {
+        return false;
+    };
+    let destination = match before {
+        Some(before) => match projects.iter().position(|project| project.id == before) {
+            Some(destination) => destination,
+            None => return false,
+        },
+        None => projects.len(),
+    };
+    let destination = destination.saturating_sub(usize::from(source < destination));
+    if source == destination {
+        return false;
+    }
+    let project = projects.remove(source);
+    projects.insert(destination, project);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +221,80 @@ mod tests {
             Some(Path::new("/tmp/example"))
         );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reordering_handles_upward_downward_adjacent_and_invalid_moves() {
+        let original: Vec<_> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| Project::new(name.to_owned()))
+            .collect();
+        let ids: Vec<_> = original.iter().map(|project| project.id).collect();
+        for (source, before, expected, changed) in [
+            (3, Some(0), vec![3, 0, 1, 2], true),
+            (0, Some(3), vec![1, 2, 0, 3], true),
+            (0, None, vec![1, 2, 3, 0], true),
+            (2, Some(1), vec![0, 2, 1, 3], true),
+            (1, Some(2), vec![0, 1, 2, 3], false),
+            (2, Some(2), vec![0, 1, 2, 3], false),
+            (3, None, vec![0, 1, 2, 3], false),
+        ] {
+            let mut projects = original.clone();
+            assert_eq!(
+                reorder_projects(&mut projects, ids[source], before.map(|i| ids[i])),
+                changed
+            );
+            assert_eq!(
+                projects
+                    .iter()
+                    .map(|project| project.id)
+                    .collect::<Vec<_>>(),
+                expected.into_iter().map(|i| ids[i]).collect::<Vec<_>>()
+            );
+        }
+        let mut projects = original;
+        assert!(!reorder_projects(&mut projects, ProjectId::new_v4(), None));
+        assert!(!reorder_projects(
+            &mut projects,
+            ids[0],
+            Some(ProjectId::new_v4())
+        ));
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(!reorder_projects(&mut Vec::new(), ids[0], None));
+    }
+
+    #[test]
+    fn reordered_projects_keep_their_identity_and_survive_restart() {
+        let path = temp_path("reorder");
+        let mut store = ProjectStore::load_from(path.clone());
+        let first = Project::from_root(PathBuf::from("/tmp/first"));
+        let mut second = Project::from_root(PathBuf::from("/tmp/second"));
+        second.default_profile_id = Some(eggie_domain::ProfileId::new_v4());
+        let first_id = first.id;
+        let second_id = second.id;
+        let profile_id = second.default_profile_id;
+        store.projects = vec![first, second];
+        assert!(reorder_projects(
+            &mut store.projects,
+            second_id,
+            Some(first_id)
+        ));
+        store.save().expect("save reordered projects");
+        let reloaded = ProjectStore::load_from(path.clone());
+        assert_eq!(reloaded.projects()[0].id, second_id);
+        assert_eq!(reloaded.projects()[1].id, first_id);
+        assert_eq!(
+            reloaded.projects()[0].root.as_deref(),
+            Some(Path::new("/tmp/second"))
+        );
+        assert_eq!(reloaded.projects()[0].default_profile_id, profile_id);
         let _ = fs::remove_file(&path);
     }
 

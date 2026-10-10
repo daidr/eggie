@@ -12,6 +12,7 @@ use crate::notes_store::NotesStore;
 use crate::popup_window::{PopupPlacement, PopupWindow, PopupWindowOptions};
 use crate::process_icons::{self, ProcessIcon};
 use crate::profile_store::ProfileStore;
+use crate::project_drag::{self, DraggedProject, ProjectDragState, ProjectDropTarget};
 use crate::project_store::ProjectStore;
 use crate::settings::{
     CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, OpenWith, SettingsStore,
@@ -933,6 +934,7 @@ pub struct EggieApp {
     active_project: ProjectId,
     collapsed_projects: HashSet<ProjectId>,
     project_row_bounds: Rc<RefCell<HashMap<ProjectId, Bounds<Pixels>>>>,
+    project_drag: ProjectDragState,
     project_popover: Option<ProjectPopoverState>,
     sidebar_row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
     sidebar_preview: Option<SidebarPreviewState>,
@@ -2214,6 +2216,7 @@ impl EggieApp {
             active_project,
             collapsed_projects: HashSet::new(),
             project_row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            project_drag: ProjectDragState::default(),
             project_popover: None,
             sidebar_row_bounds: Rc::new(RefCell::new(HashMap::new())),
             sidebar_preview: None,
@@ -3853,6 +3856,13 @@ impl EggieApp {
         self.project_row_bounds
             .borrow_mut()
             .retain(|id, _| live.contains(id));
+        if self
+            .project_drag
+            .source
+            .is_some_and(|id| !live.contains(&id))
+        {
+            self.clear_project_drag(cx);
+        }
         // Keep the active project valid; fall back to the first project if it was removed.
         if !live.contains(&self.active_project)
             && let Some(first) = self.projects.first()
@@ -4562,6 +4572,9 @@ impl EggieApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if hovered && cx.has_active_drag() {
+            return;
+        }
         if hovered {
             self.hovered_sidebar_session = Some(session_id);
             self.sidebar_preview_revision += 1;
@@ -4952,6 +4965,9 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if hovered && cx.has_active_drag() {
+            return;
+        }
         if hovered && over_anchor {
             if !self.collapsed_projects.contains(&project_id) {
                 return;
@@ -8143,6 +8159,113 @@ impl EggieApp {
             .ok();
     }
 
+    fn start_project_drag(&mut self, id: ProjectId, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_project_popover(cx);
+        self.dismiss_sidebar_preview(cx);
+        self.project_drag.source = Some(id);
+        self.project_drag.target = None;
+        self.project_drag.bounds = None;
+        self.project_drag.revision += 1;
+        let revision = self.project_drag.revision;
+        let app = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let keep_running = cx
+                    .update(|window, cx| {
+                        app.update(cx, |app, cx| {
+                            if app.project_drag.revision != revision
+                                || app.project_drag.source.is_none()
+                            {
+                                return false;
+                            }
+                            if !cx.has_active_drag() {
+                                app.clear_project_drag(cx);
+                                return false;
+                            }
+                            if let Some(bounds) = app.project_drag.bounds {
+                                let pointer = window.mouse_position();
+                                let delta = project_drag::edge_scroll_delta(bounds, pointer);
+                                let scroll = &app.project_drag.scroll;
+                                let offset = scroll.offset();
+                                let next_y =
+                                    (offset.y + delta).clamp(-scroll.max_offset().y, px(0.));
+                                if next_y != offset.y {
+                                    scroll.set_offset(point(offset.x, next_y));
+                                    cx.notify();
+                                }
+                                app.update_project_drop_target(pointer, bounds, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn clear_project_drag(&mut self, cx: &mut Context<Self>) {
+        if self.project_drag.source.take().is_some() {
+            self.project_drag.target = None;
+            self.project_drag.bounds = None;
+            self.project_drag.revision += 1;
+            cx.notify();
+        }
+    }
+
+    fn update_project_drop_target(
+        &mut self,
+        pointer: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_drag.bounds = Some(bounds);
+        let target = bounds.contains(&pointer).then(|| {
+            let rows = self.project_row_bounds.borrow();
+            project_drag::insertion_target(
+                self.projects.iter().filter_map(|project| {
+                    rows.get(&project.id).map(|bounds| (project.id, *bounds))
+                }),
+                pointer.y,
+            )
+        });
+        if self.project_drag.target != target {
+            self.project_drag.target = target;
+            cx.notify();
+        }
+    }
+
+    fn drop_project(
+        &mut self,
+        project: &DraggedProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if project.window_id != self.window_id {
+            return;
+        }
+        if let Some(bounds) = self.project_drag.bounds {
+            self.update_project_drop_target(window.mouse_position(), bounds, cx);
+        }
+        let target = self.project_drag.target;
+        self.clear_project_drag(cx);
+        if let Some(target) = target {
+            self.project_store.update(cx, |store, cx| {
+                store.move_before(project.id, target.before, cx);
+            });
+            self.reconcile_project_views(cx);
+            cx.notify();
+        }
+    }
+
     fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
         if self.tab_drop_target.take().is_some() {
             cx.notify();
@@ -8895,7 +9018,7 @@ impl EggieApp {
     }
 
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut panel = div()
+        let panel = div()
             .flex()
             .flex_none()
             .flex_col()
@@ -8932,7 +9055,31 @@ impl EggieApp {
                         .children(self.render_update_popover(cx)),
                 ),
             );
-        for (index, project) in self.projects.iter().enumerate() {
+        let mut project_list = div()
+            .id("sidebar-project-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .py(px(3.))
+            .overflow_y_scroll()
+            .track_scroll(&self.project_drag.scroll)
+            .on_drag_move::<DraggedProject>(cx.listener(
+                |app, event: &DragMoveEvent<DraggedProject>, window, cx| {
+                    let project = event
+                        .dragged_item()
+                        .downcast_ref::<DraggedProject>()
+                        .unwrap();
+                    if project.window_id == app.window_id {
+                        cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+                        app.update_project_drop_target(event.event.position, event.bounds, cx);
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|app, project: &DraggedProject, window, cx| {
+                app.drop_project(project, window, cx);
+            }));
+        for project in &self.projects {
             let project_id = project.id;
             let Some(view) = self.project_views.get(&project_id) else {
                 continue;
@@ -8942,7 +9089,28 @@ impl EggieApp {
             let has_terminals = view.layout.terminal_items().next().is_some();
             let has_tabs = view.layout.items().next().is_some();
             let row_bounds = self.project_row_bounds.clone();
-            panel = panel.child(
+            let mut icons: Vec<_> = view
+                .layout
+                .items()
+                .take(PROJECT_MAX_ICON_COUNT)
+                .map(|item| self.icon_for_item(item.kind, item.session_id))
+                .collect();
+            if icons.is_empty() {
+                icons.push(ProcessIcon::ProjectPlaceholder);
+            }
+            let dragged_project = DraggedProject {
+                id: project_id,
+                window_id: self.window_id,
+                title: project.name.clone().into(),
+                icon: process_icons::card_stack(&icons, self.use_dark, PROJECT_CARD_SIZE)
+                    .expect("project cards always contain an icon"),
+                icon_width: process_icons::stack_width(icons.len(), PROJECT_CARD_SIZE),
+                icon_height: PROJECT_CARD_SIZE + 5.,
+                width: self.left_sidebar_width - 24.,
+                colors: self.colors,
+            };
+            let drag_app = cx.entity().downgrade();
+            let mut project_block = div().relative().flex().flex_col().flex_none().child(
                 div()
                     .on_children_prepainted(move |children, _, _| {
                         if let Some(bounds) = children.first().copied() {
@@ -8951,7 +9119,7 @@ impl EggieApp {
                     })
                     .child(
                         div()
-                            .id(format!("project-{index}"))
+                            .id(format!("project-{project_id}"))
                             .flex()
                             .items_center()
                             .min_w_0()
@@ -8970,6 +9138,14 @@ impl EggieApp {
                                 move |element| element.bg(rgb(colors.hover))
                             })
                             .cursor_pointer()
+                            .on_drag(dragged_project, move |project, _, window, cx| {
+                                drag_app
+                                    .update(cx, |app, cx| {
+                                        app.start_project_drag(project.id, window, cx);
+                                    })
+                                    .ok();
+                                cx.new(|_| project.clone())
+                            })
                             .when(collapsed && has_tabs, |row| {
                                 row.on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
                                     app.project_popover_hover(
@@ -9005,7 +9181,7 @@ impl EggieApp {
                             )
                             .child(
                                 div()
-                                    .id(format!("project-end-icon-{index}"))
+                                    .id(format!("project-end-icon-{project_id}"))
                                     .flex()
                                     .flex_none()
                                     .items_center()
@@ -9208,7 +9384,7 @@ impl EggieApp {
                         ))
                         .child(label);
                     let row_bounds = self.sidebar_row_bounds.clone();
-                    panel = panel.child(
+                    project_block = project_block.child(
                         div()
                             .on_children_prepainted(move |children, _, _| {
                                 if let Some(bounds) = children.first().copied() {
@@ -9236,8 +9412,47 @@ impl EggieApp {
                     );
                 }
             }
+            project_list = project_list.child(
+                project_block
+                    .when(self.project_drag.source == Some(project_id), |block| {
+                        block.opacity(0.4)
+                    })
+                    .when(
+                        self.project_drag.target
+                            == Some(ProjectDropTarget {
+                                before: Some(project_id),
+                            }),
+                        |block| {
+                            block.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.))
+                                    .left_3()
+                                    .right_3()
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(rgb(self.colors.accent)),
+                            )
+                        },
+                    ),
+            );
         }
-        panel.into_any_element()
+        project_list = project_list.child(div().relative().flex_1().min_h(px(16.)).when(
+            self.project_drag.target == Some(ProjectDropTarget { before: None }),
+            |end| {
+                end.child(
+                    div()
+                        .absolute()
+                        .top(px(-2.))
+                        .left_3()
+                        .right_3()
+                        .h(px(2.))
+                        .rounded_full()
+                        .bg(rgb(self.colors.accent)),
+                )
+            },
+        ));
+        panel.child(project_list).into_any_element()
     }
 
     fn render_layout(&self, node: &LayoutNode, cx: &mut Context<Self>) -> AnyElement {
@@ -10884,7 +11099,15 @@ impl gpui::Render for EggieApp {
             .id("eggie-workspace")
             .relative()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::key_down))
+            .on_key_down(cx.listener(|app, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && app.project_drag.source.is_some() {
+                    cx.stop_active_drag(window);
+                    app.clear_project_drag(cx);
+                    cx.stop_propagation();
+                } else {
+                    Self::key_down(app, event, window, cx);
+                }
+            }))
             .on_key_up(cx.listener(Self::key_up))
             .on_action(cx.listener(|app, _: &TerminalCopy, _, cx| {
                 if app.copy_active_terminal_selection(cx) {
@@ -11105,6 +11328,7 @@ impl gpui::Render for EggieApp {
                     app.resizing_split = None;
                     app.dragging_scrollbar = None;
                     app.clear_tab_drop_target(cx);
+                    app.clear_project_drag(cx);
                     app.finish_terminal_selection_drag(cx);
                 }),
             )
