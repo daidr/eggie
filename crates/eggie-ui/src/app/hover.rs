@@ -56,6 +56,8 @@ impl EggieApp {
             .h(px(height))
             .overflow_hidden()
             .text_size(px(font_size))
+            // The absolute text must use the viewport's line box, not the inherited 1.618em.
+            .line_height(px(height))
             .on_children_prepainted(move |children, window, cx| {
                 let Some(bounds) = children.first() else {
                     return;
@@ -512,6 +514,7 @@ impl EggieApp {
                             .h(px(120.))
                             .overflow_hidden()
                             .rounded_md()
+                            .mask_corners(rgb(colors.panel))
                             .border_1()
                             .border_color(rgb(colors.border))
                             .child(thumbnail),

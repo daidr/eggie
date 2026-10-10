@@ -1,11 +1,12 @@
 //! Sidebar project drag presentation and insertion geometry; ordering lives in ProjectStore.
 
+use eggie_ui_kit::continuous_corners::div;
 use std::sync::Arc;
 
 use eggie_domain::{ProjectId, WindowId};
 use gpui::{
     Bounds, Context, Image, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, Window,
-    div, img, prelude::*, px, rgb,
+    img, prelude::*, px, rgb,
 };
 
 use crate::settings::UiColors;

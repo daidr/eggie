@@ -932,6 +932,8 @@ impl EggieApp {
                 element.border_r_1()
             });
         let mut content_region = div()
+            // Custom terminal output is covered at the same curve as the pane's border.
+            .mask_corners(rgb(self.colors.background))
             .flex_1()
             .min_h_0()
             .relative()

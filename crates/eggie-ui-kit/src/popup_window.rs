@@ -3,9 +3,10 @@
 //! GPUI's parent-anchored popup is not implemented on macOS yet. This shell keeps placement,
 //! window lifetime, and motion independent of the content rendered inside it.
 
+use crate::continuous_corners::div;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, Context, Pixels, Render, Size, Subscription,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
     point, prelude::*, px, rgb, size,
 };
 use std::{rc::Rc, time::Duration};

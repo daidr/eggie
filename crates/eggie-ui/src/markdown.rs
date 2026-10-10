@@ -10,9 +10,10 @@
 //! fenced code blocks, ordered / unordered lists (nested), links, block quotes,
 //! and thematic breaks. Not supported: tables, images, footnotes, task lists.
 
+use eggie_ui_kit::continuous_corners::div;
 use gpui::{
     AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveText, StyledText,
-    StrikethroughStyle, TextStyle, UnderlineStyle, div, prelude::*, px, rgb,
+    StrikethroughStyle, TextStyle, UnderlineStyle, prelude::*, px, rgb,
 };
 use std::ops::Range;
 

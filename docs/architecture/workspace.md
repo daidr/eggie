@@ -80,6 +80,8 @@ flowchart TD
 
 ## 终端视图边界
 
+UI 的 `div` 统一来自 `eggie-ui-kit::continuous_corners`，普通 radius 辅助方法在背景、交互状态、描边和阴影上应用 Apple 风格的连续 R 角。底层 GPUI 提供可选的四阶超椭圆轮廓，将名义半径换算成曲线延展范围，保留原圆弧在对角线方向的切角大小；圆形与满半径胶囊保留圆弧。SVG 图标卡片使用三次曲线近似。主题卡片的显式曲线延展范围保持原值，也使用同一 GPU 绘制能力。终端面板通过 `mask_corners` 在子内容绘制后、描边前覆盖轮廓以外的像素，支持零 padding 的 Metal 内容，遮罩只绘制边缘条带。
+
 `TerminalInputTarget` 定义读取 composition、提交文字、更新 composition 和取消 composition 四个操作。工作区实现接口，渲染器只持有一个弱 Entity 适配器；窗口销毁后更新自然失效，不形成引用环。
 
 cell 属性由 `eggie-domain::TerminalCellFlags` 定义。daemon 在编译期检查 Alacritty 的各个属性位与稳定协议一致，随后直接发送原有 `u16`，无需每个 cell 执行映射循环。终端视图不再依赖 Alacritty，协议版本及序列化形式保持不变。

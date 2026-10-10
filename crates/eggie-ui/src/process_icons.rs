@@ -32,7 +32,9 @@ pub(crate) enum ProcessIcon {
 impl ProcessIcon {
     fn source(self) -> &'static str {
         match self {
-            Self::ProjectPlaceholder => include_str!("../assets/process-icons/project-placeholder.svg"),
+            Self::ProjectPlaceholder => {
+                include_str!("../assets/process-icons/project-placeholder.svg")
+            }
             Self::Terminal => include_str!("../assets/process-icons/terminal-mark.svg"),
             Self::NodeJs => include_str!("../assets/process-icons/nodejs.svg"),
             Self::Python => include_str!("../assets/process-icons/python.svg"),
@@ -412,21 +414,35 @@ fn card_markup(poses: &[CardPose], dark: bool, card_size: f32, width: f32) -> St
         let background = hex(icon.background(dark));
         let foreground = hex(icon.foreground(dark, true));
         let artwork = svg_body(icon);
+        let outer =
+            eggie_ui_kit::continuous_corners::svg_rect_path(x, y, card_width, card_size, radius);
+        let shadow = eggie_ui_kit::continuous_corners::svg_rect_path(
+            x,
+            y + 1.5,
+            card_width,
+            card_size,
+            radius,
+        );
+        let inner = eggie_ui_kit::continuous_corners::svg_rect_path(
+            art_x,
+            art_y,
+            art_width,
+            art_height,
+            radius - 1.15,
+        );
         body.push_str(&format!(
                 r##"<g opacity="{opacity}" transform="rotate({angle} {center_x} {center_y})">
-  <rect x="{x}" y="{shadow_y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#111820" fill-opacity=".16" filter="url(#softShadow)"/>
-  <rect x="{x}" y="{y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#172025" fill-opacity=".32" filter="url(#edgeShadow)"/>
-  <rect x="{x}" y="{y}" width="{card_width}" height="{card_size}" rx="{radius}" fill="#FFFFFF"/>
-  <rect x="{art_x}" y="{art_y}" width="{art_width}" height="{art_height}" rx="{art_radius}" fill="#172025" fill-opacity=".20" filter="url(#innerShadow)"/>
-  <rect x="{art_x}" y="{art_y}" width="{art_width}" height="{art_height}" rx="{art_radius}" fill="{background}"/>
-  <rect x="{art_x}" y="{art_y}" width="{art_width}" height="{art_height}" rx="{art_radius}" fill="url(#spotlight)"/>
-  <rect x="{art_x}" y="{art_y}" width="{art_width}" height="{art_height}" rx="{art_radius}" fill="url(#bottomShade)"/>
+  <path d="{shadow}" fill="#111820" fill-opacity=".16" filter="url(#softShadow)"/>
+  <path d="{outer}" fill="#172025" fill-opacity=".32" filter="url(#edgeShadow)"/>
+  <path d="{outer}" fill="#FFFFFF"/>
+  <path d="{inner}" fill="#172025" fill-opacity=".20" filter="url(#innerShadow)"/>
+  <path d="{inner}" fill="{background}"/>
+  <path d="{inner}" fill="url(#spotlight)"/>
+  <path d="{inner}" fill="url(#bottomShade)"/>
   <svg x="{glyph_x}" y="{glyph_y}" width="{glyph_size}" height="{glyph_size}" viewBox="0 0 24 24" fill="{foreground}">{artwork}</svg>
 </g>"##,
                 center_x = x + card_width / 2.,
                 center_y = y + card_size / 2.,
-                shadow_y = y + 1.5,
-                art_radius = radius - 1.15,
             ));
     }
     format!(

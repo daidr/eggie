@@ -26,12 +26,14 @@ float dash_alpha(float t, float period, float length, float dash_velocity,
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii);
-float quad_sdf_impl(float2 center_to_point, float corner_radius);
+               Corners_ScaledPixels corner_radii, uint corner_shape);
+float quad_sdf_impl(float2 center_to_point, float corner_radius, bool continuous);
+float continuous_corner_sdf(float2 point, float2 radii);
+float calibrated_corner_radius(float radius, float2 half_size, bool continuous);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
+                   float2 half_size, bool continuous);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
@@ -114,7 +116,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.left == 0.0 &&
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
-      unrounded) {
+      unrounded && quad.corner_mask == 0u) {
     return background_color;
   }
 
@@ -129,6 +131,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Radius of the nearest corner
   float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+  bool continuous = quad.corner_shape != 0u && corner_radius < min(half_size.x, half_size.y) - 0.01;
+  corner_radius = calibrated_corner_radius(corner_radius, half_size, continuous);
 
   // Width of the nearest borders
   float2 border = float2(
@@ -173,13 +177,18 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     straight_border_inner_corner_to_point.x < -antialias_threshold &&
     straight_border_inner_corner_to_point.y < -antialias_threshold;
 
+  if (quad.corner_mask != 0u) {
+    float distance = quad_sdf_impl(corner_center_to_point, corner_radius, continuous);
+    return background_color * float4(1.0, 1.0, 1.0, saturate(0.5 + distance));
+  }
+
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
     return background_color;
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, continuous);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -202,7 +211,11 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     inner_sdf = -(outer_sdf + reduced_border.x);
   } else {
     float2 ellipse_radii = max(float2(0.0), float2(corner_radius) - reduced_border);
-    inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    if (continuous) {
+      inner_sdf = -continuous_corner_sdf(corner_center_to_point, ellipse_radii);
+    } else {
+      inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    }
   }
 
   // Negative when inside the border
@@ -519,9 +532,11 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     }
   }
 
+  bool continuous = shadow.corner_shape != 0u && corner_radius < min(half_size.x, half_size.y) - 0.01;
+  corner_radius = calibrated_corner_radius(corner_radius, half_size, continuous);
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii, shadow.corner_shape);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -536,7 +551,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha = 0.;
     for (int i = 0; i < 4; i++) {
       alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
+                            corner_radius, half_size, continuous) *
                gaussian(y, shadow.blur_radius) * step;
       y += step;
     }
@@ -547,7 +562,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
+                                      shadow.element_corner_radii, shadow.corner_shape);
     alpha *= saturate(0.5 - element_distance);
   }
 
@@ -718,7 +733,7 @@ fragment float4 polychrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, sprite.corner_shape);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -1061,22 +1076,42 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 // Signed distance of the point to the quad's border - positive outside the
 // border, and negative inside.
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii) {
+               Corners_ScaledPixels corner_radii, uint corner_shape) {
     float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.0;
     float2 center = float2(bounds.origin.x, bounds.origin.y) + half_size;
     float2 center_to_point = point - center;
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    bool continuous = corner_shape != 0u && corner_radius < min(half_size.x, half_size.y) - 0.01;
+    corner_radius = calibrated_corner_radius(corner_radius, half_size, continuous);
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, continuous);
 }
 
 // Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+// Preserve the diagonal cut of the nominal circular radius; caps remain circular.
+// CONTINUOUS_CORNER_RADIUS_SCALE comes from GPUI's generated Rust header.
+float calibrated_corner_radius(float radius, float2 half_size, bool continuous) {
+    return continuous ? min(radius * CONTINUOUS_CORNER_RADIUS_SCALE, min(half_size.x, half_size.y)) : radius;
+}
+
+// Distance to a fourth-order superellipse, normalized by the implicit gradient for antialiasing.
+float continuous_corner_sdf(float2 point, float2 radii) {
+    float2 v = point / max(radii, float2(0.0001));
+    float2 v2 = v * v;
+    float norm = sqrt(sqrt(dot(v2, v2)));
+    float gradient = length(v2 * v / (max(norm * norm * norm, 0.0001) * max(radii, float2(0.0001))));
+    return (norm - 1.0) / max(gradient, 0.0001);
+}
+
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius, bool continuous) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
+        if (continuous && all(corner_center_to_point > float2(0.0))) {
+            return continuous_corner_sdf(corner_center_to_point, float2(corner_radius));
+        }
         // Signed distance of the point from a quad that is inset by corner_radius
         // It is negative inside this quad, and positive outside
         float signed_distance_to_inset_quad =
@@ -1104,10 +1139,14 @@ float2 erf(float2 x) {
 }
 
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
+                   float2 half_size, bool continuous) {
   float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+  float extent = sqrt(max(0.0, corner * corner - delta * delta));
+  if (continuous && corner > 0.0) {
+    float v = delta / corner;
+    extent = corner * sqrt(sqrt(max(0.0, 1.0 - v * v * v * v)));
+  }
+  float curved = half_size.x - corner + extent;
   float2 integral =
       0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;

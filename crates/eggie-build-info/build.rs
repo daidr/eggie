@@ -16,6 +16,10 @@ fn main() {
         workspace.join("crates"),
         workspace.join("vendor/alacritty/alacritty_terminal/Cargo.toml"),
         workspace.join("vendor/alacritty/alacritty_terminal/src"),
+        workspace.join("vendor/zed-gpui/crates/gpui"),
+        workspace.join("vendor/zed-gpui/crates/gpui_macos"),
+        workspace.join("vendor/zed-gpui/crates/gpui_wgpu"),
+        workspace.join("vendor/zed-gpui/crates/gpui_windows"),
     ];
 
     let mut files = Vec::new();

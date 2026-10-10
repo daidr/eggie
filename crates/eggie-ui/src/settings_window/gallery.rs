@@ -441,6 +441,7 @@ impl SettingsWindow {
                     .flex_col()
                     .overflow_hidden()
                     .rounded_lg()
+                    .mask_corners(rgb(self.colors.panel))
                     .border_1()
                     .border_color(rgb(self.colors.border))
                     .bg(rgb(theme.background))
