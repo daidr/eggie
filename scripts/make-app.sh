@@ -31,7 +31,7 @@ ICNS_SRC="$ROOT/images/AppIcon.icns"
 SIGN_IDENTITY="${EGGIE_SIGN_IDENTITY:--}"
 
 echo "==> cargo build ($PROFILE)"
-cargo build -p eggie-ui -p eggie-updater $( [[ "$PROFILE" == "release" ]] && echo "--release" )
+cargo build -p eggie -p eggie-updater $( [[ "$PROFILE" == "release" ]] && echo "--release" )
 
 echo "==> 组装 $BUNDLE"
 rm -rf "$BUNDLE"

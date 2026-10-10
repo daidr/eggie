@@ -1,0 +1,25 @@
+[package]
+name = "eggie"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eggie-build-info.workspace = true
+eggie-ui.workspace = true
+eggie-daemon.workspace = true
+eggie-ipc.workspace = true
+eggie-config.workspace = true
+eggie-storage.workspace = true
+eggie-lua.workspace = true
+eggie-protocol.workspace = true
+eggie-domain.workspace = true
+eggie-themes.workspace = true
+eggie-ui-kit.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+mlua.workspace = true
+uuid.workspace = true

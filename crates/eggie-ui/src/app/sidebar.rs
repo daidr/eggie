@@ -1,0 +1,1188 @@
+use super::*;
+
+impl EggieApp {
+    pub(super) fn start_project_drag(
+        &mut self,
+        id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_project_popover(cx);
+        self.dismiss_sidebar_preview(cx);
+        self.sidebar.project_drag.source = Some(id);
+        self.sidebar.project_drag.target = None;
+        self.sidebar.project_drag.bounds = None;
+        self.sidebar.project_drag.revision += 1;
+        let revision = self.sidebar.project_drag.revision;
+        let app = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let keep_running = cx
+                    .update(|window, cx| {
+                        app.update(cx, |app, cx| {
+                            if app.sidebar.project_drag.revision != revision
+                                || app.sidebar.project_drag.source.is_none()
+                            {
+                                return false;
+                            }
+                            if !cx.has_active_drag() {
+                                app.clear_project_drag(cx);
+                                return false;
+                            }
+                            if let Some(bounds) = app.sidebar.project_drag.bounds {
+                                let pointer = window.mouse_position();
+                                let delta = project_drag::edge_scroll_delta(bounds, pointer);
+                                let scroll = &app.sidebar.project_drag.scroll;
+                                let offset = scroll.offset();
+                                let next_y =
+                                    (offset.y + delta).clamp(-scroll.max_offset().y, px(0.));
+                                if next_y != offset.y {
+                                    scroll.set_offset(point(offset.x, next_y));
+                                    cx.notify();
+                                }
+                                app.update_project_drop_target(pointer, bounds, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn clear_project_drag(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar.project_drag.source.take().is_some() {
+            self.sidebar.project_drag.target = None;
+            self.sidebar.project_drag.bounds = None;
+            self.sidebar.project_drag.revision += 1;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn update_project_drop_target(
+        &mut self,
+        pointer: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.project_drag.bounds = Some(bounds);
+        let target = bounds.contains(&pointer).then(|| {
+            let rows = self.sidebar.project_row_bounds.borrow();
+            project_drag::insertion_target(
+                self.workspace_state.projects.iter().filter_map(|project| {
+                    rows.get(&project.id).map(|bounds| (project.id, *bounds))
+                }),
+                pointer.y,
+            )
+        });
+        if self.sidebar.project_drag.target != target {
+            self.sidebar.project_drag.target = target;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn drop_project(
+        &mut self,
+        project: &DraggedProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if project.window_id != self.window_id {
+            return;
+        }
+        if let Some(bounds) = self.sidebar.project_drag.bounds {
+            self.update_project_drop_target(window.mouse_position(), bounds, cx);
+        }
+        let target = self.sidebar.project_drag.target;
+        self.clear_project_drag(cx);
+        if let Some(target) = target {
+            self.project_store.update(cx, |store, cx| {
+                store.move_before(project.id, target.before, cx);
+            });
+            self.reconcile_project_views(cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn sidebar_sessions_in_layout_order<'a>(
+        &'a self,
+        project_id: ProjectId,
+        view: &'a WindowProjectView,
+    ) -> Vec<&'a SessionSummary> {
+        // Reading-order position of each session within the layout tree.
+        let mut layout_rank: HashMap<SessionId, usize> = HashMap::new();
+        for item in view.layout.terminal_items() {
+            if let Some(session_id) = item.session_id {
+                let next_rank = layout_rank.len();
+                layout_rank.entry(session_id).or_insert(next_rank);
+            }
+        }
+        let orphan_rank = layout_rank.len();
+
+        let mut sessions: Vec<&SessionSummary> = self
+            .session_feed
+            .sessions
+            .iter()
+            .filter(|session| session.project_id == project_id)
+            .collect();
+
+        // Stable sort keeps orphan sessions (rank = len) in their original relative order, appended
+        // after everything the layout knows about.
+        sessions
+            .sort_by_key(|session| layout_rank.get(&session.id).copied().unwrap_or(orphan_rank));
+        sessions
+    }
+
+    /// The button next to "add project" that opens the detached-session popover. Rendered only when
+    /// there is at least one detached session (D6), with a count badge.
+    pub(super) fn render_detached_sessions_button(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.session_feed.detached_sessions.is_empty() {
+            return None;
+        }
+        let count = self.session_feed.detached_sessions.len();
+        let colors = self.colors;
+        let tooltip: SharedString = self.language.detached_sessions_tooltip().into();
+        let control = cx.entity().downgrade();
+        Some(
+            div()
+                // Capture the toggle's on-screen bounds so the popover can anchor just below it.
+                .on_children_prepainted(move |children, _, cx| {
+                    let Some(bounds) = children.first().copied() else {
+                        return;
+                    };
+                    let control = control.clone();
+                    cx.defer(move |cx| {
+                        control
+                            .update(cx, |app, cx| {
+                                if app.detached_toggle_bounds != Some(bounds) {
+                                    app.detached_toggle_bounds = Some(bounds);
+                                    if app.detached_popover_open {
+                                        cx.notify();
+                                    }
+                                }
+                            })
+                            .ok();
+                    });
+                })
+                .child(
+                    div()
+                        .id("detached-sessions-toggle")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .h(px(24.))
+                        .px_2()
+                        .rounded_lg()
+                        .text_color(rgb(colors.muted))
+                        .cursor_pointer()
+                        .hover(move |element| {
+                            element
+                                .bg(rgb(colors.panel_alt))
+                                .text_color(rgb(colors.text))
+                        })
+                        .tooltip(tooltip_text(tooltip, colors))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.detached_popover_open = !app.detached_popover_open;
+                            cx.notify();
+                        }))
+                        .child(icon_sized(IconName::Terminal, 14.))
+                        .child(div().text_size(px(11.)).child(count.to_string())),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The popover listing detached (unowned) sessions grouped by project, each with claim/destroy
+    /// actions (D6). Uses the same anchored + deferred + `.occlude()` overlay pattern as the settings
+    /// dropdowns; `.occlude()` stops clicks on blank areas from falling through to the sidebar.
+    pub(super) fn render_detached_sessions_popover(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.detached_popover_open || self.session_feed.detached_sessions.is_empty() {
+            return None;
+        }
+        let colors = self.colors;
+        let claim_tooltip: SharedString = self.language.claim_session_tooltip().into();
+        let destroy_tooltip: SharedString = self.language.destroy_session_tooltip().into();
+
+        // Group detached sessions by project, preserving the shared project order; sessions whose
+        // project no longer exists fall into a trailing "other" group.
+        let mut groups: Vec<(String, Vec<&SessionSummary>)> = Vec::new();
+        let mut grouped_projects: HashSet<ProjectId> = HashSet::new();
+        for project in &self.workspace_state.projects {
+            let members: Vec<&SessionSummary> = self
+                .session_feed
+                .detached_sessions
+                .iter()
+                .filter(|session| session.project_id == project.id)
+                .collect();
+            if !members.is_empty() {
+                grouped_projects.insert(project.id);
+                groups.push((project.name.clone(), members));
+            }
+        }
+        let mut orphans: Vec<&SessionSummary> = self
+            .session_feed
+            .detached_sessions
+            .iter()
+            .filter(|session| !grouped_projects.contains(&session.project_id))
+            .collect();
+        if !orphans.is_empty() {
+            orphans.sort_by(|a, b| a.initial_directory.cmp(&b.initial_directory));
+            groups.push((self.language.detached_other_group().to_owned(), orphans));
+        }
+
+        let mut list = div().flex().flex_col().py_1();
+        for (title, members) in groups {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.muted))
+                    .child(title),
+            );
+            for session in members {
+                let session_id = session.id;
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .hover(move |element| element.bg(rgb(colors.hover)))
+                        .child(icon_sized(IconName::Terminal, 14.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .child(session.title.clone()),
+                        )
+                        .child(icon_button(
+                            IconName::CombineIcon,
+                            SharedString::from(format!("claim-detached-{session_id}")),
+                            colors,
+                            Some(claim_tooltip.clone()),
+                            cx.listener(move |app, _, window, cx| {
+                                app.claim_detached_session(session_id, window, cx)
+                            }),
+                        ))
+                        .child(icon_button(
+                            IconName::Close,
+                            SharedString::from(format!("destroy-detached-{session_id}")),
+                            colors,
+                            Some(destroy_tooltip.clone()),
+                            cx.listener(move |app, _, _, cx| {
+                                app.destroy_detached_session(session_id, cx)
+                            }),
+                        )),
+                );
+            }
+        }
+
+        let popover = div()
+            .flex()
+            .flex_col()
+            .w(px(260.))
+            .max_h(px(360.))
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_lg()
+            // Floating overlay: block mouse events for the sidebar rows behind it so clicks on the
+            // popover's blank areas don't bubble through (see [[gpui-overlay-occlude]]).
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
+                cx.defer_in(window, move |app, _, cx| {
+                    if app.detached_popover_open {
+                        app.detached_popover_open = false;
+                        cx.notify();
+                    }
+                });
+            }))
+            .child(list);
+
+        // Anchor the popover just below the toggle button. Anchoring the popover's top-right corner
+        // to the button's bottom-right opens it downward and leftward, keeping it inside the sidebar.
+        // Fall back to a window-snapped corner until the button's bounds have been captured once.
+        let anchored_popover = match self.detached_toggle_bounds {
+            Some(bounds) => anchored()
+                .anchor(Anchor::TopRight)
+                .position(point(bounds.right(), bounds.bottom() + px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+            None => anchored()
+                .anchor(Anchor::TopRight)
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+        };
+
+        Some(deferred(anchored_popover).priority(2).into_any_element())
+    }
+
+    /// The copy-path + open-with split button pair shown under a directory row in the Info tab. The
+    /// open button's left half launches the persisted [`OpenWith`] app on `path`; its right half is a
+    /// caret that toggles a dropdown to pick (and persist) a different opener.
+    pub(super) fn render_directory_actions(
+        &self,
+        field: DirectoryField,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors;
+        let language = self.language;
+        let opener = self.settings.read(cx).config().open_directory_with;
+        let slug = field.slug();
+
+        let copy_value = path.display().to_string();
+        let copy_button = div()
+            .id(SharedString::from(format!("copy-path-{slug}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(24.))
+            .px_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .text_color(rgb(colors.muted))
+            .cursor_pointer()
+            .hover(move |element| {
+                element
+                    .bg(rgb(colors.panel_alt))
+                    .text_color(rgb(colors.text))
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_value.clone()));
+            }))
+            .child(icon_sized(IconName::Copy, 14.))
+            .child(div().text_size(px(12.)).child(language.copy_path()));
+
+        let open_path = path.to_path_buf();
+        // Left half: launch the persisted opener on the directory.
+        let open_action = div()
+            .id(SharedString::from(format!("open-with-{slug}")))
+            .flex()
+            .flex_1()
+            .items_center()
+            .gap_1()
+            .h_full()
+            .px_2()
+            .cursor_pointer()
+            .hover(move |element| element.bg(rgb(colors.panel_alt)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |_, _, _, _| {
+                open_path_with(&open_path, opener);
+            }))
+            .child(icon_sized(icon_for_open_with(opener), 14.))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .child(open_with_label(language, opener)),
+            );
+
+        // Right half: a caret that toggles this row's opener dropdown.
+        let caret = div()
+            .id(SharedString::from(format!("open-with-caret-{slug}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h_full()
+            .border_l_1()
+            .border_color(rgb(colors.border))
+            .cursor_pointer()
+            .hover(move |element| element.bg(rgb(colors.panel_alt)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |app, _, _, cx| {
+                app.open_with_dropdown = if app.open_with_dropdown == Some(field) {
+                    None
+                } else {
+                    Some(field)
+                };
+                cx.notify();
+            }))
+            .child(icon_sized(IconName::ArrowDown, 12.));
+
+        let control = cx.entity().downgrade();
+        let mut open_button = div()
+            // Capture the split-button's bounds so the dropdown can anchor just below it.
+            .on_children_prepainted(move |children, _, cx| {
+                let Some(bounds) = children.first().copied() else {
+                    return;
+                };
+                let control = control.clone();
+                cx.defer(move |cx| {
+                    control
+                        .update(cx, |app, cx| {
+                            if app.open_with_dropdown_bounds.get(&field) != Some(&bounds) {
+                                app.open_with_dropdown_bounds.insert(field, bounds);
+                                if app.open_with_dropdown == Some(field) {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(24.))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .text_color(rgb(colors.muted))
+                    .child(open_action)
+                    .child(caret),
+            );
+        if let Some(dropdown) = self.render_open_with_dropdown(field, cx) {
+            open_button = open_button.child(dropdown);
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(copy_button)
+            .child(open_button)
+            .into_any_element()
+    }
+
+    /// A button that opens a prompt for a port forward spec, for a remote session. The spec is a
+    /// single line: `L 8080 localhost:80` for local, `R 8080 localhost:80` for remote, or
+    /// `D 1080` for dynamic.
+    pub(super) fn render_forward_port_button(
+        &self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors;
+        let language = self.language;
+        div()
+            .id(format!("forward-port-{session_id}"))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(28.))
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .text_size(px(12.))
+            .text_color(rgb(colors.muted))
+            .cursor_pointer()
+            .hover(move |element| {
+                element
+                    .bg(rgb(colors.panel_alt))
+                    .text_color(rgb(colors.text))
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |app, _, window, cx| {
+                app.prompt_forward_port(session_id, window, cx);
+            }))
+            .child(language.forward_port())
+            .into_any_element()
+    }
+
+    /// The dropdown listing the available [`OpenWith`] apps for `field`, anchored below its split
+    /// button. Selecting an option persists it as the new default opener. Same anchored + deferred +
+    /// `.occlude()` overlay pattern as the settings dropdowns.
+    pub(super) fn render_open_with_dropdown(
+        &self,
+        field: DirectoryField,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.open_with_dropdown != Some(field) {
+            return None;
+        }
+        let colors = self.colors;
+        let language = self.language;
+        let selected = self.settings.read(cx).config().open_directory_with;
+        let slug = field.slug();
+
+        let mut list = div().flex().flex_col().py_1();
+        for option in OpenWith::ALL {
+            let is_selected = option == selected;
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "open-with-{slug}-{}",
+                        option.slug()
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_selected, |element| {
+                        element
+                            .bg(rgb(colors.panel_alt))
+                            .text_color(rgb(colors.accent))
+                    })
+                    .hover(move |element| element.bg(rgb(colors.panel_alt)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.set_open_directory_with(option, cx);
+                        app.open_with_dropdown = None;
+                        cx.notify();
+                    }))
+                    .child(icon_sized(icon_for_open_with(option), 14.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .child(open_with_label(language, option)),
+                    ),
+            );
+        }
+
+        let popover = div()
+            .flex()
+            .flex_col()
+            .w(px(160.))
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .shadow_lg()
+            // Floating overlay: block clicks on blank areas from bubbling through (see
+            // [[gpui-overlay-occlude]]).
+            .occlude()
+            .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
+                cx.defer_in(window, move |app, _, cx| {
+                    if app.open_with_dropdown == Some(field) {
+                        app.open_with_dropdown = None;
+                        cx.notify();
+                    }
+                });
+            }))
+            .child(list);
+
+        // Anchor the dropdown just below the split button (top-left corner to the button's
+        // bottom-left), falling back to a window-snapped corner until bounds are captured once.
+        let anchored_dropdown = match self.open_with_dropdown_bounds.get(&field).copied() {
+            Some(bounds) => anchored()
+                .anchor(Anchor::TopLeft)
+                .position(point(bounds.left(), bounds.bottom() + px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+            None => anchored()
+                .anchor(Anchor::TopLeft)
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+        };
+
+        Some(deferred(anchored_dropdown).priority(2).into_any_element())
+    }
+
+    /// Persist a new default directory opener. No-op (and no save) if it is already selected.
+    pub(super) fn set_open_directory_with(&mut self, opener: OpenWith, cx: &mut Context<Self>) {
+        if self.settings.read(cx).config().open_directory_with == opener {
+            return;
+        }
+        self.settings.update(cx, |settings, cx| {
+            settings.update(|config| config.open_directory_with = opener, cx);
+        });
+    }
+
+    pub(super) fn render_project_icon_stack(
+        &self,
+        project_id: ProjectId,
+        view: &WindowProjectView,
+    ) -> Option<AnyElement> {
+        let mut desired: Vec<_> = view
+            .layout
+            .items()
+            .take(PROJECT_MAX_ICON_COUNT)
+            .map(|item| ProjectIconCard {
+                id: Some(item.id),
+                icon: self.icon_for_item(item.kind, item.session_id),
+            })
+            .collect();
+        if desired.is_empty() {
+            desired.push(ProjectIconCard {
+                id: None,
+                icon: ProcessIcon::ProjectPlaceholder,
+            });
+        }
+        let state = {
+            let mut states = self.sidebar.project_icon_states.borrow_mut();
+            let state = states
+                .entry(project_id)
+                .or_insert_with(|| ProjectIconState {
+                    icons: Vec::new(),
+                    previous: Vec::new(),
+                    revision: 0,
+                    started_at: Instant::now(),
+                });
+            if state.icons != desired {
+                state.previous = std::mem::replace(&mut state.icons, desired);
+                state.revision += 1;
+                state.started_at = Instant::now();
+            }
+            state.clone()
+        };
+        let animating = state.started_at.elapsed() < PROJECT_ICON_TRANSITION;
+        let image_width = process_icons::stack_width(PROJECT_MAX_ICON_COUNT, PROJECT_CARD_SIZE);
+        // Keep the first card at the same left edge as a single icon.
+        let image_left = image_width - process_icons::stack_width(1, PROJECT_CARD_SIZE);
+        let slot_width = image_width + 16.;
+        let card_height = PROJECT_CARD_SIZE + 5.;
+        if !animating {
+            let icons = state.icons.iter().map(|card| card.icon).collect::<Vec<_>>();
+            let image = process_icons::card_stack_frame(&icons, self.use_dark, PROJECT_CARD_SIZE)?;
+            let content_width = process_icons::stack_width(icons.len(), PROJECT_CARD_SIZE);
+            return Some(
+                div()
+                    .flex_none()
+                    .w(px(slot_width))
+                    .h(px(card_height))
+                    .child(
+                        img(image)
+                            .ml(px(image_left))
+                            .w(px(content_width))
+                            .h(px(card_height)),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let dark = self.use_dark;
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .overflow_hidden()
+                .w(px(slot_width))
+                .h(px(card_height))
+                .with_animation(
+                    format!("project-icons-{project_id}-{}", state.revision),
+                    Animation::new(PROJECT_ICON_TRANSITION).with_easing(gpui::ease_in_out),
+                    move |element, progress| {
+                        let poses = project_card_poses(&state.previous, &state.icons, progress);
+                        let frame =
+                            process_icons::card_frame(&poses, dark, PROJECT_CARD_SIZE, image_width);
+                        element.child(
+                            img(frame)
+                                .absolute()
+                                .left(px(image_left))
+                                .top_0()
+                                .w(px(image_width))
+                                .h(px(card_height)),
+                        )
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn sidebar_status_row_transition(
+        &self,
+        session_id: SessionId,
+        expanded: bool,
+    ) -> Option<(f32, f32, u64)> {
+        let now = Instant::now();
+        let target_height = if expanded {
+            SIDEBAR_STATUS_ROW_HEIGHT
+        } else {
+            SIDEBAR_SESSION_ROW_HEIGHT
+        };
+        let mut states = self.sidebar.sidebar_status_rows.borrow_mut();
+        let state = states.entry(session_id).or_insert(SidebarStatusRowState {
+            expanded,
+            from_height: target_height,
+            revision: 0,
+            started_at: now,
+        });
+        if state.expanded != expanded {
+            state.from_height = state.current_height(now);
+            state.expanded = expanded;
+            state.revision += 1;
+            state.started_at = now;
+        }
+        (state.started_at.elapsed() < SIDEBAR_STATUS_TRANSITION
+            && (state.from_height - target_height).abs() > f32::EPSILON)
+            .then_some((state.from_height, target_height, state.revision))
+    }
+
+    pub(super) fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel = div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .w(px(self.left_sidebar_width))
+            .h_full()
+            .overflow_hidden()
+            .bg(rgb(self.colors.panel))
+            .child(self.render_window_drag_region(cx))
+            .child(
+                div().flex().flex_col().px_3().pb_3().gap_3().child(
+                    div()
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(section_label(self.language.projects_label(), self.colors))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .children(self.render_detached_sessions_button(cx))
+                                .child(icon_button(
+                                    IconName::Add,
+                                    "add-project",
+                                    self.colors,
+                                    Some(self.language.add_project_tooltip().into()),
+                                    cx.listener(|app, _, window, cx| {
+                                        app.prompt_add_project(window, cx)
+                                    }),
+                                )),
+                        )
+                        .children(self.render_detached_sessions_popover(cx))
+                        .children(self.render_update_popover(cx)),
+                ),
+            );
+        let mut project_list = div()
+            .id("sidebar-project-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .py(px(3.))
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar.project_drag.scroll)
+            .on_drag_move::<DraggedProject>(cx.listener(
+                |app, event: &DragMoveEvent<DraggedProject>, window, cx| {
+                    let project = event
+                        .dragged_item()
+                        .downcast_ref::<DraggedProject>()
+                        .unwrap();
+                    if project.window_id == app.window_id {
+                        cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+                        app.update_project_drop_target(event.event.position, event.bounds, cx);
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|app, project: &DraggedProject, window, cx| {
+                app.drop_project(project, window, cx);
+            }));
+        for project in &self.workspace_state.projects {
+            let project_id = project.id;
+            let Some(view) = self.workspace_state.project_views.get(&project_id) else {
+                continue;
+            };
+            let collapsed = self
+                .workspace_state
+                .collapsed_projects
+                .contains(&project_id);
+            let is_active_project = project_id == self.workspace_state.active_project;
+            let has_terminals = view.layout.terminal_items().next().is_some();
+            let has_tabs = view.layout.items().next().is_some();
+            let row_bounds = self.sidebar.project_row_bounds.clone();
+            let mut icons: Vec<_> = view
+                .layout
+                .items()
+                .take(PROJECT_MAX_ICON_COUNT)
+                .map(|item| self.icon_for_item(item.kind, item.session_id))
+                .collect();
+            if icons.is_empty() {
+                icons.push(ProcessIcon::ProjectPlaceholder);
+            }
+            let dragged_project = DraggedProject {
+                id: project_id,
+                window_id: self.window_id,
+                title: project.name.clone().into(),
+                icon: process_icons::card_stack(&icons, self.use_dark, PROJECT_CARD_SIZE)
+                    .expect("project cards always contain an icon"),
+                icon_width: process_icons::stack_width(icons.len(), PROJECT_CARD_SIZE),
+                icon_height: PROJECT_CARD_SIZE + 5.,
+                width: self.left_sidebar_width - 24.,
+                colors: self.colors,
+            };
+            let drag_app = cx.entity().downgrade();
+            let mut project_block = div().relative().flex().flex_col().flex_none().child(
+                div()
+                    .on_children_prepainted(move |children, _, _| {
+                        if let Some(bounds) = children.first().copied() {
+                            row_bounds.borrow_mut().insert(project_id, bounds);
+                        }
+                    })
+                    .child(
+                        div()
+                            .id(format!("project-{project_id}"))
+                            .flex()
+                            .items_center()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap_0()
+                            .mx_3()
+                            .pr_2()
+                            .py_1()
+                            .rounded_md()
+                            .mb_1()
+                            .when(is_active_project, |element| {
+                                element.bg(rgb(self.colors.panel_alt))
+                            })
+                            .hover({
+                                let colors = self.colors;
+                                move |element| element.bg(rgb(colors.hover))
+                            })
+                            .cursor_pointer()
+                            .on_drag(dragged_project, move |project, _, window, cx| {
+                                drag_app
+                                    .update(cx, |app, cx| {
+                                        app.start_project_drag(project.id, window, cx);
+                                    })
+                                    .ok();
+                                cx.new(|_| project.clone())
+                            })
+                            .when(collapsed && has_tabs, |row| {
+                                row.on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
+                                    app.project_popover_hover(
+                                        project_id, true, *hovered, window, cx,
+                                    );
+                                }))
+                            })
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                let clicked_add = !has_terminals
+                                    && app
+                                        .sidebar
+                                        .project_row_bounds
+                                        .borrow()
+                                        .get(&project_id)
+                                        .is_some_and(|bounds| {
+                                            window.mouse_position().x >= bounds.right() - px(32.)
+                                        });
+                                if clicked_add {
+                                    app.create_terminal_in_project(project_id, window, cx);
+                                } else {
+                                    app.activate_project(project_id, cx);
+                                    app.toggle_project_collapsed(project_id, cx);
+                                }
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |app, _, window, cx| {
+                                    app.show_project_context_menu(project_id, window, cx)
+                                }),
+                            )
+                            .children(self.render_project_icon_stack(project_id, view))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(project.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("project-end-icon-{project_id}"))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(24.))
+                                    .h(px(24.))
+                                    .ml_2()
+                                    .rounded_md()
+                                    .text_color(rgb(self.colors.muted))
+                                    .when(!has_terminals, |end| {
+                                        end.cursor_pointer().hover({
+                                            let colors = self.colors;
+                                            move |end| {
+                                                end.bg(rgb(colors.panel_alt))
+                                                    .text_color(rgb(colors.accent))
+                                            }
+                                        })
+                                    })
+                                    .child(icon_sized(
+                                        if !has_terminals {
+                                            IconName::Add
+                                        } else if collapsed {
+                                            IconName::ArrowRight
+                                        } else {
+                                            IconName::ArrowDown
+                                        },
+                                        14.,
+                                    )),
+                            ),
+                    ),
+            );
+            if !collapsed {
+                for session in self.sidebar_sessions_in_layout_order(project_id, view) {
+                    let active = is_active_project && self.active_session_id() == Some(session.id);
+                    let session_id = session.id;
+                    // Prefer the tab's custom title (if any) so the sidebar stays consistent with
+                    // the tab bar; fall back to the session's process title.
+                    let tab_title = view
+                        .layout
+                        .terminal_display_title(session_id)
+                        .unwrap_or(session.title.as_str());
+                    let program_status = session.program_status.as_ref();
+                    let display_title = view
+                        .layout
+                        .terminal_custom_title(session_id)
+                        .or_else(|| program_status.and_then(|status| status.title.as_deref()))
+                        .unwrap_or(tab_title);
+                    let title_key = format!("sidebar-title-{session_id}");
+                    let subtitle_key = format!("sidebar-subtitle-{session_id}");
+                    let marquee_hovered = self
+                        .sidebar
+                        .marquee_states
+                        .borrow()
+                        .get(&title_key)
+                        .is_some_and(|state| state.hovered);
+                    let label_background = if marquee_hovered {
+                        self.colors.hover
+                    } else if active {
+                        self.colors.panel_alt
+                    } else {
+                        self.colors.panel
+                    };
+                    let label: AnyElement = if let Some(status) = program_status {
+                        let state_label = program_state_label(status.state, self.language);
+                        let mut subtitle = match (&status.title, &status.message) {
+                            (Some(title), Some(message)) if title != display_title => {
+                                format!("{title}: {message}")
+                            }
+                            (_, Some(message)) => message.clone(),
+                            (Some(title), None) if title != display_title => title.clone(),
+                            _ => state_label.to_owned(),
+                        };
+                        if let Some(progress) = status.progress {
+                            subtitle.push_str(&format!(" · {progress}%"));
+                        }
+                        let tag = matches!(
+                            status.state,
+                            TerminalProgramState::Blocked
+                                | TerminalProgramState::Done
+                                | TerminalProgramState::Error
+                        )
+                        .then_some((status.state, state_label));
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.render_marquee(
+                                        title_key.clone(),
+                                        display_title.to_owned(),
+                                        12.,
+                                        17.,
+                                        label_background,
+                                        cx,
+                                    ))
+                                    .when_some(tag, |row, (state, label)| {
+                                        let tint = match state {
+                                            TerminalProgramState::Blocked => {
+                                                self.interface_theme.palette[3]
+                                            }
+                                            TerminalProgramState::Error => {
+                                                self.interface_theme.palette[1]
+                                            }
+                                            _ => self.interface_theme.palette[2],
+                                        };
+                                        row.child(
+                                            div()
+                                                .flex_none()
+                                                .h(px(16.))
+                                                .px_1()
+                                                .rounded_full()
+                                                .bg(rgba((tint << 8) | 0x30))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(self.colors.text))
+                                                .child(label),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_color(rgb(self.colors.muted))
+                                    .child(self.render_marquee(
+                                        subtitle_key.clone(),
+                                        subtitle,
+                                        11.,
+                                        15.,
+                                        label_background,
+                                        cx,
+                                    )),
+                            )
+                            .into_any_element()
+                    } else {
+                        self.render_marquee(
+                            title_key.clone(),
+                            display_title.to_owned(),
+                            12.,
+                            17.,
+                            label_background,
+                            cx,
+                        )
+                    };
+                    let height_transition =
+                        self.sidebar_status_row_transition(session_id, program_status.is_some());
+                    let row = div()
+                        .id(format!("sidebar-session-{session_id}"))
+                        .flex()
+                        .items_center()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .gap_3()
+                        .ml_5()
+                        .mr_3()
+                        .pl_1()
+                        .pr_2()
+                        .rounded_md()
+                        .mb_1()
+                        .text_size(px(12.))
+                        .text_color(rgb(if active {
+                            self.colors.text
+                        } else {
+                            self.colors.muted
+                        }))
+                        .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
+                        .when_some(self.bell_flash_tint(session_id), |element, tint| {
+                            element.bg(rgba(tint))
+                        })
+                        .hover({
+                            let colors = self.colors;
+                            move |element| element.bg(rgb(colors.hover))
+                        })
+                        .on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
+                            app.set_marquee_hover(
+                                &[
+                                    format!("sidebar-title-{session_id}"),
+                                    format!("sidebar-subtitle-{session_id}"),
+                                ],
+                                *hovered,
+                                cx,
+                            );
+                            app.sidebar_preview_hover(session_id, *hovered, window, cx);
+                        }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |app, _, window, cx| {
+                            app.dismiss_sidebar_preview(cx);
+                            app.activate_session(project_id, session_id, window, cx)
+                        }))
+                        .child(self.render_item_icon(
+                            ItemKind::Terminal,
+                            Some(session_id),
+                            format!("sidebar-progress-{session_id}"),
+                        ))
+                        .child(label);
+                    let row_bounds = self.sidebar.sidebar_row_bounds.clone();
+                    project_block = project_block.child(
+                        div()
+                            .on_children_prepainted(move |children, _, _| {
+                                if let Some(bounds) = children.first().copied() {
+                                    row_bounds.borrow_mut().insert(session_id, bounds);
+                                }
+                            })
+                            .child(if let Some((from, to, revision)) = height_transition {
+                                row.with_animation(
+                                    format!("sidebar-status-height-{session_id}-{revision}"),
+                                    Animation::new(SIDEBAR_STATUS_TRANSITION)
+                                        .with_easing(gpui::ease_in_out),
+                                    move |element, progress| {
+                                        element.h(px(from + (to - from) * progress))
+                                    },
+                                )
+                                .into_any_element()
+                            } else {
+                                row.h(px(if program_status.is_some() {
+                                    SIDEBAR_STATUS_ROW_HEIGHT
+                                } else {
+                                    SIDEBAR_SESSION_ROW_HEIGHT
+                                }))
+                                .into_any_element()
+                            }),
+                    );
+                }
+            }
+            project_list = project_list.child(
+                project_block
+                    .when(
+                        self.sidebar.project_drag.source == Some(project_id),
+                        |block| block.opacity(0.4),
+                    )
+                    .when(
+                        self.sidebar.project_drag.target
+                            == Some(ProjectDropTarget {
+                                before: Some(project_id),
+                            }),
+                        |block| {
+                            block.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.))
+                                    .left_3()
+                                    .right_3()
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(rgb(self.colors.accent)),
+                            )
+                        },
+                    ),
+            );
+        }
+        project_list = project_list.child(div().relative().flex_1().min_h(px(16.)).when(
+            self.sidebar.project_drag.target == Some(ProjectDropTarget { before: None }),
+            |end| {
+                end.child(
+                    div()
+                        .absolute()
+                        .top(px(-2.))
+                        .left_3()
+                        .right_3()
+                        .h(px(2.))
+                        .rounded_full()
+                        .bg(rgb(self.colors.accent)),
+                )
+            },
+        ));
+        panel.child(project_list).into_any_element()
+    }
+}

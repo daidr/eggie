@@ -11,7 +11,7 @@ pub(super) struct PreferencesService {
 
 impl PreferencesService {
     pub(super) fn new() -> Self {
-        Self::new_at(eggie_config::state_dir())
+        Self::new_at(eggie_storage::state_dir())
     }
 
     pub(super) fn new_at(directory: PathBuf) -> Self {

@@ -212,7 +212,7 @@ impl UpdateController {
         if !release.daemon_compatible() {
             command
                 .arg("--daemon-socket")
-                .arg(eggie_daemon::daemon_socket_path());
+                .arg(eggie_ipc::daemon_socket_path());
         }
         command.arg("--relaunch");
         command

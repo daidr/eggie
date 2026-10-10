@@ -1,0 +1,10 @@
+[package]
+name = "eggie-ui-kit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gpui.workspace = true
+anyhow.workspace = true

@@ -47,7 +47,7 @@ pub(crate) fn gui_socket_path() -> PathBuf {
 ///
 /// 返回 `true` 表示已成功把请求交给原进程(调用方应立即退出);`false` 表示当前没有可唤醒的 GUI
 /// (无人监听或连接失败),调用方应自己成为首个 GUI。
-pub(crate) fn try_wake_existing(cwd: PathBuf) -> bool {
+pub fn try_wake_existing(cwd: PathBuf) -> bool {
     let path = gui_socket_path();
     let Ok(mut stream) = UnixStream::connect(&path) else {
         // 没人监听,或 socket 是陈旧文件。清掉陈旧文件,让调用方顺利 bind。
@@ -75,9 +75,8 @@ pub(crate) fn try_wake_existing(cwd: PathBuf) -> bool {
 pub(crate) fn bind_listener() -> Result<UnixListener> {
     let path = gui_socket_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create Eggie runtime dir {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create Eggie runtime dir {}", parent.display()))?;
     }
     if path.exists() {
         let _ = std::fs::remove_file(&path);
@@ -136,7 +135,10 @@ pub(crate) fn reap_stale_gui_sockets() {
 fn write_message(stream: &mut UnixStream, message: &GuiWakeMessage) -> Result<()> {
     let body = rmp_serde::to_vec_named(message).context("failed to encode GUI wake message")?;
     if body.len() > MAX_WAKE_MESSAGE_SIZE {
-        bail!("GUI wake message exceeds {MAX_WAKE_MESSAGE_SIZE} bytes: {}", body.len());
+        bail!(
+            "GUI wake message exceeds {MAX_WAKE_MESSAGE_SIZE} bytes: {}",
+            body.len()
+        );
     }
     let header = (body.len() as u32).to_le_bytes();
     stream.write_all(&header)?;

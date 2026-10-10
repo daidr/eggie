@@ -7,5 +7,5 @@ mkdir -p "$(dirname "$output")"
 if [[ "$output" != /* ]]; then
   output="$PWD/$output"
 fi
-EGGIE_THEME_AUDIT_HTML="$output" cargo test -p eggie-ui --no-default-features ui_palette_audit -- --nocapture
+EGGIE_THEME_AUDIT_HTML="$output" cargo test -p eggie-themes --no-default-features ui_palette_audit -- --nocapture
 printf 'Palette preview: %s\n' "$output"

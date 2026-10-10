@@ -1,10 +1,18 @@
 [workspace]
 members = [
+    "crates/eggie",
+    "crates/eggie-build-info",
     "crates/eggie-daemon",
     "crates/eggie-config",
+    "crates/eggie-ipc",
+    "crates/eggie-lua",
+    "crates/eggie-storage",
+    "crates/eggie-themes",
     "crates/eggie-domain",
     "crates/eggie-protocol",
     "crates/eggie-ui",
+    "crates/eggie-ui-kit",
+    "crates/eggie-terminal-view",
     "crates/eggie-update",
     "crates/eggie-updater",
 ]
@@ -12,17 +20,27 @@ exclude = ["vendor/alacritty", "vendor/zed-gpui"]
 resolver = "2"
 
 [workspace.package]
+version = "0.0.1-alpha.3"
 edition = "2024"
 publish = false
 rust-version = "1.96"
 
 [workspace.dependencies]
+eggie-build-info = { path = "crates/eggie-build-info" }
+eggie-ui = { path = "crates/eggie-ui" }
 alacritty_terminal = { path = "vendor/alacritty/alacritty_terminal" }
 anyhow = "1.0.100"
 base64 = "0.22.1"
+bitflags = "2"
 crossterm = "0.29"
 eggie-daemon = { path = "crates/eggie-daemon" }
 eggie-config = { path = "crates/eggie-config" }
+eggie-ui-kit = { path = "crates/eggie-ui-kit" }
+eggie-terminal-view = { path = "crates/eggie-terminal-view" }
+eggie-ipc = { path = "crates/eggie-ipc" }
+eggie-lua = { path = "crates/eggie-lua" }
+eggie-storage = { path = "crates/eggie-storage" }
+eggie-themes = { path = "crates/eggie-themes" }
 eggie-domain = { path = "crates/eggie-domain" }
 eggie-protocol = { path = "crates/eggie-protocol" }
 eggie-update = { path = "crates/eggie-update" }
@@ -72,4 +90,7 @@ opt-level = 3
 opt-level = 1
 
 [profile.test.package."*"]
+opt-level = 3
+
+[profile.dev.package.eggie-terminal-view]
 opt-level = 3

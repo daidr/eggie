@@ -1,0 +1,6 @@
+[package]
+name = "eggie-build-info"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true

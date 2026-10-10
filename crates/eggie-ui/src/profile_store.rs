@@ -72,13 +72,13 @@ impl ProfileStore {
     /// 从默认位置加载。`legacy` 是全局设置里的旧 shell 字段,仅在 `profiles.json` **确实不存在**时
     /// 迁入 Default profile。
     pub(crate) fn load(legacy: LegacyShellSettings) -> Self {
-        Self::load_from(crate::persist::data_file_path("profiles.json"), legacy)
+        Self::load_from(eggie_storage::data_file_path("profiles.json"), legacy)
     }
 
     fn load_from(path: PathBuf, legacy: LegacyShellSettings) -> Self {
-        use crate::persist::LoadOutcome;
+        use eggie_storage::LoadOutcome;
 
-        match crate::persist::load_json_outcome::<PersistedProfiles>(&path) {
+        match eggie_storage::load_json_outcome::<PersistedProfiles>(&path) {
             LoadOutcome::Loaded(persisted) => {
                 if persisted.version > PERSIST_VERSION {
                     // 更新的格式:不认识的字段可能承载了这份文件的关键语义,盖写会丢数据。
@@ -142,7 +142,7 @@ impl ProfileStore {
     /// 不落盘:隔离后 `path` 已不存在,下次启动会走 `Missing` 分支重新迁移 —— 对「文件损坏」这个
     /// 场景来说,那正是想要的行为(用户的 profile 已丢,回到首次运行状态最诚实)。
     fn quarantined_fallback(path: PathBuf) -> Self {
-        match crate::persist::quarantine_corrupt_file(&path) {
+        match eggie_storage::quarantine_corrupt_file(&path) {
             Some(quarantined) => {
                 eprintln!("preserved the previous profiles file at {}", quarantined.display());
             }
@@ -305,7 +305,7 @@ impl ProfileStore {
             version: PERSIST_VERSION,
             profiles: self.profiles.clone(),
         };
-        crate::persist::save_json_atomic(&self.path, &persisted)
+        eggie_storage::save_json_atomic(&self.path, &persisted)
     }
 }
 
@@ -486,7 +486,7 @@ mod tests {
             version: PERSIST_VERSION + 1,
             profiles: vec![Profile::default_builtin(), Profile::new("Future".to_owned())],
         };
-        crate::persist::save_json_atomic(&path, &persisted).expect("seed file");
+        eggie_storage::save_json_atomic(&path, &persisted).expect("seed file");
 
         let store = ProfileStore::load_from(path.clone(), legacy());
         assert_eq!(store.profiles().len(), 1, "unknown-format contents are not adopted");
@@ -545,7 +545,7 @@ mod tests {
                 alias,
             ],
         };
-        crate::persist::save_json_atomic(&path, &persisted).expect("seed file");
+        eggie_storage::save_json_atomic(&path, &persisted).expect("seed file");
 
         let store = ProfileStore::load_from(path.clone(), LegacyShellSettings::default());
         // 重复的 Default 与重复的自定义 id 都只保留首个:否则第二份永远不可达也删不掉。
@@ -611,7 +611,7 @@ mod tests {
             version: PERSIST_VERSION,
             profiles: vec![custom.clone()],
         };
-        crate::persist::save_json_atomic(&path, &persisted).expect("seed file");
+        eggie_storage::save_json_atomic(&path, &persisted).expect("seed file");
 
         let store = ProfileStore::load_from(path.clone(), legacy());
         assert_eq!(store.profiles().len(), 2, "Default must be inserted");
@@ -634,7 +634,7 @@ mod tests {
             version: PERSIST_VERSION,
             profiles: vec![custom.clone(), Profile::default_builtin()],
         };
-        crate::persist::save_json_atomic(&path, &persisted).expect("seed file");
+        eggie_storage::save_json_atomic(&path, &persisted).expect("seed file");
 
         let store = ProfileStore::load_from(path.clone(), LegacyShellSettings::default());
         assert_eq!(store.profiles().len(), 2);

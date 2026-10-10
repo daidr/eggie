@@ -72,17 +72,9 @@ pub fn select_update(current_version: &str, releases: &[ReleaseInfo]) -> Option<
     })
 }
 
-/// Per-user application data directory:
-/// `~/Library/Application Support/Eggie` on macOS, `~/.config/eggie` elsewhere.
-///
-/// Shared with settings and project storage through `eggie-config`.
-pub fn app_data_dir() -> PathBuf {
-    eggie_config::state_dir()
-}
-
-/// Working directory for update downloads and updater logs.
+/// Downloaded update packages below the shared application state directory.
 pub fn updates_dir() -> PathBuf {
-    app_data_dir().join("updates")
+    eggie_storage::state_dir().join("updates")
 }
 
 /// Base URL of the published feed, served from the `daidr/eggie` repository's

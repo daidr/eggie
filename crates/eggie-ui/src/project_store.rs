@@ -32,11 +32,11 @@ pub(crate) struct ProjectStore {
 
 impl ProjectStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(crate::persist::data_file_path("projects.json"))
+        Self::load_from(eggie_storage::data_file_path("projects.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let projects = crate::persist::load_json::<PersistedProjects>(&path)
+        let projects = eggie_storage::load_json::<PersistedProjects>(&path)
             .map(|persisted| persisted.projects)
             .unwrap_or_default();
         Self { projects, path }
@@ -158,7 +158,7 @@ impl ProjectStore {
             version: PERSIST_VERSION,
             projects: self.projects.clone(),
         };
-        crate::persist::save_json_atomic(&self.path, &persisted)
+        eggie_storage::save_json_atomic(&self.path, &persisted)
     }
 }
 

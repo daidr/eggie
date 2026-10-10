@@ -15,14 +15,14 @@
 use gpui::{App, DummyKeyboardMapper, KeyBinding, Keystroke};
 use serde::Deserialize;
 
-use crate::settings::{AppSettings, Language};
-use crate::settings_window::{
+use crate::actions::{
     ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow,
     NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown,
     SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
     ToggleLeftSidebar, ToggleRightSidebar,
 };
+use crate::settings::{AppSettings, Language};
 
 /// One user-configurable action. `ACTION_SPECS` is the single source of truth;
 /// its order is the order rows render in the settings window.
@@ -595,7 +595,7 @@ mod tests {
                 key: base_key.to_string(),
                 key_char: None,
             };
-            let binding = KeyBinding::new(default, crate::settings_window::NextTab, None);
+            let binding = KeyBinding::new(default, crate::actions::NextTab, None);
             assert_eq!(
                 binding.match_keystrokes(&[live]),
                 Some(false),
