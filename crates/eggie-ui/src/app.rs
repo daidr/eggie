@@ -4434,7 +4434,8 @@ impl EggieApp {
         let parent = Window::window_handle(window)
             .downcast::<Self>()
             .expect("project popover belongs to an Eggie window");
-        let content_height = (tabs.len().min(8) as f32 * PROJECT_POPOVER_ROW_HEIGHT + 8.).max(48.);
+        // Row padding is 4 px on each side; the outer border also consumes 1 px per side.
+        let content_height = tabs.len().min(8) as f32 * PROJECT_POPOVER_ROW_HEIGHT + 10.;
         let popup = PopupWindow::open(
             cx,
             window,
@@ -4490,16 +4491,22 @@ impl EggieApp {
                             .when(tab.active, |row| row.bg(rgb(colors.panel_alt)))
                             .hover(move |row| row.bg(rgb(colors.hover)))
                             .cursor_pointer()
-                            .on_click(move |_, popup_window, cx| {
-                                parent
-                                    .update(cx, |app, parent_window, cx| {
-                                        app.active_project = project_id;
-                                        app.activate_item(group_id, item_id, parent_window, cx);
-                                        app.project_popover = None;
-                                        parent_window.activate_window();
-                                    })
-                                    .ok();
+                            .on_mouse_down(MouseButton::Left, move |_, popup_window, cx| {
                                 popup_window.remove_window();
+                                // The popup can close as the pointer leaves its parent window.
+                                // Commit selection from the press event, then switch once both
+                                // windows have returned to the app.
+                                cx.defer(move |cx| {
+                                    if let Err(error) = parent.update(cx, |app, parent_window, cx| {
+                                        app.project_popover = None;
+                                        app.activate_project(project_id, cx);
+                                        app.activate_item(group_id, item_id, parent_window, cx);
+                                        parent_window.activate_window();
+                                    }) {
+                                        eprintln!("failed to activate project popover tab: {error:#}");
+                                    }
+                                });
+                                cx.stop_propagation();
                             })
                             .child(
                                 img(icon)
@@ -4513,11 +4520,13 @@ impl EggieApp {
                 list.into_any_element()
             },
             move |hovered, _, cx| {
-                parent
-                    .update(cx, |app, parent_window, cx| {
+                cx.defer(move |cx| {
+                    if let Err(error) = parent.update(cx, |app, parent_window, cx| {
                         app.project_popover_hover(project_id, false, hovered, parent_window, cx);
-                    })
-                    .ok();
+                    }) {
+                        eprintln!("failed to update project popover hover: {error:#}");
+                    }
+                });
             },
         );
         match popup {
