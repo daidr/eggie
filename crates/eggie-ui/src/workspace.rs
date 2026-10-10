@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use eggie_domain::{GroupId, LayoutNode, Project, ProjectId};
 use serde::{Deserialize, Serialize};
 
-use crate::persist;
+use eggie_storage as persist;
 
 const WORKSPACE_FILE: &str = "workspace.json";
 

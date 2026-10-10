@@ -1,4 +1,7 @@
+use super::server::serve_connection;
 use super::*;
+use eggie_ipc::TerminalImageChunkMetadata;
+use std::process::Command;
 
 /// Serializes tests that are sensitive to machine load: those driving a real PTY (their assertions
 /// depend on the child shell producing output within a timeout) and those spawning subprocesses.
@@ -126,28 +129,6 @@ fn default_socket_is_scoped_by_user_and_protocol() {
 }
 
 #[test]
-fn default_client_removes_only_obsolete_protocol_sockets() {
-    let directory = std::env::temp_dir().join(format!(
-        "eggie-daemon-cleanup-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-    let current = directory.join(format!("daemon-v{PROTOCOL_VERSION}.sock"));
-    let obsolete = directory.join("daemon-v999.sock");
-    let unrelated = directory.join("keep-me.sock");
-    fs::write(&current, []).unwrap();
-    fs::write(&obsolete, []).unwrap();
-    fs::write(&unrelated, []).unwrap();
-
-    DaemonClient::new(current.clone(), "test").terminate_obsolete_daemons();
-
-    assert!(current.exists());
-    assert!(!obsolete.exists());
-    assert!(unrelated.exists());
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
 fn raw_terminal_image_wire_appends_pixels_without_messagepack_copying() {
     let (mut writer, reader) = UnixStream::pair().unwrap();
     let pixels = Arc::new(PixelBuffer::from_vec(
@@ -165,8 +146,9 @@ fn raw_terminal_image_wire_appends_pixels_without_messagepack_copying() {
         end: pixels.len(),
         pixels: Arc::clone(&pixels),
     };
-    let expected = chunk.bytes().to_vec();
-    let writer_thread = thread::spawn(move || write_terminal_image_wire(&mut writer, &chunk));
+    let expected = chunk.wire_chunk().bytes().to_vec();
+    let writer_thread =
+        thread::spawn(move || write_terminal_image_wire(&mut writer, &chunk.wire_chunk()));
 
     let mut reader = BufReader::new(reader);
     let header = read_wire_header(&mut reader).unwrap().unwrap();
@@ -322,11 +304,7 @@ fn serve_connection_delivers_images_through_shared_memory() {
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server_state = state.clone();
     let server = thread::spawn(move || serve_connection(server_stream, &server_state));
-    let mut connection = DaemonConnection {
-        stream: BufReader::new(client_stream),
-        request: Vec::with_capacity(512),
-        response: Vec::with_capacity(1024 * 1024),
-    };
+    let mut connection = DaemonConnection::from_stream(client_stream);
 
     thread::sleep(Duration::from_millis(100));
     // A 2x2 RGBA image: bytes 0..16 map to the four pixels. `AQIDBAUGBwgJCgsMDQ4PEA==`
@@ -1034,11 +1012,7 @@ fn sustained_full_screen_snapshot_transport_benchmark() {
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server_state = state.clone();
     let server = thread::spawn(move || serve_connection(server_stream, &server_state));
-    let mut connection = DaemonConnection {
-        stream: BufReader::new(client_stream),
-        request: Vec::with_capacity(512),
-        response: Vec::with_capacity(1024 * 1024),
-    };
+    let mut connection = DaemonConnection::from_stream(client_stream);
 
     thread::sleep(Duration::from_millis(800));
     session
@@ -1077,7 +1051,7 @@ fn sustained_full_screen_snapshot_transport_benchmark() {
         samples.push(started.elapsed());
         revision = snapshot.revision;
         payload_cells = snapshot.cells.len();
-        payload_bytes = connection.response.len();
+        payload_bytes = connection.last_response_size();
     }
     samples.sort_unstable();
     let p50 = samples[(samples.len() - 1) * 50 / 100];
@@ -1208,11 +1182,7 @@ fn image_generation_wire_transport_benchmark() {
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server_state = state.clone();
     let server = thread::spawn(move || serve_connection(server_stream, &server_state));
-    let mut connection = DaemonConnection {
-        stream: BufReader::new(client_stream),
-        request: Vec::with_capacity(512),
-        response: Vec::with_capacity(1024 * 1024),
-    };
+    let mut connection = DaemonConnection::from_stream(client_stream);
 
     thread::sleep(Duration::from_millis(100));
     let commands = bench_transmit_commands();
@@ -1312,7 +1282,7 @@ fn image_generation_chunk_ref_stays_zero_copy() {
                 .image_chunk_ref(key, fetched as u32, expected_length as u32)
                 .unwrap();
             assert_eq!(chunk.total_length as usize, expected_length);
-            let chunk_len = chunk.bytes().len();
+            let chunk_len = chunk.wire_chunk().bytes().len();
             assert!(chunk_len > 0, "chunk borrow stalled mid-frame");
             fetched += chunk_len;
         }
@@ -1339,58 +1309,6 @@ fn image_generation_chunk_ref_stays_zero_copy() {
     // A zero-copy Arc clone + bounds math must stay far below a millisecond even for a 20 MiB
     // image; a regression to per-fetch copying would blow past this.
     assert!(p95 < Duration::from_millis(5));
-}
-
-#[test]
-fn adjacent_input_messages_are_coalesced_without_losing_order() {
-    let session_id = SessionId::new_v4();
-    let mut first = QueuedTerminalInput::Input {
-        session_id,
-        bytes: b"a".to_vec(),
-        sequence: 1,
-    };
-    first
-        .merge(QueuedTerminalInput::Input {
-            session_id,
-            bytes: b"b".to_vec(),
-            sequence: 2,
-        })
-        .unwrap();
-    let ClientRequest::Input {
-        bytes, sequence, ..
-    } = first.request()
-    else {
-        panic!("coalesced input changed request kind")
-    };
-    assert_eq!(bytes, b"ab");
-    assert_eq!(sequence, 2);
-}
-
-#[test]
-fn continuous_input_is_dispatched_in_latency_bounded_batches() {
-    let session_id = SessionId::new_v4();
-    let (sender, receiver) = mpsc::channel();
-    for sequence in 1..=(MAX_INPUT_BATCH_MESSAGES as u64 * 3) {
-        sender
-            .send(QueuedTerminalInput::Input {
-                session_id,
-                bytes: vec![b'x'],
-                sequence,
-            })
-            .unwrap();
-    }
-    let first = receiver.recv().unwrap();
-    let batch = receive_input_batch(&receiver, first);
-    assert_eq!(batch.len(), 1, "adjacent key input should still coalesce");
-    let ClientRequest::Input {
-        bytes, sequence, ..
-    } = batch.into_iter().next().unwrap().request()
-    else {
-        panic!("input batch changed request kind")
-    };
-    assert_eq!(bytes.len(), MAX_INPUT_BATCH_MESSAGES);
-    assert_eq!(sequence, MAX_INPUT_BATCH_MESSAGES as u64);
-    assert_eq!(receiver.try_iter().count(), MAX_INPUT_BATCH_MESSAGES * 2);
 }
 
 #[test]
@@ -3466,7 +3384,7 @@ fn scroll_to_commands_move_the_viewport_across_scrollback() {
         if snapshot
             .plain_lines()
             .iter()
-            .any(|line| line.contains("LASTLINE"))
+            .any(|line| line.trim() == "LASTLINE")
         {
             break;
         }
@@ -3502,7 +3420,7 @@ fn scroll_to_commands_move_the_viewport_across_scrollback() {
             .snapshot()
             .plain_lines()
             .iter()
-            .any(|line| line.contains("LASTLINE")),
+            .any(|line| line.trim() == "LASTLINE"),
         "scroll-to-bottom should return to the live viewport"
     );
     assert!(
@@ -4421,87 +4339,6 @@ fn mouse_motion_respects_drag_any_motion_shift_and_vi_modes() {
 }
 
 #[test]
-fn input_queue_coalesces_motion_and_scroll_without_crossing_event_barriers() {
-    let session_id = SessionId::new_v4();
-    let mut motion = QueuedTerminalInput::Mouse {
-        session_id,
-        event: TerminalMouseEvent {
-            action: TerminalMouseAction::Move,
-            button: None,
-            position: TerminalMousePosition {
-                column: 1,
-                row: 1,
-                pixel_x: 0,
-                pixel_y: 0,
-            },
-            modifiers: TerminalModifiers::default(),
-        },
-    };
-    assert!(
-        motion
-            .merge(QueuedTerminalInput::Mouse {
-                session_id,
-                event: TerminalMouseEvent {
-                    action: TerminalMouseAction::Move,
-                    button: None,
-                    position: TerminalMousePosition {
-                        column: 3,
-                        row: 2,
-                        pixel_x: 0,
-                        pixel_y: 0
-                    },
-                    modifiers: TerminalModifiers::default(),
-                },
-            })
-            .is_ok()
-    );
-    let ClientRequest::Mouse { event, .. } = motion.request() else {
-        panic!("coalesced motion changed request kind");
-    };
-    assert_eq!(
-        event.position,
-        TerminalMousePosition {
-            column: 3,
-            row: 2,
-            pixel_x: 0,
-            pixel_y: 0
-        }
-    );
-
-    let scroll_event = |y| TerminalScrollEvent {
-        delta: eggie_protocol::TerminalScrollDelta {
-            x: 0,
-            y,
-            unit: TerminalScrollUnit::Pixels,
-        },
-        phase: TerminalScrollPhase::Moved,
-        position: TerminalMousePosition {
-            column: 0,
-            row: 0,
-            pixel_x: 0,
-            pixel_y: 0,
-        },
-        modifiers: TerminalModifiers::default(),
-    };
-    let mut scroll = QueuedTerminalInput::Scroll {
-        session_id,
-        event: scroll_event(100),
-    };
-    assert!(
-        scroll
-            .merge(QueuedTerminalInput::Scroll {
-                session_id,
-                event: scroll_event(250),
-            })
-            .is_ok()
-    );
-    let ClientRequest::Scroll { event, .. } = scroll.request() else {
-        panic!("coalesced scroll changed request kind");
-    };
-    assert_eq!(event.delta.y, 350);
-}
-
-#[test]
 fn mouse_and_focus_reports_round_trip_through_the_real_pty() {
     if !Command::new("sh")
         .args(["-c", "command -v python3 >/dev/null 2>&1"])
@@ -4993,21 +4830,4 @@ fn kitty_file_transfer_preserves_safe_hierarchy_and_streams_zlib() {
         PathBuf::from("fallback")
     );
     fs::remove_dir_all(destination).unwrap();
-}
-
-#[test]
-fn handshake_acceptance_rules() {
-    // Protocol mismatch is always rejected.
-    assert!(!handshake_accepted(2, "any", 1, "any"));
-
-    // Same protocol, same build id is always accepted.
-    assert!(handshake_accepted(1, "build-a", 1, "build-a"));
-
-    // Same protocol but different build id: rejected in debug builds
-    // (so a recompile swaps the daemon), accepted in release builds
-    // (so in-place updates keep a compatible daemon).
-    assert_eq!(
-        handshake_accepted(1, "build-a", 1, "build-b"),
-        !cfg!(debug_assertions)
-    );
 }

@@ -30,7 +30,7 @@ compatibility contract is finalized.
 ## Development
 
 ```sh
-cargo run -p eggie-ui
+cargo run -p eggie
 ```
 
 The GUI starts the daemon automatically. Use `cargo test --workspace` for the
@@ -63,7 +63,7 @@ The generated preview is `target/theme-palette-audit.html`. Its search field
 filters themes by name.
 
 To measure interactive terminal latency, launch with
-`EGGIE_INPUT_LATENCY=1 cargo run -p eggie-ui`. Eggie reports rolling p50/p95
+`EGGIE_INPUT_LATENCY=1 cargo run -p eggie`. Eggie reports rolling p50/p95
 timings for input-to-snapshot, snapshot-to-Metal, terminal preparation, Metal
 encoding, end-to-Metal, and GPUI input-to-presentation latency. It also reports
 input events coalesced per frame and events received during a draw. Metrics are
@@ -73,5 +73,14 @@ its input path when disabled.
 Run the repeatable dense-grid preparation benchmark with:
 
 ```sh
-cargo test --release -p eggie-ui benchmark_dense_terminal_preparation -- --ignored --nocapture
+cargo test --release -p eggie-terminal-view benchmark_dense_terminal_preparation -- --ignored --nocapture
 ```
+
+## Architecture
+
+See [crate boundaries and UI organization](docs/architecture/workspace.md).
+
+Run `python3 scripts/check-architecture.py` to check dependency boundaries, and
+`cargo test --workspace` for regression tests. The `eggie` crate owns the executable;
+`eggie-ui` is the workspace library, `eggie-ui-kit` contains reusable controls, and
+`eggie-terminal-view` owns terminal rendering.

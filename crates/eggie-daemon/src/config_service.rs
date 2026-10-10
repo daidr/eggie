@@ -5,7 +5,8 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use eggie_config::{ActionContext, ConfigSnapshot, LuaConfig, QueuedAction};
+use eggie_lua::LuaConfig;
+use eggie_config::{ActionContext, ConfigSnapshot, QueuedAction};
 use parking_lot::{Condvar, Mutex};
 
 pub(super) struct ConfigService {

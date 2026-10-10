@@ -103,7 +103,7 @@ impl UpdateWindow {
 
     fn colors(&self, window: &Window, cx: &mut Context<Self>) -> UiColors {
         let settings = self.settings.read(cx);
-        let system_is_dark = crate::settings_window::is_dark_appearance(window.appearance());
+        let system_is_dark = eggie_ui_kit::is_dark_appearance(window.appearance());
         UiColors::from_theme(settings.config().interface_theme(system_is_dark))
     }
 

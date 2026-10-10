@@ -56,11 +56,11 @@ pub(crate) struct SnippetStore {
 
 impl SnippetStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(crate::persist::data_file_path("snippets.json"))
+        Self::load_from(eggie_storage::data_file_path("snippets.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let snippets = crate::persist::load_json::<PersistedSnippets>(&path)
+        let snippets = eggie_storage::load_json::<PersistedSnippets>(&path)
             .map(|persisted| persisted.snippets)
             .unwrap_or_default();
         Self { snippets, path }
@@ -114,7 +114,7 @@ impl SnippetStore {
             version: PERSIST_VERSION,
             snippets: self.snippets.clone(),
         };
-        crate::persist::save_json_atomic(&self.path, &persisted)
+        eggie_storage::save_json_atomic(&self.path, &persisted)
     }
 }
 

@@ -31,11 +31,11 @@ pub(crate) struct NotesStore {
 
 impl NotesStore {
     pub(crate) fn load() -> Self {
-        Self::load_from(crate::persist::data_file_path("notes.json"))
+        Self::load_from(eggie_storage::data_file_path("notes.json"))
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let text = crate::persist::load_json::<PersistedNotes>(&path)
+        let text = eggie_storage::load_json::<PersistedNotes>(&path)
             .map(|persisted| persisted.text)
             .unwrap_or_default();
         Self { text, path }
@@ -67,7 +67,7 @@ impl NotesStore {
             version: PERSIST_VERSION,
             text: self.text.clone(),
         };
-        crate::persist::save_json_atomic(&self.path, &persisted)
+        eggie_storage::save_json_atomic(&self.path, &persisted)
     }
 }
 

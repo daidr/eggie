@@ -13,12 +13,12 @@
 
 use gpui::Action;
 
-use crate::keybindings::{ACTION_SPECS, display_keystroke, effective_keystroke};
-use crate::settings::{AppSettings, Language};
-use crate::settings_window::{
+use crate::actions::{
     About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, NewTabWithProfile,
     ShowAll, SplitLeft, SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
 };
+use crate::keybindings::{ACTION_SPECS, display_keystroke, effective_keystroke};
+use crate::settings::{AppSettings, Language};
 
 /// A command that exists only in the menu bar (no configurable keybinding), surfaced in the palette
 /// so every menu action is reachable by search too.

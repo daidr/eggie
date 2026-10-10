@@ -156,7 +156,7 @@ fn run_phases(args: &Args, phase: &mut Phase) -> Result<()> {
     if let Some(socket) = &args.daemon_socket {
         *phase = Phase::TerminateDaemon;
         log_line(&format!("terminating daemon at {}", socket.display()));
-        eggie_daemon::terminate_daemon_at(socket);
+        eggie_ipc::terminate_daemon_at(socket);
     }
 
     *phase = Phase::Backup;
