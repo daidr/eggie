@@ -12,7 +12,7 @@ use std::{rc::Rc, time::Duration};
 
 const IN_DURATION: Duration = Duration::from_millis(180);
 const OUT_DURATION: Duration = Duration::from_millis(120);
-const INSET: f32 = 8.;
+const INSET: f32 = 12.;
 const GAP: f32 = 5.;
 
 type Content = Rc<dyn Fn(&mut Window, &mut Context<PopupWindow>) -> AnyElement>;
@@ -161,7 +161,7 @@ impl Render for PopupWindow {
                     .border_1()
                     .border_color(rgb(self.border))
                     .bg(rgb(self.background))
-                    .shadow_lg()
+                    .shadow_md()
                     .overflow_hidden()
                     .child(content)
                     .with_animation(

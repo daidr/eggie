@@ -881,6 +881,11 @@ impl MacWindow {
                 target_screen,
             );
             assert!(!native_window.is_null());
+            if matches!(kind, WindowKind::PopUp | WindowKind::AnchoredPopup(_)) {
+                // Popup content draws its own rounded shadow. AppKit's shadow follows the
+                // rectangular transparent window and leaves a second outline around it.
+                native_window.setHasShadow_(NO);
+            }
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
