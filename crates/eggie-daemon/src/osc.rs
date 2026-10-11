@@ -1,6 +1,17 @@
 use super::*;
 
 pub(super) struct ListenerState {
+    pub(super) native_result_revision: AtomicU64,
+    pub(super) completion_input_gate: Mutex<()>,
+    pub(super) completion_query_blocked: AtomicBool,
+    pub(super) completion_engine: &'static eggie_completion::CompletionEngine,
+    pub(super) native_completions: Mutex<
+        Option<(
+            eggie_completion::PromptInput,
+            Vec<eggie_completion::CompletionItem>,
+        )>,
+    >,
+    pub(super) native_completion_request: Mutex<Option<(eggie_completion::PromptInput, Instant)>>,
     pub(super) session_id: SessionId,
     pub(super) event_bus: Option<Arc<event_bus::EventBus>>,
     pub(super) title: RwLock<String>,
@@ -190,6 +201,12 @@ impl ListenerState {
         event_bus: Option<Arc<event_bus::EventBus>>,
     ) -> Self {
         Self {
+            native_result_revision: AtomicU64::new(0),
+            completion_input_gate: Mutex::new(()),
+            completion_query_blocked: AtomicBool::new(false),
+            completion_engine: eggie_completion::CompletionEngine::shared(),
+            native_completions: Mutex::new(None),
+            native_completion_request: Mutex::new(None),
             session_id,
             event_bus,
             title: RwLock::new("shell".to_owned()),
@@ -231,7 +248,7 @@ impl ListenerState {
         }
     }
 
-    pub(super) fn publish_terminal(&self, terminal: &Term<DaemonEventListener>) {
+    pub(super) fn publish_terminal(&self, terminal: &mut Term<DaemonEventListener>) {
         // Every caller already owns the terminal mutex. Build the immutable frame under that
         // existing ownership and only take the snapshot lock for the final Arc swap.
         let started = Instant::now();
@@ -240,14 +257,22 @@ impl ListenerState {
             .lock()
             .observe_scroll(terminal.grid().history_size(), TERMINAL_SCROLLBACK_LIMIT);
         let revision = self.revision.load(Ordering::Relaxed).wrapping_add(1);
-        let mut snapshot = snapshot_terminal(
+        let base = self.published_snapshots.read().back().cloned();
+        let mut snapshot = snapshot_terminal_incremental(
             terminal,
+            base.as_deref(),
             self.session_id,
             *self.size.read(),
             self.title.read().clone(),
             revision,
             self.last_input_sequence.load(Ordering::Acquire),
         );
+        snapshot.prompt_input = self.prompt_input_for_frame(terminal);
+        snapshot.prompt_editable = !self.completion_query_blocked.load(Ordering::Acquire)
+            && matches!(
+                self.shell_integration.lock().phase,
+                TerminalSemanticPhase::Prompt | TerminalSemanticPhase::Input
+            );
         self.detect_urls_into(&mut snapshot, terminal);
         let snapshot = Arc::new(snapshot);
         let cell_count = snapshot.cells.len();
@@ -476,6 +501,9 @@ impl ListenerState {
     }
 
     pub(super) fn handle_iterm2_command(&self, payload: &str, terminator: &str) {
+        if self.handle_completion_report(payload) {
+            return;
+        }
         if let Some(metadata) = payload.strip_prefix("MultipartFile=") {
             self.start_iterm2_multipart(metadata);
         } else if let Some(encoded) = payload.strip_prefix("FilePart=") {

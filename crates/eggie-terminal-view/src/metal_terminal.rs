@@ -39,11 +39,13 @@ use core_text::{
 };
 use gpui::MetalRenderContext;
 use memmap2::Mmap;
+#[cfg(test)]
+use metal::CompileOptions;
 use metal::{
-    Buffer, CompileOptions, Device, DeviceRef, MTLBlendFactor, MTLBlendOperation, MTLPixelFormat,
-    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter,
-    MTLStorageMode, MTLTextureUsage, NSUInteger, RenderPipelineDescriptor, RenderPipelineState,
-    SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    Buffer, Device, DeviceRef, MTLBlendFactor, MTLBlendOperation, MTLPixelFormat, MTLPrimitiveType,
+    MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLStorageMode,
+    MTLTextureUsage, NSUInteger, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor,
 };
 use parking_lot::Mutex;
 use rasterizer::*;
@@ -57,7 +59,7 @@ use std::{
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+        mpsc::{Receiver, Sender, channel},
     },
     thread,
     time::{Duration, Instant},
@@ -68,6 +70,8 @@ use metal::{MTLClearColor, MTLLoadAction, MTLStoreAction, RenderPassDescriptor};
 
 const MASK_ATLAS_SIZE: usize = 4096;
 const COLOR_ATLAS_SIZE: usize = 2048;
+const INITIAL_ATLAS_SIZE: usize = 512;
+const GLYPH_QUEUE_CAPACITY: usize = 32_768;
 /// Hard ceiling on cached CPU glyph rasters. When the cache grows past this, `prepare_terminal`
 /// falls back to keeping only the visible working set plus in-flight jobs, regardless of recency.
 const CPU_GLYPH_CACHE_LIMIT: usize = 65_536;
@@ -94,7 +98,9 @@ unsafe extern "C" {
     static kCTFontOpenTypeFeatureValue: CFStringRef;
 }
 
+#[cfg(test)]
 const SHADER: &str = include_str!("metal_terminal/terminal.metal");
+const SHADER_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.metallib"));
 
 // Keep this layout in lockstep with the Metal `Instance` above. The final uint4 makes the
 // CPU/GPU stride unambiguously 64 bytes; a trailing `uint` + `uint3` is 80 bytes in Metal because

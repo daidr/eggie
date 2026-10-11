@@ -313,7 +313,7 @@ fn serve_connection_delivers_images_through_shared_memory() {
         let mut terminal = session.terminal.lock();
         terminal
             .kitty_graphics_command(b"a=T,f=32,s=2,v=2,i=11,c=1,r=1,C=1;AQIDBAUGBwgJCgsMDQ4PEA==");
-        session.events.publish_terminal(&terminal);
+        session.events.publish_terminal(&mut terminal);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     let key = loop {
@@ -462,7 +462,7 @@ fn kitty_graphics_crosses_the_real_pty_snapshot_and_resource_paths() {
         let mut terminal = session.terminal.lock();
         terminal.kitty_graphics_command(b"a=d,d=I,i=7,q=2;");
         terminal.kitty_graphics_command(b"a=T,f=32,s=1,v=1,i=7,c=1,r=1,C=1;BQYHCA==");
-        session.events.publish_terminal(&terminal);
+        session.events.publish_terminal(&mut terminal);
     }
     let newer_descriptor = loop {
         let current = session.snapshot();
@@ -642,6 +642,8 @@ fn snapshot_omits_only_visually_empty_default_cells() {
 #[test]
 fn messagepack_wire_round_trip_preserves_truecolor_cells() {
     let snapshot = Arc::new(TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         session_id: SessionId::nil(),
         size: TerminalSize {
             columns: 1,
@@ -658,7 +660,8 @@ fn messagepack_wire_round_trip_preserves_truecolor_cells() {
             underline_color: Some(eggie_protocol::TerminalColor::Rgb(0x112233ff)),
             hyperlink: Some("https://example.com".to_owned()),
             flags: 0,
-        }],
+        }]
+        .into(),
         color_overrides: vec![TerminalColorOverride {
             index: 42,
             color: 0xaabbccff,
@@ -706,6 +709,8 @@ fn snapshot_delta_keeps_color_only_cell_changes() {
         flags: 0,
     };
     let mut base = TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         session_id: SessionId::nil(),
         size: TerminalSize {
             columns: 2,
@@ -715,7 +720,8 @@ fn snapshot_delta_keeps_color_only_cell_changes() {
         cells: vec![
             cell(0, 0x111111ff, 0x222222ff),
             cell(1, 0x333333ff, 0x444444ff),
-        ],
+        ]
+        .into(),
         color_overrides: Vec::new(),
         cursor_line: 0,
         cursor_column: 0,
@@ -761,10 +767,12 @@ fn snapshot_delta_keeps_color_only_cell_changes() {
     });
     let mut current = base.clone();
     current.revision = 11;
-    current.cells[1] = cell(1, 0xaabbccff, 0x123456ff);
+    let mut cells = current.cells.to_vec();
+    cells[1] = cell(1, 0xaabbccff, 0x123456ff);
+    current.cells = cells.into();
 
     let delta = snapshot_delta(&base, &current).expect("one of two cells changed");
-    assert_eq!(delta.cells, vec![current.cells[1].clone()]);
+    assert_eq!(delta.cells, vec![current.cells.get(1).unwrap().to_owned()]);
     assert!(delta.cleared.is_empty());
     assert!(delta.images.is_none());
     assert!(delta.image_placements.is_none());
@@ -1128,7 +1136,7 @@ fn bench_bump_image_generation(
         for command in commands {
             terminal.kitty_graphics_command(command);
         }
-        session.events.publish_terminal(&terminal);
+        session.events.publish_terminal(&mut terminal);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1441,7 +1449,7 @@ fn runtime_scrollback_and_cursor_changes_do_not_clobber_each_other() {
     let _pty_guard = PTY_TEST_LOCK.lock();
     let session = TerminalSession::spawn(SessionSpawnConfig {
         project_id: ProjectId::new_v4(),
-        window_id: WindowId::new_v4(),
+
         cwd: std::env::current_dir().unwrap(),
         size: TerminalSize::default(),
         appearance: TerminalAppearance::default(),
@@ -1530,7 +1538,7 @@ fn custom_shell_program_drives_the_session_shell() {
     let _pty_guard = PTY_TEST_LOCK.lock();
     let session = TerminalSession::spawn(SessionSpawnConfig {
         project_id: ProjectId::new_v4(),
-        window_id: WindowId::new_v4(),
+
         cwd: std::env::current_dir().unwrap(),
         size: TerminalSize::default(),
         appearance: TerminalAppearance::default(),
@@ -4830,4 +4838,456 @@ fn kitty_file_transfer_preserves_safe_hierarchy_and_streams_zlib() {
         PathBuf::from("fallback")
     );
     fs::remove_dir_all(destination).unwrap();
+}
+
+#[test]
+fn presentation_moves_and_window_closes_preserve_the_original_pty_and_output() {
+    use eggie_domain::{
+        ItemLocation, PresentationTarget, PresentationWorkspace, TabItem, WindowId,
+        WindowPresentation,
+    };
+    let _guard = PTY_TEST_LOCK.lock();
+    let project = ProjectId::new_v4();
+    let session = Arc::new(
+        TerminalSession::spawn(SessionSpawnConfig {
+            project_id: project,
+            cwd: std::env::temp_dir(),
+            size: TerminalSize::default(),
+            appearance: TerminalAppearance::default(),
+            scrollback_limit: 1000,
+            shell_program: Some("/bin/sh".into()),
+            shell_args: Some(vec!["-i".into()]),
+            shell_features: "".into(),
+            profile_env: BTreeMap::new(),
+            remote: None,
+            remote_install_consented: false,
+            remote_cwd: None,
+            event_bus: None,
+        })
+        .unwrap(),
+    );
+    let id = session.id;
+    let pid = session.shell_pid;
+    let state = DaemonState {
+        sessions: RwLock::new(HashMap::from([(id, session.clone())])),
+        build_id: Arc::from("window-lifecycle-test"),
+        config: test_config_service(),
+        events: Arc::new(event_bus::EventBus::new()),
+        preferences: test_preferences_service(),
+    };
+    assert!(matches!(
+        state.handle(ClientRequest::Input {
+            session_id: id,
+            bytes: b"printf 'EGGIE_ORIGINAL_PTY\\n'\n".to_vec(),
+            sequence: 1
+        }),
+        DaemonResponse::Ok
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text: String = session
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.character)
+            .collect();
+        if text.contains("EGGIE_ORIGINAL_PTY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the original process should emit its marker"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut a = WindowPresentation::new(WindowId::new_v4(), project);
+    let b = WindowPresentation::new(WindowId::new_v4(), project);
+    let group = a.views[&project].active_group_id;
+    let mut item = TabItem::terminal_with_profile(id, "process", eggie_domain::ProfileId::new_v4());
+    item.custom_title = Some("Keep my process".into());
+    let item_id = item.id;
+    a.views
+        .get_mut(&project)
+        .unwrap()
+        .layout
+        .find_group_mut(group)
+        .unwrap()
+        .add_item(item);
+    let source = ItemLocation {
+        window_id: a.id,
+        project_id: project,
+        group_id: group,
+        item_id,
+    };
+    let target = PresentationTarget {
+        window_id: b.id,
+        project_id: project,
+        group_id: b.views[&project].active_group_id,
+        insertion_index: None,
+        split: None,
+    };
+    let mut workspace = PresentationWorkspace::default();
+    workspace.windows.insert(a.id, a);
+    workspace.windows.insert(b.id, b.clone());
+    workspace.move_item(source, target).unwrap();
+    workspace.close_window(b.id).unwrap();
+    assert_eq!(
+        workspace.background[&id].item.custom_title.as_deref(),
+        Some("Keep my process")
+    );
+    workspace.windows.insert(b.id, b);
+    workspace.restore_background(id, target).unwrap();
+    assert_eq!(
+        workspace.item(workspace.locate(id).unwrap()).unwrap().id,
+        item_id
+    );
+    match state.handle(ClientRequest::ListSessions) {
+        DaemonResponse::Sessions { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, id);
+            assert_eq!(sessions[0].shell_pid, pid);
+        }
+        other => panic!("unexpected daemon response: {other:?}"),
+    }
+    assert_eq!(
+        unsafe { libc::kill(pid as i32, 0) },
+        0,
+        "the original shell is still alive"
+    );
+    assert!(matches!(
+        state.handle(ClientRequest::Input {
+            session_id: id,
+            bytes: b"printf 'EGGIE_AFTER_RESTORE\\n'\n".to_vec(),
+            sequence: 2
+        }),
+        DaemonResponse::Ok
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text: String = session
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.character)
+            .collect();
+        if text.contains("EGGIE_AFTER_RESTORE") {
+            assert!(text.contains("EGGIE_ORIGINAL_PTY"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "input still reaches the same PTY after restoration"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(matches!(
+        state.handle(ClientRequest::Terminate { session_id: id }),
+        DaemonResponse::Ok
+    ));
+    assert!(state.sessions.read().is_empty());
+}
+
+#[test]
+fn dirty_row_snapshots_match_full_engine_projection_across_terminal_operations() {
+    let size = TerminalSize {
+        columns: 24,
+        rows: 6,
+        cell_width: 8,
+        cell_height: 18,
+    };
+    let id = SessionId::new_v4();
+    let listener = DaemonEventListener(Arc::new(ListenerState::new(
+        id,
+        size,
+        TerminalAppearance::default(),
+        Arc::new(AtomicU64::new(0)),
+        None,
+    )));
+    let mut term = Term::new(Config::default(), &GridSize(size), listener);
+    let mut parser: alacritty_terminal::vte::ansi::Processor =
+        alacritty_terminal::vte::ansi::Processor::new();
+    let mut base = None;
+    let mut revision = 1;
+    let mut verify = |term: &mut Term<DaemonEventListener>, size| {
+        let full = snapshot_terminal(term, id, size, "title".into(), revision, 9);
+        let incremental = snapshot_terminal_incremental(
+            term,
+            base.as_ref(),
+            id,
+            size,
+            "title".into(),
+            revision,
+            9,
+        );
+        assert_eq!(incremental, full, "revision {revision}");
+        base = Some(incremental);
+        revision += 1;
+    };
+    verify(&mut term, size);
+    for bytes in [
+        "first\r\nsecond\r\nthird",
+        "\x1b[2;3HX",
+        "\x1b[1;1H界e\u{301}🙂",
+        "\x1b[38;2;12;34;56m\x1b[48;5;2m\x1b[4mcolour\x1b[0m",
+        "\x1b]8;;https://例子.com\x1b\\link\x1b]8;;\x1b\\",
+        "\x1b[2;1H\x1b[2K",
+        "\x1b[3;1H\x1b[2@insert",
+        "\x1b[3;1H\x1b[3P",
+        "\x1b[2;5r\x1b[2;1H\x1b[L",
+        "\x1b[M\x1b[r",
+        "\x1b[6;1H\n1\n2\n3\n4\n5\n6\n7\n8",
+        "\x1b[?1049h\x1b[2Jalternative",
+        "\x1b[?1049l",
+        "\x1b]10;#123456\x07",
+        "\x1b[5 q",
+        "\x1b[?25l",
+        "\x1b[?25h",
+        "\x1b[?7l012345678901234567890123456789\x1b[?7h",
+    ] {
+        parser.advance(&mut term, bytes.as_bytes());
+        verify(&mut term, size);
+    }
+    term.scroll_display(Scroll::Delta(4));
+    verify(&mut term, size);
+    term.scroll_display(Scroll::Bottom);
+    verify(&mut term, size);
+    term.selection = Some(Selection::new(
+        SelectionType::Simple,
+        Point::new(Line(1), Column(1)),
+        Side::Left,
+    ));
+    term.selection
+        .as_mut()
+        .unwrap()
+        .update(Point::new(Line(2), Column(4)), Side::Right);
+    verify(&mut term, size);
+    term.selection = None;
+    verify(&mut term, size);
+    let smaller = TerminalSize {
+        columns: 12,
+        rows: 4,
+        ..size
+    };
+    term.resize(GridSize(smaller));
+    verify(&mut term, smaller);
+    term.resize(GridSize(size));
+    verify(&mut term, size);
+    parser.advance(&mut term, b"\x1b[2J\x1b[H");
+    verify(&mut term, size);
+}
+
+#[test]
+fn cursor_only_publications_reuse_all_cell_rows() {
+    let size = TerminalSize {
+        columns: 20,
+        rows: 4,
+        cell_width: 8,
+        cell_height: 18,
+    };
+    let id = SessionId::new_v4();
+    let listener = DaemonEventListener(Arc::new(ListenerState::new(
+        id,
+        size,
+        TerminalAppearance::default(),
+        Arc::new(AtomicU64::new(0)),
+        None,
+    )));
+    let mut term = Term::new(Config::default(), &GridSize(size), listener);
+    let mut parser: alacritty_terminal::vte::ansi::Processor =
+        alacritty_terminal::vte::ansi::Processor::new();
+    parser.advance(&mut term, b"line1\r\nline2");
+    let first = snapshot_terminal_incremental(&mut term, None, id, size, String::new(), 1, 0);
+    parser.advance(&mut term, b"\x1b[1;1H");
+    let next =
+        snapshot_terminal_incremental(&mut term, Some(&first), id, size, String::new(), 2, 0);
+    for (a, b) in first.cells.rows().iter().zip(next.cells.rows()) {
+        assert!(a.same_storage(b));
+    }
+}
+
+#[test]
+fn serve_connection_shares_text_rows_and_reconnects_with_a_full_frame() {
+    let _pty_guard = PTY_TEST_LOCK.lock();
+    let session = Arc::new(
+        TerminalSession::spawn_default(
+            ProjectId::new_v4(),
+            std::env::current_dir().unwrap(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                ..TerminalSize::default()
+            },
+            TerminalAppearance::default(),
+        )
+        .unwrap(),
+    );
+    let id = session.id;
+    let state = Arc::new(DaemonState {
+        sessions: RwLock::new(HashMap::from([(id, session.clone())])),
+        build_id: Arc::from("shared-grid-test"),
+        config: test_config_service(),
+        events: Arc::new(event_bus::EventBus::new()),
+        preferences: test_preferences_service(),
+    });
+    for reconnect in [false, true] {
+        let (client, server) = UnixStream::pair().unwrap();
+        let state = state.clone();
+        let worker = thread::spawn(move || serve_connection(server, &state));
+        let mut connection = DaemonConnection::from_stream(client);
+        let mut current = match connection
+            .request(ClientRequest::WaitForRenderFrame {
+                session_id: id,
+                after_revision: 0,
+                timeout_ms: 0,
+            })
+            .unwrap()
+        {
+            DaemonResponse::Snapshot { snapshot } => snapshot,
+            _ => panic!("missing frame"),
+        };
+        if !reconnect {
+            session
+                .input(b"printf 'shared-grid-ready\\n'\r".to_vec(), 1)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !current
+                .plain_lines()
+                .iter()
+                .any(|line| line == "shared-grid-ready")
+            {
+                assert!(Instant::now() < deadline, "no shell output");
+                match connection
+                    .request(ClientRequest::WaitForRenderFrame {
+                        session_id: id,
+                        after_revision: current.revision,
+                        timeout_ms: 100,
+                    })
+                    .unwrap()
+                {
+                    DaemonResponse::Snapshot { snapshot } => current = snapshot,
+                    DaemonResponse::SnapshotUnchanged { .. } => {}
+                    _ => panic!("unexpected update"),
+                }
+            }
+        } else {
+            assert!(
+                current
+                    .plain_lines()
+                    .iter()
+                    .any(|line| line == "shared-grid-ready")
+            );
+        }
+        drop(connection);
+        worker.join().unwrap().unwrap();
+        // A closed publisher connection must not invalidate a retained frame used for a preview.
+        assert!(current.cells.iter().any(|cell| cell.character == 's'));
+    }
+    session.terminate();
+}
+
+#[test]
+#[ignore = "controlled local PTY echo latency benchmark"]
+fn shared_grid_pty_echo_ab_benchmark() {
+    let _pty_guard = PTY_TEST_LOCK.lock();
+    for shared in [false, true] {
+        let session = Arc::new(
+            TerminalSession::spawn_default(
+                ProjectId::new_v4(),
+                std::env::current_dir().unwrap(),
+                TerminalSize {
+                    columns: 240,
+                    rows: 80,
+                    ..TerminalSize::default()
+                },
+                TerminalAppearance::default(),
+            )
+            .unwrap(),
+        );
+        let id = session.id;
+        let state = Arc::new(DaemonState {
+            sessions: RwLock::new(HashMap::from([(id, session.clone())])),
+            build_id: Arc::from("echo-benchmark"),
+            config: test_config_service(),
+            events: Arc::new(event_bus::EventBus::new()),
+            preferences: test_preferences_service(),
+        });
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || serve_connection(server, &state));
+        let mut connection = DaemonConnection::from_stream(client);
+        let mut snapshot = session.snapshot();
+        let mut samples = vec![];
+        // Disable line-discipline echo: only output returned by cat can satisfy the marker check.
+        connection
+            .request(ClientRequest::Input {
+                session_id: id,
+                bytes: b"stty -echo; printf '\\033[2J\\033[HECHO_READY\\n'; exec /bin/cat\r"
+                    .to_vec(),
+                sequence: 1,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for sequence in 0..81 {
+            let marker = if sequence == 0 {
+                "ECHO_READY".into()
+            } else {
+                format!("ACK{sequence:04}")
+            };
+            let started = Instant::now();
+            if sequence != 0 {
+                connection
+                    .request(ClientRequest::Input {
+                        session_id: id,
+                        bytes: format!("\x1b[H{marker}\n").into_bytes(),
+                        sequence,
+                    })
+                    .unwrap();
+            }
+            loop {
+                let after_revision = snapshot.revision;
+                let response = connection
+                    .request(if shared {
+                        ClientRequest::WaitForRenderFrame {
+                            session_id: id,
+                            after_revision,
+                            timeout_ms: 100,
+                        }
+                    } else {
+                        ClientRequest::WaitForSnapshot {
+                            session_id: id,
+                            after_revision,
+                            timeout_ms: 100,
+                        }
+                    })
+                    .unwrap();
+                match response {
+                    DaemonResponse::Snapshot { snapshot: next } => snapshot = next,
+                    DaemonResponse::SnapshotDelta { delta } => {
+                        snapshot = Arc::new(snapshot.apply_delta(&delta).unwrap())
+                    }
+                    DaemonResponse::SnapshotUnchanged { .. } => {}
+                    _ => panic!("unexpected response"),
+                }
+                if snapshot.plain_lines()[0].starts_with(&marker) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline + Duration::from_secs(20),
+                    "no echo marker {marker}"
+                );
+            }
+            if sequence > 10 {
+                samples.push(started.elapsed());
+            }
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "pty-echo-ab transport={} input_request_to_verified_echo_p50_ms={:.3} p95_ms={:.3}",
+            if shared { "shared-rows" } else { "messagepack" },
+            samples[samples.len() / 2].as_secs_f64() * 1000.,
+            samples[samples.len() * 95 / 100].as_secs_f64() * 1000.
+        );
+        session.terminate();
+        drop(connection);
+        worker.join().unwrap().unwrap();
+    }
 }

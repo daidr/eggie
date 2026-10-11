@@ -135,6 +135,18 @@ unsafe fn build_classes() {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
             decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
+            decl.add_method(
+                sel!(accessibilityChildren),
+                accessibility_children as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(accessibilityFocusedUIElement),
+                accessibility_focus as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(accessibilityHitTest:),
+                accessibility_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
 
             decl.add_method(
                 sel!(performKeyEquivalent:),
@@ -369,11 +381,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
 
         decl.add_method(
             sel!(canBecomeMainWindow),
-            yes as extern "C" fn(&Object, Sel) -> BOOL,
+            can_become_key_or_main_window as extern "C" fn(&Object, Sel) -> BOOL,
         );
         decl.add_method(
             sel!(canBecomeKeyWindow),
-            yes as extern "C" fn(&Object, Sel) -> BOOL,
+            can_become_key_or_main_window as extern "C" fn(&Object, Sel) -> BOOL,
         );
         decl.add_method(
             sel!(windowDidResize:),
@@ -508,7 +520,7 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
-    renderer: renderer::Renderer,
+    renderer: Option<renderer::Renderer>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -543,7 +555,7 @@ struct MacWindowState {
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
-    accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
+    accesskit_adapter: Option<MacAccessibility>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
 }
@@ -769,6 +781,7 @@ impl MacWindow {
             bounds,
             titlebar,
             kind,
+            buffering,
             is_movable,
             app_owns_titlebar_drag,
             is_resizable,
@@ -912,13 +925,14 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
-                renderer: renderer::new_renderer(
+                renderer: Some(renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
                     native_view as *mut _,
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
-                ),
+                    buffering,
+                )),
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1008,6 +1022,26 @@ impl MacWindow {
             let main_window: id = msg_send![app, mainWindow];
             let mut sheet_parent = None;
 
+            // Every window needs exit events to release hover when the pointer crosses windows.
+            // Popups also receive movement while inactive; normal windows already receive it.
+            let tracking_options = NSTrackingMouseEnteredAndExited
+                | NSTrackingActiveAlways
+                | NSTrackingInVisibleRect
+                | if matches!(&kind, WindowKind::PopUp | WindowKind::AnchoredPopup(_)) {
+                    NSTrackingMouseMoved
+                } else {
+                    0
+                };
+            let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
+            let tracking_area: id = msg_send![
+                tracking_area,
+                initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                options: tracking_options
+                owner: native_view
+                userInfo: nil
+            ];
+            let _: () = msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
+
             match kind {
                 WindowKind::Normal | WindowKind::Floating => {
                     if kind == WindowKind::Floating {
@@ -1028,20 +1062,6 @@ impl MacWindow {
                 // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
                 // for exhaustiveness.
                 WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
-                    // Use a tracking area to allow receiving MouseMoved events even when
-                    // the window or application aren't active, which is often the case
-                    // e.g. for notification windows.
-                    let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
-                    let _: () = msg_send![
-                        tracking_area,
-                        initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
-                        options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
-                        owner: native_view
-                        userInfo: nil
-                    ];
-                    let _: () =
-                        msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
-
                     native_window.setLevel_(NSPopUpWindowLevel);
                     let _: () = msg_send![
                         native_window,
@@ -1189,10 +1209,15 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
-        this.renderer.destroy();
+        // Native observers may retain a closed view; GPU resources belong to the GPUI window.
+        if let Some(renderer) = this.renderer.take() {
+            renderer.destroy();
+        }
         let window = this.native_window;
+        let native_view = this.native_view.as_ptr();
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
+        this.request_frame_callback.take();
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1204,6 +1229,9 @@ impl Drop for MacWindow {
                         let _: () = msg_send![parent, endSheet: window];
                     }
                     window.close();
+                    // Detach the backing layer even if AppKit retains its view after closing.
+                    let _: () = msg_send![native_view, setWantsLayer: NO];
+                    let _: () = msg_send![native_view, setLayer: nil];
                     window.autorelease();
                 }
             })
@@ -1547,7 +1575,9 @@ impl PlatformWindow for MacWindow {
         this.background_appearance = background_appearance;
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
-        this.renderer.update_transparency(!opaque);
+        if let Some(renderer) = &mut this.renderer {
+            renderer.update_transparency(!opaque);
+        }
 
         unsafe {
             this.native_window.setOpaque_(opaque as BOOL);
@@ -1765,11 +1795,19 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        if let Some(renderer) = &mut this.renderer {
+            renderer.draw(scene);
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.0.lock().renderer.sprite_atlas().clone()
+        self.0
+            .lock()
+            .renderer
+            .as_ref()
+            .expect("a closed window has no sprite atlas")
+            .sprite_atlas()
+            .clone()
     }
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
@@ -1996,7 +2034,10 @@ impl PlatformWindow for MacWindow {
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
-        this.renderer.render_to_image(scene)
+        this.renderer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("cannot render a closed window"))?
+            .render_to_image(scene)
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
@@ -2007,15 +2048,19 @@ impl PlatformWindow for MacWindow {
         };
         let action_handler = A11yActionHandler(callbacks.action);
 
+        // Our view implements the accessibility methods; Adapter keeps only a weak view reference.
         let adapter = unsafe {
-            accesskit_macos::SubclassingAdapter::for_window(
-                lock.native_window as *mut c_void,
-                activation_handler,
+            accesskit_macos::Adapter::new(
+                lock.native_view.as_ptr().cast(),
+                lock.native_window.isKeyWindow() == YES,
                 action_handler,
             )
         };
 
-        lock.accesskit_adapter = Some(adapter);
+        lock.accesskit_adapter = Some(MacAccessibility {
+            adapter,
+            activation_handler,
+        });
     }
 
     fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
@@ -2023,7 +2068,7 @@ impl PlatformWindow for MacWindow {
             let mut lock = self.0.lock();
             lock.accesskit_adapter
                 .as_mut()
-                .and_then(|adapter| adapter.update_if_active(|| tree_update))
+                .and_then(|accessibility| accessibility.adapter.update_if_active(|| tree_update))
         };
         if let Some(events) = events {
             events.raise();
@@ -2033,6 +2078,53 @@ impl PlatformWindow for MacWindow {
     fn a11y_update_window_bounds(&self) {
         // macOS handles window bounds tracking automatically via NSAccessibility.
     }
+}
+
+struct MacAccessibility {
+    adapter: accesskit_macos::Adapter,
+    activation_handler: A11yActivationHandler,
+}
+
+extern "C" fn accessibility_children(this: &Object, _: Sel) -> id {
+    let state = unsafe { get_window_state(this) };
+    let mut lock = state.lock();
+    lock.accesskit_adapter
+        .as_mut()
+        .map_or(nil, |accessibility| {
+            accessibility
+                .adapter
+                .view_children(&mut accessibility.activation_handler)
+                .cast()
+        })
+}
+
+extern "C" fn accessibility_focus(this: &Object, _: Sel) -> id {
+    let state = unsafe { get_window_state(this) };
+    let mut lock = state.lock();
+    lock.accesskit_adapter
+        .as_mut()
+        .map_or(nil, |accessibility| {
+            accessibility
+                .adapter
+                .focus(&mut accessibility.activation_handler)
+                .cast()
+        })
+}
+
+extern "C" fn accessibility_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    let state = unsafe { get_window_state(this) };
+    let mut lock = state.lock();
+    lock.accesskit_adapter
+        .as_mut()
+        .map_or(nil, |accessibility| {
+            accessibility
+                .adapter
+                .hit_test(
+                    accesskit_macos::NSPoint::new(point.x, point.y),
+                    &mut accessibility.activation_handler,
+                )
+                .cast()
+        })
 }
 
 struct A11yActivationHandler {
@@ -2115,6 +2207,16 @@ unsafe fn drop_window_state(object: &Object) {
 
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
+}
+
+extern "C" fn can_become_key_or_main_window(this: &Object, _: Sel) -> BOOL {
+    let style: NSWindowStyleMask = unsafe { msg_send![this, styleMask] };
+    // Nonactivating popups must also keep the parent's keyboard focus when clicked.
+    if style.contains(NSWindowStyleMaskNonactivatingPanel) {
+        NO
+    } else {
+        YES
+    }
 }
 
 extern "C" fn dealloc_window(this: &Object, _: Sel) {
@@ -2634,7 +2736,10 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     let scale_factor = lock.scale_factor();
     let size = lock.content_size();
     let drawable_size = size.to_device_pixels(scale_factor);
-    if let Some(layer) = lock.renderer.layer() {
+    let Some(renderer) = &mut lock.renderer else {
+        return;
+    };
+    if let Some(layer) = renderer.layer() {
         unsafe {
             let _: () = msg_send![
                 layer,
@@ -2643,7 +2748,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
         }
     }
 
-    lock.renderer.update_drawable_size(drawable_size);
+    renderer.update_drawable_size(drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();
@@ -2695,7 +2800,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         let mut lock = window_state.lock();
         lock.accesskit_adapter
             .as_mut()
-            .and_then(|adapter| adapter.update_view_focus_state(is_active))
+            .and_then(|accessibility| accessibility.adapter.update_view_focus_state(is_active))
     };
     if let Some(events) = a11y_events {
         events.raise();
@@ -2713,14 +2818,18 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
+                if let Some(renderer) = &mut lock.renderer {
+                    renderer.set_presents_with_transaction(true);
+                }
                 lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
+                if let Some(renderer) = &mut lock.renderer {
+                    renderer.set_presents_with_transaction(false);
+                }
                 lock.start_display_link();
             }
         } else {
@@ -2777,7 +2886,10 @@ extern "C" fn close_window(this: &Object, _: Sel) {
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
     let window_state = unsafe { get_window_state(this) };
     let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    window_state
+        .renderer
+        .as_ref()
+        .map_or(nil, |renderer| renderer.layer_ptr() as id)
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
@@ -2812,7 +2924,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
-    lock.renderer.update_drawable_size(drawable_size);
+    if let Some(renderer) = &mut lock.renderer {
+        renderer.update_drawable_size(drawable_size);
+    }
 
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();
@@ -2827,14 +2941,18 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
+        if let Some(renderer) = &mut lock.renderer {
+            renderer.set_presents_with_transaction(true);
+        }
         lock.stop_display_link();
         drop(lock);
         callback(Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
+        if let Some(renderer) = &mut lock.renderer {
+            renderer.set_presents_with_transaction(false);
+        }
         lock.start_display_link();
     }
 }

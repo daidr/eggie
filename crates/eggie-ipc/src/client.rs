@@ -18,7 +18,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INPUT_BATCH_MESSAGES: usize = 8;
 static RENDER_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
 
-fn render_metrics_enabled() -> bool {
+pub(crate) fn render_metrics_enabled() -> bool {
     *RENDER_METRICS_ENABLED.get_or_init(|| {
         std::env::var_os("EGGIE_RENDER_METRICS")
             .is_some_and(|value| !value.is_empty() && value != "0")
@@ -63,6 +63,8 @@ pub struct DaemonConnection {
     stream: BufReader<UnixStream>,
     request: Vec<u8>,
     response: Vec<u8>,
+    #[cfg(unix)]
+    grid: crate::GridReader,
 }
 
 #[derive(Clone)]
@@ -298,6 +300,8 @@ impl DaemonConnection {
             stream: BufReader::new(stream),
             request: Vec::with_capacity(512),
             response: Vec::with_capacity(8 * 1024),
+            #[cfg(unix)]
+            grid: crate::GridReader::default(),
         }
     }
 
@@ -308,7 +312,12 @@ impl DaemonConnection {
 
     pub fn request(&mut self, request: ClientRequest) -> Result<DaemonResponse> {
         write_wire_message(self.stream.get_mut(), &mut self.request, &request)?;
-        let Some(response) = read_daemon_response(&mut self.stream, &mut self.response)? else {
+        #[cfg(unix)]
+        let response =
+            read_daemon_response_with_grid(&mut self.stream, &mut self.response, &mut self.grid)?;
+        #[cfg(not(unix))]
+        let response = read_daemon_response(&mut self.stream, &mut self.response)?;
+        let Some(response) = response else {
             bail!("daemon closed the persistent connection");
         };
         if let DaemonResponse::Error { message } = &response {
@@ -346,6 +355,7 @@ impl DaemonConnection {
             WireFrameKind::ShmImage => {
                 return read_terminal_image_shm_wire_into(&mut self.stream, length, destination);
             }
+            WireFrameKind::ShmGrid => bail!("unexpected shared grid image response"),
             WireFrameKind::Message => {}
         }
 
@@ -421,6 +431,7 @@ impl DaemonConnection {
                 }
                 Ok(TerminalImageFrame::Inline { metadata, pixels })
             }
+            WireFrameKind::ShmGrid => bail!("unexpected shared grid image response"),
             WireFrameKind::Message => {
                 let response = read_message_body::<DaemonResponse>(
                     &mut self.stream,
@@ -569,25 +580,15 @@ pub fn terminate_daemon_at(socket_path: &Path) {
     }
 }
 
-/// Whether a daemon's handshake response is acceptable to this client.
-///
-/// The protocol version must always match. In debug builds the build id must
-/// also match, so any recompile swaps in a fresh daemon. In release builds
-/// only the protocol version matters, allowing an in-place update to keep a
-/// compatible daemon running (terminal sessions stay alive across updates).
+/// The versioned protocol is the compatibility contract; build identity is diagnostic.
 pub fn handshake_accepted(
-    daemon_protocol: u32,
-    daemon_build_id: &str,
-    self_protocol: u32,
-    self_build_id: &str,
+    daemon_protocol_version: u32,
+    _daemon_build_id: &str,
+    self_protocol_version: u32,
+    _self_build_id: &str,
 ) -> bool {
-    if daemon_protocol != self_protocol {
-        return false;
-    }
-    if cfg!(debug_assertions) && daemon_build_id != self_build_id {
-        return false;
-    }
-    true
+    // Process lifetime is independent of GUI builds; protocol changes are the compatibility gate.
+    daemon_protocol_version == self_protocol_version
 }
 
 impl DaemonClient {
@@ -679,8 +680,7 @@ impl DaemonClient {
                     );
                 }
                 if build_id != self.build_id.as_ref() {
-                    // Release builds accept a daemon from a different build as long as the
-                    // protocol version matches (in-place updates keep the daemon alive).
+                    // GUI rebuilds preserve a compatible daemon and its running processes.
                     eprintln!(
                         "connected to daemon with a different build id: daemon {build_id}, app {}",
                         self.build_id
@@ -921,12 +921,7 @@ mod tests {
         // Same protocol, same build id is always accepted.
         assert!(handshake_accepted(1, "build-a", 1, "build-a"));
 
-        // Same protocol but different build id: rejected in debug builds
-        // (so a recompile swaps the daemon), accepted in release builds
-        // (so in-place updates keep a compatible daemon).
-        assert_eq!(
-            handshake_accepted(1, "build-a", 1, "build-b"),
-            !cfg!(debug_assertions)
-        );
+        // A GUI rebuild must not end compatible daemon processes.
+        assert_eq!(handshake_accepted(1, "build-a", 1, "build-b"), true);
     }
 }

@@ -1,8 +1,8 @@
 //! 跨窗口共享的项目列表及其磁盘持久化。
 //!
 //! 项目(名称、根目录、顺序)是所有窗口共享的:任一窗口增删改都要即时反映到其它窗口,并在
-//! 完全退出应用后保留。会话(session)不在此处 —— 它按窗口独立、由 daemon 维护;布局(layout)
-//! 也不在此处 —— 它是每窗口易变的 UI 态。所以这里只序列化 `Vec<Project>`。
+//! 完全退出应用后保留。进程由 daemon 维护，窗口和后台标签页由应用级 WindowManager 管理。
+//! 此处只保存项目的名称、目录和顺序。
 //!
 //! 实现刻意对齐 [`crate::settings::SettingsStore`]:同款 `Entity` + `cx.observe` 跨窗口同步、
 //! 同款 `load` / 原子 `save`(写 `.tmp` 再 rename)、同款「mutating 方法末尾 save + notify」惯用法。
@@ -82,7 +82,12 @@ impl ProjectStore {
     }
 
     /// 设置根目录并落盘。id 不存在则无操作。
-    pub(crate) fn set_root(&mut self, id: ProjectId, root: Option<PathBuf>, cx: &mut Context<Self>) {
+    pub(crate) fn set_root(
+        &mut self,
+        id: ProjectId,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(project) = self.projects.iter_mut().find(|project| project.id == id) {
             project.root = root;
             self.persist(cx);
@@ -355,15 +360,29 @@ mod tests {
             changed
         };
 
-        assert!(forget(&mut store, doomed), "a match reports a change so the caller can persist");
-        assert_eq!(by_name(&store, "uses-doomed"), None, "every match is cleared");
+        assert!(
+            forget(&mut store, doomed),
+            "a match reports a change so the caller can persist"
+        );
+        assert_eq!(
+            by_name(&store, "uses-doomed"),
+            None,
+            "every match is cleared"
+        );
         assert_eq!(by_name(&store, "also-doomed"), None);
-        assert_eq!(by_name(&store, "uses-kept"), Some(kept), "other profiles are untouched");
+        assert_eq!(
+            by_name(&store, "uses-kept"),
+            Some(kept),
+            "other profiles are untouched"
+        );
 
         // Idempotent, and a no-op reports false — that is what keeps it from rewriting the file (and
         // notifying every window) when a profile no project referenced is deleted.
         assert!(!forget(&mut store, doomed), "a second pass changes nothing");
-        assert!(!forget(&mut store, eggie_domain::ProfileId::new_v4()), "an unknown id is a no-op");
+        assert!(
+            !forget(&mut store, eggie_domain::ProfileId::new_v4()),
+            "an unknown id is a no-op"
+        );
 
         let _ = fs::remove_file(&path);
     }

@@ -8,7 +8,7 @@ use super::*;
 pub(super) fn prompt_for_text(
     window: &Window,
     title: &str,
-    message: &str,
+    message: Option<&str>,
     placeholder: Option<&str>,
     initial: Option<&str>,
     ok_label: &str,
@@ -23,10 +23,12 @@ pub(super) fn prompt_for_text(
             alert,
             setMessageText: NSString::alloc(nil).init_str(title)
         ];
-        let _: () = msg_send![
-            alert,
-            setInformativeText: NSString::alloc(nil).init_str(message)
-        ];
+        if let Some(message) = message {
+            let _: () = msg_send![
+                alert,
+                setInformativeText: NSString::alloc(nil).init_str(message)
+            ];
+        }
 
         let text_field: id = msg_send![class!(NSTextField), alloc];
         let text_field: id = msg_send![
@@ -112,7 +114,7 @@ pub(super) fn prompt_for_text(
 pub(super) fn prompt_for_text(
     _window: &Window,
     _title: &str,
-    _message: &str,
+    _message: Option<&str>,
     _placeholder: Option<&str>,
     _initial: Option<&str>,
     _ok_label: &str,
@@ -135,7 +137,8 @@ pub(super) fn prompt_for_snippet(
     content_seed: &str,
     auto_run_seed: bool,
     name_placeholder: &str,
-    content_placeholder: &str,
+    content_label: &str,
+    description: &str,
     auto_run_label: &str,
     ok_label: &str,
     cancel_label: &str,
@@ -150,19 +153,25 @@ pub(super) fn prompt_for_snippet(
         const WIDTH: f64 = 320.;
         const NAME_H: f64 = 24.;
         const CONTENT_H: f64 = 120.;
+        const LABEL_H: f64 = 16.;
         const CHECK_H: f64 = 20.;
         const GAP: f64 = 8.;
-        let total_h = NAME_H + GAP + CONTENT_H + GAP + CHECK_H;
+        let total_h = NAME_H + GAP + LABEL_H + GAP + CONTENT_H + GAP + CHECK_H;
         let container: id = msg_send![class!(NSView), alloc];
         let container: id = msg_send![
             container,
             initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(WIDTH, total_h))
         ];
 
-        // Layout is bottom-up (AppKit y grows upward): checkbox at the bottom, then content, then name.
+        // AppKit lays out bottom-up: checkbox, command editor, command label, name field.
         let check_y = 0.;
         let content_y = CHECK_H + GAP;
-        let name_y = content_y + CONTENT_H + GAP;
+        let label_y = content_y + CONTENT_H + GAP;
+        let name_y = label_y + LABEL_H + GAP;
+
+        let command_label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str(content_label)];
+        let _: () = msg_send![command_label, setFrame: NSRect::new(NSPoint::new(0., label_y), NSSize::new(WIDTH, LABEL_H))];
+        let _: () = msg_send![container, addSubview: command_label];
 
         // Name field (single line) at the top.
         let name_field: id = msg_send![class!(NSTextField), alloc];
@@ -218,12 +227,11 @@ pub(super) fn prompt_for_snippet(
         let _: () = msg_send![checkbox, setState: (if auto_run_seed { 1 } else { 0 }) as NSInteger];
         let _: () = msg_send![container, addSubview: checkbox];
 
-        // NSTextView has no native placeholder; surface the content hint as the dialog body only
-        // when creating a new snippet (empty content), so an editing dialog is not cluttered.
+        // Show the feature's purpose when creating a snippet; the editor has its own label.
         if content_seed.is_empty() {
             let _: () = msg_send![
                 alert,
-                setInformativeText: NSString::alloc(nil).init_str(content_placeholder)
+                setInformativeText: NSString::alloc(nil).init_str(description)
             ];
         }
         let _: () = msg_send![alert, setAccessoryView: container];
@@ -307,7 +315,8 @@ pub(super) fn prompt_for_snippet(
     _content_seed: &str,
     _auto_run_seed: bool,
     _name_placeholder: &str,
-    _content_placeholder: &str,
+    _content_label: &str,
+    _description: &str,
     _auto_run_label: &str,
     _ok_label: &str,
     _cancel_label: &str,

@@ -815,6 +815,13 @@ impl VisualTestContext {
         })
     }
 
+    /// Simulate a native window move while the physical pointer remains at the given relative position.
+    pub fn simulate_window_move(&mut self, origin: Point<Pixels>, mouse_position: Point<Pixels>) {
+        self.test_window(self.window)
+            .simulate_move(origin, mouse_position);
+        self.background_executor.run_until_parked();
+    }
+
     /// Simulate a mouse down event to the given point
     pub fn simulate_mouse_down(
         &mut self,

@@ -30,6 +30,7 @@ const _: () = {
 };
 use super::*;
 
+#[cfg(test)]
 pub(super) fn snapshot_terminal(
     terminal: &Term<DaemonEventListener>,
     session_id: SessionId,
@@ -38,10 +39,9 @@ pub(super) fn snapshot_terminal(
     revision: u64,
     last_input_sequence: u64,
 ) -> TerminalSnapshot {
-    let graphics = terminal.kitty_graphics_snapshot();
     let content = terminal.renderable_content();
     let display_offset = content.display_offset;
-    let cells = content
+    let cells: Vec<TerminalCell> = content
         .display_iter
         .filter_map(|indexed| {
             let point = point_to_viewport(display_offset, indexed.point)?;
@@ -62,6 +62,94 @@ pub(super) fn snapshot_terminal(
             })
         })
         .collect();
+    snapshot_metadata(
+        terminal,
+        session_id,
+        size,
+        title,
+        revision,
+        last_input_sequence,
+        cells.into(),
+    )
+}
+
+pub(super) fn snapshot_terminal_incremental(
+    terminal: &mut Term<DaemonEventListener>,
+    base: Option<&TerminalSnapshot>,
+    session_id: SessionId,
+    size: TerminalSize,
+    title: String,
+    revision: u64,
+    last_input_sequence: u64,
+) -> TerminalSnapshot {
+    let display_offset = terminal.grid().display_offset();
+    let compatible = base
+        .is_some_and(|base| base.size == size && base.display_offset as usize == display_offset);
+    let dirty: Vec<usize> = match terminal.damage() {
+        TermDamage::Partial(lines) if compatible => lines.map(|line| line.line).collect(),
+        _ => (0..size.rows as usize).collect(),
+    };
+    let mut rows = if compatible {
+        base.unwrap().cells.rows().to_vec()
+    } else {
+        Vec::new()
+    };
+    rows.resize_with(size.rows as usize, || TerminalRow::owned(Vec::new()));
+    for line in dirty {
+        if line >= rows.len() {
+            continue;
+        }
+        let engine_row = &terminal.grid()[Line(line as i32 - display_offset as i32)];
+        let cells = engine_row[..]
+            .iter()
+            .enumerate()
+            .filter_map(|(column, cell)| {
+                if snapshot_cell_is_empty(cell) {
+                    return None;
+                }
+                Some(TerminalCell {
+                    line: line as u16,
+                    column: column as u16,
+                    character: cell.c,
+                    zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                    foreground: snapshot_color(cell.fg),
+                    background: snapshot_color(cell.bg),
+                    underline_color: cell.underline_color().map(snapshot_color),
+                    hyperlink: cell.hyperlink().map(|link| link.uri().to_owned()),
+                    flags: cell.flags.bits(),
+                })
+            })
+            .collect::<Vec<_>>();
+        // Cursor damage may cover a row whose text did not change. Keep its storage identity.
+        if !rows[line].iter().eq(cells.iter().map(TerminalCell::view)) {
+            rows[line] = TerminalRow::owned(cells);
+        }
+    }
+    let snapshot = snapshot_metadata(
+        terminal,
+        session_id,
+        size,
+        title,
+        revision,
+        last_input_sequence,
+        TerminalCells::from_rows(rows),
+    );
+    terminal.reset_damage();
+    snapshot
+}
+
+pub(super) fn snapshot_metadata(
+    terminal: &Term<DaemonEventListener>,
+    session_id: SessionId,
+    size: TerminalSize,
+    title: String,
+    revision: u64,
+    last_input_sequence: u64,
+    cells: TerminalCells,
+) -> TerminalSnapshot {
+    let graphics = terminal.kitty_graphics_snapshot();
+    let content = terminal.renderable_content();
+    let display_offset = content.display_offset;
     let color_overrides = (0..COUNT)
         .filter_map(|index| {
             content.colors[index].map(|color| TerminalColorOverride {
@@ -82,6 +170,8 @@ pub(super) fn snapshot_terminal(
         .filter(|point| point.line < size.rows as usize);
     let selection = project_selection(terminal, display_offset, size);
     TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         session_id,
         size,
         cells,
@@ -156,42 +246,42 @@ pub(super) fn snapshot_delta(
     }
     let mut cells = Vec::new();
     let mut cleared = Vec::new();
-    let mut base_index = 0;
-    let mut current_index = 0;
-    while base_index < base.cells.len() || current_index < current.cells.len() {
-        let base_cell = base.cells.get(base_index);
-        let current_cell = current.cells.get(current_index);
+    let mut base_iter = base.cells.iter().peekable();
+    let mut current_iter = current.cells.iter().peekable();
+    while base_iter.peek().is_some() || current_iter.peek().is_some() {
+        let base_cell = base_iter.peek().copied();
+        let current_cell = current_iter.peek().copied();
         let base_position = base_cell.map(|cell| (cell.line, cell.column));
         let current_position = current_cell.map(|cell| (cell.line, cell.column));
         match (base_position, current_position) {
             (Some(base_position), Some(current_position)) if base_position == current_position => {
                 if base_cell != current_cell {
-                    cells.push(current_cell.expect("current cell exists").clone());
+                    cells.push(current_cell.expect("current cell exists").to_owned());
                 }
-                base_index += 1;
-                current_index += 1;
+                base_iter.next();
+                current_iter.next();
             }
             (Some(base_position), Some(current_position)) if base_position < current_position => {
                 cleared.push(TerminalCellPosition {
                     line: base_position.0,
                     column: base_position.1,
                 });
-                base_index += 1;
+                base_iter.next();
             }
             (Some(_), Some(_)) => {
-                cells.push(current_cell.expect("current cell exists").clone());
-                current_index += 1;
+                cells.push(current_cell.expect("current cell exists").to_owned());
+                current_iter.next();
             }
             (Some(base_position), None) => {
                 cleared.push(TerminalCellPosition {
                     line: base_position.0,
                     column: base_position.1,
                 });
-                base_index += 1;
+                base_iter.next();
             }
             (None, Some(_)) => {
-                cells.push(current_cell.expect("current cell exists").clone());
-                current_index += 1;
+                cells.push(current_cell.expect("current cell exists").to_owned());
+                current_iter.next();
             }
             (None, None) => break,
         }
@@ -201,6 +291,8 @@ pub(super) fn snapshot_delta(
         return None;
     }
     Some(TerminalSnapshotDelta {
+        prompt_editable: current.prompt_editable,
+        prompt_input: current.prompt_input.clone(),
         session_id: current.session_id,
         base_revision: base.revision,
         size: current.size,

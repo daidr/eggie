@@ -1,3 +1,4 @@
+pub use eggie_completion::{CompletionItem, PromptInput};
 mod events;
 pub use events::*;
 mod messages;
@@ -6,14 +7,16 @@ mod input;
 pub use input::*;
 mod session;
 pub use session::*;
+mod cells;
+pub use cells::*;
 mod snapshot;
-use eggie_domain::{ProjectId, SessionId, WindowId};
+use eggie_domain::{ProjectId, SessionId};
 use serde::{Deserialize, Serialize};
 pub use snapshot::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Fixed-point scale used by [`TerminalScrollDelta`]. Keeping scroll deltas integral preserves
 /// sub-pixel trackpad motion without introducing non-reflexive floating-point values into the

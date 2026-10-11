@@ -6,7 +6,7 @@ impl EggieApp {
         let receiver = prompt_for_text(
             window,
             language.new_project_title(),
-            language.new_project_message(),
+            None,
             Some(language.project_name_placeholder()),
             None,
             language.ok(),
@@ -46,7 +46,9 @@ impl EggieApp {
     }
 
     pub(super) fn activate_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        self.dismiss_project_selector(cx);
         if self.workspace_state.project_views.contains_key(&project_id) {
+            self.project_picker = false;
             self.workspace_state.active_project = project_id;
             self.ensure_snapshot_watchers(cx);
             self.sync_terminal_focus();
@@ -123,10 +125,15 @@ impl EggieApp {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        let Some(view) = self.workspace_state.project_views.get(&project_id) else {
+        let Some(_) = self.workspace_state.project_views.get(&project_id) else {
             return;
         };
-        let tab_count = view.layout.item_count();
+        let tab_count = self
+            .window_manager
+            .read(cx)
+            .state
+            .project_session_ids(project_id)
+            .len();
         let Some(menu) = prepare_project_menu(window, tab_count, self.language) else {
             return;
         };
@@ -247,7 +254,7 @@ impl EggieApp {
                 let receiver = prompt_for_text(
                     window,
                     language.rename_project_title(),
-                    language.rename_project_message(),
+                    None,
                     None,
                     Some(&current_name),
                     language.ok(),
@@ -286,7 +293,7 @@ impl EggieApp {
         let receiver = prompt_for_text(
             window,
             language.forward_port(),
-            language.forward_port_prompt(),
+            Some(language.forward_port_prompt()),
             None,
             None,
             language.ok(),
@@ -308,49 +315,75 @@ impl EggieApp {
         .detach();
     }
 
-    pub(super) fn close_project_tabs(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
-        let Some(view) = self.workspace_state.project_views.get(&project_id) else {
-            return;
-        };
-        let items_to_close: Vec<(GroupId, ItemId)> = view
-            .layout
-            .terminal_items()
-            .filter_map(|item| {
-                item.session_id
-                    .and_then(|session_id| view.layout.find_terminal_item(session_id))
-            })
-            .collect();
-        for (group_id, item_id) in items_to_close {
-            self.close_item(group_id, item_id, cx);
-        }
+    pub(super) fn close_project_tabs(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        self.confirm_project_operation(project, false, cx);
     }
 
-    pub(super) fn delete_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
-        let Some(view) = self.workspace_state.project_views.get(&project_id) else {
+    pub(super) fn delete_project(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        self.confirm_project_operation(project, true, cx);
+    }
+
+    fn confirm_project_operation(
+        &mut self,
+        project: ProjectId,
+        delete: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.publish_window_state(cx);
+        let manager = self.window_manager.clone();
+        if !manager.update(cx, |manager, _| manager.pending_projects.insert(project)) {
             return;
-        };
-        // Terminate this window's terminals in the project before dropping it from the shared list.
-        let items_to_close: Vec<(GroupId, ItemId)> = view
-            .layout
-            .terminal_items()
-            .filter_map(|item| {
-                item.session_id
-                    .and_then(|session_id| view.layout.find_terminal_item(session_id))
-            })
-            .collect();
-        for (group_id, item_id) in items_to_close {
-            self.close_item(group_id, item_id, cx);
         }
-        // Remove from the shared store (syncs to all windows); the observer reconciles views.
-        self.project_store
-            .update(cx, |store, cx| store.remove(project_id, cx));
-        self.reconcile_project_views(cx);
-        // D8: never leave the list empty — recreate a default Home project.
-        if self.workspace_state.projects.is_empty() {
-            self.add_project("Home".to_owned(), cx);
-        }
-        self.ensure_snapshot_watchers(cx);
-        self.sync_terminal_focus();
-        cx.notify();
+        let client = self.client.clone();
+        let store = self.project_store.clone();
+        let zh = self.language == Language::SimplifiedChinese;
+        let ids = manager.read(cx).state.project_session_ids(project);
+        let live = manager
+            .read(cx)
+            .sessions
+            .iter()
+            .filter(|s| s.project_id == project)
+            .map(|s| s.id)
+            .collect::<HashSet<_>>();
+        cx.spawn(async move |app, cx| {
+            if !live.is_empty() {
+                let prompt = app.update_in(cx, |_, window, cx| window.prompt(PromptLevel::Warning,
+                    if delete { if zh { "删除项目并结束其终端？" } else { "Delete project and terminate its terminals?" } }
+                    else { if zh { "结束此项目的全部终端？" } else { "Terminate all terminals in this project?" } },
+                    Some(if zh { "其他窗口和后台终端也会结束，当前命令将中断。" } else { "Includes other windows and background terminals. Running commands will stop." }),
+                    &[if zh { "取消" } else { "Cancel" }, if zh { "结束终端" } else { "Terminate" }], cx));
+                let confirmed = match prompt { Ok(prompt) => prompt.await == Ok(1), Err(_) => false };
+                if !confirmed { let _ = manager.update(cx, |manager, _| { manager.pending_projects.remove(&project); }); return; }
+            }
+            let result = cx.background_executor().spawn(async move {
+                let sessions = match client.request(ClientRequest::ListSessions)? { DaemonResponse::Sessions { sessions } => sessions, other => anyhow::bail!("Unexpected session response: {other:?}") };
+                let mut terminated = Vec::new();
+                let mut error = None;
+                for session in sessions.iter().filter(|s| s.project_id == project) {
+                    match client.request(ClientRequest::Terminate { session_id: session.id }) {
+                        Ok(DaemonResponse::Ok) => terminated.push(session.id),
+                        other => { error = Some(format!("Could not terminate project terminal: {other:?}")); break; }
+                    }
+                }
+                Ok::<_, anyhow::Error>((terminated, error))
+            }).await;
+            let _ = cx.update(|cx| {
+                manager.update(cx, |manager, _| { manager.pending_projects.remove(&project); });
+                match result {
+                    Ok((terminated, error)) => {
+                        manager.update(cx, |manager, cx| {
+                            for id in terminated { manager.remove_session(id, cx); }
+                            if let Some(error) = &error { manager.error = Some(error.clone()); cx.notify(); }
+                            else { for id in ids { manager.remove_session(id, cx); } }
+                        });
+                        if delete && error.is_none() { store.update(cx, |store, cx| {
+                            store.remove(project, cx);
+                            if store.projects().is_empty() { store.add(Project::new("Home".into()), cx); }
+                        }); }
+                    }
+                    Err(error) => manager.update(cx, |manager, cx| { manager.error = Some(error.to_string()); cx.notify(); }),
+                }
+            });
+        }).detach();
     }
 }

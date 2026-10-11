@@ -1,5 +1,28 @@
-
 use super::{SelectorKind, selector_matches};
+
+#[cfg(target_os = "macos")]
+#[test]
+fn filtered_font_query_preserves_installed_monospace_families() {
+    use core_text::font_descriptor::{SymbolicTraitAccessors, TraitAccessors};
+    use std::collections::BTreeSet;
+
+    let collection = core_text::font_collection::create_for_all_families();
+    let descriptors = collection.get_descriptors().expect("installed fonts");
+    let mut expected = descriptors
+        .into_iter()
+        .filter(|descriptor| descriptor.traits().symbolic_traits().is_monospace())
+        .map(|descriptor| descriptor.family_name())
+        .collect::<BTreeSet<_>>();
+    expected.insert("Menlo".into());
+    let actual = super::macos_monospace_font_names();
+    assert_eq!(actual.iter().cloned().collect::<BTreeSet<_>>(), expected);
+    assert!(
+        actual
+            .windows(2)
+            .all(|names| names[0].to_lowercase() <= names[1].to_lowercase())
+    );
+    assert_eq!(actual.len(), expected.len());
+}
 
 #[test]
 fn selector_indices_are_a_bijection_onto_the_bounds_array() {

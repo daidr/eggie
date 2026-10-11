@@ -25,7 +25,24 @@ impl EggieApp {
         let snippet_store = SnippetStore::load();
         let notes_store = NotesStore::load();
 
-        gpui_platform::application().run(move |cx: &mut App| {
+        let application = gpui_platform::application();
+        application.on_reopen(|cx| {
+            let Some(global) = cx.try_global::<crate::workspace::SharedWindows>() else {
+                return;
+            };
+            let manager = global.0.read(cx);
+            let handle = manager
+                .state
+                .active_window
+                .and_then(|id| manager.handles.get(&id).copied())
+                .or_else(|| manager.handles.values().next().copied());
+            if let Some(handle) = handle {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            } else {
+                cx.dispatch_action(&crate::actions::NewWindow);
+            }
+        });
+        application.run(move |cx: &mut App| {
             cx.set_app_identity("me.daidr.eggie", "Eggie");
             let notification_routes: NotificationRoutes = Rc::new(RefCell::new(HashMap::new()));
             let response_routes = notification_routes.clone();
@@ -44,10 +61,31 @@ impl EggieApp {
                 response_routes.borrow_mut().remove(&tag);
                 if activated {
                     cx.activate(true);
-                    let _ = route.app.update_in(cx, |app, window, cx| {
-                        window.activate_window();
-                        app.activate_session_by_id(route.session_id, window, cx);
-                    });
+                    let manager = WindowManager::global(cx);
+                    let handle = manager
+                        .read(cx)
+                        .state
+                        .locate(route.session_id)
+                        .and_then(|location| {
+                            manager.read(cx).handles.get(&location.window_id).copied()
+                        })
+                        .or_else(|| manager.read(cx).handles.values().next().copied());
+                    if let Some(handle) = handle {
+                        let _ = handle.update(cx, |app, window, cx| {
+                            window.activate_window();
+                            app.navigate_terminal(route.session_id, window, cx);
+                        });
+                    } else {
+                        cx.dispatch_action(&crate::actions::NewWindow);
+                        cx.defer(move |cx| {
+                            if let Some(handle) = manager.read(cx).handles.values().next().copied()
+                            {
+                                let _ = handle.update(cx, |app, window, cx| {
+                                    app.navigate_terminal(route.session_id, window, cx)
+                                });
+                            }
+                        });
+                    }
                 }
             });
             eggie_ui_kit::init(cx);
@@ -69,20 +107,112 @@ impl EggieApp {
                 cx,
             );
             Self::spawn_config_watcher(cx, client.clone(), settings.clone());
-            Self::open_new_window(
-                cx,
-                client.clone(),
-                settings.clone(),
-                updates.clone(),
-                project_store.clone(),
-                profile_store.clone(),
-                snippet_store.clone(),
-                notes_store.clone(),
-                notification_routes.clone(),
-                NewWindowInit::ColdStart {
-                    project_root: project_root.clone(),
-                },
-            );
+            let launch_project = project_store.update(cx, |store, cx| {
+                store.upsert_by_root(project_root.clone(), cx).0
+            });
+            let windows = cx.new(|_| WindowManager::load());
+            windows.update(cx, |manager, _| {
+                manager.notification_routes = notification_routes.clone();
+                manager.project_store = Some(project_store.clone());
+            });
+            cx.set_global(crate::workspace::SharedWindows(windows.clone()));
+            let projects = project_store.read(cx).projects().to_vec();
+            windows.update(cx, |manager, cx| manager.reconcile_projects(&projects, cx));
+            if let Ok(DaemonResponse::Sessions { sessions }) =
+                client.request(ClientRequest::ListSessions)
+            {
+                windows.update(cx, |manager, cx| manager.set_sessions(sessions, cx));
+            }
+            let restore = windows
+                .read(cx)
+                .state
+                .windows
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let active_window = windows.read(cx).state.active_window;
+            if restore.is_empty() {
+                let init = if windows.read(cx).state.background.is_empty() {
+                    NewWindowInit::OpenDir {
+                        project_id: launch_project,
+                    }
+                } else {
+                    NewWindowInit::Empty
+                };
+                Self::open_new_window(
+                    cx,
+                    client.clone(),
+                    settings.clone(),
+                    updates.clone(),
+                    project_store.clone(),
+                    profile_store.clone(),
+                    snippet_store.clone(),
+                    notes_store.clone(),
+                    notification_routes.clone(),
+                    init,
+                );
+            } else {
+                for state in restore {
+                    Self::open_new_window(
+                        cx,
+                        client.clone(),
+                        settings.clone(),
+                        updates.clone(),
+                        project_store.clone(),
+                        profile_store.clone(),
+                        snippet_store.clone(),
+                        notes_store.clone(),
+                        notification_routes.clone(),
+                        NewWindowInit::Restore(state),
+                    );
+                }
+                if let Some(id) = active_window
+                    && let Some(handle) = windows.read(cx).handles.get(&id).copied()
+                {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+            }
+            WindowManager::start_polling(&windows, client.clone(), cx);
+            let menu_settings = settings.clone();
+            let mut previous_menu = Vec::new();
+            cx.observe(&windows, move |manager, cx| {
+                let manager = manager.read(cx);
+                let menu = manager
+                    .state
+                    .windows
+                    .keys()
+                    .map(|id| {
+                        (
+                            *id,
+                            manager.window_label(*id),
+                            manager.state.active_window == Some(*id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if menu != previous_menu {
+                    previous_menu = menu;
+                    crate::actions::rebuild_menus(menu_settings.read(cx).config().language, cx);
+                }
+            })
+            .detach();
+            crate::actions::rebuild_menus(settings.read(cx).config().language, cx);
+            let projects_for_windows = project_store.clone();
+            cx.observe(&project_store, move |store, cx| {
+                let projects = store.read(cx).projects().to_vec();
+                WindowManager::global(cx)
+                    .update(cx, |manager, cx| manager.reconcile_projects(&projects, cx));
+            })
+            .detach();
+            let _ = projects_for_windows;
+            let windows_for_quit = windows.clone();
+            cx.on_app_quit(move |cx| {
+                windows_for_quit.update(cx, |manager, _| {
+                    manager.persist();
+                    manager.quitting = true;
+                });
+                std::future::ready(())
+            })
+            .detach();
             // Single-instance listener: bind the GUI wake socket so subsequent `eggie` invocations
             // open a window here instead of starting a second process.
             Self::spawn_wake_listener(
@@ -115,16 +245,16 @@ impl EggieApp {
                 })
                 .detach();
             }
-            // D9: quitting when the last main window closes. The daemon and its sessions live on
-            // independently; the next `eggie` invocation reopens a window and reclaims them. The
-            // settings window alone must not keep the process alive, so only count `EggieApp` windows.
-            cx.on_window_closed(|cx, _closed_window_id| {
-                let has_main_window = cx
-                    .windows()
-                    .into_iter()
-                    .any(|window| window.downcast::<EggieApp>().is_some());
-                if !has_main_window {
-                    cx.quit();
+            cx.on_window_closed(|cx, native_id| {
+                let manager = WindowManager::global(cx);
+                let id = manager
+                    .read(cx)
+                    .handles
+                    .iter()
+                    .find(|(_, handle)| handle.window_id() == native_id)
+                    .map(|(id, _)| *id);
+                if let Some(id) = id {
+                    manager.update(cx, |manager, cx| manager.close(id, cx));
                 }
             })
             .detach();
@@ -222,6 +352,27 @@ impl EggieApp {
                     // focused on it.
                     let (project_id, _created) =
                         project_store.update(cx, |store, cx| store.upsert_by_root(cwd.clone(), cx));
+                    let manager = WindowManager::global(cx);
+                    let existing = manager
+                        .read(cx)
+                        .state
+                        .windows
+                        .values()
+                        .find(|w| {
+                            w.active_project == project_id
+                                || w.views
+                                    .get(&project_id)
+                                    .is_some_and(|v| v.layout.item_count() > 0)
+                        })
+                        .and_then(|w| manager.read(cx).handles.get(&w.id).copied());
+                    if let Some(handle) = existing {
+                        let _ = handle.update(cx, |app, window, cx| {
+                            app.activate_project(project_id, cx);
+                            window.activate_window();
+                        });
+                        cx.activate(true);
+                        return;
+                    }
                     Self::open_new_window(
                         cx,
                         client,
@@ -241,9 +392,7 @@ impl EggieApp {
         .detach();
     }
 
-    /// Open a new main window on an already-running app. Called for the first (cold-start) window
-    /// and for every subsequent `New Window` / single-instance wake. All windows share the same
-    /// `settings`, `project_store` and `profile_store` entities, so their lists stay in sync.
+    /// Open one presentation window; the registry remains the only owner of placement state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_new_window(
         cx: &mut App,
@@ -256,13 +405,78 @@ impl EggieApp {
         notes_store: Entity<NotesStore>,
         notification_routes: NotificationRoutes,
         init: NewWindowInit,
-    ) {
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        cx.open_window(
+    ) -> Option<gpui::WindowHandle<Self>> {
+        let manager = WindowManager::global(cx);
+        let preferred = manager
+            .read(cx)
+            .state
+            .active_window
+            .and_then(|id| manager.read(cx).state.windows.get(&id))
+            .map(|w| w.active_project)
+            .or_else(|| project_store.read(cx).projects().first().map(|p| p.id))?;
+        let (id, saved_frame) = match &init {
+            NewWindowInit::Restore(state) => (state.id, state.frame),
+            NewWindowInit::EmptyAt(pointer) => (
+                WindowId::new_v4(),
+                Some(eggie_domain::WindowFrame {
+                    x: f32::from(pointer.x) - 100.,
+                    y: f32::from(pointer.y) - 24.,
+                    width: 1280.,
+                    height: 800.,
+                }),
+            ),
+            _ => (WindowId::new_v4(), None),
+        };
+        let bounds = saved_frame
+            .filter(|f| {
+                [f.x, f.y, f.width, f.height].iter().all(|v| v.is_finite())
+                    && f.width > 0.
+                    && f.height > 0.
+            })
+            .map(|f| {
+                let saved = Bounds::new(point(px(f.x), px(f.y)), size(px(f.width), px(f.height)));
+                let display = cx
+                    .displays()
+                    .into_iter()
+                    .find(|display| display.visible_bounds().intersects(&saved))
+                    .or_else(|| cx.primary_display());
+                let Some(display) = display else {
+                    return Bounds::centered(None, size(px(1280.), px(800.)), cx);
+                };
+                let visible = display.visible_bounds();
+                let width = px(f.width.max(760.)).min(visible.size.width);
+                let height = px(f.height.max(480.)).min(visible.size.height);
+                Bounds::new(
+                    point(
+                        px(f.x).max(visible.left()).min(visible.right() - width),
+                        px(f.y).max(visible.top()).min(visible.bottom() - height),
+                    ),
+                    size(width, height),
+                )
+            })
+            .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(800.)), cx));
+        let initial = match &init {
+            NewWindowInit::Restore(state) => state.clone(),
+            NewWindowInit::OpenDir { project_id } => {
+                eggie_domain::WindowPresentation::new(id, *project_id)
+            }
+            NewWindowInit::Empty | NewWindowInit::EmptyAt(_) => {
+                let mut window = eggie_domain::WindowPresentation::new(id, preferred);
+                window.project_picker = true;
+                window
+            }
+        };
+        if manager
+            .update(cx, |manager, cx| manager.capture(initial, None, cx))
+            .is_err()
+        {
+            return None;
+        }
+        let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: None,
+                    title: Some("Eggie".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(
                         px(TRAFFIC_LIGHT_INSET),
@@ -276,7 +490,7 @@ impl EggieApp {
             move |window, cx| {
                 cx.new(|cx| {
                     Self::new(
-                        WindowId::new_v4(),
+                        id,
                         client,
                         settings,
                         updates,
@@ -291,13 +505,20 @@ impl EggieApp {
                     )
                 })
             },
-        )
-        .expect("failed to open Eggie window");
+        );
+        match result {
+            Ok(handle) => {
+                manager.update(cx, |manager, cx| manager.register(id, handle, cx));
+                Some(handle)
+            }
+            Err(error) => {
+                eprintln!("failed to open Eggie window: {error:#}");
+                manager.update(cx, |manager, cx| manager.discard_empty_window(id, cx));
+                None
+            }
+        }
     }
 
-    /// Resolve a [`NewWindowInit`] into this window's `(active_project, owned_sessions)`, mutating the
-    /// shared [`ProjectStore`] as needed. Runs before the `EggieApp` struct exists, so it takes the
-    /// pieces it needs explicitly and talks to the daemon directly.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn seed_window(
         init: &NewWindowInit,
@@ -308,55 +529,43 @@ impl EggieApp {
         config: &crate::settings::AppSettings,
         global: crate::settings::GlobalTerminalLayer,
         cx: &mut Context<Self>,
-    ) -> (ProjectId, Vec<SeededSession>, Option<WorkspaceRestoreState>) {
-        match init {
-            NewWindowInit::ColdStart { project_root } => Self::seed_cold_start(
-                project_root,
-                window_id,
-                client,
-                project_store,
-                profile_store,
-                config,
-                global,
-                cx,
-            ),
-            NewWindowInit::OpenDir { project_id } => {
-                // The project already exists in the shared store (added by the waking path). Open one
-                // terminal in it, since `eggie <dir>` is an explicit request for a terminal there.
-                let (root, profile) =
-                    Self::project_root_and_profile(*project_id, project_store, profile_store, cx);
-                let sessions = Self::create_session(
-                    client,
-                    *project_id,
-                    window_id,
-                    root,
-                    &profile,
-                    config,
-                    global,
-                )
-                .map(|summary| SeededSession::launched(summary, profile.id))
-                .into_iter()
+    ) -> (
+        ProjectId,
+        Vec<SeededSession>,
+        Option<eggie_domain::WindowPresentation>,
+    ) {
+        let manager = WindowManager::global(cx);
+        let state = manager.read(cx).state.windows[&window_id].clone();
+        if let NewWindowInit::OpenDir { project_id } = init {
+            if manager.read(cx).terminating_all
+                || manager.read(cx).pending_projects.contains(project_id)
+            {
+                return (state.active_project, Vec::new(), Some(state));
+            }
+            let (root, profile) =
+                Self::project_root_and_profile(*project_id, project_store, profile_store, cx);
+            let sessions =
+                Self::create_session(client, *project_id, root, &profile, config, global)
+                    .map(|session| SeededSession::launched(session, profile.id))
+                    .into_iter()
+                    .collect();
+            (state.active_project, sessions, None)
+        } else {
+            let local: HashSet<_> = state
+                .views
+                .values()
+                .flat_map(|v| v.layout.terminal_items())
+                .filter_map(|t| t.session_id)
                 .collect();
-                (*project_id, sessions, None)
-            }
-            NewWindowInit::Empty => {
-                // New Window (Cmd+N): activate the first shared project, show it empty (D7).
-                let active = project_store
-                    .read(cx)
-                    .projects()
-                    .first()
-                    .map(|project| project.id);
-                match active {
-                    Some(id) => (id, Vec::new(), None),
-                    None => {
-                        // No projects at all (should not happen once Home exists); create one.
-                        let project = Project::new("Home".to_owned());
-                        let id = project.id;
-                        project_store.update(cx, |store, cx| store.add(project, cx));
-                        (id, Vec::new(), None)
-                    }
-                }
-            }
+            let sessions = manager
+                .read(cx)
+                .sessions
+                .iter()
+                .filter(|s| local.contains(&s.id))
+                .cloned()
+                .map(SeededSession::adopted)
+                .collect();
+            (state.active_project, sessions, Some(state))
         }
     }
 
@@ -386,118 +595,6 @@ impl EggieApp {
         (root, profile)
     }
 
-    /// Cold-start seeding: reconcile the persisted project list with the daemon's surviving sessions.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn seed_cold_start(
-        project_root: &Path,
-        window_id: WindowId,
-        client: &DaemonClient,
-        project_store: &Entity<ProjectStore>,
-        profile_store: &Entity<ProfileStore>,
-        config: &crate::settings::AppSettings,
-        global: crate::settings::GlobalTerminalLayer,
-        cx: &mut Context<Self>,
-    ) -> (ProjectId, Vec<SeededSession>, Option<WorkspaceRestoreState>) {
-        // Adopt a project for the launch directory: reuse a persisted project with the same root,
-        // otherwise create one. Done before restore so `eggie <dir>` lands in the store even when
-        // an unrelated workspace is restored.
-        let (launch_project, project_root_buf) = project_store.update(cx, |store, cx| {
-            let (id, _) = store.upsert_by_root(project_root.to_path_buf(), cx);
-            (id, project_root.to_path_buf())
-        });
-
-        // Restore the persisted workspace first: claim each session the saved layouts reference by
-        // id (the daemon re-owns unconditionally; dead sessions fail and are pruned). When at least
-        // one session survives, rebuild the old tabs/splits around it.
-        if let Some(mut restored) = WorkspaceRestoreState::load() {
-            // Drop views for projects that no longer exist BEFORE claiming, so their sessions aren't
-            // claimed into this window with no tab to hold them (orphan sessions the user can't see).
-            let known_projects: HashSet<ProjectId> = project_store
-                .read(cx)
-                .projects()
-                .iter()
-                .map(|project| project.id)
-                .collect();
-            restored
-                .views
-                .retain(|project_id, _| known_projects.contains(project_id));
-
-            let mut claimed = Vec::new();
-            for session_id in restored.persisted_session_ids() {
-                if let Ok(DaemonResponse::SessionClaimed { session }) =
-                    client.request(ClientRequest::ClaimSession {
-                        session_id,
-                        window_id,
-                    })
-                {
-                    claimed.push(session);
-                }
-            }
-            let live: HashSet<_> = claimed.iter().map(|session| session.id).collect();
-            let projects = project_store.read(cx).projects().to_vec();
-            if restored.prune_to_live(&live, &projects) {
-                let claimed = claimed.into_iter().map(SeededSession::adopted).collect();
-                return (restored.active_project, claimed, Some(restored));
-            }
-        }
-
-        // No restorable workspace (or nothing survived in the daemon): claim every surviving
-        // session whose project this window is adopting, and any that match the launch directory.
-        let all_sessions = match client.request(ClientRequest::ListSessions) {
-            Ok(DaemonResponse::Sessions { sessions }) => sessions,
-            _ => Vec::new(),
-        };
-        let mut owned: Vec<SeededSession> = Vec::new();
-        for session in all_sessions {
-            let belongs = session.project_id == launch_project
-                || session.initial_directory == project_root_buf;
-            if !belongs {
-                continue;
-            }
-            if let Ok(DaemonResponse::SessionClaimed { session }) =
-                client.request(ClientRequest::ClaimSession {
-                    session_id: session.id,
-                    window_id,
-                })
-            {
-                owned.push(SeededSession::adopted(session));
-            }
-        }
-
-        // Nothing to adopt: open a fresh terminal so the window is not empty on first launch.
-        if owned.is_empty() {
-            // `launch_project` was just upserted from `project_root`, so the lookup all but always
-            // hits; `project_root_buf` covers the impossible case without reaching for the home dir.
-            let project = project_store
-                .read(cx)
-                .projects()
-                .iter()
-                .find(|project| project.id == launch_project)
-                .cloned();
-            let root = project
-                .as_ref()
-                .map(Project::effective_root)
-                .unwrap_or(project_root_buf);
-            let profile = profile_store
-                .read(cx)
-                .resolve(project.and_then(|project| project.default_profile_id))
-                .clone();
-            owned.extend(
-                Self::create_session(
-                    client,
-                    launch_project,
-                    window_id,
-                    root,
-                    &profile,
-                    config,
-                    global,
-                )
-                .map(|summary| SeededSession::launched(summary, profile.id)),
-            );
-        }
-        (launch_project, owned, None)
-    }
-
     /// Spawn a single terminal session in the daemon, returning its summary (or `None` on error).
     ///
     /// `profile` supplies the launch fields and, when it overrides the theme, the spawn palette;
@@ -508,7 +605,6 @@ impl EggieApp {
     pub(super) fn create_session(
         client: &DaemonClient,
         project_id: ProjectId,
-        window_id: WindowId,
         cwd: PathBuf,
         profile: &Profile,
         config: &crate::settings::AppSettings,
@@ -527,7 +623,6 @@ impl EggieApp {
         .appearance();
         match client.request(ClientRequest::CreateSession {
             project_id,
-            window_id,
             cwd: spawn.cwd,
             size: TerminalSize::default(),
             appearance,
@@ -612,12 +707,12 @@ impl EggieApp {
             .collect();
         let restored_sidebar = match restored {
             Some(restored) => {
-                let sidebar = restored.sidebar_states();
+                let sidebar = SidebarRestoreState::from(&restored);
                 for (project_id, view) in restored.views {
                     project_views.insert(project_id, view);
                 }
                 // Persisted tab titles may be stale (the shell kept running); refresh from the
-                // claimed summaries. The session poll would fix these too, but not before first paint.
+                // global session catalog. The session poll would fix these too, but not before first paint.
                 for session in &sessions {
                     for view in project_views.values_mut() {
                         view.layout
@@ -650,7 +745,7 @@ impl EggieApp {
         };
 
         // Appearance is deliberately NOT pushed here. Broadcasting the global palette would clobber the
-        // profile-resolved palette a freshly launched session was spawned with, and for a claimed
+        // profile-resolved palette a freshly launched session was spawned with, and for a restored
         // session the daemon still holds the palette from the run that created it — which may predate a
         // theme change. `applied_appearance_inputs: None` makes the first render reconcile every session
         // to its own resolved palette, which is both correct by construction and the same one request
@@ -700,12 +795,31 @@ impl EggieApp {
                 }
             })
             .collect::<HashMap<_, _>>();
-        cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        cx.observe(&settings, |app, _, cx| {
+            app.dismiss_project_selector(cx);
+            let layout = app.settings.read(cx).config().sidebar_layout;
+            if app
+                .applied_config
+                .as_ref()
+                .is_some_and(|config| config.sidebar_layout != layout)
+            {
+                app.dismiss_project_popover(cx);
+                app.dismiss_sidebar_preview(cx);
+                app.clear_project_drag(cx);
+                app.sidebar
+                    .project_drag
+                    .scroll
+                    .set_offset(point(px(0.), px(0.)));
+            }
+            cx.notify();
+        })
+        .detach();
         // Update state changes (found/downloading/ready) re-render the sidebar indicator.
         cx.observe(&updates, |_, _, cx| cx.notify()).detach();
         // Cross-window project sync: when any window mutates the shared store, reconcile this
         // window's per-project views (add/drop) and re-render.
         cx.observe(&project_store, |app, _, cx| {
+            app.dismiss_project_selector(cx);
             app.reconcile_project_views(cx);
             cx.notify();
         })
@@ -733,12 +847,14 @@ impl EggieApp {
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         cx.observe_window_bounds(window, |app, _, cx| {
+            app.dismiss_project_selector(cx);
             app.dismiss_project_popover(cx);
             app.dismiss_sidebar_preview(cx);
         })
         .detach();
         cx.observe_window_activation(window, |app, window, cx| {
             if !window.is_window_active() {
+                app.dismiss_project_selector(cx);
                 app.dismiss_project_popover(cx);
                 app.dismiss_sidebar_preview(cx);
             }
@@ -789,12 +905,19 @@ impl EggieApp {
                 projects,
                 project_views,
                 active_project,
-                collapsed_projects: HashSet::new(),
+                collapsed_projects: match &init {
+                    NewWindowInit::Restore(w) => w.collapsed_projects.clone(),
+                    _ => HashSet::new(),
+                },
             },
             sidebar: SidebarState {
+                project_selector: None,
+                project_selector_bounds: Rc::new(std::cell::Cell::new(None)),
                 project_row_bounds: Rc::new(RefCell::new(HashMap::new())),
                 project_drag: ProjectDragState::default(),
                 project_popover: None,
+                hovered_project: None,
+                project_hover_revision: 0,
                 sidebar_row_bounds: Rc::new(RefCell::new(HashMap::new())),
                 sidebar_preview: None,
                 hovered_sidebar_session: None,
@@ -806,12 +929,9 @@ impl EggieApp {
             },
             session_feed: SessionFeedState {
                 snapshot_watchers: HashSet::new(),
-                progress_watchers: HashSet::new(),
-                osc_watchers: HashSet::new(),
                 progress_updates: HashMap::new(),
-                pending_progress_updates: HashMap::new(),
                 sessions,
-                detached_sessions: Vec::new(),
+                global_sessions: WindowManager::global(cx).read(cx).sessions.clone(),
                 snapshots,
                 session_inspections: HashMap::new(),
                 session_inspection_errors: HashMap::new(),
@@ -831,7 +951,7 @@ impl EggieApp {
             use_dark: config.use_dark(system_is_dark),
             global_appearance,
             // Empty on purpose: what the daemon holds for a seeded session is not knowable here (a
-            // launched one carries its profile's palette, a claimed one carries the palette of the run
+            // launched one carries its profile's palette, a restored one carries the palette of the run
             // that spawned it). Pre-filling with the global palette would make the reconcile's diff
             // report "no change" and leave those terminals on stale daemon-side colors, so instead the
             // first render pushes every session its resolved palette — one request each, correct by
@@ -856,7 +976,6 @@ impl EggieApp {
             terminal_renderer: MetalTerminalRenderer::default(),
             terminal_images_in_flight: HashSet::new(),
             terminal_frame_scheduled: false,
-            progress_frame_scheduled: false,
             progress_animation_scheduled: false,
             progress_animation_epoch: Instant::now(),
             bell_flash: HashMap::new(),
@@ -865,12 +984,24 @@ impl EggieApp {
             cursor_blink_scheduled: false,
             progress_timeouts,
             window_id,
+            window_number: WindowManager::global(cx).read(cx).state.windows[&window_id].number,
+            window_manager: WindowManager::global(cx),
+            window_revision: 0,
+            window_frame: Some(eggie_domain::WindowFrame {
+                x: f32::from(window.bounds().origin.x),
+                y: f32::from(window.bounds().origin.y),
+                width: f32::from(window.bounds().size.width),
+                height: f32::from(window.bounds().size.height),
+            }),
+            project_picker: match &init {
+                NewWindowInit::Restore(w) => w.project_picker,
+                NewWindowInit::Empty | NewWindowInit::EmptyAt(_) => true,
+                _ => false,
+            },
             project_store,
             profile_store,
             snippet_store,
             notes_store,
-            detached_popover_open: false,
-            detached_toggle_bounds: None,
             update_popover_open: false,
             update_toggle_bounds: None,
             open_with_dropdown: None,
@@ -886,6 +1017,7 @@ impl EggieApp {
             terminal_has_focus: false,
             terminal_focused_session: None,
             terminal_ime_states: HashMap::new(),
+            completion: CompletionUi::default(),
             right_tab: RightTab::Info,
             command_history_collapsed: false,
             snippets_collapsed: false,
@@ -901,6 +1033,9 @@ impl EggieApp {
             scrollbar_bounds: Rc::new(RefCell::new(HashMap::new())),
             moving_window: false,
             tab_drop_target: None,
+            group_drop_bounds: Rc::new(RefCell::new(HashMap::new())),
+            tab_drop_bounds: Rc::new(RefCell::new(HashMap::new())),
+            dragged_tab: None,
             right_sidebar_scroll_handle: ScrollHandle::new(),
             tab_bar_scroll_handles: RefCell::new(HashMap::new()),
             focus_handle: cx.focus_handle(),
@@ -923,19 +1058,20 @@ impl EggieApp {
         for snapshot in visible_snapshots {
             app.schedule_terminal_images(&snapshot, cx);
         }
+        app.install_window_lifecycle(window, cx);
+        app.publish_window_state(cx);
+        let mut catalog = app.window_manager.read(cx).sessions.clone();
+        for session in &app.session_feed.sessions {
+            if !catalog.iter().any(|existing| existing.id == session.id) {
+                catalog.push(session.clone());
+            }
+        }
+        app.window_manager
+            .update(cx, |manager, cx| manager.set_sessions(catalog, cx));
         app.start_polling(cx);
         app.start_inspection_polling(cx);
         app.start_shell_integration_polling(cx);
         app.start_latency_reporting(cx);
-        app.install_close_confirmation(window, cx);
-        // Persist the workspace on quit so the next cold start restores tabs/splits. Every window
-        // registers; each saves its own state (last-writer-wins for the single restore snapshot).
-        // A window that closed earlier leaves a dead entity behind — the weak update then no-ops.
-        cx.on_app_quit(move |app, _| {
-            app.persist_workspace();
-            std::future::ready(())
-        })
-        .detach();
         cx.on_focus_in(&app.focus_handle, window, |app, _, cx| {
             app.set_terminal_has_focus(true);
             cx.notify();
@@ -948,6 +1084,7 @@ impl EggieApp {
         .detach();
         app.focus_handle.focus(window, cx);
         app.set_terminal_has_focus(true);
+        app.publish_window_state(cx);
         app
     }
 }

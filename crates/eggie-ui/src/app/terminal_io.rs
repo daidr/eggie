@@ -99,6 +99,7 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_completion();
         self.focus_group(group_id, window, cx);
         let Some(viewport) = self.terminal_viewports.get(&group_id).copied() else {
             return;
@@ -487,6 +488,7 @@ impl EggieApp {
     }
 
     pub(super) fn paste_into_active_terminal(&mut self, cx: &mut Context<Self>) -> bool {
+        self.dismiss_completion();
         let Some(session_id) = self.active_session_id() else {
             return false;
         };
@@ -617,6 +619,7 @@ impl EggieApp {
         if text.is_empty() {
             self.terminal_ime_states.remove(&session_id);
         } else {
+            self.dismiss_completion();
             let selected_range = selected_range.unwrap_or(length..length);
             self.terminal_ime_states.insert(
                 session_id,
@@ -649,6 +652,7 @@ impl EggieApp {
         self.terminal_ime_states.remove(&session_id);
         let _ = self.input_sender.send_selection_clear(session_id);
         if !text.is_empty() {
+            self.completion.wants = true;
             self.enqueue_terminal_input(session_id, terminal_text_bytes(text));
         }
         cx.notify();

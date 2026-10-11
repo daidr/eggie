@@ -1,5 +1,6 @@
 mod osc_events;
 use osc_events::*;
+mod completion;
 mod shell_integration;
 use shell_integration::*;
 mod progress;
@@ -28,7 +29,7 @@ use alacritty_terminal::{
     selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{
-        ClipboardType, Config, Osc52, Term, TermMode,
+        ClipboardType, Config, Osc52, Term, TermDamage, TermMode,
         cell::{Cell, Flags},
         color::COUNT,
         kitty_graphics::{ImageKey as KittyImageKey, PixelBuffer},
@@ -45,7 +46,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::read::DecoderReader;
-use eggie_domain::{ProjectId, RemoteTarget, SessionId, WindowId};
+use eggie_domain::{ProjectId, RemoteTarget, SessionId};
 #[cfg(test)]
 use eggie_ipc::{DaemonConnection, daemon_socket_path};
 use eggie_ipc::{configure_latency_sensitive_thread, wire::*};
@@ -55,17 +56,18 @@ use eggie_protocol::{
     ClientRequest, DaemonResponse, PROTOCOL_VERSION, PortForwardSpec, ProcessSummary,
     SessionInspection, SessionStatus, SessionSummary, TERMINAL_SCROLL_DELTA_SCALE,
     TerminalAppearance, TerminalAttentionRequest, TerminalCell, TerminalCellPosition,
-    TerminalClipboardContent, TerminalClipboardSelection, TerminalColorOverride,
+    TerminalCells, TerminalClipboardContent, TerminalClipboardSelection, TerminalColorOverride,
     TerminalCommandRecord, TerminalCursorShape, TerminalFileTransferOffer,
     TerminalFileTransferProtocol, TerminalImageDescriptor, TerminalImageKey,
     TerminalImagePlacement, TerminalLinkRange, TerminalMouseAction, TerminalMouseEvent,
     TerminalMousePosition, TerminalNotification, TerminalOscEvent, TerminalOscEventPayload,
     TerminalOscEventUpdate, TerminalProgress, TerminalProgressState, TerminalProgressTimeouts,
-    TerminalProgressUpdate, TerminalReportedLocation, TerminalScrollCommand, TerminalScrollEvent,
-    TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection, TerminalSearchMatch,
-    TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind, TerminalSelectionRange,
-    TerminalSelectionSide, TerminalSemanticPhase, TerminalShellIntegrationState, TerminalSize,
-    TerminalSnapshot, TerminalSnapshotDelta, TerminalUserVariable,
+    TerminalProgressUpdate, TerminalReportedLocation, TerminalRow, TerminalScrollCommand,
+    TerminalScrollEvent, TerminalScrollPhase, TerminalScrollUnit, TerminalSearchDirection,
+    TerminalSearchMatch, TerminalSearchRequest, TerminalSearchResult, TerminalSelectionKind,
+    TerminalSelectionRange, TerminalSelectionSide, TerminalSemanticPhase,
+    TerminalShellIntegrationState, TerminalSize, TerminalSnapshot, TerminalSnapshotDelta,
+    TerminalUserVariable,
 };
 use flate2::write::ZlibDecoder;
 use parking_lot::{Condvar, Mutex, RwLock};

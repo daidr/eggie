@@ -6,6 +6,9 @@ use std::path::PathBuf;
 /// Stable action names accepted by the configuration service. The UI has the
 /// constructors for these actions; the service only needs their identities.
 pub const BUILTIN_ACTIONS: &[&str] = &[
+    "terminal_switcher",
+    "window_switcher",
+    "undo_window_operation",
     "pane.split",
     "tab.new",
     "open_settings",
@@ -15,6 +18,7 @@ pub const BUILTIN_ACTIONS: &[&str] = &[
     "terminal_paste",
     "terminal_select_all",
     "terminal_find",
+    "terminal_suggest",
     "find_next",
     "find_previous",
     "new_tab",

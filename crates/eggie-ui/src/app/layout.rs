@@ -2,6 +2,7 @@ use super::*;
 
 impl EggieApp {
     pub(super) fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_project_selector(cx);
         self.dismiss_project_popover(cx);
         self.left_sidebar_collapsed = !self.left_sidebar_collapsed;
         self.resizing_sidebar = None;
@@ -490,6 +491,8 @@ impl EggieApp {
             let show_insertion_after = tab_insertion_index == Some(group.items.len())
                 && tab_index + 1 == group.items.len();
             let dragged_tab = DraggedTab {
+                source_window_id: self.window_id,
+                project_id: self.workspace_state.active_project,
                 source_group_id: group_id,
                 item_id,
                 icon: self.icon_for_item(item.kind, item.session_id),
@@ -498,121 +501,148 @@ impl EggieApp {
                 active,
                 colors: self.colors,
             };
+            let drag_owner = cx.weak_entity();
+            let tab_bounds = self.tab_drop_bounds.clone();
             tabs_scroll = tabs_scroll.child(
                 div()
-                    .id(format!("tab-{item_id}"))
-                    .flex()
-                    .items_center()
-                    .relative()
-                    .flex_shrink_0()
-                    .min_w(px(TAB_MIN_WIDTH))
-                    .max_w(px(TAB_MAX_WIDTH))
+                    .flex_none()
                     .h_full()
-                    .pl(px(TAB_ICON_LEADING_PADDING))
-                    .pr_1()
-                    .gap_2()
-                    .text_size(px(TAB_TITLE_FONT_SIZE))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(self.colors.border))
-                    .when(tab_index + 1 < group.items.len(), |element| {
-                        element.mr(px(TAB_GAP))
+                    .on_children_prepainted(move |children, _, _| {
+                        if let Some(bounds) = children.first() {
+                            tab_bounds.borrow_mut().insert(item_id, *bounds);
+                        }
                     })
-                    .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
-                    .when_some(
-                        item.session_id.and_then(|sid| self.bell_flash_tint(sid)),
-                        |element, tint| element.bg(rgba(tint)),
-                    )
-                    .cursor_pointer()
-                    .on_hover(cx.listener(move |app, hovered: &bool, _, cx| {
-                        app.set_marquee_hover(&[format!("tab-title-{item_id}")], *hovered, cx);
-                    }))
-                    .on_click(cx.listener(move |app, _, window, cx| {
-                        app.activate_item(group_id, item_id, window, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |app, _, window, cx| {
-                            app.show_native_tab_context_menu(group_id, item_id, window, cx);
-                        }),
-                    )
-                    .on_drag(dragged_tab, |tab, _, _, cx| {
-                        cx.new(|_| DraggedTabPreview { tab: tab.clone() })
-                    })
-                    .on_drag_move::<DraggedTab>(cx.listener(move |app, event, window, cx| {
-                        cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
-                        app.update_tab_bar_drop_target(group_id, tab_index, event, cx)
-                    }))
-                    .on_drop(cx.listener(|app, dragged_tab: &DraggedTab, _, cx| {
-                        app.handle_tab_drop(dragged_tab, cx)
-                    }))
-                    .child(self.render_item_icon(
-                        item.kind,
-                        item.session_id,
-                        format!("tab-progress-{item_id}"),
-                    ))
-                    .when_some(
-                        self.tab_profile_badge(item, cx),
-                        |element, (color, name)| {
-                            element.child(
-                                div()
-                                    // `tooltip` requires a stateful (identified) element.
-                                    .id(format!("tab-badge-{item_id}"))
-                                    .flex_none()
-                                    .size(px(TAB_BADGE_SIZE))
-                                    .rounded_full()
-                                    .bg(rgb(color))
-                                    // The dot alone says "this tab is special" but not which profile;
-                                    // the tooltip names it, which is the whole point of the marker.
-                                    .tooltip(tooltip_text(name, self.colors)),
-                            )
-                        },
-                    )
-                    .child(self.render_marquee(
-                        title_key,
-                        item.display_title().to_owned(),
-                        TAB_TITLE_FONT_SIZE,
-                        16.,
-                        label_background,
-                        cx,
-                    ))
                     .child(
                         div()
-                            .id(format!("close-tab-{item_id}"))
-                            .flex_none()
-                            .text_color(rgb(self.colors.muted))
+                            .id(format!("tab-{item_id}"))
+                            .flex()
+                            .items_center()
+                            .relative()
+                            .flex_shrink_0()
+                            .min_w(px(TAB_MIN_WIDTH))
+                            .max_w(px(TAB_MAX_WIDTH))
+                            .h_full()
+                            .pl(px(TAB_ICON_LEADING_PADDING))
+                            .pr_1()
+                            .gap_2()
+                            .text_size(px(TAB_TITLE_FONT_SIZE))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(self.colors.border))
+                            .when(tab_index + 1 < group.items.len(), |element| {
+                                element.mr(px(TAB_GAP))
+                            })
+                            .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
+                            .when_some(
+                                item.session_id.and_then(|sid| self.bell_flash_tint(sid)),
+                                |element, tint| element.bg(rgba(tint)),
+                            )
                             .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                cx.stop_propagation();
-                                app.close_item(group_id, item_id, cx)
+                            .on_hover(cx.listener(move |app, hovered: &bool, _, cx| {
+                                app.set_marquee_hover(
+                                    &[format!("tab-title-{item_id}")],
+                                    *hovered,
+                                    cx,
+                                );
                             }))
-                            .child(icon_sized(IconName::Close, TAB_CLOSE_ICON_SIZE)),
-                    )
-                    .when(show_insertion_before, |element| {
-                        // Centered in the gap before this tab. (The first tab is handled on the
-                        // scroll wrapper to avoid overflow clipping — see `show_insertion_before`.)
-                        element.child(
-                            div()
-                                .absolute()
-                                .left(px(-TAB_DROP_INDICATOR_OFFSET))
-                                .top_0()
-                                .bottom_0()
-                                .w(px(TAB_DROP_INDICATOR_WIDTH))
-                                .bg(rgb(self.colors.accent)),
-                        )
-                    })
-                    .when(show_insertion_after, |element| {
-                        element.child(
-                            div()
-                                .absolute()
-                                .right(px(-TAB_DROP_INDICATOR_OFFSET))
-                                .top_0()
-                                .bottom_0()
-                                .w(px(TAB_DROP_INDICATOR_WIDTH))
-                                .bg(rgb(self.colors.accent)),
-                        )
-                    }),
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                app.activate_item(group_id, item_id, window, cx)
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |app, _, window, cx| {
+                                    app.show_native_tab_context_menu(group_id, item_id, window, cx);
+                                }),
+                            )
+                            .on_drag(dragged_tab, move |tab, _, _, cx| {
+                                let _ = drag_owner.update(cx, |app, cx| {
+                                    app.publish_window_state(cx);
+                                    app.dragged_tab = Some(tab.clone());
+                                });
+                                cx.new(|_| DraggedTabPreview { tab: tab.clone() })
+                            })
+                            .on_drag_move::<DraggedTab>(cx.listener(
+                                move |app, event, window, cx| {
+                                    cx.set_active_drag_cursor_style(
+                                        gpui::CursorStyle::ClosedHand,
+                                        window,
+                                    );
+                                    app.update_tab_bar_drop_target(group_id, tab_index, event, cx)
+                                },
+                            ))
+                            .on_drop(cx.listener(|app, dragged_tab: &DraggedTab, _, cx| {
+                                app.handle_tab_drop(dragged_tab, cx)
+                            }))
+                            .child(self.render_item_icon(
+                                item.kind,
+                                item.session_id,
+                                format!("tab-progress-{item_id}"),
+                            ))
+                            .when_some(
+                                self.tab_profile_badge(item, cx),
+                                |element, (color, name)| {
+                                    element.child(
+                                        div()
+                                            // `tooltip` requires a stateful (identified) element.
+                                            .id(format!("tab-badge-{item_id}"))
+                                            .flex_none()
+                                            .size(px(TAB_BADGE_SIZE))
+                                            .rounded_full()
+                                            .bg(rgb(color))
+                                            // The dot alone says "this tab is special" but not which profile;
+                                            // the tooltip names it, which is the whole point of the marker.
+                                            .tooltip(tooltip_text(name, self.colors)),
+                                    )
+                                },
+                            )
+                            .child(self.render_marquee(
+                                title_key,
+                                item.display_title().to_owned(),
+                                TAB_TITLE_FONT_SIZE,
+                                16.,
+                                label_background,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .id(format!("close-tab-{item_id}"))
+                                    .flex_none()
+                                    .text_color(rgb(self.colors.muted))
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        cx.stop_propagation();
+                                        app.close_item(group_id, item_id, cx)
+                                    }))
+                                    .child(icon_sized(IconName::Close, TAB_CLOSE_ICON_SIZE)),
+                            )
+                            .when(show_insertion_before, |element| {
+                                // Centered in the gap before this tab. (The first tab is handled on the
+                                // scroll wrapper to avoid overflow clipping — see `show_insertion_before`.)
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(-TAB_DROP_INDICATOR_OFFSET))
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(TAB_DROP_INDICATOR_WIDTH))
+                                        .bg(rgb(self.colors.accent)),
+                                )
+                            })
+                            .when(show_insertion_after, |element| {
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-TAB_DROP_INDICATOR_OFFSET))
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(TAB_DROP_INDICATOR_WIDTH))
+                                        .bg(rgb(self.colors.accent)),
+                                )
+                            }),
+                    ),
             );
         }
         let item_count = group.items.len();
@@ -891,17 +921,63 @@ impl EggieApp {
                     .into_any_element()
             })
             .unwrap_or_else(|| {
+                let ended = group
+                    .active_item()
+                    .and_then(|item| item.session_id)
+                    .is_some_and(|id| {
+                        !self
+                            .session_feed
+                            .global_sessions
+                            .iter()
+                            .any(|session| session.id == id)
+                    });
+                let profile = self
+                    .profile_store
+                    .read(cx)
+                    .resolve(group.active_item().and_then(|item| item.profile_id))
+                    .clone();
+                let status = self.poll_error.clone().or_else(|| {
+                    group.active_item().map(|_| {
+                        match (ended, self.language) {
+                            (true, Language::SimplifiedChinese) => "进程已结束",
+                            (true, Language::English) => "Process ended",
+                            (false, Language::SimplifiedChinese) => "正在连接终端…",
+                            (false, Language::English) => "Connecting to terminal…",
+                        }
+                        .to_owned()
+                    })
+                });
                 div()
                     .size_full()
                     .flex()
+                    .flex_col()
+                    .gap_3()
                     .items_center()
                     .justify_center()
                     .text_color(rgb(self.colors.muted))
-                    .child(
-                        self.poll_error
-                            .clone()
-                            .unwrap_or_else(|| "Connecting to terminal…".to_owned()),
-                    )
+                    .children(status)
+                    .when(ended || group.active_item().is_none(), |element| {
+                        element.child(
+                            div()
+                                .id(format!("new-terminal-empty-{group_id}"))
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(rgb(self.colors.panel_alt))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |app, _, window, cx| {
+                                    app.new_terminal_with_profile(
+                                        group_id,
+                                        None,
+                                        None,
+                                        profile.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                }))
+                                .child(self.language.new_terminal_tooltip()),
+                        )
+                    })
                     .into_any_element()
             });
 
@@ -1050,7 +1126,19 @@ impl EggieApp {
             content_region = content_region.child(scrollbar);
         }
 
+        let group_bounds = self.group_drop_bounds.clone();
         div()
+            .on_children_prepainted(move |children, _, _| {
+                if let (Some(top), Some(content)) = (children.first(), children.get(1)) {
+                    group_bounds.borrow_mut().insert(
+                        group_id,
+                        Bounds::new(
+                            top.origin,
+                            size(top.size.width, content.bottom() - top.top()),
+                        ),
+                    );
+                }
+            })
             .id(format!("terminal-group-{group_id}"))
             .flex()
             .flex_col()

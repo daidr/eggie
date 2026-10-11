@@ -71,7 +71,7 @@ pub(super) struct GlyphRasterCounters {
 /// the complete visible glyph set while Metal only performs cheap atlas uploads.
 pub(crate) struct GlyphRasterCache {
     pub(super) entries: Arc<Mutex<FxHashMap<GlyphKey, RasterCacheEntry>>>,
-    pub(super) sender: SyncSender<GlyphKey>,
+    pub(super) sender: Sender<GlyphKey>,
     pub(super) counters: Arc<GlyphRasterCounters>,
     /// Monotonic count of `prepare_terminal` calls, used as the "now" for idle reclamation. Shared
     /// with the raster workers so freshly rasterized glyphs are stamped with the current frame.
@@ -80,11 +80,11 @@ pub(crate) struct GlyphRasterCache {
 
 impl Default for GlyphRasterCache {
     fn default() -> Self {
-        const QUEUE_CAPACITY: usize = 32_768;
         let entries = Arc::new(Mutex::new(FxHashMap::default()));
         let counters = Arc::new(GlyphRasterCounters::default());
         let frame = Arc::new(AtomicU64::new(0));
-        let (sender, receiver) = sync_channel(QUEUE_CAPACITY);
+        // Keep the same job limit without preallocating 32K large glyph keys in an idle queue.
+        let (sender, receiver) = channel();
         let receiver = Arc::new(Mutex::new(receiver));
         let worker_count = thread::available_parallelism()
             .map_or(2, usize::from)
@@ -173,18 +173,28 @@ impl GlyphRasterCache {
             }
         }
         for key in queued {
-            if let Err(error) = self.sender.try_send(key) {
-                let key = match error {
-                    TrySendError::Full(key) | TrySendError::Disconnected(key) => key,
-                };
+            let reserved = self
+                .counters
+                .pending
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    (pending < GLYPH_QUEUE_CAPACITY).then_some(pending + 1)
+                })
+                .is_ok();
+            let rejected = if reserved {
+                self.sender.send(key).err().map(|error| {
+                    self.counters.pending.fetch_sub(1, Ordering::Relaxed);
+                    error.0
+                })
+            } else {
+                Some(key)
+            };
+            if let Some(key) = rejected {
                 if matches!(
                     self.entries.lock().remove(&key),
                     Some(RasterCacheEntry::Pending)
                 ) {
                     pending = pending.saturating_sub(1);
                 }
-            } else {
-                self.counters.pending.fetch_add(1, Ordering::Relaxed);
             }
         }
         GlyphPreparation {
@@ -343,22 +353,23 @@ impl ShelfAllocator {
         if width == 0 || height == 0 || width > atlas_size || height > atlas_size {
             return None;
         }
-        if self.next_x + width > atlas_size {
-            self.next_x = 0;
-            self.next_y += self.row_height + 1;
-            self.row_height = 0;
-        }
-        if self.next_y + height > atlas_size {
+        let (x, y, row_height) = if self.next_x + width > atlas_size {
+            (0, self.next_y + self.row_height + 1, 0)
+        } else {
+            (self.next_x, self.next_y, self.row_height)
+        };
+        if y + height > atlas_size {
             return None;
         }
         let entry = AtlasEntry {
-            x: self.next_x,
-            y: self.next_y,
+            x,
+            y,
             width,
             height,
         };
-        self.next_x += width + 1;
-        self.row_height = self.row_height.max(height);
+        self.next_x = x + width + 1;
+        self.next_y = y;
+        self.row_height = row_height.max(height);
         Some(entry)
     }
 
@@ -378,7 +389,7 @@ pub(super) struct GlyphAtlas {
 
 impl GlyphAtlas {
     pub(super) fn new(device: &Device) -> Self {
-        let mask_texture = atlas_texture(device, MASK_ATLAS_SIZE, MTLPixelFormat::R8Unorm);
+        let mask_texture = atlas_texture(device, INITIAL_ATLAS_SIZE, MTLPixelFormat::R8Unorm);
         let empty_color_texture = atlas_texture(device, 1, MTLPixelFormat::RGBA8Unorm);
         let transparent = [0u8; 4];
         empty_color_texture.replace_region(
@@ -449,10 +460,16 @@ impl GlyphAtlas {
                         image.height
                     ));
                 }
-                let entry = self
-                    .mask_allocator
-                    .allocate(image.width, image.height, MASK_ATLAS_SIZE)
-                    .ok_or_else(|| anyhow!("terminal mask atlas is full"))?;
+                let entry = allocate_glyph(
+                    device,
+                    &mut self.mask_texture,
+                    &mut self.mask_allocator,
+                    image.width,
+                    image.height,
+                    MASK_ATLAS_SIZE,
+                    1,
+                )
+                .ok_or_else(|| anyhow!("terminal mask atlas is full"))?;
                 self.mask_texture.replace_region(
                     atlas_region(entry),
                     0,
@@ -485,26 +502,25 @@ impl GlyphAtlas {
                         image.height
                     ));
                 }
-                let entry = self
-                    .color_allocator
-                    .allocate(image.width, image.height, COLOR_ATLAS_SIZE)
-                    .ok_or_else(|| anyhow!("terminal color atlas is full"))?;
-                if self.color_texture.is_none() {
-                    self.color_texture = Some(atlas_texture(
-                        device,
-                        COLOR_ATLAS_SIZE,
-                        MTLPixelFormat::RGBA8Unorm,
-                    ));
-                }
-                self.color_texture
-                    .as_ref()
-                    .expect("color atlas was allocated")
-                    .replace_region(
-                        atlas_region(entry),
-                        0,
-                        image.pixels.as_ptr().cast(),
-                        (image.width * 4) as u64,
-                    );
+                let texture = self.color_texture.get_or_insert_with(|| {
+                    atlas_texture(device, INITIAL_ATLAS_SIZE, MTLPixelFormat::RGBA8Unorm)
+                });
+                let entry = allocate_glyph(
+                    device,
+                    texture,
+                    &mut self.color_allocator,
+                    image.width,
+                    image.height,
+                    COLOR_ATLAS_SIZE,
+                    4,
+                )
+                .ok_or_else(|| anyhow!("terminal color atlas is full"))?;
+                texture.replace_region(
+                    atlas_region(entry),
+                    0,
+                    image.pixels.as_ptr().cast(),
+                    (image.width * 4) as u64,
+                );
                 CachedGlyph {
                     entry,
                     kind: GlyphTextureKind::Color,
@@ -533,10 +549,52 @@ impl GlyphAtlas {
     }
 }
 
+// Grow without relocating existing tiles; pixel UVs stay valid even within a partially built batch.
+fn allocate_glyph(
+    device: &Device,
+    texture: &mut Texture,
+    allocator: &mut ShelfAllocator,
+    width: usize,
+    height: usize,
+    limit: usize,
+    channels: usize,
+) -> Option<AtlasEntry> {
+    // Keep the original logical packing and capacity; allocate only its populated rectangle.
+    let entry = allocator.allocate(width, height, limit)?;
+    let old_width = texture.width() as usize;
+    let old_height = texture.height() as usize;
+    let new_width = old_width
+        .max((entry.x + width).next_power_of_two())
+        .min(limit);
+    let new_height = old_height
+        .max((entry.y + height).next_power_of_two())
+        .min(limit);
+    if new_width != old_width || new_height != old_height {
+        let larger = atlas_texture_rect(device, new_width, new_height, texture.pixel_format());
+        let stride = old_width * channels;
+        let mut pixels = vec![0; stride * old_height];
+        let region = MTLRegion::new_2d(0, 0, old_width as u64, old_height as u64);
+        // Both textures are CPU-written shared resources; in-flight draws retain the old one.
+        texture.get_bytes(pixels.as_mut_ptr().cast(), stride as u64, region, 0);
+        larger.replace_region(region, 0, pixels.as_ptr().cast(), stride as u64);
+        *texture = larger;
+    }
+    Some(entry)
+}
+
 pub(super) fn atlas_texture(device: &Device, size: usize, format: MTLPixelFormat) -> Texture {
+    atlas_texture_rect(device, size, size, format)
+}
+
+fn atlas_texture_rect(
+    device: &Device,
+    width: usize,
+    height: usize,
+    format: MTLPixelFormat,
+) -> Texture {
     let descriptor = TextureDescriptor::new();
-    descriptor.set_width(size as u64);
-    descriptor.set_height(size as u64);
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
     descriptor.set_pixel_format(format);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::ShaderRead);

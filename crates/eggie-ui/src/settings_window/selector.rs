@@ -299,8 +299,8 @@ impl SettingsWindow {
                     .child(div().min_w_0().truncate().child(clear_label)),
             );
         }
-        // Theme selectors get a live hover preview: resting on an option lights the theme up across
-        // the real terminals and the preview swatch. Font selectors don't (fonts can't preview live).
+        // Theme selectors preview their layer across the interface and real terminals.
+        // Font selectors don't preview live.
         // Every theme slot previews — including the per-profile overrides, which reach the same live
         // path but apply only to that profile's terminals.
         let is_theme_selector = kind.is_theme();

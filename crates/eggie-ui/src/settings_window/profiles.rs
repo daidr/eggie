@@ -490,7 +490,7 @@ impl SettingsWindow {
         // --- The selected profile's fields ---
         let name_row = settings_row(
             language.profile_name_row(),
-            language.profile_name_description(),
+            None,
             self.render_profile_input("settings-profile-name", &self.profile_inputs.name, 220.),
             self.colors,
         );
@@ -498,7 +498,7 @@ impl SettingsWindow {
         let launch_rows = vec![
             settings_row(
                 language.shell_program_row(),
-                language.shell_program_description(),
+                Some(language.shell_program_description()),
                 self.render_profile_input(
                     "settings-profile-shell-program",
                     &self.profile_inputs.shell_program,
@@ -508,7 +508,7 @@ impl SettingsWindow {
             ),
             settings_row(
                 language.shell_args_row(),
-                language.shell_args_description(),
+                Some(language.shell_args_description()),
                 self.render_profile_input(
                     "settings-profile-shell-args",
                     &self.profile_inputs.shell_args,
@@ -518,13 +518,13 @@ impl SettingsWindow {
             ),
             settings_row(
                 language.profile_cwd_row(),
-                language.profile_cwd_description(),
+                Some(language.profile_cwd_description()),
                 self.render_profile_input("settings-profile-cwd", &self.profile_inputs.cwd, 220.),
                 self.colors,
             ),
             settings_row(
                 language.shell_integration_path_row(),
-                language.shell_integration_path_description(),
+                Some(language.shell_integration_path_description()),
                 self.render_profile_path_control(profile.shell_integration_path, language, cx),
                 self.colors,
             ),
@@ -548,7 +548,7 @@ impl SettingsWindow {
             self.render_profile_remote_host_row(language, remote_warning),
             settings_row(
                 language.profile_remote_user_row(),
-                language.profile_remote_user_description(),
+                Some(language.profile_remote_user_description()),
                 self.render_profile_input(
                     "settings-profile-remote-user",
                     &self.profile_inputs.remote_user,
@@ -558,7 +558,7 @@ impl SettingsWindow {
             ),
             settings_row(
                 language.profile_remote_port_row(),
-                language.profile_remote_port_description(),
+                Some(language.profile_remote_port_description()),
                 self.render_profile_input(
                     "settings-profile-remote-port",
                     &self.profile_inputs.remote_port,
@@ -571,7 +571,7 @@ impl SettingsWindow {
         let appearance_rows = vec![
             settings_row(
                 language.profile_terminal_dark_theme_row(),
-                language.profile_terminal_dark_theme_description(),
+                None,
                 self.render_selector(
                     "settings-profile-terminal-dark-theme",
                     profile
@@ -588,7 +588,7 @@ impl SettingsWindow {
             ),
             settings_row(
                 language.profile_terminal_light_theme_row(),
-                language.profile_terminal_light_theme_description(),
+                None,
                 self.render_selector(
                     "settings-profile-terminal-light-theme",
                     profile
@@ -605,7 +605,7 @@ impl SettingsWindow {
             ),
             settings_row(
                 language.profile_font_row(),
-                language.profile_font_description(),
+                None,
                 self.render_selector(
                     "settings-profile-font",
                     profile
@@ -623,13 +623,13 @@ impl SettingsWindow {
             ),
             settings_row(
                 language.profile_font_size_row(),
-                language.profile_font_size_description(),
+                None,
                 self.render_profile_font_size_control(&profile, language, cx),
                 self.colors,
             ),
             settings_row(
                 language.profile_badge_row(),
-                language.profile_badge_description(),
+                None,
                 self.render_profile_badge_control(&profile, language, cx),
                 self.colors,
             ),

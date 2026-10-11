@@ -14,7 +14,10 @@ pub(crate) fn terminal_bytes(event: &KeyDownEvent) -> Option<Vec<u8>> {
     terminal_bytes_with_mode(event, 0)
 }
 
-pub(crate) fn terminal_bytes_with_mode(event: &KeyDownEvent, keyboard_flags: u8) -> Option<Vec<u8>> {
+pub(crate) fn terminal_bytes_with_mode(
+    event: &KeyDownEvent,
+    keyboard_flags: u8,
+) -> Option<Vec<u8>> {
     if keyboard_flags != 0 {
         return kitty_key_bytes(
             &event.keystroke,
@@ -246,12 +249,15 @@ pub(crate) fn cell_position(point: TerminalPoint) -> eggie_protocol::TerminalCel
     }
 }
 
-pub(crate) fn terminal_hyperlink_at(snapshot: &TerminalSnapshot, point: TerminalPoint) -> Option<String> {
+pub(crate) fn terminal_hyperlink_at(
+    snapshot: &TerminalSnapshot,
+    point: TerminalPoint,
+) -> Option<String> {
     snapshot
         .cells
         .iter()
         .find(|cell| cell.line == point.line && cell.column == point.column)
-        .and_then(|cell| cell.hyperlink.clone())
+        .and_then(|cell| cell.hyperlink.map(str::to_owned))
 }
 
 /// The auto-detected URL range covering `point`, if any. Ranges are per-row, so a hit is a simple

@@ -53,7 +53,7 @@ pub enum Msg {
 ///
 /// Handles all the PTY I/O and runs the PTY parser which updates terminal
 /// state.
-type TerminalUpdate<U> = Box<dyn Fn(&Term<U>) + Send + 'static>;
+type TerminalUpdate<U> = Box<dyn Fn(&mut Term<U>) + Send + 'static>;
 
 pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     poll: Arc<Poller>,
@@ -102,7 +102,10 @@ where
     ///
     /// Consumers which mirror terminal state to another process can use this to publish an
     /// immutable render snapshot without racing the PTY reader for the live terminal mutex.
-    pub fn with_terminal_update(mut self, callback: impl Fn(&Term<U>) + Send + 'static) -> Self {
+    pub fn with_terminal_update(
+        mut self,
+        callback: impl Fn(&mut Term<U>) + Send + 'static,
+    ) -> Self {
         self.terminal_update = Some(Box::new(callback));
         self
     }
@@ -403,7 +406,7 @@ struct ParserDriver<U: EventListener> {
 }
 
 impl<U: EventListener> ParserDriver<U> {
-    fn publish_terminal_update(&self, terminal: &Term<U>, force: bool) -> bool {
+    fn publish_terminal_update(&self, terminal: &mut Term<U>, force: bool) -> bool {
         let Some(callback) = &self.terminal_update else {
             return false;
         };
@@ -481,7 +484,7 @@ impl<U: EventListener> ParserDriver<U> {
         changed |= terminal.flush_ready_kitty_graphics_commands();
         self.state.graphics_decode_pending = terminal.has_pending_kitty_graphics_commands();
         if parser.sync_timeout().sync_timeout().is_none() && changed {
-            self.publish_terminal_update(&terminal, false);
+            self.publish_terminal_update(&mut terminal, false);
             self.event_proxy.send_event(Event::Wakeup);
         }
         self.state.graphics_animation_deadline = terminal.next_graphics_animation_deadline();
@@ -508,7 +511,7 @@ impl<U: EventListener> ParserDriver<U> {
         let synchronized = self.state.parser.sync_timeout().sync_timeout().is_some();
         let forced =
             synchronized_update_expired || !synchronized && (animation_changed || decode_changed);
-        let published = !synchronized && self.publish_terminal_update(&terminal, forced);
+        let published = !synchronized && self.publish_terminal_update(&mut terminal, forced);
         if forced || published {
             self.event_proxy.send_event(Event::Wakeup);
         }
@@ -539,7 +542,7 @@ impl<U: EventListener> ParserDriver<U> {
                     let mut terminal = self.terminal.lock();
                     terminal.flush_kitty_graphics_commands();
                     terminal.exit();
-                    self.publish_terminal_update(&terminal, true);
+                    self.publish_terminal_update(&mut terminal, true);
                     self.event_proxy.send_event(Event::Wakeup);
                     if let Some(status) = status {
                         self.event_proxy.send_event(Event::ChildExit(status));

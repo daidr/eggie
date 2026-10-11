@@ -37,7 +37,7 @@ pub enum Event {
     /// because the parser holds the terminal lock. Eggie combines it with the cursor line to record
     /// a scroll-stable coordinate for jump-to-prompt, which cannot be recovered later from the
     /// throttled snapshot path.
-    SemanticPrompt(SemanticPrompt, i32, usize),
+    SemanticPrompt(SemanticPrompt, i32, usize, usize),
 
     /// Desktop notification command reported by OSC 9, OSC 99, or OSC 777.
     DesktopNotification(DesktopNotification),
@@ -117,8 +117,11 @@ impl Debug for Event {
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::ProgressReport(progress) => write!(f, "ProgressReport({progress:?})"),
             Event::WorkingDirectory(directory) => write!(f, "WorkingDirectory({directory:?})"),
-            Event::SemanticPrompt(prompt, line, history_size) => {
-                write!(f, "SemanticPrompt({prompt:?}, {line}, {history_size})")
+            Event::SemanticPrompt(prompt, line, history_size, column) => {
+                write!(
+                    f,
+                    "SemanticPrompt({prompt:?}, {line}, {history_size}, {column})"
+                )
             }
             Event::DesktopNotification(notification) => {
                 write!(f, "DesktopNotification({notification:?})")

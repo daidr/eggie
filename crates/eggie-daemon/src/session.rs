@@ -44,7 +44,30 @@ impl EventListener for DaemonEventListener {
                     serde_json::json!({ "pwd": directory }),
                 );
             }
-            Event::SemanticPrompt(prompt, cursor_line, history_size) => {
+            Event::SemanticPrompt(prompt, cursor_line, history_size, column) => {
+                if matches!(
+                    prompt.action,
+                    SemanticPromptAction::PromptStart | SemanticPromptAction::FreshLineAndPrompt
+                ) {
+                    self.0
+                        .completion_query_blocked
+                        .store(false, Ordering::Release);
+                }
+                if matches!(
+                    prompt.action,
+                    SemanticPromptAction::InputStart
+                        | SemanticPromptAction::InputStartAndTerminatePrompt
+                ) {
+                    let mut tracker = self.0.shell_integration.lock();
+                    tracker.advance_scroll_base(history_size);
+                    let global =
+                        (tracker.total_scrolled_lines as i64 + cursor_line as i64).max(0) as u64;
+                    if let Some(p) = tracker.input_starts.iter_mut().find(|(l, _)| *l == global) {
+                        p.1 = column;
+                    } else {
+                        tracker.input_starts.push((global, column));
+                    }
+                }
                 if prompt.action == SemanticPromptAction::FreshLineAndPrompt {
                     for id in self.0.program_status.lock().clear_active() {
                         self.0.publish_event(
@@ -138,9 +161,6 @@ impl EventListener for DaemonEventListener {
 pub(super) struct TerminalSession {
     pub(super) id: SessionId,
     pub(super) project_id: ProjectId,
-    /// Owning GUI window, or `None` when the session is detached (its window closed but the shell
-    /// keeps running, so it survives as claimable). Mutated at runtime by `ClaimSession`/`DetachWindow`.
-    pub(super) window_id: Mutex<Option<WindowId>>,
     pub(super) initial_directory: PathBuf,
     pub(super) shell_pid: u32,
     pub(super) pty_fd: i32,
@@ -210,8 +230,7 @@ pub(super) struct SessionRuntimeMetadata {
 /// thread positional arguments.
 pub(super) struct SessionSpawnConfig {
     pub(super) project_id: ProjectId,
-    /// Window that will own the freshly spawned session.
-    pub(super) window_id: WindowId,
+
     pub(super) cwd: PathBuf,
     pub(super) size: TerminalSize,
     pub(super) appearance: TerminalAppearance,
@@ -241,7 +260,7 @@ impl TerminalSession {
     pub(super) fn spawn(config: SessionSpawnConfig) -> Result<Self> {
         let SessionSpawnConfig {
             project_id,
-            window_id,
+
             cwd,
             size,
             appearance,
@@ -372,7 +391,7 @@ impl TerminalSession {
             .with_context(|| format!("failed to create PTY in {}", cwd.display()))?;
         let shell_pid = pty.child().id();
         let pty_fd = pty.file().as_raw_fd();
-        state.publish_terminal(&terminal.lock());
+        state.publish_terminal(&mut terminal.lock());
         let publisher = state.clone();
         let event_loop = EventLoop::new(terminal.clone(), listener, pty, true, false)
             .context("failed to create Alacritty event loop")?
@@ -385,7 +404,7 @@ impl TerminalSession {
         Ok(Self {
             id,
             project_id,
-            window_id: Mutex::new(Some(window_id)),
+
             initial_directory: cwd.clone(),
             shell_pid,
             pty_fd,
@@ -427,7 +446,7 @@ impl TerminalSession {
     ) -> Result<Self> {
         Self::spawn(SessionSpawnConfig {
             project_id,
-            window_id: WindowId::new_v4(),
+
             cwd,
             size,
             appearance,
@@ -465,7 +484,7 @@ impl TerminalSession {
         SessionSummary {
             id: self.id,
             project_id: self.project_id,
-            window_id: *self.window_id.lock(),
+
             title: self.events.title.read().clone(),
             initial_directory: self.initial_directory.clone(),
             current_directory,
@@ -670,6 +689,26 @@ impl TerminalSession {
     }
 
     pub(super) fn input(&self, bytes: Vec<u8>, sequence: u64) -> Result<()> {
+        // Serialize private completion queries with input; Enter blocks them until the next prompt.
+        let _gate = self.events.completion_input_gate.lock();
+        if bytes.len() > 2
+            && bytes.starts_with(b"\x18\x1e")
+            && (self.events.completion_query_blocked.load(Ordering::Acquire)
+                || !matches!(
+                    self.events.shell_integration.lock().phase,
+                    TerminalSemanticPhase::Prompt | TerminalSemanticPhase::Input
+                ))
+        {
+            anyhow::bail!("shell input is no longer editable");
+        }
+        if crate::completion::submits_command(&bytes) {
+            self.events
+                .completion_query_blocked
+                .store(true, Ordering::Release);
+        }
+        self.events.shell_integration.lock().prompt_input = None;
+        *self.events.native_completions.lock() = None;
+        *self.events.native_completion_request.lock() = None;
         self.last_input_sequence.store(sequence, Ordering::Release);
         // Scroll-on-keystroke: typing while scrolled back into history snaps the viewport to the
         // live bottom, so the user sees what they type. The kernel pins the viewport during output
@@ -678,7 +717,7 @@ impl TerminalSession {
             let mut terminal = self.terminal.lock();
             if terminal.grid().display_offset() != 0 {
                 terminal.scroll_display(Scroll::Bottom);
-                self.events.publish_terminal(&terminal);
+                self.events.publish_terminal(&mut terminal);
             }
         }
         self.sender
@@ -848,7 +887,7 @@ impl TerminalSession {
         let viewport_changed = terminal.grid().display_offset() != initial_display_offset;
         drop(mouse_state);
         if viewport_changed {
-            self.events.publish_terminal(&terminal);
+            self.events.publish_terminal(&mut terminal);
         }
         drop(terminal);
         Ok(())
@@ -875,7 +914,7 @@ impl TerminalSession {
         terminal.scroll_display(scroll);
         let viewport_changed = terminal.grid().display_offset() != initial_display_offset;
         if viewport_changed {
-            self.events.publish_terminal(&terminal);
+            self.events.publish_terminal(&mut terminal);
         }
         drop(terminal);
         Ok(())
@@ -896,7 +935,7 @@ impl TerminalSession {
         if delta != 0 {
             terminal.scroll_display(Scroll::Delta(delta));
             if terminal.grid().display_offset() != initial {
-                self.events.publish_terminal(&terminal);
+                self.events.publish_terminal(&mut terminal);
             }
         }
         drop(terminal);
@@ -930,7 +969,7 @@ impl TerminalSession {
             terminal.scroll_display(Scroll::Delta(
                 target_offset as i32 - initial_display_offset as i32,
             ));
-            self.events.publish_terminal(&terminal);
+            self.events.publish_terminal(&mut terminal);
         }
         drop(terminal);
         Ok(())
@@ -1054,7 +1093,7 @@ impl TerminalSession {
         if target_offset != display_offset {
             let delta = target_offset as i32 - display_offset as i32;
             terminal.scroll_display(Scroll::Delta(delta));
-            self.events.publish_terminal(&terminal);
+            self.events.publish_terminal(&mut terminal);
         }
 
         // Collect every match that falls within the (possibly newly scrolled) viewport, in
@@ -1094,7 +1133,7 @@ impl TerminalSession {
             TerminalSelectionKind::Block => SelectionType::Block,
         };
         terminal.selection = Some(Selection::new(ty, absolute, selection_side(side)));
-        self.events.publish_terminal(&terminal);
+        self.events.publish_terminal(&mut terminal);
         Ok(())
     }
 
@@ -1109,7 +1148,7 @@ impl TerminalSession {
         if let Some(selection) = terminal.selection.as_mut() {
             selection.update(absolute, selection_side(side));
         }
-        self.events.publish_terminal(&terminal);
+        self.events.publish_terminal(&mut terminal);
         Ok(())
     }
 
@@ -1117,7 +1156,7 @@ impl TerminalSession {
     pub(super) fn selection_clear(&self) -> Result<()> {
         let mut terminal = self.terminal.lock();
         if terminal.selection.take().is_some() {
-            self.events.publish_terminal(&terminal);
+            self.events.publish_terminal(&mut terminal);
         }
         Ok(())
     }
@@ -1131,7 +1170,7 @@ impl TerminalSession {
         let end = Point::new(terminal.bottommost_line(), terminal.grid().last_column());
         selection.update(end, Side::Right);
         terminal.selection = Some(selection);
-        self.events.publish_terminal(&terminal);
+        self.events.publish_terminal(&mut terminal);
         Ok(())
     }
 
@@ -1175,7 +1214,7 @@ impl TerminalSession {
         };
         resize_terminal_with_history_reflow(&mut terminal, size, phase, prompt_start_line);
         terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
-        self.events.publish_terminal(&terminal);
+        self.events.publish_terminal(&mut terminal);
         drop(terminal);
         self.sender
             .send(Msg::Resize(window_size(size)))
@@ -1323,7 +1362,7 @@ impl TerminalSession {
         if previous != detect_urls {
             // Republish so detected-link highlights appear (or clear) without waiting for the next
             // terminal output.
-            self.events.publish_terminal(&self.terminal.lock());
+            self.events.publish_terminal(&mut self.terminal.lock());
         }
     }
 
@@ -1338,7 +1377,7 @@ impl TerminalSession {
         let config = terminal_config(state.cursor_shape, state.scrollback_limit);
         drop(state);
         terminal.set_options(config);
-        self.events.publish_terminal(&terminal);
+        self.events.publish_terminal(&mut terminal);
     }
 
     /// Set the session's scrollback history depth at runtime. Rebuilds the whole config from the
@@ -1354,7 +1393,7 @@ impl TerminalSession {
         let config = terminal_config(state.cursor_shape, state.scrollback_limit);
         drop(state);
         terminal.set_options(config);
-        self.events.publish_terminal(&terminal);
+        self.events.publish_terminal(&mut terminal);
     }
 
     pub(super) fn terminate(&self) {

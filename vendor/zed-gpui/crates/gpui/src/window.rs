@@ -912,6 +912,8 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    // Keep images alive while their sprites can be replayed from a cached view.
+    painted_images: Vec<Arc<RenderImage>>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -940,6 +942,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    painted_images_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
@@ -958,6 +961,7 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
+            painted_images: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -983,6 +987,7 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.painted_images.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -1079,6 +1084,7 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    image_atlas_sources: FxHashMap<crate::ImageId, (Weak<RenderImage>, usize)>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1379,6 +1385,8 @@ impl Window {
             focus,
             show,
             kind,
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            buffering,
             is_movable,
             app_owns_titlebar_drag,
             is_resizable,
@@ -1408,6 +1416,8 @@ impl Window {
                 bounds: window_bounds.get_bounds(),
                 titlebar,
                 kind,
+                #[cfg(target_os = "macos")]
+                buffering,
                 is_movable,
                 app_owns_titlebar_drag,
                 is_resizable,
@@ -1682,7 +1692,21 @@ impl Window {
             let mut cx = cx.to_async();
             move || {
                 handle
-                    .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
+                    .update(&mut cx, |_, window, cx| {
+                        let previous_position = window.mouse_position();
+                        window.bounds_changed(cx);
+                        // Moving a window changes pointer hit testing even without a mouse event.
+                        if window.mouse_position() != previous_position {
+                            window.dispatch_event(
+                                PlatformInput::MouseMove(MouseMoveEvent {
+                                    position: window.mouse_position(),
+                                    modifiers: window.modifiers,
+                                    pressed_button: None,
+                                }),
+                                cx,
+                            );
+                        }
+                    })
                     .log_err();
             }
         }));
@@ -1834,6 +1858,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            image_atlas_sources: FxHashMap::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -2884,6 +2909,7 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.reclaim_dropped_images();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3364,6 +3390,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            painted_images_index: self.next_frame.painted_images.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
@@ -3374,6 +3401,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.next_frame.painted_images.extend(
+            self.rendered_frame.painted_images
+                [range.start.painted_images_index..range.end.painted_images_index]
+                .iter()
+                .cloned(),
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -4477,6 +4510,11 @@ impl Window {
             })?
             .expect("Callback above only returns Some");
 
+        self.image_atlas_sources
+            .entry(data.id)
+            .or_insert_with(|| (Arc::downgrade(&data), data.frame_count()));
+        self.next_frame.painted_images.push(data);
+
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
@@ -4583,6 +4621,7 @@ impl Window {
 
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+        self.image_atlas_sources.remove(&data.id);
         for frame_index in 0..data.frame_count() {
             let params = RenderImageParams {
                 image_id: data.id,
@@ -4593,6 +4632,31 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    fn reclaim_dropped_images(&mut self) {
+        self.image_atlas_sources
+            .retain(|&image_id, (source, frame_count)| {
+                if source.strong_count() > 0 {
+                    return true;
+                }
+                for frame_index in 0..*frame_count {
+                    self.sprite_atlas.remove(
+                        &RenderImageParams {
+                            image_id,
+                            frame_index,
+                        }
+                        .into(),
+                    );
+                }
+                false
+            });
+    }
+
+    /// Number of live image sources uploaded into this window's sprite atlas.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn image_atlas_source_count(&self) -> usize {
+        self.image_atlas_sources.len()
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.

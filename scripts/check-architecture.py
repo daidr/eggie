@@ -18,10 +18,12 @@ graph = {
 # These lower layers have deliberately small, closed sets of direct dependencies.
 allowed = {
     "eggie-domain": {"serde", "uuid", "bitflags"},
+    "eggie-completion": {"serde", "serde_json", "unicode-segmentation", "libc"},
     "eggie-config": {"serde", "serde_json"},
     "eggie-storage": {"serde", "serde_json"},
     "eggie-themes": {"eggie-domain"},
-    "eggie-ui-kit": {"gpui", "anyhow"},
+    # Native popup positioning stays in the UI shell, independent of terminal/workspace state.
+    "eggie-ui-kit": {"gpui", "anyhow", "cocoa", "objc", "raw-window-handle"},
     "eggie-build-info": set(),
 }
 # Views consume the domain cell contract, never the parser or a live daemon/client.

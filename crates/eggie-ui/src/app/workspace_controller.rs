@@ -1,88 +1,6 @@
 use super::*;
 
 impl EggieApp {
-    pub(super) fn persist_workspace(&self) {
-        let views = self
-            .workspace_state
-            .project_views
-            .iter()
-            .map(|(id, view)| (*id, view.clone()))
-            .collect();
-        WorkspaceRestoreState {
-            active_project: self.workspace_state.active_project,
-            views,
-            left_sidebar_collapsed: self.left_sidebar_collapsed,
-            right_sidebar_collapsed: self.right_sidebar_collapsed,
-            left_sidebar_width: self.left_sidebar_width,
-            right_sidebar_width: self.right_sidebar_width,
-        }
-        .save();
-    }
-
-    pub(super) fn install_close_confirmation(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let app = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |window, cx| {
-            app.update(cx, |app, cx| {
-                if app.closing || app.session_feed.sessions.is_empty() {
-                    return true;
-                }
-                let language = app.language;
-                let prompt = window.prompt(
-                    PromptLevel::Warning,
-                    language.close_window_title(),
-                    Some(language.close_window_message()),
-                    &[
-                        language.terminate_all(),
-                        language.detach(),
-                        language.cancel(),
-                    ],
-                    cx,
-                );
-                let app = cx.entity().downgrade();
-                cx.spawn_in(window, async move |_, cx| {
-                    let Ok(choice) = prompt.await else {
-                        return;
-                    };
-                    if choice == 2 {
-                        return;
-                    }
-                    let _ = cx.update(|window, cx| {
-                        let _ = app.update(cx, |app, _| {
-                            // Persist before the window is torn down: on_app_quit's weak entity is
-                            // already dead by the time the async platform quit runs, so the close
-                            // path must save explicitly. Harmless for both choices — dead sessions
-                            // are pruned on restore.
-                            app.persist_workspace();
-                            if choice == 0 {
-                                // Terminate all: kill this window's sessions.
-                                for session_id in app.window_session_ids() {
-                                    let _ =
-                                        app.client.request(ClientRequest::Terminate { session_id });
-                                }
-                            } else {
-                                // Detach (choice == 1): clear this window's ownership so the sessions
-                                // survive as claimable, unowned terminals instead of pointing at a
-                                // window that is about to be destroyed.
-                                let _ = app.client.request(ClientRequest::DetachWindow {
-                                    window_id: app.window_id,
-                                });
-                            }
-                            app.closing = true;
-                        });
-                        window.remove_window();
-                    });
-                })
-                .detach();
-                false
-            })
-            .unwrap_or(true)
-        });
-    }
-
     /// Rebuild `project_views` and the local `projects` mirror to track the shared store: create an
     /// empty view for each newly-synced project, drop views for removed projects, and keep
     /// `active_project` pointing at a project that still exists.
@@ -156,7 +74,26 @@ impl EggieApp {
             .values()
             .flat_map(|view| view.layout.split_ids())
             .collect();
+        let live_items: HashSet<_> = self
+            .workspace_state
+            .project_views
+            .values()
+            .flat_map(|view| {
+                view.layout.group_ids().into_iter().flat_map(|id| {
+                    view.layout
+                        .find_group(id)
+                        .into_iter()
+                        .flat_map(|group| group.items.iter().map(|item| item.id))
+                })
+            })
+            .collect();
+        self.tab_drop_bounds
+            .borrow_mut()
+            .retain(|id, _| live_items.contains(id));
         self.terminal_viewports
+            .retain(|group_id, _| live_groups.contains(group_id));
+        self.group_drop_bounds
+            .borrow_mut()
             .retain(|group_id, _| live_groups.contains(group_id));
         self.scrollbar_bounds
             .borrow_mut()
@@ -206,6 +143,9 @@ impl EggieApp {
     }
 
     pub(super) fn set_terminal_has_focus(&mut self, focused: bool) {
+        if !focused {
+            self.dismiss_completion();
+        }
         self.terminal_has_focus = focused;
         self.sync_terminal_focus();
     }
@@ -232,13 +172,13 @@ impl EggieApp {
         }
     }
 
-    /// Ids of the sessions this window owns. `self.session_feed.sessions` is already filtered to this window's
-    /// sessions by the polling classifier, so this is just their ids.
+    /// Presentation determines which sessions this window renders; the daemon has no window owner.
     pub(super) fn window_session_ids(&self) -> Vec<SessionId> {
-        self.session_feed
-            .sessions
-            .iter()
-            .map(|session| session.id)
+        self.workspace_state
+            .project_views
+            .values()
+            .flat_map(|view| view.layout.terminal_items())
+            .filter_map(|item| item.session_id)
             .collect()
     }
 
@@ -261,73 +201,6 @@ impl EggieApp {
             changed |= view.layout.update_terminal_title(session_id, title);
         }
         changed
-    }
-
-    /// Claim a detached session into this window: set its owner to this window in the daemon, then
-    /// place it as a tab in its project's layout. If the session's project isn't in the shared list
-    /// (its project was deleted), fall back to the active project. Activates the claimed session.
-    pub(super) fn claim_detached_session(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Ok(DaemonResponse::SessionClaimed { session }) =
-            self.client.request(ClientRequest::ClaimSession {
-                session_id,
-                window_id: self.window_id,
-            })
-        else {
-            return;
-        };
-        // Choose the project this session lands in: its own project if this window has a view for it,
-        // otherwise the currently active project (orphaned project_id, R8).
-        let target_project = if self
-            .workspace_state
-            .project_views
-            .contains_key(&session.project_id)
-        {
-            session.project_id
-        } else {
-            self.workspace_state.active_project
-        };
-        if let Some(view) = self.workspace_state.project_views.get_mut(&target_project) {
-            let group_id = view.active_group_id;
-            if let Some(group) = view.layout.find_group_mut(group_id) {
-                group.add_item(TabItem::terminal(session.id, session.title.clone()));
-            }
-        }
-        self.configure_session_progress(session.id);
-        self.configure_session_osc_policy(session.id);
-        self.session_feed.sessions.push(session);
-        self.session_feed
-            .detached_sessions
-            .retain(|candidate| candidate.id != session_id);
-        if self.session_feed.detached_sessions.is_empty() {
-            self.detached_popover_open = false;
-        }
-        self.workspace_state.active_project = target_project;
-        self.activate_session(target_project, session_id, window, cx);
-        self.ensure_snapshot_watchers(cx);
-        self.ensure_progress_watchers(cx);
-        self.ensure_osc_watchers(cx);
-        cx.notify();
-    }
-
-    /// Permanently terminate a detached session from the popover.
-    pub(super) fn destroy_detached_session(
-        &mut self,
-        session_id: SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let _ = self.client.request(ClientRequest::Terminate { session_id });
-        self.session_feed
-            .detached_sessions
-            .retain(|candidate| candidate.id != session_id);
-        if self.session_feed.detached_sessions.is_empty() {
-            self.detached_popover_open = false;
-        }
-        cx.notify();
     }
 
     pub(super) fn configure_session_progress(&self, session_id: SessionId) {
@@ -514,6 +387,15 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.window_manager.read(cx).terminating_all
+            || self
+                .window_manager
+                .read(cx)
+                .pending_projects
+                .contains(&self.workspace_state.active_project)
+        {
+            return;
+        }
         let project = self.workspace_state.active_project_data().clone();
         let scrollback_limit = self.settings.read(cx).config().scrollback_lines;
         // Launch fields come from the profile; scrollback stays global (it is a resource limit, not
@@ -567,7 +449,6 @@ impl EggieApp {
         let Ok(DaemonResponse::SessionCreated { session }) =
             self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
-                window_id: self.window_id,
                 cwd: spawn.cwd,
                 size: TerminalSize::default(),
                 appearance,
@@ -600,7 +481,15 @@ impl EggieApp {
         }
         self.configure_session_progress(session.id);
         self.configure_session_osc_policy(session.id);
-        self.session_feed.sessions.push(session);
+        self.session_feed.sessions.push(session.clone());
+        self.session_feed.global_sessions.push(session.clone());
+        self.publish_window_state(cx);
+        self.window_manager.update(cx, |manager, cx| {
+            let mut sessions = manager.sessions.clone();
+            sessions.retain(|s| s.id != session.id);
+            sessions.push(session);
+            manager.set_sessions(sessions, cx);
+        });
         self.ensure_snapshot_watchers(cx);
         self.ensure_progress_watchers(cx);
         self.ensure_osc_watchers(cx);
@@ -666,6 +555,7 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_project_selector(cx);
         let Some((group_id, item_id)) = self
             .workspace_state
             .project_views
@@ -678,29 +568,11 @@ impl EggieApp {
         self.activate_item(group_id, item_id, window, cx);
     }
 
-    pub(super) fn activate_session_by_id(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(project_id) = self
-            .workspace_state
-            .project_views
-            .iter()
-            .find(|(_, view)| view.layout.find_terminal_item(session_id).is_some())
-            .map(|(id, _)| *id)
-        {
-            self.activate_session(project_id, session_id, window, cx);
-        }
-    }
-
     /// The profile a live session was launched from, if its tab recorded one and that profile still
     /// exists. `None` means "no overrides" — the terminal follows the global appearance.
     ///
-    /// Adopted sessions (restored from the daemon, or claimed from another window) legitimately have no
-    /// recorded profile, and a profile deleted while its terminals run resolves to `None` rather than
-    /// keeping a dangling override.
+    /// Sessions discovered without saved tab metadata use the global appearance. Moving a saved tab
+    /// preserves its profile; deleting that profile resolves to the global appearance.
     ///
     /// Returns the profile id alongside the overrides because resolving also needs to ask whether the
     /// settings window's hover preview targets *this* profile.
@@ -800,81 +672,99 @@ impl EggieApp {
         }
     }
 
+    /// Closing a terminal ends its process; closing a window only changes presentation.
     pub(super) fn close_item(
         &mut self,
         group_id: GroupId,
-        item_id: eggie_domain::ItemId,
+        item_id: ItemId,
         cx: &mut Context<Self>,
     ) {
-        let removed = self
-            .workspace_state
-            .workspace_mut()
-            .layout
-            .close_item(group_id, item_id);
-        self.sidebar
-            .marquee_states
-            .borrow_mut()
-            .remove(&format!("tab-title-{item_id}"));
-        let workspace = self.workspace_state.workspace_mut();
-        if workspace.layout.find_group(group_id).is_none() {
-            workspace.active_group_id = workspace.layout.first_group_id();
+        self.publish_window_state(cx);
+        let source = self.item_location(group_id, item_id);
+        let Some(item) = self.window_manager.read(cx).state.item(source).cloned() else {
+            return;
+        };
+        let Some(id) = item.session_id else {
+            self.workspace_state
+                .workspace_mut()
+                .layout
+                .close_item(group_id, item_id);
+            self.workspace_state.workspace_mut().repair_active_group();
+            cx.notify();
+            return;
+        };
+        if self
+            .window_manager
+            .read(cx)
+            .pending_termination
+            .contains(&id)
+        {
+            return;
         }
-        if let Some(session_id) = removed.and_then(|item| item.session_id) {
-            if self
-                .sidebar
-                .sidebar_preview
-                .as_ref()
-                .map(|preview| preview.session_id)
-                == Some(session_id)
-            {
-                self.dismiss_sidebar_preview(cx);
-            }
-            self.sidebar
-                .sidebar_row_bounds
-                .borrow_mut()
-                .remove(&session_id);
-            self.sidebar
-                .marquee_states
-                .borrow_mut()
-                .remove(&format!("sidebar-title-{session_id}"));
-            self.sidebar
-                .marquee_states
-                .borrow_mut()
-                .remove(&format!("sidebar-subtitle-{session_id}"));
-            if self.terminal_focused_session == Some(session_id) {
-                self.terminal_focused_session = None;
-            }
-            let _ = self.client.request(ClientRequest::Terminate { session_id });
-            self.session_feed
-                .sessions
-                .retain(|session| session.id != session_id);
-            self.session_feed.snapshots.remove(&session_id);
-            self.terminal_sizes.remove(&session_id);
-            self.terminal_resize_in_flight.remove(&session_id);
-            self.terminal_ime_states.remove(&session_id);
-            if self
-                .terminal_hovered_link
-                .as_ref()
-                .is_some_and(|(hovered_session, _)| *hovered_session == session_id)
-            {
-                self.terminal_hovered_link = None;
-            }
-            self.session_feed.session_inspections.remove(&session_id);
-            self.session_feed
-                .session_inspection_errors
-                .remove(&session_id);
-            self.session_feed.shell_integration.remove(&session_id);
-            // Drop any un-actioned system-notification routes owned by this session: the session is
-            // gone, so their "user clicked the notification" callback can never fire to remove them.
-            self.notification_routes
-                .borrow_mut()
-                .retain(|_, route| route.session_id != session_id);
+        let session = self
+            .window_manager
+            .read(cx)
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .cloned();
+        if session.is_none() {
+            self.window_manager
+                .update(cx, |manager, cx| manager.remove_session(id, cx));
+            self.pull_window_state(cx);
+            cx.notify();
+            return;
         }
-        // The closed item may have collapsed a group or split out of the layout; reap their caches.
-        self.reconcile_layout_caches();
-        self.ensure_snapshot_watchers(cx);
-        self.sync_terminal_focus();
-        cx.notify();
+        let busy = session.as_ref().is_some_and(|s| {
+            s.status == SessionStatus::Running
+                && (s.current_process.pid != s.shell_pid || s.active_command.is_some())
+        }) || item
+            .profile_id
+            .and_then(|id| self.profile_store.read(cx).profile(id))
+            .is_some_and(|p| p.remote.is_some());
+        let manager = self.window_manager.clone();
+        let client = self.client.clone();
+        if !busy {
+            manager.update(cx, |manager, cx| manager.terminate(id, client, cx));
+            return;
+        }
+        manager.update(cx, |manager, _| {
+            manager.pending_termination.insert(id);
+        });
+        let zh = self.language == Language::SimplifiedChinese;
+        cx.spawn(async move |app, cx| {
+            let prompt = app.update_in(cx, |_, window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    if zh {
+                        "结束终端？"
+                    } else {
+                        "Terminate terminal?"
+                    },
+                    Some(if zh {
+                        "当前命令将中断。关闭窗口可保留后台运行。"
+                    } else {
+                        "The current command will stop. Close the window to keep it running."
+                    }),
+                    &[
+                        if zh { "取消" } else { "Cancel" },
+                        if zh { "结束终端" } else { "Terminate" },
+                    ],
+                    cx,
+                )
+            });
+            let confirmed = match prompt {
+                Ok(prompt) => prompt.await == Ok(1),
+                Err(_) => false,
+            };
+            let _ = manager.update(cx, |manager, cx| {
+                manager.pending_termination.remove(&id);
+                if confirmed {
+                    manager.terminate(id, client, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn new_tab_in_active_group(
@@ -1009,6 +899,10 @@ impl EggieApp {
         let Some(session_id) = self.active_session_id() else {
             return;
         };
+        if self.completion_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let keyboard_flags = self
             .session_feed
             .snapshots

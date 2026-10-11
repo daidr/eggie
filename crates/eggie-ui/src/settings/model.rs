@@ -89,6 +89,18 @@ impl ThemeMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SidebarLayout {
+    #[default]
+    AllProjects,
+    SingleProject,
+}
+
+impl SidebarLayout {
+    pub(crate) const ALL: [Self; 2] = [Self::AllProjects, Self::SingleProject];
+}
+
 /// Where the terminal's colors come from, independently of the interface theme.
 ///
 /// The interface theme always decides the app's own chrome. This chooses whether the terminal cells
@@ -298,6 +310,7 @@ impl CursorBlink {
 #[serde(default)]
 pub(crate) struct AppSettings {
     pub(crate) language: Language,
+    pub(crate) sidebar_layout: SidebarLayout,
     pub(crate) theme_mode: ThemeMode,
     /// Interface theme used when the resolved appearance is dark. Drives the app's own chrome
     /// ([`UiColors::from_theme`]) and, when [`Self::terminal_theme_source`] is
@@ -373,6 +386,8 @@ pub(crate) struct AppSettings {
     pub(crate) progress_complete_timeout_secs: u32,
     pub(crate) progress_stale_timeout_secs: u32,
     pub(crate) allow_osc_clipboard_read: bool,
+    #[serde(default = "default_true")]
+    pub(crate) terminal_suggestions: bool,
     pub(crate) detect_urls: bool,
     pub(crate) copy_on_select: bool,
     /// Whether to check for app updates on launch. The check is silent; results
@@ -426,6 +441,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             language: Language::default(),
+            sidebar_layout: SidebarLayout::default(),
             theme_mode: ThemeMode::System,
             interface_dark_theme: DEFAULT_DARK_THEME.to_owned(),
             interface_light_theme: DEFAULT_LIGHT_THEME.to_owned(),
@@ -451,6 +467,7 @@ impl Default for AppSettings {
             progress_complete_timeout_secs: DEFAULT_PROGRESS_COMPLETE_TIMEOUT_SECS,
             progress_stale_timeout_secs: DEFAULT_PROGRESS_STALE_TIMEOUT_SECS,
             allow_osc_clipboard_read: false,
+            terminal_suggestions: true,
             detect_urls: true,
             copy_on_select: true,
             auto_check_updates: true,

@@ -1,6 +1,36 @@
 use super::*;
 
 impl SettingsWindow {
+    pub(super) fn render_sidebar_layout_control(
+        &self,
+        selected: SidebarLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = self.settings.read(cx).config().language;
+        self.render_segmented(
+            "sidebar-layout",
+            SidebarLayout::ALL
+                .into_iter()
+                .map(|layout| {
+                    (
+                        SharedString::from(format!("{layout:?}")),
+                        SharedString::from(language.sidebar_layout_label(layout)),
+                        selected == layout,
+                    )
+                })
+                .collect(),
+            |window, index, cx| {
+                window.settings.update(cx, |store, cx| {
+                    store.update(
+                        |config| config.sidebar_layout = SidebarLayout::ALL[index],
+                        cx,
+                    );
+                });
+            },
+            cx,
+        )
+    }
+
     pub(super) fn render_segmented(
         &self,
         id_prefix: &str,

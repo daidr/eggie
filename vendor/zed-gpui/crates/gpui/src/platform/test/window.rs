@@ -34,6 +34,7 @@ pub(crate) struct TestWindowState {
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
+    mouse_position: Point<Pixels>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
@@ -90,6 +91,7 @@ impl TestWindow {
             hover_status_change_callback: None,
             resize_callback: None,
             moved_callback: None,
+            mouse_position: Point::default(),
             appearance_change_callback: None,
             input_handler: None,
             is_fullscreen: false,
@@ -97,6 +99,19 @@ impl TestWindow {
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
         })))
+    }
+
+    /// Move the native frame and provide the physical pointer's new window-relative position.
+    pub fn simulate_move(&mut self, origin: Point<Pixels>, mouse_position: Point<Pixels>) {
+        let mut lock = self.0.lock();
+        lock.bounds.origin = origin;
+        lock.mouse_position = mouse_position;
+        let Some(mut callback) = lock.moved_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().moved_callback = Some(callback);
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -188,7 +203,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        Point::default()
+        self.0.lock().mouse_position
     }
 
     fn modifiers(&self) -> crate::Modifiers {

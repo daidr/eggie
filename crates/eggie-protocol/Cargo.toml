@@ -6,6 +6,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eggie-completion.workspace = true
 eggie-domain.workspace = true
 eggie-config.workspace = true
 base64.workspace = true

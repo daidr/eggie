@@ -1,7 +1,48 @@
-
 use super::*;
 use gpui::{Keystroke, Modifiers};
 use uuid::Uuid;
+
+#[test]
+fn project_popover_keyboard_navigation_starts_at_the_active_terminal() {
+    let project = ProjectId::new_v4();
+    let window = WindowId::new_v4();
+    let group = GroupId::new_v4();
+    let mut tabs: Vec<_> = (0..3)
+        .map(|index| {
+            let item_id = ItemId::new_v4();
+            ProjectPopoverTab {
+                location: eggie_domain::ItemLocation {
+                    window_id: window,
+                    project_id: project,
+                    group_id: group,
+                    item_id,
+                },
+                session_id: None,
+                item_id,
+                title: "/".into(),
+                subtitle: None,
+                icon: ProcessIcon::Terminal,
+                active: index == 1,
+            }
+        })
+        .collect();
+    assert_eq!(project_popover_selection_index(&tabs, None), Some(1));
+
+    // A live catalog reorder must keep keyboard focus on the same terminal.
+    let keyboard_target = Some(tabs[2].item_id);
+    tabs.remove(0);
+    assert_eq!(
+        project_popover_selection_index(&tabs, keyboard_target),
+        Some(1)
+    );
+    tabs.pop();
+    assert_eq!(
+        project_popover_selection_index(&tabs, keyboard_target),
+        Some(0)
+    );
+    tabs[0].active = false;
+    assert_eq!(project_popover_selection_index(&tabs, None), None);
+}
 
 #[test]
 fn marquee_reverses_from_its_current_position() {
@@ -23,54 +64,6 @@ fn marquee_reverses_from_its_current_position() {
         ..Default::default()
     };
     assert_eq!(marquee_offset(resuming, now), current);
-}
-
-#[test]
-fn adding_and_removing_project_cards_moves_and_rotates_them() {
-    let first = ProjectIconCard {
-        id: Some(Uuid::from_u128(1)),
-        icon: ProcessIcon::Terminal,
-    };
-    let second = ProjectIconCard {
-        id: Some(Uuid::from_u128(2)),
-        icon: ProcessIcon::BunJs,
-    };
-    let adding = project_card_poses(&[first], &[first, second], 0.5);
-    assert_eq!(adding.len(), 2);
-    assert_eq!(adding[0].icon, ProcessIcon::BunJs);
-    assert_eq!(adding[0].offset_x, 2.5);
-    assert_eq!(adding[0].angle, 3.5);
-    assert_eq!(adding[0].opacity, 0.5);
-    assert_eq!(adding[1].offset_x, 0.);
-    assert_eq!(adding[1].angle, -3.5);
-    let removing = project_card_poses(&[first, second], &[first], 0.5);
-    assert_eq!(removing.len(), 2);
-    assert_eq!(removing[0].offset_x, 2.5);
-    assert_eq!(removing[0].angle, 3.5);
-    assert_eq!(removing[0].opacity, 0.5);
-    assert_eq!(removing[1].offset_x, 0.);
-    assert_eq!(removing[1].angle, -3.5);
-}
-
-#[test]
-fn first_project_card_crossfades_with_placeholder_without_moving() {
-    let placeholder = ProjectIconCard {
-        id: None,
-        icon: ProcessIcon::ProjectPlaceholder,
-    };
-    let terminal = ProjectIconCard {
-        id: Some(Uuid::from_u128(1)),
-        icon: ProcessIcon::Terminal,
-    };
-    for poses in [
-        project_card_poses(&[placeholder], &[terminal], 0.5),
-        project_card_poses(&[terminal], &[placeholder], 0.5),
-    ] {
-        assert_eq!(poses.len(), 2);
-        assert!(poses.iter().all(|pose| pose.offset_x == 0.));
-        assert!(poses.iter().all(|pose| pose.angle == 0.));
-        assert!(poses.iter().all(|pose| pose.opacity == 0.5));
-    }
 }
 
 #[test]
@@ -113,7 +106,7 @@ fn test_session() -> eggie_protocol::SessionSummary {
     eggie_protocol::SessionSummary {
         id: uuid::Uuid::nil(),
         project_id: uuid::Uuid::nil(),
-        window_id: None,
+
         title: String::new(),
         initial_directory: std::path::PathBuf::from("/"),
         current_directory: std::path::PathBuf::from("/"),

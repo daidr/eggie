@@ -99,6 +99,8 @@ impl MetalAtlasState {
         texture_kind: AtlasTextureKind,
     ) -> Option<AtlasTile> {
         {
+            let device = self.device.clone();
+            let is_apple_gpu = self.is_apple_gpu;
             let textures = match texture_kind {
                 AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
                 AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
@@ -112,6 +114,14 @@ impl MetalAtlasState {
             {
                 return Some(tile);
             }
+            // Grow the last small page in place: tile coordinates and texture IDs stay valid.
+            if let Some(texture) = textures.iter_mut().last() {
+                while texture.grow(&device, is_apple_gpu, size) {
+                    if let Some(tile) = texture.allocate(size) {
+                        return Some(tile);
+                    }
+                }
+            }
         }
 
         let texture = self.push_texture(size, texture_kind);
@@ -124,47 +134,29 @@ impl MetalAtlasState {
         kind: AtlasTextureKind,
     ) -> &mut MetalAtlasTexture {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
+            width: DevicePixels(256),
+            height: DevicePixels(256),
         };
         // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
         const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(16384),
             height: DevicePixels(16384),
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.into());
-        texture_descriptor.set_height(size.height.into());
-        let pixel_format;
-        let usage;
-        match kind {
-            AtlasTextureKind::Monochrome => {
-                pixel_format = metal::MTLPixelFormat::A8Unorm;
-                usage = metal::MTLTextureUsage::ShaderRead;
-            }
-            AtlasTextureKind::Polychrome => {
-                pixel_format = metal::MTLPixelFormat::BGRA8Unorm;
-                usage = metal::MTLTextureUsage::ShaderRead;
-            }
-            AtlasTextureKind::Subpixel => unreachable!(),
-        }
-        texture_descriptor.set_pixel_format(pixel_format);
-        texture_descriptor.set_usage(usage);
-        // Shared memory mode can be used only on Apple GPU families
-        // https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared
-        texture_descriptor.set_storage_mode(if self.is_apple_gpu {
-            metal::MTLStorageMode::Shared
-        } else {
-            metal::MTLStorageMode::Managed
-        });
-        let metal_texture = self.device.new_texture(&texture_descriptor);
-
         let texture_list = match kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
         };
+        let page_size = texture_list
+            .iter_mut()
+            .fold(DEFAULT_ATLAS_SIZE, |size, texture| {
+                size.max(&Size {
+                    width: DevicePixels((texture.metal_texture.width() as i32).min(1024)),
+                    height: DevicePixels((texture.metal_texture.height() as i32).min(1024)),
+                })
+            });
+        let size = min_size.min(&MAX_ATLAS_SIZE).max(&page_size);
+        let metal_texture = make_texture(&self.device, self.is_apple_gpu, size, kind);
 
         let index = texture_list.free_list.pop();
 
@@ -208,6 +200,43 @@ struct MetalAtlasTexture {
 }
 
 impl MetalAtlasTexture {
+    fn grow(&mut self, device: &Device, is_apple_gpu: bool, min_size: Size<DevicePixels>) -> bool {
+        let old_size = self.allocator.size();
+        if min_size.width.0 > 1024 || min_size.height.0 > 1024 {
+            return false;
+        }
+        let width = (old_size.width * 2)
+            .max(min_size.width.0)
+            .min(1024)
+            .max(old_size.width);
+        let height = (old_size.height * 2)
+            .max(min_size.height.0)
+            .min(1024)
+            .max(old_size.height);
+        if width == old_size.width && height == old_size.height {
+            return false;
+        }
+        let texture = make_texture(
+            device,
+            is_apple_gpu,
+            Size {
+                width: DevicePixels(width),
+                height: DevicePixels(height),
+            },
+            self.id.kind,
+        );
+        let bytes_per_row = old_size.width as usize * self.bytes_per_pixel() as usize;
+        let mut bytes = vec![0u8; bytes_per_row * old_size.height as usize];
+        let region = metal::MTLRegion::new_2d(0, 0, old_size.width as u64, old_size.height as u64);
+        // Atlas textures are CPU-uploaded and GPU-read-only; in-flight commands retain the old texture.
+        self.metal_texture
+            .get_bytes(bytes.as_mut_ptr().cast(), bytes_per_row as u64, region, 0);
+        texture.replace_region(region, 0, bytes.as_ptr().cast(), bytes_per_row as u64);
+        self.metal_texture = AssertSend(texture);
+        self.allocator.grow(etagere::size2(width, height));
+        true
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
         let allocation = self.allocator.allocate(size_to_etagere(size))?;
         let tile = AtlasTile {
@@ -256,6 +285,29 @@ impl MetalAtlasTexture {
     }
 }
 
+fn make_texture(
+    device: &Device,
+    is_apple_gpu: bool,
+    size: Size<DevicePixels>,
+    kind: AtlasTextureKind,
+) -> metal::Texture {
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_width(size.width.into());
+    descriptor.set_height(size.height.into());
+    descriptor.set_pixel_format(match kind {
+        AtlasTextureKind::Monochrome => metal::MTLPixelFormat::A8Unorm,
+        AtlasTextureKind::Polychrome => metal::MTLPixelFormat::BGRA8Unorm,
+        AtlasTextureKind::Subpixel => unreachable!(),
+    });
+    descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+    descriptor.set_storage_mode(if is_apple_gpu {
+        metal::MTLStorageMode::Shared
+    } else {
+        metal::MTLStorageMode::Managed
+    });
+    device.new_texture(&descriptor)
+}
+
 fn size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
     etagere::Size::new(size.width.into(), size.height.into())
 }
@@ -275,6 +327,7 @@ unsafe impl<T> Send for AssertSend<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foreign_types::ForeignType;
     use gpui::PlatformAtlas;
     use std::borrow::Cow;
 
@@ -375,5 +428,53 @@ mod tests {
         };
         let key = make_image_key(999, 0);
         atlas.remove(&key);
+    }
+
+    #[test]
+    fn small_atlas_grows_without_moving_tiles_or_losing_pixels() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let key = make_image_key(1, 0);
+        let small = Size {
+            width: DevicePixels(32),
+            height: DevicePixels(32),
+        };
+        let pixels = vec![173u8; 32 * 32 * 4];
+        let tile = atlas
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((small, Cow::Borrowed(pixels.as_slice()))))
+            })
+            .unwrap()
+            .unwrap();
+        let original = atlas.metal_texture(tile.texture_id);
+        assert_eq!((original.width(), original.height()), (256, 256));
+        let larger = insert_tile(
+            &atlas,
+            &make_image_key(2, 0),
+            Size {
+                width: DevicePixels(700),
+                height: DevicePixels(700),
+            },
+        );
+        assert_eq!(larger.texture_id, tile.texture_id);
+        let grown = atlas.metal_texture(tile.texture_id);
+        assert_eq!((grown.width(), grown.height()), (1024, 1024));
+        assert_ne!(grown.as_ptr(), original.as_ptr());
+        assert_eq!(atlas.0.lock().tiles_by_key[&key], tile);
+        let mut actual = vec![0u8; pixels.len()];
+        let region = metal::MTLRegion::new_2d(
+            tile.bounds.origin.x.0 as u64,
+            tile.bounds.origin.y.0 as u64,
+            32,
+            32,
+        );
+        for texture in [&grown, &original] {
+            texture.get_bytes(actual.as_mut_ptr().cast(), 32 * 4, region, 0);
+            assert_eq!(
+                actual, pixels,
+                "both the new atlas and retained old texture preserve artwork"
+            );
+        }
     }
 }

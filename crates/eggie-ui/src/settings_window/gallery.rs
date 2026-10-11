@@ -109,6 +109,8 @@ impl SettingsWindow {
         let sample_fill = blend_rgb(card_fill, theme.foreground, 0.055);
         let chip_fill = theme.palette[0];
         let chip_text = readable_on(chip_fill);
+        // Match the horizontal card-edge inset to the marker's vertical card-edge inset.
+        let sample_padding = 11. + (42. - 29.) / 2. - 8.;
         let name_owned = name.to_owned();
         let hover_name = name_owned.clone();
         let selected_name = name_owned.clone();
@@ -194,7 +196,7 @@ impl SettingsWindow {
                                     .items_center()
                                     .justify_between()
                                     .h(px(42.))
-                                    .px_1()
+                                    .px(px(sample_padding))
                                     .rounded_xl()
                                     .bg(rgb(sample_fill))
                                     .child(
@@ -268,7 +270,6 @@ impl SettingsWindow {
         &self,
         kind: SelectorKind,
         label: &'static str,
-        description: &'static str,
         selected: &str,
         window: &Window,
         cx: &mut Context<Self>,
@@ -394,7 +395,6 @@ impl SettingsWindow {
                             .id(format!("theme-gallery-label-{}", kind.index()))
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .tooltip(tooltip_text(description, self.colors))
                             .child(if managed {
                                 format!("{label} · init.lua")
                             } else {
@@ -404,55 +404,6 @@ impl SettingsWindow {
                     .child(self.render_theme_search(kind, window, cx)),
             )
             .child(strip_wrapper)
-            .into_any_element()
-    }
-
-    pub(super) fn render_terminal_preview(
-        &self,
-        config: &AppSettings,
-        theme: &TerminalTheme,
-    ) -> AnyElement {
-        let language = config.language;
-        let foreground =
-            minimum_contrast_rgb(theme.foreground, theme.background, config.minimum_contrast);
-        let command =
-            minimum_contrast_rgb(theme.palette[2], theme.background, config.minimum_contrast);
-        div()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .gap_2()
-            .h(px(124.))
-            .p_3()
-            .border_t_1()
-            .border_color(rgb(self.colors.border))
-            .bg(rgb(self.colors.panel))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(self.colors.muted))
-                    .child(language.terminal_preview_label()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .flex_col()
-                    .overflow_hidden()
-                    .rounded_lg()
-                    .mask_corners(rgb(self.colors.panel))
-                    .border_1()
-                    .border_color(rgb(self.colors.border))
-                    .bg(rgb(theme.background))
-                    .px(px(config.terminal_padding_x))
-                    .py(px(config.terminal_padding_y))
-                    .font_family(SharedString::from(config.font_family.clone()))
-                    .text_size(px(config.font_size))
-                    .text_color(rgb(foreground))
-                    .child("~/Eggie")
-                    .child(div().text_color(rgb(command)).child("$ cargo run")),
-            )
             .into_any_element()
     }
 }

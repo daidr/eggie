@@ -19,8 +19,9 @@ use crate::actions::{
     ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow,
     NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown,
-    SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, ToggleFullScreen,
-    ToggleLeftSidebar, ToggleRightSidebar,
+    SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, TerminalSuggest,
+    TerminalSwitcher, ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar, UndoWindowOperation,
+    WindowSwitcher,
 };
 use crate::settings::{AppSettings, Language};
 
@@ -82,6 +83,30 @@ fn load_binding(keystrokes: &str, action: Box<dyn gpui::Action>) -> Option<KeyBi
 
 /// The single source of truth for configurable actions.
 pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
+    ActionSpec {
+        id: "terminal_suggest",
+        default_keystroke: "ctrl-space",
+        label: Language::terminal_suggest,
+        make_action: || Box::new(TerminalSuggest),
+    },
+    ActionSpec {
+        id: "terminal_switcher",
+        default_keystroke: "cmd-shift-k",
+        label: Language::terminal_switcher,
+        make_action: || Box::new(TerminalSwitcher),
+    },
+    ActionSpec {
+        id: "window_switcher",
+        default_keystroke: "cmd-alt-w",
+        label: Language::window_switcher,
+        make_action: || Box::new(WindowSwitcher),
+    },
+    ActionSpec {
+        id: "undo_window_operation",
+        default_keystroke: "cmd-shift-t",
+        label: Language::undo_window_operation,
+        make_action: || Box::new(UndoWindowOperation),
+    },
     ActionSpec {
         id: "open_settings",
         default_keystroke: "cmd-,",

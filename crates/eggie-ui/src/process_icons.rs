@@ -5,7 +5,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex, OnceLock},
 };
-use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
+use tiny_skia::{BlendMode, FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
 /// Terminal icons follow the session's foreground process, never the editable tab title.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -234,12 +234,17 @@ pub(crate) fn stack_angle(index: usize, count: usize) -> f32 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CardPose {
     pub icon: ProcessIcon,
     pub offset_x: f32,
     pub angle: f32,
     pub opacity: f32,
+}
+
+pub(crate) struct CardLayer {
+    pub poses: Vec<CardPose>,
+    pub weight: f32,
 }
 
 /// One card for a sidebar tab, or up to three cards for a project's icon group.
@@ -285,6 +290,41 @@ pub(crate) fn card_frame(
     card_size: f32,
     width: f32,
 ) -> Arc<gpui::RenderImage> {
+    card_render_image(card_pixmap(poses, dark, card_size, width))
+}
+
+/// Mixing complete paint orders keeps occlusion continuous when the front card changes.
+pub(crate) fn card_layers_frame(
+    layers: &[CardLayer],
+    dark: bool,
+    card_size: f32,
+    width: f32,
+) -> Arc<gpui::RenderImage> {
+    let pixel_width = (width * 2.).ceil().max(1.) as u32;
+    let pixel_height = ((card_size + 5.) * 2.).ceil() as u32;
+    let mut frame = Pixmap::new(pixel_width, pixel_height).expect("process card canvas");
+    for layer in layers {
+        if layer.weight <= 0. {
+            continue;
+        }
+        let image = card_pixmap(&layer.poses, dark, card_size, width);
+        frame.draw_pixmap(
+            0,
+            0,
+            image.as_ref(),
+            &PixmapPaint {
+                opacity: layer.weight,
+                blend_mode: BlendMode::Plus,
+                ..PixmapPaint::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+    card_render_image(frame)
+}
+
+fn card_pixmap(poses: &[CardPose], dark: bool, card_size: f32, width: f32) -> Pixmap {
     let pixel_width = (width * 2.).ceil().max(1.) as u32;
     let pixel_height = ((card_size + 5.) * 2.).ceil() as u32;
     let mut frame = Pixmap::new(pixel_width, pixel_height).expect("process card canvas");
@@ -310,6 +350,12 @@ pub(crate) fn card_frame(
             None,
         );
     }
+    frame
+}
+
+fn card_render_image(frame: Pixmap) -> Arc<gpui::RenderImage> {
+    let pixel_width = frame.width();
+    let pixel_height = frame.height();
     let mut pixels = frame.take();
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -508,7 +554,6 @@ mod tests {
         let mut session = SessionSummary {
             id: uuid::Uuid::nil(),
             project_id: uuid::Uuid::nil(),
-            window_id: None,
             title: String::new(),
             initial_directory: "/".into(),
             current_directory: "/".into(),

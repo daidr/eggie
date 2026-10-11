@@ -142,210 +142,6 @@ impl EggieApp {
         sessions
     }
 
-    /// The button next to "add project" that opens the detached-session popover. Rendered only when
-    /// there is at least one detached session (D6), with a count badge.
-    pub(super) fn render_detached_sessions_button(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.session_feed.detached_sessions.is_empty() {
-            return None;
-        }
-        let count = self.session_feed.detached_sessions.len();
-        let colors = self.colors;
-        let tooltip: SharedString = self.language.detached_sessions_tooltip().into();
-        let control = cx.entity().downgrade();
-        Some(
-            div()
-                // Capture the toggle's on-screen bounds so the popover can anchor just below it.
-                .on_children_prepainted(move |children, _, cx| {
-                    let Some(bounds) = children.first().copied() else {
-                        return;
-                    };
-                    let control = control.clone();
-                    cx.defer(move |cx| {
-                        control
-                            .update(cx, |app, cx| {
-                                if app.detached_toggle_bounds != Some(bounds) {
-                                    app.detached_toggle_bounds = Some(bounds);
-                                    if app.detached_popover_open {
-                                        cx.notify();
-                                    }
-                                }
-                            })
-                            .ok();
-                    });
-                })
-                .child(
-                    div()
-                        .id("detached-sessions-toggle")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .h(px(24.))
-                        .px_2()
-                        .rounded_lg()
-                        .text_color(rgb(colors.muted))
-                        .cursor_pointer()
-                        .hover(move |element| {
-                            element
-                                .bg(rgb(colors.panel_alt))
-                                .text_color(rgb(colors.text))
-                        })
-                        .tooltip(tooltip_text(tooltip, colors))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|app, _, _, cx| {
-                            app.detached_popover_open = !app.detached_popover_open;
-                            cx.notify();
-                        }))
-                        .child(icon_sized(IconName::Terminal, 14.))
-                        .child(div().text_size(px(11.)).child(count.to_string())),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// The popover listing detached (unowned) sessions grouped by project, each with claim/destroy
-    /// actions (D6). Uses the same anchored + deferred + `.occlude()` overlay pattern as the settings
-    /// dropdowns; `.occlude()` stops clicks on blank areas from falling through to the sidebar.
-    pub(super) fn render_detached_sessions_popover(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !self.detached_popover_open || self.session_feed.detached_sessions.is_empty() {
-            return None;
-        }
-        let colors = self.colors;
-        let claim_tooltip: SharedString = self.language.claim_session_tooltip().into();
-        let destroy_tooltip: SharedString = self.language.destroy_session_tooltip().into();
-
-        // Group detached sessions by project, preserving the shared project order; sessions whose
-        // project no longer exists fall into a trailing "other" group.
-        let mut groups: Vec<(String, Vec<&SessionSummary>)> = Vec::new();
-        let mut grouped_projects: HashSet<ProjectId> = HashSet::new();
-        for project in &self.workspace_state.projects {
-            let members: Vec<&SessionSummary> = self
-                .session_feed
-                .detached_sessions
-                .iter()
-                .filter(|session| session.project_id == project.id)
-                .collect();
-            if !members.is_empty() {
-                grouped_projects.insert(project.id);
-                groups.push((project.name.clone(), members));
-            }
-        }
-        let mut orphans: Vec<&SessionSummary> = self
-            .session_feed
-            .detached_sessions
-            .iter()
-            .filter(|session| !grouped_projects.contains(&session.project_id))
-            .collect();
-        if !orphans.is_empty() {
-            orphans.sort_by(|a, b| a.initial_directory.cmp(&b.initial_directory));
-            groups.push((self.language.detached_other_group().to_owned(), orphans));
-        }
-
-        let mut list = div().flex().flex_col().py_1();
-        for (title, members) in groups {
-            list = list.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_size(px(11.))
-                    .text_color(rgb(colors.muted))
-                    .child(title),
-            );
-            for session in members {
-                let session_id = session.id;
-                list = list.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .mx_1()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .hover(move |element| element.bg(rgb(colors.hover)))
-                        .child(icon_sized(IconName::Terminal, 14.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.))
-                                .child(session.title.clone()),
-                        )
-                        .child(icon_button(
-                            IconName::CombineIcon,
-                            SharedString::from(format!("claim-detached-{session_id}")),
-                            colors,
-                            Some(claim_tooltip.clone()),
-                            cx.listener(move |app, _, window, cx| {
-                                app.claim_detached_session(session_id, window, cx)
-                            }),
-                        ))
-                        .child(icon_button(
-                            IconName::Close,
-                            SharedString::from(format!("destroy-detached-{session_id}")),
-                            colors,
-                            Some(destroy_tooltip.clone()),
-                            cx.listener(move |app, _, _, cx| {
-                                app.destroy_detached_session(session_id, cx)
-                            }),
-                        )),
-                );
-            }
-        }
-
-        let popover = div()
-            .flex()
-            .flex_col()
-            .w(px(260.))
-            .max_h(px(360.))
-            .overflow_hidden()
-            .rounded_xl()
-            .border_1()
-            .border_color(rgb(colors.border))
-            .bg(rgb(colors.panel))
-            .shadow_lg()
-            // Floating overlay: block mouse events for the sidebar rows behind it so clicks on the
-            // popover's blank areas don't bubble through (see [[gpui-overlay-occlude]]).
-            .occlude()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .on_mouse_down_out(cx.listener(move |_, _, window, cx| {
-                cx.defer_in(window, move |app, _, cx| {
-                    if app.detached_popover_open {
-                        app.detached_popover_open = false;
-                        cx.notify();
-                    }
-                });
-            }))
-            .child(list);
-
-        // Anchor the popover just below the toggle button. Anchoring the popover's top-right corner
-        // to the button's bottom-right opens it downward and leftward, keeping it inside the sidebar.
-        // Fall back to a window-snapped corner until the button's bounds have been captured once.
-        let anchored_popover = match self.detached_toggle_bounds {
-            Some(bounds) => anchored()
-                .anchor(Anchor::TopRight)
-                .position(point(bounds.right(), bounds.bottom() + px(4.)))
-                .snap_to_window_with_margin(px(8.))
-                .child(popover),
-            None => anchored()
-                .anchor(Anchor::TopRight)
-                .snap_to_window_with_margin(px(8.))
-                .child(popover),
-        };
-
-        Some(deferred(anchored_popover).priority(2).into_any_element())
-    }
-
-    /// The copy-path + open-with split button pair shown under a directory row in the Info tab. The
-    /// open button's left half launches the persisted [`OpenWith`] app on `path`; its right half is a
-    /// caret that toggles a dropdown to pick (and persist) a different opener.
     pub(super) fn render_directory_actions(
         &self,
         field: DirectoryField,
@@ -624,6 +420,8 @@ impl EggieApp {
         &self,
         project_id: ProjectId,
         view: &WindowProjectView,
+        layout: ProjectIconLayout,
+        cx: &App,
     ) -> Option<AnyElement> {
         let mut desired: Vec<_> = view
             .layout
@@ -634,6 +432,34 @@ impl EggieApp {
                 icon: self.icon_for_item(item.kind, item.session_id),
             })
             .collect();
+        for window in self
+            .window_manager
+            .read(cx)
+            .state
+            .windows
+            .values()
+            .filter(|w| w.id != self.window_id)
+        {
+            if let Some(view) = window.views.get(&project_id) {
+                desired.extend(view.layout.terminal_items().map(|item| ProjectIconCard {
+                    id: Some(item.id),
+                    icon: self.icon_for_item(item.kind, item.session_id),
+                }));
+            }
+        }
+        desired.extend(
+            self.window_manager
+                .read(cx)
+                .state
+                .background
+                .values()
+                .filter(|tab| tab.project_id == project_id)
+                .map(|tab| ProjectIconCard {
+                    id: Some(tab.item.id),
+                    icon: self.icon_for_item(tab.item.kind, tab.item.session_id),
+                }),
+        );
+        desired.truncate(PROJECT_MAX_ICON_COUNT);
         if desired.is_empty() {
             desired.push(ProjectIconCard {
                 id: None,
@@ -641,27 +467,29 @@ impl EggieApp {
             });
         }
         let state = {
+            let now = Instant::now();
             let mut states = self.sidebar.project_icon_states.borrow_mut();
             let state = states
                 .entry(project_id)
-                .or_insert_with(|| ProjectIconState {
-                    icons: Vec::new(),
-                    previous: Vec::new(),
-                    revision: 0,
-                    started_at: Instant::now(),
-                });
-            if state.icons != desired {
-                state.previous = std::mem::replace(&mut state.icons, desired);
-                state.revision += 1;
-                state.started_at = Instant::now();
-            }
+                .or_insert_with(|| ProjectIconState::new(desired.clone(), now));
+            state.retarget(desired, now);
             state.clone()
         };
         let animating = state.started_at.elapsed() < PROJECT_ICON_TRANSITION;
         let image_width = process_icons::stack_width(PROJECT_MAX_ICON_COUNT, PROJECT_CARD_SIZE);
-        // Keep the first card at the same left edge as a single icon.
-        let image_left = image_width - process_icons::stack_width(1, PROJECT_CARD_SIZE);
-        let slot_width = image_width + 16.;
+        let (image_left, slot_width) = match layout {
+            ProjectIconLayout::Sidebar => {
+                // Keep the first card at the same left edge as a single icon.
+                let left = image_width - process_icons::stack_width(1, PROJECT_CARD_SIZE);
+                (left, image_width + 16.)
+            }
+            ProjectIconLayout::SelectorTrigger => {
+                // Let the label follow the actual stack, with a small, consistent gap.
+                let width = process_icons::stack_width(state.icons.len(), PROJECT_CARD_SIZE) + 6.;
+                (0., width)
+            }
+            ProjectIconLayout::SelectorOption => (0., image_width + 6.),
+        };
         let card_height = PROJECT_CARD_SIZE + 5.;
         if !animating {
             let icons = state.icons.iter().map(|card| card.icon).collect::<Vec<_>>();
@@ -691,13 +519,27 @@ impl EggieApp {
                 .h(px(card_height))
                 .with_animation(
                     format!("project-icons-{project_id}-{}", state.revision),
-                    Animation::new(PROJECT_ICON_TRANSITION).with_easing(gpui::ease_in_out),
+                    Animation::new(PROJECT_ICON_TRANSITION),
                     move |element, progress| {
-                        let poses = project_card_poses(&state.previous, &state.icons, progress);
-                        let frame =
-                            process_icons::card_frame(&poses, dark, PROJECT_CARD_SIZE, image_width);
-                        element.child(
-                            img(frame)
+                        // All presentations use the state clock, including during a retarget.
+                        let frame = state.frame(if progress >= 1. {
+                            state.started_at + PROJECT_ICON_TRANSITION
+                        } else {
+                            Instant::now()
+                        });
+                        let width = if matches!(layout, ProjectIconLayout::SelectorTrigger) {
+                            frame.width + 6.
+                        } else {
+                            slot_width
+                        };
+                        let image = process_icons::card_layers_frame(
+                            &frame.layers(),
+                            dark,
+                            PROJECT_CARD_SIZE,
+                            image_width,
+                        );
+                        element.w(px(width)).child(
+                            img(image)
                                 .absolute()
                                 .left(px(image_left))
                                 .top_0()
@@ -739,7 +581,239 @@ impl EggieApp {
             .then_some((state.from_height, target_height, state.revision))
     }
 
+    pub(super) fn render_sidebar_project_items(
+        &self,
+        project_id: ProjectId,
+        view: &WindowProjectView,
+        nested: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_active_project = project_id == self.workspace_state.active_project;
+        let nonlocal_rows = self.render_nonlocal_terminals(project_id, cx);
+        let mut terminal_list = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .mb_2()
+            .when(nested, |list| {
+                // The list owns its hierarchy inset so every terminal row shares one left edge.
+                list.ml(px(28.))
+                    .mr_3()
+                    .pl(px(12.))
+                    .border_l_1()
+                    .border_color(rgba((self.colors.border << 8) | 0x80))
+            })
+            .when(!nested, |list| list.mx_2());
+        if !nonlocal_rows.is_empty() && view.layout.terminal_items().next().is_some() {
+            terminal_list = terminal_list.child(self.render_terminal_section_label(
+                if self.language == Language::SimplifiedChinese {
+                    "此窗口".into()
+                } else {
+                    "This window".into()
+                },
+            ));
+        }
+        for session in self.sidebar_sessions_in_layout_order(project_id, view) {
+            let active = is_active_project && self.active_session_id() == Some(session.id);
+            let session_id = session.id;
+            // Prefer the tab's custom title (if any) so the sidebar stays consistent with
+            // the tab bar; fall back to the session's process title.
+            let tab_title = view
+                .layout
+                .terminal_display_title(session_id)
+                .unwrap_or(session.title.as_str());
+            let program_status = session.program_status.as_ref();
+            let display_title = view
+                .layout
+                .terminal_custom_title(session_id)
+                .or_else(|| program_status.and_then(|status| status.title.as_deref()))
+                .unwrap_or(tab_title);
+            let title_key = format!("sidebar-title-{session_id}");
+            let subtitle_key = format!("sidebar-subtitle-{session_id}");
+            let marquee_hovered = self
+                .sidebar
+                .marquee_states
+                .borrow()
+                .get(&title_key)
+                .is_some_and(|state| state.hovered);
+            let label_background = if marquee_hovered {
+                self.colors.hover
+            } else if active {
+                self.colors.panel_alt
+            } else {
+                self.colors.panel
+            };
+            let label: AnyElement = if let Some(status) = program_status {
+                let state_label = program_state_label(status.state, self.language);
+                let mut subtitle = match (&status.title, &status.message) {
+                    (Some(title), Some(message)) if title != display_title => {
+                        format!("{title}: {message}")
+                    }
+                    (_, Some(message)) => message.clone(),
+                    (Some(title), None) if title != display_title => title.clone(),
+                    _ => state_label.to_owned(),
+                };
+                if let Some(progress) = status.progress {
+                    subtitle.push_str(&format!(" · {progress}%"));
+                }
+                let tag = matches!(
+                    status.state,
+                    TerminalProgramState::Blocked
+                        | TerminalProgramState::Done
+                        | TerminalProgramState::Error
+                )
+                .then_some((status.state, state_label));
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(self.render_marquee(
+                                title_key.clone(),
+                                display_title.to_owned(),
+                                12.,
+                                17.,
+                                label_background,
+                                cx,
+                            ))
+                            .when_some(tag, |row, (state, label)| {
+                                let tint = match state {
+                                    TerminalProgramState::Blocked => {
+                                        self.interface_theme.palette[3]
+                                    }
+                                    TerminalProgramState::Error => self.interface_theme.palette[1],
+                                    _ => self.interface_theme.palette[2],
+                                };
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .h(px(16.))
+                                        .px_1()
+                                        .rounded_full()
+                                        .bg(rgba((tint << 8) | 0x30))
+                                        .text_size(px(10.))
+                                        .text_color(rgb(self.colors.text))
+                                        .child(label),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .w_full()
+                            .min_w_0()
+                            .text_color(rgb(self.colors.muted))
+                            .child(self.render_marquee(
+                                subtitle_key.clone(),
+                                subtitle,
+                                11.,
+                                15.,
+                                label_background,
+                                cx,
+                            )),
+                    )
+                    .into_any_element()
+            } else {
+                self.render_marquee(
+                    title_key.clone(),
+                    display_title.to_owned(),
+                    12.,
+                    17.,
+                    label_background,
+                    cx,
+                )
+            };
+            let height_transition =
+                self.sidebar_status_row_transition(session_id, program_status.is_some());
+            let row = div()
+                .id(format!("sidebar-session-{session_id}"))
+                .flex()
+                .items_center()
+                .min_w_0()
+                .overflow_hidden()
+                .gap_2()
+                .pl_1()
+                .pr_2()
+                .rounded_md()
+                .mb_1()
+                .text_size(px(12.))
+                .text_color(rgb(if active {
+                    self.colors.text
+                } else {
+                    self.colors.muted
+                }))
+                .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
+                .when_some(self.bell_flash_tint(session_id), |element, tint| {
+                    element.bg(rgba(tint))
+                })
+                .hover({
+                    let colors = self.colors;
+                    move |element| element.bg(rgb(colors.hover))
+                })
+                .on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
+                    app.set_marquee_hover(
+                        &[
+                            format!("sidebar-title-{session_id}"),
+                            format!("sidebar-subtitle-{session_id}"),
+                        ],
+                        *hovered,
+                        cx,
+                    );
+                    app.sidebar_preview_hover(session_id, *hovered, window, cx);
+                }))
+                .cursor_pointer()
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.dismiss_sidebar_preview(cx);
+                    app.activate_session(project_id, session_id, window, cx)
+                }))
+                .child(self.render_item_icon(
+                    ItemKind::Terminal,
+                    Some(session_id),
+                    format!("sidebar-progress-{session_id}"),
+                ))
+                .child(label);
+            let row_bounds = self.sidebar.sidebar_row_bounds.clone();
+            terminal_list = terminal_list.child(
+                div()
+                    .on_children_prepainted(move |children, _, _| {
+                        if let Some(bounds) = children.first().copied() {
+                            row_bounds.borrow_mut().insert(session_id, bounds);
+                        }
+                    })
+                    .child(if let Some((from, to, revision)) = height_transition {
+                        row.with_animation(
+                            format!("sidebar-status-height-{session_id}-{revision}"),
+                            Animation::new(SIDEBAR_STATUS_TRANSITION)
+                                .with_easing(gpui::ease_in_out),
+                            move |element, progress| element.h(px(from + (to - from) * progress)),
+                        )
+                        .into_any_element()
+                    } else {
+                        row.h(px(if program_status.is_some() {
+                            SIDEBAR_STATUS_ROW_HEIGHT
+                        } else {
+                            SIDEBAR_SESSION_ROW_HEIGHT
+                        }))
+                        .into_any_element()
+                    }),
+            );
+        }
+        terminal_list = terminal_list
+            .children(self.render_ended_terminals(project_id, cx))
+            .children(nonlocal_rows);
+        terminal_list.into_any_element()
+    }
+
     pub(super) fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.settings.read(cx).config().sidebar_layout == SidebarLayout::SingleProject {
+            return self.render_single_project_sidebar(cx);
+        }
         let panel = div()
             .flex()
             .flex_none()
@@ -757,23 +831,13 @@ impl EggieApp {
                         .items_center()
                         .justify_between()
                         .child(section_label(self.language.projects_label(), self.colors))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .children(self.render_detached_sessions_button(cx))
-                                .child(icon_button(
-                                    IconName::Add,
-                                    "add-project",
-                                    self.colors,
-                                    Some(self.language.add_project_tooltip().into()),
-                                    cx.listener(|app, _, window, cx| {
-                                        app.prompt_add_project(window, cx)
-                                    }),
-                                )),
-                        )
-                        .children(self.render_detached_sessions_popover(cx))
+                        .child(div().flex().items_center().gap_1().child(icon_button(
+                            IconName::Add,
+                            "add-project",
+                            self.colors,
+                            Some(self.language.add_project_tooltip().into()),
+                            cx.listener(|app, _, window, cx| app.prompt_add_project(window, cx)),
+                        )))
                         .children(self.render_update_popover(cx)),
                 ),
             );
@@ -811,8 +875,14 @@ impl EggieApp {
                 .collapsed_projects
                 .contains(&project_id);
             let is_active_project = project_id == self.workspace_state.active_project;
-            let has_terminals = view.layout.terminal_items().next().is_some();
-            let has_tabs = view.layout.items().next().is_some();
+            let has_terminals = view.layout.terminal_items().next().is_some()
+                || !self
+                    .window_manager
+                    .read(cx)
+                    .state
+                    .project_session_ids(project_id)
+                    .is_empty();
+            let has_tabs = view.layout.items().next().is_some() || has_terminals;
             let row_bounds = self.sidebar.project_row_bounds.clone();
             let mut icons: Vec<_> = view
                 .layout
@@ -879,21 +949,8 @@ impl EggieApp {
                                 }))
                             })
                             .on_click(cx.listener(move |app, _, window, cx| {
-                                let clicked_add = !has_terminals
-                                    && app
-                                        .sidebar
-                                        .project_row_bounds
-                                        .borrow()
-                                        .get(&project_id)
-                                        .is_some_and(|bounds| {
-                                            window.mouse_position().x >= bounds.right() - px(32.)
-                                        });
-                                if clicked_add {
-                                    app.create_terminal_in_project(project_id, window, cx);
-                                } else {
-                                    app.activate_project(project_id, cx);
-                                    app.toggle_project_collapsed(project_id, cx);
-                                }
+                                app.activate_project(project_id, cx);
+                                app.focus_handle.focus(window, cx);
                             }))
                             .on_mouse_down(
                                 MouseButton::Right,
@@ -901,7 +958,12 @@ impl EggieApp {
                                     app.show_project_context_menu(project_id, window, cx)
                                 }),
                             )
-                            .children(self.render_project_icon_stack(project_id, view))
+                            .children(self.render_project_icon_stack(
+                                project_id,
+                                view,
+                                ProjectIconLayout::Sidebar,
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -909,6 +971,29 @@ impl EggieApp {
                                     .truncate()
                                     .child(project.name.clone()),
                             )
+                            .when(has_tabs, |row| {
+                                row.child(
+                                    div()
+                                        .id(format!("project-add-{project_id}"))
+                                        .w(px(22.))
+                                        .h(px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(rgb(self.colors.muted))
+                                        .hover(|e| e.bg(rgb(self.colors.hover)))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(move |app, _, window, cx| {
+                                            cx.stop_propagation();
+                                            app.create_terminal_in_project(project_id, window, cx);
+                                        }))
+                                        .child(icon_sized(IconName::Add, 14.)),
+                                )
+                            })
                             .child(
                                 div()
                                     .id(format!("project-end-icon-{project_id}"))
@@ -921,6 +1006,18 @@ impl EggieApp {
                                     .ml_2()
                                     .rounded_md()
                                     .text_color(rgb(self.colors.muted))
+                                    .when(has_terminals || has_tabs, |e| {
+                                        e.on_click(cx.listener(move |app, _, _, cx| {
+                                            cx.stop_propagation();
+                                            app.toggle_project_collapsed(project_id, cx);
+                                        }))
+                                    })
+                                    .when(!has_terminals && !has_tabs, |e| {
+                                        e.on_click(cx.listener(move |app, _, window, cx| {
+                                            cx.stop_propagation();
+                                            app.create_terminal_in_project(project_id, window, cx);
+                                        }))
+                                    })
                                     .when(!has_terminals, |end| {
                                         end.cursor_pointer().hover({
                                             let colors = self.colors;
@@ -943,204 +1040,9 @@ impl EggieApp {
                             ),
                     ),
             );
-            if !collapsed {
-                for session in self.sidebar_sessions_in_layout_order(project_id, view) {
-                    let active = is_active_project && self.active_session_id() == Some(session.id);
-                    let session_id = session.id;
-                    // Prefer the tab's custom title (if any) so the sidebar stays consistent with
-                    // the tab bar; fall back to the session's process title.
-                    let tab_title = view
-                        .layout
-                        .terminal_display_title(session_id)
-                        .unwrap_or(session.title.as_str());
-                    let program_status = session.program_status.as_ref();
-                    let display_title = view
-                        .layout
-                        .terminal_custom_title(session_id)
-                        .or_else(|| program_status.and_then(|status| status.title.as_deref()))
-                        .unwrap_or(tab_title);
-                    let title_key = format!("sidebar-title-{session_id}");
-                    let subtitle_key = format!("sidebar-subtitle-{session_id}");
-                    let marquee_hovered = self
-                        .sidebar
-                        .marquee_states
-                        .borrow()
-                        .get(&title_key)
-                        .is_some_and(|state| state.hovered);
-                    let label_background = if marquee_hovered {
-                        self.colors.hover
-                    } else if active {
-                        self.colors.panel_alt
-                    } else {
-                        self.colors.panel
-                    };
-                    let label: AnyElement = if let Some(status) = program_status {
-                        let state_label = program_state_label(status.state, self.language);
-                        let mut subtitle = match (&status.title, &status.message) {
-                            (Some(title), Some(message)) if title != display_title => {
-                                format!("{title}: {message}")
-                            }
-                            (_, Some(message)) => message.clone(),
-                            (Some(title), None) if title != display_title => title.clone(),
-                            _ => state_label.to_owned(),
-                        };
-                        if let Some(progress) = status.progress {
-                            subtitle.push_str(&format!(" · {progress}%"));
-                        }
-                        let tag = matches!(
-                            status.state,
-                            TerminalProgramState::Blocked
-                                | TerminalProgramState::Done
-                                | TerminalProgramState::Error
-                        )
-                        .then_some((status.state, state_label));
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(self.render_marquee(
-                                        title_key.clone(),
-                                        display_title.to_owned(),
-                                        12.,
-                                        17.,
-                                        label_background,
-                                        cx,
-                                    ))
-                                    .when_some(tag, |row, (state, label)| {
-                                        let tint = match state {
-                                            TerminalProgramState::Blocked => {
-                                                self.interface_theme.palette[3]
-                                            }
-                                            TerminalProgramState::Error => {
-                                                self.interface_theme.palette[1]
-                                            }
-                                            _ => self.interface_theme.palette[2],
-                                        };
-                                        row.child(
-                                            div()
-                                                .flex_none()
-                                                .h(px(16.))
-                                                .px_1()
-                                                .rounded_full()
-                                                .bg(rgba((tint << 8) | 0x30))
-                                                .text_size(px(10.))
-                                                .text_color(rgb(self.colors.text))
-                                                .child(label),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .text_color(rgb(self.colors.muted))
-                                    .child(self.render_marquee(
-                                        subtitle_key.clone(),
-                                        subtitle,
-                                        11.,
-                                        15.,
-                                        label_background,
-                                        cx,
-                                    )),
-                            )
-                            .into_any_element()
-                    } else {
-                        self.render_marquee(
-                            title_key.clone(),
-                            display_title.to_owned(),
-                            12.,
-                            17.,
-                            label_background,
-                            cx,
-                        )
-                    };
-                    let height_transition =
-                        self.sidebar_status_row_transition(session_id, program_status.is_some());
-                    let row = div()
-                        .id(format!("sidebar-session-{session_id}"))
-                        .flex()
-                        .items_center()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .gap_3()
-                        .ml_5()
-                        .mr_3()
-                        .pl_1()
-                        .pr_2()
-                        .rounded_md()
-                        .mb_1()
-                        .text_size(px(12.))
-                        .text_color(rgb(if active {
-                            self.colors.text
-                        } else {
-                            self.colors.muted
-                        }))
-                        .when(active, |element| element.bg(rgb(self.colors.panel_alt)))
-                        .when_some(self.bell_flash_tint(session_id), |element, tint| {
-                            element.bg(rgba(tint))
-                        })
-                        .hover({
-                            let colors = self.colors;
-                            move |element| element.bg(rgb(colors.hover))
-                        })
-                        .on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
-                            app.set_marquee_hover(
-                                &[
-                                    format!("sidebar-title-{session_id}"),
-                                    format!("sidebar-subtitle-{session_id}"),
-                                ],
-                                *hovered,
-                                cx,
-                            );
-                            app.sidebar_preview_hover(session_id, *hovered, window, cx);
-                        }))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |app, _, window, cx| {
-                            app.dismiss_sidebar_preview(cx);
-                            app.activate_session(project_id, session_id, window, cx)
-                        }))
-                        .child(self.render_item_icon(
-                            ItemKind::Terminal,
-                            Some(session_id),
-                            format!("sidebar-progress-{session_id}"),
-                        ))
-                        .child(label);
-                    let row_bounds = self.sidebar.sidebar_row_bounds.clone();
-                    project_block = project_block.child(
-                        div()
-                            .on_children_prepainted(move |children, _, _| {
-                                if let Some(bounds) = children.first().copied() {
-                                    row_bounds.borrow_mut().insert(session_id, bounds);
-                                }
-                            })
-                            .child(if let Some((from, to, revision)) = height_transition {
-                                row.with_animation(
-                                    format!("sidebar-status-height-{session_id}-{revision}"),
-                                    Animation::new(SIDEBAR_STATUS_TRANSITION)
-                                        .with_easing(gpui::ease_in_out),
-                                    move |element, progress| {
-                                        element.h(px(from + (to - from) * progress))
-                                    },
-                                )
-                                .into_any_element()
-                            } else {
-                                row.h(px(if program_status.is_some() {
-                                    SIDEBAR_STATUS_ROW_HEIGHT
-                                } else {
-                                    SIDEBAR_SESSION_ROW_HEIGHT
-                                }))
-                                .into_any_element()
-                            }),
-                    );
-                }
+            if !collapsed && has_terminals {
+                project_block = project_block
+                    .child(self.render_sidebar_project_items(project_id, view, true, cx));
             }
             project_list = project_list.child(
                 project_block

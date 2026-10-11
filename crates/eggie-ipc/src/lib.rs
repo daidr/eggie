@@ -1,4 +1,8 @@
 //! Eggie client connections and shared wire transport, independent of daemon implementation.
+#[cfg(unix)]
+mod shared_grid;
+#[cfg(unix)]
+pub use shared_grid::{GridReader, GridWriter};
 mod client;
 pub mod wire;
 pub use client::{
