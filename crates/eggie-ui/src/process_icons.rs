@@ -24,6 +24,7 @@ pub(crate) enum ProcessIcon {
     Codex,
     ClaudeCode,
     OpenCode,
+    PiAgent,
     File,
     Browser,
     Settings,
@@ -47,6 +48,7 @@ impl ProcessIcon {
             Self::Codex => include_str!("../assets/process-icons/codex.svg"),
             Self::ClaudeCode => include_str!("../assets/process-icons/claude-code.svg"),
             Self::OpenCode => include_str!("../assets/process-icons/opencode.svg"),
+            Self::PiAgent => include_str!("../assets/process-icons/pi-agent.svg"),
             Self::File => include_str!("../assets/process-icons/file.svg"),
             Self::Browser => include_str!("../assets/process-icons/browser.svg"),
             Self::Settings => include_str!("../assets/process-icons/settings.svg"),
@@ -68,9 +70,20 @@ impl ProcessIcon {
             Self::Rust => 0xce422b,
             Self::BunJs => 0xbd6b4c,
             Self::Zig => 0xf7a41d,
-            Self::Codex | Self::OpenCode if in_card => 0x202833,
-            Self::Codex | Self::OpenCode if dark => 0xe9ecf2,
-            Self::Codex | Self::OpenCode => 0x202833,
+            Self::Codex => 0x3941ff,
+            Self::PiAgent => 0x4d9abf,
+            Self::OpenCode if in_card => 0x202833,
+            Self::OpenCode if dark => 0xe9ecf2,
+            Self::OpenCode => 0x202833,
+        }
+    }
+
+    // Match visual size across padded marks and dense, full-viewport artwork.
+    fn glyph_scale(self) -> f32 {
+        match self {
+            Self::Codex => 0.94,
+            Self::PiAgent => 0.66,
+            _ => 0.78,
         }
     }
 
@@ -90,6 +103,7 @@ impl ProcessIcon {
             Self::Codex => 0xeeeef8,
             Self::ClaudeCode => 0xd97757,
             Self::OpenCode => 0xe5ebec,
+            Self::PiAgent => 0xf4f0e8,
             Self::File => 0xe6effb,
             Self::Browser => 0xe1f4f5,
             Self::Settings => 0xf0eafb,
@@ -135,6 +149,13 @@ pub(crate) fn for_process(process: &ProcessSummary) -> ProcessIcon {
         || has_agent("opencode") && matches!(name.as_str(), "node" | "nodejs" | "bun")
     {
         return ProcessIcon::OpenCode;
+    }
+    if matches!(name.as_str(), "pi" | "pi-agent" | "pi-coding-agent")
+        || matches!(name.as_str(), "node" | "nodejs" | "bun")
+            && (has_agent("pi-coding-agent")
+                || agent.first().is_some_and(|arg| basename(arg) == "pi"))
+    {
+        return ProcessIcon::PiAgent;
     }
     match name.as_str() {
         "node" | "nodejs" | "npm" | "npx" | "pnpm" | "yarn" => ProcessIcon::NodeJs,
@@ -450,7 +471,7 @@ fn card_markup(poses: &[CardPose], dark: bool, card_size: f32, width: f32) -> St
         let angle = pose.angle;
         let opacity = pose.opacity;
         let radius = (card_size * 0.28).min(6.);
-        let glyph_size = card_size * 0.78;
+        let glyph_size = card_size * icon.glyph_scale();
         let glyph_x = x + (card_width - glyph_size) / 2.;
         let glyph_y = y + (card_size - glyph_size) / 2.;
         let art_x = x + 1.15;
@@ -543,6 +564,31 @@ mod tests {
             for_process(&process("node", &["node", "/opt/claude-code/cli.js"])),
             ProcessIcon::ClaudeCode
         );
+        for (name, args) in [
+            ("/usr/local/bin/pi", vec!["pi"]),
+            ("node", vec!["node", "/usr/local/bin/pi"]),
+            (
+                "node",
+                vec![
+                    "node",
+                    "--no-warnings",
+                    "/opt/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                ],
+            ),
+            (
+                "bun",
+                vec![
+                    "bun",
+                    "/opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+                ],
+            ),
+        ] {
+            assert_eq!(for_process(&process(name, &args)), ProcessIcon::PiAgent);
+        }
+        assert_eq!(
+            for_process(&process("node", &["node", "server.js", "--prompt", "pi"])),
+            ProcessIcon::NodeJs
+        );
         assert_eq!(
             for_process(&process("zsh", &["zsh"])),
             ProcessIcon::Terminal
@@ -567,6 +613,8 @@ mod tests {
         assert_eq!(for_session(&session), ProcessIcon::GitDiff);
         session.active_command = Some("claude".into());
         assert_eq!(for_session(&session), ProcessIcon::ClaudeCode);
+        session.active_command = Some("pi".into());
+        assert_eq!(for_session(&session), ProcessIcon::PiAgent);
         session.active_command = None;
         session.program_status = Some(eggie_protocol::TerminalProgramStatus {
             state: eggie_protocol::TerminalProgramState::Working,
@@ -577,6 +625,8 @@ mod tests {
             progress: None,
         });
         assert_eq!(for_session(&session), ProcessIcon::ClaudeCode);
+        session.program_status.as_mut().unwrap().app = Some("pi-agent".into());
+        assert_eq!(for_session(&session), ProcessIcon::PiAgent);
         session.program_status = None;
         session.current_process = process("node", &["node", "server.js"]);
         assert_eq!(for_session(&session), ProcessIcon::NodeJs);
@@ -615,6 +665,7 @@ mod tests {
             ProcessIcon::Codex,
             ProcessIcon::ClaudeCode,
             ProcessIcon::OpenCode,
+            ProcessIcon::PiAgent,
             ProcessIcon::File,
             ProcessIcon::Browser,
             ProcessIcon::Settings,
