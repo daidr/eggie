@@ -1,10 +1,11 @@
-
 use super::*;
 use uuid::Uuid;
 
 /// Minimal snapshot carrying only the fields `plain_lines`/`has_scheme_candidate` read.
 fn snapshot_with_cells(columns: u16, rows: u16, cells: Vec<TerminalCell>) -> TerminalSnapshot {
     TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         session_id: Uuid::nil(),
         size: TerminalSize {
             columns,
@@ -12,7 +13,7 @@ fn snapshot_with_cells(columns: u16, rows: u16, cells: Vec<TerminalCell>) -> Ter
             cell_width: 0,
             cell_height: 0,
         },
-        cells,
+        cells: cells.into(),
         color_overrides: Vec::new(),
         cursor_line: 0,
         cursor_column: 0,
@@ -380,7 +381,7 @@ fn set_scrollback_limit_request_round_trips() {
 fn create_session_carries_scrollback_and_shell_overrides() {
     let request = ClientRequest::CreateSession {
         project_id: Uuid::nil(),
-        window_id: Uuid::nil(),
+
         cwd: PathBuf::from("/tmp"),
         size: TerminalSize::default(),
         appearance: TerminalAppearance::default(),
@@ -416,10 +417,10 @@ fn create_session_carries_scrollback_and_shell_overrides() {
 #[test]
 fn create_session_shell_overrides_default_to_empty_when_absent() {
     // A request omitting the optional shell fields (older client shape) decodes with empty/zero
-    // defaults. `window_id` is required in v27, so it is always present.
+    // defaults; project identity is required independently of any window.
     let appearance = serde_json::to_string(&TerminalAppearance::default()).unwrap();
     let json = format!(
-        r#"{{"type":"create_session","project_id":"00000000-0000-0000-0000-000000000000","window_id":"00000000-0000-0000-0000-000000000000","cwd":"/tmp","size":{{"columns":80,"rows":24,"cell_width":8,"cell_height":16}},"appearance":{appearance}}}"#
+        r#"{{"type":"create_session","project_id":"00000000-0000-0000-0000-000000000000","cwd":"/tmp","size":{{"columns":80,"rows":24,"cell_width":8,"cell_height":16}},"appearance":{appearance}}}"#
     );
     let decoded: ClientRequest = serde_json::from_str(&json).unwrap();
     match decoded {
@@ -628,6 +629,8 @@ fn handshake_without_a_build_id_is_treated_as_a_stale_daemon() {
 #[test]
 fn render_snapshot_round_trips_without_losing_terminal_semantics() {
     let snapshot = TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         session_id: Uuid::nil(),
         size: TerminalSize {
             columns: 2,
@@ -644,7 +647,8 @@ fn render_snapshot_round_trips_without_losing_terminal_semantics() {
             underline_color: Some(TerminalColor::Rgb(0x112233ff)),
             hyperlink: Some("https://example.com".to_owned()),
             flags: 0x4a0a,
-        }],
+        }]
+        .into(),
         color_overrides: vec![TerminalColorOverride {
             index: 1,
             color: 0x123456ff,
@@ -731,6 +735,8 @@ fn snapshot_cursor_blinking_defaults_to_false_when_absent() {
 
     // And when present it round-trips.
     let blinking = TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         cursor_blinking: true,
         ..snapshot
     };
@@ -776,6 +782,8 @@ fn snapshot_without_scroll_position_keys_decodes_to_zero() {
 #[test]
 fn snapshot_delta_replaces_and_clears_cells_without_losing_metadata() {
     let snapshot = TerminalSnapshot {
+        prompt_editable: false,
+        prompt_input: None,
         session_id: Uuid::nil(),
         size: TerminalSize {
             columns: 3,
@@ -805,7 +813,8 @@ fn snapshot_delta_replaces_and_clears_cells_without_losing_metadata() {
                 hyperlink: None,
                 flags: 0,
             },
-        ],
+        ]
+        .into(),
         color_overrides: Vec::new(),
         cursor_line: 0,
         cursor_column: 1,
@@ -861,6 +870,13 @@ fn snapshot_delta_replaces_and_clears_cells_without_losing_metadata() {
         flags: 4,
     };
     let delta = TerminalSnapshotDelta {
+        prompt_editable: true,
+        prompt_input: Some(PromptInput {
+            text: "echo 中".into(),
+            cursor: "echo 中".len(),
+            native: true,
+            ..Default::default()
+        }),
         session_id: Uuid::nil(),
         base_revision: 4,
         size: snapshot.size,
@@ -905,6 +921,20 @@ fn snapshot_delta_replaces_and_clears_cells_without_losing_metadata() {
     // Scroll position is taken from the delta (like cursor_line), not diffed against the base.
     assert_eq!(updated.display_offset, 5);
     assert_eq!(updated.history_size, 200);
+    assert_eq!(updated.prompt_input, delta.prompt_input);
+    assert!(updated.prompt_editable);
+    let mut clear = delta.clone();
+    clear.base_revision = updated.revision;
+    clear.revision += 1;
+    clear.prompt_input = None;
+    let pending = updated.apply_delta(&clear).unwrap();
+    assert!(pending.prompt_input.is_none());
+    assert!(
+        pending.prompt_editable,
+        "a redraw must retain prompt ownership"
+    );
+    clear.prompt_editable = false;
+    assert!(!updated.apply_delta(&clear).unwrap().prompt_editable);
     let mut wrong_base = delta;
     wrong_base.base_revision = 3;
     assert!(snapshot.apply_delta(&wrong_base).is_none());

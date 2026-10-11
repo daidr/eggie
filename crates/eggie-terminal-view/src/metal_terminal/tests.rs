@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// `font_metrics` takes the family and size as arguments — the caller reads them from the
@@ -498,6 +497,121 @@ fn color_atlas_allocation_is_lazy_and_does_not_expand_the_text_path() {
         GlyphTextureKind::Color
     );
     assert!(atlas.color_texture.is_some());
+    assert_eq!(atlas.color_texture().height(), INITIAL_ATLAS_SIZE as u64);
+    assert!(atlas.mask_texture.height() < MASK_ATLAS_SIZE as u64);
+}
+
+#[test]
+fn atlas_growth_preserves_pixels_coordinates_and_original_capacity() {
+    let device = Device::system_default().expect("Metal device for atlas regression test");
+    let raster_cache = GlyphRasterCache::default();
+    for (kind, limit, channels) in [
+        (GlyphTextureKind::Mask, MASK_ATLAS_SIZE, 1),
+        (GlyphTextureKind::Color, COLOR_ATLAS_SIZE, 4),
+    ] {
+        let mut atlas = GlyphAtlas::new(&device);
+        let mut original_allocator = ShelfAllocator::default();
+        let pixels = vec![173; 256 * 128 * channels];
+        let rasterized = Arc::new(match kind {
+            GlyphTextureKind::Mask => RasterizedGlyph::exact_mask(pixels.clone(), 256, 128),
+            GlyphTextureKind::Color => RasterizedGlyph::Color(RasterizedImage {
+                pixels: pixels.clone(),
+                width: 256,
+                height: 128,
+                offset: [0, 0],
+            }),
+        });
+        let mut first = None;
+        for index in 0..1000 {
+            let key = text_glyph_key(&format!("{kind:?}-{index}"), "Test", 16, 256, 256, 128);
+            raster_cache.install_synchronous(key.clone(), rasterized.clone(), Duration::ZERO);
+            let lookup = atlas.get_or_insert(&device, &raster_cache, key.clone());
+            let Some(expected) = original_allocator.allocate(256, 128, limit) else {
+                assert!(lookup.err().unwrap().to_string().contains("atlas is full"));
+                break;
+            };
+            let actual = lookup.unwrap().glyph.entry;
+            assert_eq!((actual.x, actual.y), (expected.x, expected.y));
+            first.get_or_insert((key, actual));
+            let texture = match kind {
+                GlyphTextureKind::Mask => &atlas.mask_texture,
+                GlyphTextureKind::Color => atlas.color_texture(),
+            };
+            for entry in [actual, first.as_ref().unwrap().1] {
+                let mut readback = vec![0; pixels.len()];
+                texture.get_bytes(
+                    readback.as_mut_ptr().cast(),
+                    (256 * channels) as u64,
+                    atlas_region(entry),
+                    0,
+                );
+                assert_eq!(
+                    readback, pixels,
+                    "growth must not lose old or new glyph pixels"
+                );
+            }
+        }
+        let texture = match kind {
+            GlyphTextureKind::Mask => &atlas.mask_texture,
+            GlyphTextureKind::Color => atlas.color_texture(),
+        };
+        assert_eq!(
+            (texture.width(), texture.height()),
+            (limit as u64, limit as u64)
+        );
+        let (key, first) = first.unwrap();
+        let cached = atlas.get_or_insert(&device, &raster_cache, key).unwrap();
+        assert!(cached.hit);
+        assert_eq!(
+            (cached.glyph.entry.x, cached.glyph.entry.y),
+            (first.x, first.y)
+        );
+        atlas.reset();
+        assert!(atlas.entries.is_empty());
+        assert_eq!(atlas.mask_allocator.next_x, 0);
+        assert_eq!(atlas.color_allocator.next_x, 0);
+    }
+}
+
+#[test]
+fn a_failed_shelf_allocation_does_not_change_the_next_tile_position() {
+    let mut allocator = ShelfAllocator::default();
+    allocator.allocate(500, 500, 512).unwrap();
+    assert!(allocator.allocate(30, 30, 512).is_none());
+    let next = allocator.allocate(30, 30, 1024).unwrap();
+    assert_eq!((next.x, next.y), (501, 0));
+}
+
+#[test]
+fn demand_allocated_raster_queue_keeps_backpressure_and_disconnect_cleanup() {
+    let (sender, receiver) = channel();
+    let cache = GlyphRasterCache {
+        entries: Arc::new(Mutex::new(FxHashMap::default())),
+        sender,
+        counters: Arc::new(GlyphRasterCounters::default()),
+        frame: Arc::new(AtomicU64::new(0)),
+    };
+    let mut terminal = prepared_with_families(None);
+    terminal.commands.push(glyph_command(false, false));
+    cache
+        .counters
+        .pending
+        .store(GLYPH_QUEUE_CAPACITY, Ordering::Relaxed);
+    assert!(cache.prepare_terminal(&terminal, 1., [0., 0.]).ready);
+    assert!(cache.entries.lock().is_empty());
+    assert!(receiver.try_recv().is_err());
+
+    cache.counters.pending.store(0, Ordering::Relaxed);
+    assert!(!cache.prepare_terminal(&terminal, 1., [0., 0.]).ready);
+    assert!(receiver.try_recv().is_ok());
+    assert_eq!(cache.counters.pending.load(Ordering::Relaxed), 1);
+
+    cache.entries.lock().clear();
+    cache.counters.pending.store(0, Ordering::Relaxed);
+    drop(receiver);
+    assert!(cache.prepare_terminal(&terminal, 1., [0., 0.]).ready);
+    assert!(cache.entries.lock().is_empty());
+    assert_eq!(cache.counters.pending.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -530,9 +644,19 @@ fn metal_reads_consecutive_instances_with_the_cpu_stride() {
     let Some(device) = Device::system_default() else {
         return;
     };
-    let library = device
-        .new_library_with_source(SHADER, &CompileOptions::new())
-        .expect("terminal Metal shader must compile");
+    for library in [
+        device
+            .new_library_with_source(SHADER, &CompileOptions::new())
+            .expect("terminal Metal source must compile"),
+        device
+            .new_library_with_data(SHADER_LIBRARY)
+            .expect("bundled terminal library must load"),
+    ] {
+        assert_terminal_shader_pixels(&device, &library);
+    }
+}
+
+fn assert_terminal_shader_pixels(device: &DeviceRef, library: &metal::LibraryRef) {
     let descriptor = RenderPipelineDescriptor::new();
     descriptor.set_vertex_function(Some(
         &library
@@ -629,7 +753,7 @@ fn metal_reads_consecutive_instances_with_the_cpu_stride() {
             size: [4., 4.],
             color: [16. / 255., 16. / 255., 16. / 255., 1.],
             uv_origin: [0., 0.],
-            uv_size: [1. / MASK_ATLAS_SIZE as f32, 1. / MASK_ATLAS_SIZE as f32],
+            uv_size: [1., 1.],
             metadata: [GlyphTextureKind::Mask as u32, 0x101010ff, 3f32.to_bits(), 0],
         },
         Instance {
@@ -650,7 +774,7 @@ fn metal_reads_consecutive_instances_with_the_cpu_stride() {
             size: [4., 4.],
             color: [16. / 255., 16. / 255., 16. / 255., 1.],
             uv_origin: [0., 0.],
-            uv_size: [1. / MASK_ATLAS_SIZE as f32, 1. / MASK_ATLAS_SIZE as f32],
+            uv_size: [1., 1.],
             metadata: [
                 GlyphTextureKind::Mask as u32,
                 0x101010ff,

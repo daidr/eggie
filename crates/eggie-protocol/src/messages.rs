@@ -31,9 +31,6 @@ pub enum ClientRequest {
     },
     CreateSession {
         project_id: ProjectId,
-        /// Identity of the window that owns this session. Each GUI window sees only the sessions it
-        /// owns (plus unowned/detached ones); the daemon tags the session with this id on creation.
-        window_id: WindowId,
         cwd: PathBuf,
         size: TerminalSize,
         appearance: TerminalAppearance,
@@ -95,6 +92,12 @@ pub enum ClientRequest {
         after_revision: u64,
         timeout_ms: u32,
     },
+    /// Rendering subscribers receive leased immutable rows; ordinary snapshots remain value data.
+    WaitForRenderFrame {
+        session_id: SessionId,
+        after_revision: u64,
+        timeout_ms: u32,
+    },
     WaitForProgress {
         session_id: SessionId,
         after_revision: u64,
@@ -104,6 +107,12 @@ pub enum ClientRequest {
         session_id: SessionId,
         after_revision: u64,
         timeout_ms: u32,
+    },
+    TerminalCompletions {
+        session_id: SessionId,
+        input: PromptInput,
+        /// Enqueue a native query; candidates arrive via the input revision and a non-native fetch.
+        native: bool,
     },
     GetShellIntegrationState {
         session_id: SessionId,
@@ -244,18 +253,6 @@ pub enum ClientRequest {
     Terminate {
         session_id: SessionId,
     },
-    /// Reassign a session's owning window. Used to claim a detached (unowned) session into the
-    /// requesting window, or to move a session between windows. The daemon replies with
-    /// [`DaemonResponse::SessionClaimed`] carrying the updated summary.
-    ClaimSession {
-        session_id: SessionId,
-        window_id: WindowId,
-    },
-    /// Detach every session owned by `window_id`, clearing their ownership so they survive the
-    /// window closing and become claimable from any window. Sent right before a window is removed.
-    DetachWindow {
-        window_id: WindowId,
-    },
     /// Open a port forward on a session's ssh master. The daemon replies with [`DaemonResponse::Ok`].
     ForwardPort {
         session_id: SessionId,
@@ -358,11 +355,6 @@ pub enum DaemonResponse {
     SessionCreated {
         session: SessionSummary,
     },
-    /// Reply to [`ClientRequest::ClaimSession`]: the session's ownership was updated to the
-    /// requesting window. Carries the refreshed summary (with the new `window_id`).
-    SessionClaimed {
-        session: SessionSummary,
-    },
     Sessions {
         sessions: Vec<SessionSummary>,
     },
@@ -391,6 +383,11 @@ pub enum DaemonResponse {
     OscEventsUnchanged {
         session_id: SessionId,
         revision: u64,
+    },
+    TerminalCompletions {
+        session_id: SessionId,
+        input: PromptInput,
+        items: Vec<CompletionItem>,
     },
     ShellIntegrationState {
         session_id: SessionId,

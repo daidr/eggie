@@ -32,10 +32,17 @@ pub(super) fn marquee_offset(state: MarqueeState, now: Instant) -> f32 {
 
 pub(super) struct SidebarPreviewState {
     pub(super) session_id: SessionId,
+    pub(super) content_revision: u64,
     pub(super) window: gpui::WindowHandle<PopupWindow>,
     pub(super) anchor_hovered: bool,
     pub(super) popup_hovered: bool,
     pub(super) leave_revision: u64,
+}
+
+impl SidebarPreviewState {
+    pub(super) fn is_current_target(&self, session_id: SessionId, revision: u64) -> bool {
+        self.session_id == session_id && self.content_revision == revision
+    }
 }
 
 pub(super) struct ProjectPopoverState {
@@ -44,15 +51,33 @@ pub(super) struct ProjectPopoverState {
     pub(super) anchor_hovered: bool,
     pub(super) popup_hovered: bool,
     pub(super) leave_revision: u64,
+    pub(super) keyboard_target: Rc<std::cell::Cell<Option<ItemId>>>,
+    pub(super) scroll: ScrollHandle,
+}
+
+pub(super) struct ProjectSelectorState {
+    pub(super) window: gpui::WindowHandle<PopupWindow>,
+    pub(super) keyboard_target: Rc<std::cell::Cell<ProjectId>>,
+    pub(super) scroll: ScrollHandle,
 }
 
 pub(super) struct ProjectPopoverTab {
-    pub(super) group_id: GroupId,
+    pub(super) location: eggie_domain::ItemLocation,
+    pub(super) session_id: Option<SessionId>,
     pub(super) item_id: ItemId,
     pub(super) title: String,
     pub(super) subtitle: Option<String>,
     pub(super) icon: ProcessIcon,
     pub(super) active: bool,
+}
+
+pub(super) fn project_popover_selection_index(
+    tabs: &[ProjectPopoverTab],
+    keyboard_target: Option<ItemId>,
+) -> Option<usize> {
+    keyboard_target
+        .and_then(|id| tabs.iter().position(|tab| tab.item_id == id))
+        .or_else(|| tabs.iter().position(|tab| tab.active))
 }
 
 pub(super) fn program_state_label(state: TerminalProgramState, language: Language) -> &'static str {
@@ -123,10 +148,7 @@ pub(super) const TERMINAL_SCROLLBAR_WIDTH: f32 = 12.;
 pub(super) const TERMINAL_SCROLLBAR_THUMB_WIDTH: f32 = 6.;
 pub(super) const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 24.;
 pub(super) const SESSION_INSPECTION_INTERVAL: Duration = Duration::from_secs(1);
-pub(super) const SESSION_LIST_INTERVAL: Duration = Duration::from_millis(500);
 pub(super) const SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
-pub(super) const PROGRESS_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
-pub(super) const OSC_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 pub(super) const PROCESS_ROW_HEIGHT: f32 = 20.;
 pub(super) const TERMINAL_IMAGE_CHUNK_SIZE: u32 = 16 * 1024 * 1024;
 /// A bell triggers a single smooth pulse: the tab tint fades in, then back out, over this span.
@@ -271,7 +293,6 @@ pub(super) static NEXT_INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(crate) struct NotificationRoute {
-    pub(crate) app: WeakEntity<EggieApp>,
     pub(crate) client: DaemonClient,
     pub(crate) session_id: SessionId,
     pub(crate) notification_id: String,
@@ -387,6 +408,9 @@ pub(super) struct CommandPaletteUi {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PaletteMode {
     Commands,
+    Terminals,
+    Windows,
+    MoveToWindow(eggie_domain::ItemLocation),
     /// The profile picker: rows are profiles, confirming launches a terminal from the chosen one.
     Profiles,
     /// The same profile list, but confirming sets the named project's default profile instead of
@@ -403,86 +427,6 @@ pub(super) struct PaletteRow {
     pub(super) trailing: Option<String>,
     /// Leading accent dot (`0xRRGGBB`) for a profile that defines one.
     pub(super) badge_color: Option<u32>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct ProjectIconCard {
-    pub(super) id: Option<ItemId>,
-    pub(super) icon: ProcessIcon,
-}
-
-#[derive(Clone)]
-pub(super) struct ProjectIconState {
-    pub(super) icons: Vec<ProjectIconCard>,
-    pub(super) previous: Vec<ProjectIconCard>,
-    pub(super) revision: u64,
-    pub(super) started_at: Instant,
-}
-
-pub(super) fn project_card_poses(
-    previous: &[ProjectIconCard],
-    current: &[ProjectIconCard],
-    progress: f32,
-) -> Vec<process_icons::CardPose> {
-    let at = |icon, index, count| process_icons::CardPose {
-        icon,
-        offset_x: index as f32 * 5.,
-        angle: process_icons::stack_angle(index, count),
-        opacity: 1.,
-    };
-    let tween =
-        |from: process_icons::CardPose, to: process_icons::CardPose| process_icons::CardPose {
-            icon: to.icon,
-            offset_x: from.offset_x + (to.offset_x - from.offset_x) * progress,
-            angle: from.angle + (to.angle - from.angle) * progress,
-            opacity: from.opacity + (to.opacity - from.opacity) * progress,
-        };
-    let mut poses = Vec::with_capacity(previous.len() + current.len());
-    for (index, card) in previous.iter().enumerate().rev() {
-        let target = current.iter().position(|next| next.id == card.id);
-        if target.is_some_and(|target| current[target].icon == card.icon) {
-            continue;
-        }
-        let from = at(card.icon, index, previous.len());
-        let to = if card.icon == ProcessIcon::ProjectPlaceholder {
-            from
-        } else if let Some(target) = target {
-            at(card.icon, target, current.len())
-        } else if current.is_empty() {
-            at(card.icon, 0, 1)
-        } else {
-            at(card.icon, current.len() - 1, current.len())
-        };
-        poses.push(tween(from, process_icons::CardPose { opacity: 0., ..to }));
-    }
-    for (index, card) in current.iter().enumerate().rev() {
-        let target = at(card.icon, index, current.len());
-        let from = if card.icon == ProcessIcon::ProjectPlaceholder {
-            process_icons::CardPose {
-                opacity: 0.,
-                ..target
-            }
-        } else if let Some(previous_index) = previous.iter().position(|old| old.id == card.id) {
-            let previous_card = previous[previous_index];
-            let mut from = at(card.icon, previous_index, previous.len());
-            if previous_card.icon != card.icon {
-                from.opacity = 0.;
-            }
-            from
-        } else if previous.is_empty() {
-            process_icons::CardPose {
-                opacity: 0.,
-                ..target
-            }
-        } else {
-            process_icons::CardPose {
-                opacity: 0.,
-                ..at(card.icon, previous.len() - 1, previous.len())
-            }
-        };
-        poses.push(tween(from, target));
-    }
-    poses
 }
 
 #[derive(Clone, Copy)]
@@ -520,6 +464,8 @@ impl SidebarStatusRowState {
 
 #[derive(Clone, Debug)]
 pub(super) struct DraggedTab {
+    pub(super) source_window_id: WindowId,
+    pub(super) project_id: ProjectId,
     pub(super) source_group_id: GroupId,
     pub(super) item_id: ItemId,
     pub(super) icon: ProcessIcon,
@@ -655,18 +601,11 @@ impl DirectoryField {
     }
 }
 
-/// How a freshly opened window should seed its initial project/session state.
 pub(crate) enum NewWindowInit {
-    /// The process's first window (cold start). Reconcile the persisted project list with the
-    /// daemon's existing sessions: adopt a project for `project_root`, claim surviving sessions into
-    /// this window, and open a default terminal if the daemon had nothing.
-    ColdStart { project_root: PathBuf },
-    /// A `New Window` (Cmd+N) opened at runtime. The shared project list already exists; activate the
-    /// first project and show it empty (D7: no terminal is spawned until the user acts).
     Empty,
-    /// A single-instance wake (`eggie <dir>`). Activate `project_id` and open one default terminal in
-    /// it, since running `eggie <dir>` is an explicit request for a terminal there.
+    EmptyAt(Point<Pixels>),
     OpenDir { project_id: ProjectId },
+    Restore(eggie_domain::WindowPresentation),
 }
 
 /// Fallback working directory when a project's root can't be resolved: the user's home, or `.`.

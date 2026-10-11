@@ -1,5 +1,5 @@
-
 use super::*;
+use eggie_themes::minimum_contrast_rgb;
 use std::fs;
 
 #[test]
@@ -337,6 +337,7 @@ fn an_existing_settings_file_keeps_its_chosen_themes() {
     .unwrap();
     assert_eq!(config.interface_dark_theme, "Atom One Dark");
     assert_eq!(config.interface_light_theme, "iTerm2 Solarized Light");
+    assert_eq!(config.sidebar_layout, SidebarLayout::AllProjects);
     // An old file says nothing about the terminal layer, so it follows the interface — which is
     // exactly the behaviour that file was written under.
     assert_eq!(
@@ -351,6 +352,7 @@ fn settings_round_trip_and_normalize_font_size() {
     let path = directory.join("settings.json");
     let mut config = AppSettings {
         language: Language::English,
+        sidebar_layout: SidebarLayout::SingleProject,
         theme_mode: ThemeMode::Light,
         interface_dark_theme: "Catppuccin Mocha".to_owned(),
         interface_light_theme: "Ayu Light".to_owned(),
@@ -376,6 +378,7 @@ fn settings_round_trip_and_normalize_font_size() {
         progress_complete_timeout_secs: 0,
         progress_stale_timeout_secs: u32::MAX,
         allow_osc_clipboard_read: true,
+        terminal_suggestions: true,
         detect_urls: false,
         copy_on_select: false,
         auto_check_updates: true,
@@ -400,6 +403,7 @@ fn settings_round_trip_and_normalize_font_size() {
     fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
 
     let loaded = SettingsStore::load_from(path);
+    assert_eq!(loaded.config.sidebar_layout, SidebarLayout::SingleProject);
     assert_eq!(loaded.config.font_size, MAX_FONT_SIZE);
     // Remembered remote-install answers survive a round trip: being re-asked on every launch
     // would defeat the point of recording the decision.

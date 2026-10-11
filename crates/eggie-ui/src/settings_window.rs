@@ -5,6 +5,7 @@ mod editing;
 mod gallery;
 mod keybindings;
 mod profiles;
+mod sections;
 mod selector;
 use std::sync::{Arc, OnceLock};
 
@@ -18,9 +19,8 @@ use crate::{
         DEFAULT_LIGHT_THEME, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST,
         MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING, MIN_FONT_SIZE,
         MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
-        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, TerminalTheme,
-        TerminalThemeSource, ThemeMode, UiColors, UpdateChannel, minimum_contrast_rgb,
-        theme_catalog,
+        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, SidebarLayout, TerminalTheme,
+        TerminalThemeSource, ThemeMode, UiColors, UpdateChannel, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };
@@ -379,6 +379,7 @@ pub(crate) fn open_settings_window(
                 )),
             }),
             app_owns_titlebar_drag: true,
+            buffering: gpui::WindowBuffering::Double,
             window_bounds: Some(WindowBounds::centered(
                 size(px(SETTINGS_WIDTH), px(SETTINGS_HEIGHT)),
                 cx,
@@ -413,20 +414,38 @@ fn monospace_font_names(cx: &App) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 fn monospace_font_names_uncached(_cx: &App) -> Vec<String> {
-    use core_foundation::{array::CFArray, base::TCFType};
-    use core_text::font_collection::create_for_all_families;
-    use core_text::font_descriptor::{CTFontDescriptor, SymbolicTraitAccessors, TraitAccessors};
+    macos_monospace_font_names()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_monospace_font_names() -> Vec<String> {
+    use core_foundation::{
+        array::CFArray, base::TCFType, dictionary::CFDictionary, number::CFNumber, set::CFSet,
+        string::CFString,
+    };
+    use core_text::font_descriptor::{
+        CTFontDescriptor, CTFontDescriptorCreateMatchingFontDescriptors, SymbolicTraitAccessors,
+        TraitAccessors, kCTFontMonoSpaceTrait, kCTFontSymbolicTrait, kCTFontTraitsAttribute,
+        new_from_attributes,
+    };
     use std::collections::HashSet;
 
-    let collection = create_for_all_families();
+    // Ask CoreText for monospace faces directly instead of materializing every installed face.
     let descriptors: Option<CFArray<CTFontDescriptor>> = unsafe {
-        unsafe extern "C" {
-            fn CTFontCollectionCreateMatchingFontDescriptors(
-                collection: core_text::font_collection::CTFontCollectionRef,
-            ) -> core_foundation::array::CFArrayRef;
-        }
-        let array_ref =
-            CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
+        let traits_key = CFString::wrap_under_get_rule(kCTFontTraitsAttribute);
+        let symbolic_key = CFString::wrap_under_get_rule(kCTFontSymbolicTrait);
+        let traits = CFDictionary::from_CFType_pairs(&[(
+            symbolic_key,
+            CFNumber::from(kCTFontMonoSpaceTrait as i64).as_CFType(),
+        )]);
+        let attributes =
+            CFDictionary::from_CFType_pairs(&[(traits_key.clone(), traits.as_CFType())]);
+        let query = new_from_attributes(&attributes);
+        let mandatory = CFSet::from_slice(&[traits_key]);
+        let array_ref = CTFontDescriptorCreateMatchingFontDescriptors(
+            query.as_concrete_TypeRef(),
+            mandatory.as_concrete_TypeRef(),
+        );
         if array_ref.is_null() {
             None
         } else {
@@ -892,18 +911,11 @@ impl gpui::Render for SettingsWindow {
             .exists
             .then(|| self.settings.read(cx).lua_config().path.clone());
         let system_is_dark = is_dark_appearance(window.appearance());
-        // The settings window's own chrome follows the resolved *interface* theme, while the preview
-        // swatch below follows the resolved *terminal* theme — so hovering an interface option repaints
-        // the window, hovering a terminal option repaints only the swatch, and each preview shows
-        // exactly what committing it would do.
+        // Settings chrome follows the interface layer, including a live interface hover preview.
         let interface_theme = self
             .settings
             .read(cx)
             .resolved_interface_theme(system_is_dark);
-        let terminal_theme = self
-            .settings
-            .read(cx)
-            .resolved_terminal_theme(system_is_dark);
         if !std::ptr::eq(self.colors_for_theme, interface_theme) {
             let colors = UiColors::from_theme(interface_theme);
             let style = settings_input_style(colors);
@@ -935,216 +947,7 @@ impl gpui::Render for SettingsWindow {
         // the selected profile was deleted elsewhere (reading the store here is what subscribes this
         // view to it, so that mutation repaints us and the stale id resolves to the built-in Default).
         self.sync_profile_inputs(cx);
-        let language_control = self.render_language_control(language, cx);
-        let bell_control = self.render_bell_control(config.bell_mode, window, cx);
-        let mode_control = self.render_mode_control(config.theme_mode, cx);
-        let interface_light_gallery = self.render_theme_gallery(
-            SelectorKind::InterfaceLight,
-            language.interface_light_theme_row(),
-            language.interface_light_theme_description(),
-            &config.interface_light_theme,
-            window,
-            cx,
-        );
-        let interface_dark_gallery = self.render_theme_gallery(
-            SelectorKind::InterfaceDark,
-            language.interface_dark_theme_row(),
-            language.interface_dark_theme_description(),
-            &config.interface_dark_theme,
-            window,
-            cx,
-        );
-        let terminal_theme_source_control =
-            self.render_terminal_theme_source_control(config.terminal_theme_source, cx);
-        // Only built when the terminal uses its own pair: under `FollowInterface` these two rows are
-        // omitted entirely rather than shown disabled, so the panel states what is actually in effect.
-        let terminal_theme_galleries =
-            (config.terminal_theme_source == TerminalThemeSource::Custom).then(|| {
-                (
-                    self.render_theme_gallery(
-                        SelectorKind::TerminalLight,
-                        language.terminal_light_theme_row(),
-                        language.terminal_light_theme_description(),
-                        &config.terminal_light_theme,
-                        window,
-                        cx,
-                    ),
-                    self.render_theme_gallery(
-                        SelectorKind::TerminalDark,
-                        language.terminal_dark_theme_row(),
-                        language.terminal_dark_theme_description(),
-                        &config.terminal_dark_theme,
-                        window,
-                        cx,
-                    ),
-                )
-            });
-        let font_selector = self.render_selector(
-            "font-selector",
-            config.font_family.clone(),
-            Some(config.font_family.clone()),
-            SelectorKind::Font,
-            window,
-            cx,
-        );
-        // Per-style family selectors. An empty stored value means "fall back to the regular family";
-        // show a localized hint and preview in the regular family in that case.
-        let style_family_selector = |this: &Self,
-                                     id: &'static str,
-                                     stored: &str,
-                                     kind: SelectorKind,
-                                     window: &Window,
-                                     cx: &mut Context<Self>| {
-            let has_value = !stored.trim().is_empty();
-            let display = if has_value {
-                stored.to_owned()
-            } else {
-                language.font_family_use_regular().to_owned()
-            };
-            let preview_family = if has_value {
-                stored.to_owned()
-            } else {
-                config.font_family.clone()
-            };
-            this.render_selector(id, display, Some(preview_family), kind, window, cx)
-        };
-        let font_bold_selector = style_family_selector(
-            self,
-            "font-bold-selector",
-            &config.font_family_bold,
-            SelectorKind::FontBold,
-            window,
-            cx,
-        );
-        let font_italic_selector = style_family_selector(
-            self,
-            "font-italic-selector",
-            &config.font_family_italic,
-            SelectorKind::FontItalic,
-            window,
-            cx,
-        );
-        let font_bold_italic_selector = style_family_selector(
-            self,
-            "font-bold-italic-selector",
-            &config.font_family_bold_italic,
-            SelectorKind::FontBoldItalic,
-            window,
-            cx,
-        );
-        let synthetic_bold_control = self.render_synthetic_style_control(
-            SyntheticStyleKind::Bold,
-            config.font_synthetic_style.bold,
-            cx,
-        );
-        let synthetic_italic_control = self.render_synthetic_style_control(
-            SyntheticStyleKind::Italic,
-            config.font_synthetic_style.italic,
-            cx,
-        );
-        let synthetic_bold_italic_control = self.render_synthetic_style_control(
-            SyntheticStyleKind::BoldItalic,
-            config.font_synthetic_style.bold_italic,
-            cx,
-        );
-        let ligatures_control = self.render_ligatures_control(config.ligatures, cx);
-        let shaping_break_control =
-            self.render_shaping_break_control(config.font_shaping_break_cursor, cx);
-        let font_thicken_control = self.render_font_thicken_control(config.font_thicken, cx);
-        let font_thicken_strength_control =
-            self.render_font_thicken_strength_control(config.font_thicken_strength, cx);
-        let font_size_control = self.render_font_size_control(config.font_size, cx);
-        let cursor_shape_control = self.render_cursor_shape_control(config.cursor_shape, cx);
-        let cursor_blink_control = self.render_cursor_blink_control(config.cursor_blink, cx);
-        let minimum_contrast_control =
-            self.render_minimum_contrast_control(config.minimum_contrast, cx);
-        // The Theme section, assembled here rather than inline because two of its rows are conditional
-        // and the section list sits several levels deep in the element tree.
-        //
-        // Order tells the story of the layering: the interface pair first (it decides the chrome, and
-        // the terminal follows it by default), then the terminal's own source and — only when it has
-        // one — its pair.
-        let mut theme_rows = vec![
-            settings_row(
-                language.theme_row(),
-                language.theme_description(),
-                mode_control,
-                self.colors,
-            ),
-            interface_light_gallery,
-            interface_dark_gallery,
-            settings_row(
-                language.terminal_theme_source_row(),
-                language.terminal_theme_source_description(),
-                terminal_theme_source_control,
-                self.colors,
-            ),
-        ];
-        if let Some((terminal_light_gallery, terminal_dark_gallery)) = terminal_theme_galleries {
-            theme_rows.push(terminal_light_gallery);
-            theme_rows.push(terminal_dark_gallery);
-        }
-        theme_rows.push(settings_row(
-            language.minimum_contrast_row(),
-            language.minimum_contrast_description(),
-            minimum_contrast_control,
-            self.colors,
-        ));
-        let horizontal_padding_control = self.render_terminal_padding_control(
-            PaddingAxis::Horizontal,
-            config.terminal_padding_x,
-            cx,
-        );
-        let vertical_padding_control = self.render_terminal_padding_control(
-            PaddingAxis::Vertical,
-            config.terminal_padding_y,
-            cx,
-        );
-        // Build the nine font-metric adjustment rows up front (label + description + stepper).
-        let metric_rows: Vec<AnyElement> = MetricAdjustmentKind::ALL
-            .into_iter()
-            .map(|kind| {
-                let (label, description) = Self::metric_adjustment_labels(language, kind);
-                settings_row(
-                    label,
-                    description,
-                    self.render_metric_adjustment_control(kind, cx),
-                    self.colors,
-                )
-            })
-            .collect();
-        let progress_complete_timeout_control = self.render_progress_timeout_control(
-            ProgressTimeoutKind::Complete,
-            config.progress_complete_timeout_secs,
-            1,
-            cx,
-        );
-        let progress_stale_timeout_control = self.render_progress_timeout_control(
-            ProgressTimeoutKind::Stale,
-            config.progress_stale_timeout_secs,
-            5,
-            cx,
-        );
-        let osc_clipboard_read_control =
-            self.render_osc_clipboard_read_control(config.allow_osc_clipboard_read, cx);
-        let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
-        let copy_on_select_control = self.render_copy_on_select_control(config.copy_on_select, cx);
-        let scrollback_control = self.render_scrollback_control(config.scrollback_lines, cx);
-        let shell_program_control =
-            self.render_shell_input_control("settings-shell-program", &self.shell_program_input);
-        let shell_args_control =
-            self.render_shell_input_control("settings-shell-args", &self.shell_args_input);
-        let shell_integration_path_control = self.render_shell_integration_path_control(
-            // Read from the Default profile, which owns this field — `config` keeps only the
-            // downgrade mirror, so reading it would show a stale value after an edit elsewhere.
-            self.profile_store
-                .read(cx)
-                .default_profile()
-                .shell_integration_path,
-            cx,
-        );
-        let terminal_preview = self.render_terminal_preview(&config, terminal_theme);
-
+        let section_content = self.render_current_section(&config, window, cx);
         div()
             .relative()
             .flex()
@@ -1185,7 +988,12 @@ impl gpui::Render for SettingsWindow {
                             window.titlebar_double_click();
                         }
                     })
-                    .child(div().text_size(px(15.)).font_weight(gpui::FontWeight::SEMIBOLD).child(language.settings_title()))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(language.settings_title()),
+                    )
                     .when_some(lua_path, |element, path| {
                         element.child(
                             div()
@@ -1199,7 +1007,9 @@ impl gpui::Render for SettingsWindow {
                                     let opener = "open";
                                     #[cfg(not(target_os = "macos"))]
                                     let opener = "xdg-open";
-                                    if let Err(error) = std::process::Command::new(opener).arg(&path).spawn() {
+                                    if let Err(error) =
+                                        std::process::Command::new(opener).arg(&path).spawn()
+                                    {
                                         eprintln!("failed to open {}: {error}", path.display());
                                     }
                                 })
@@ -1276,9 +1086,8 @@ impl gpui::Render for SettingsWindow {
                                             .text_color(rgb(self.colors.accent))
                                     })
                                     .when(!selected, |element| {
-                                        element.hover(|element| {
-                                            element.bg(rgb(self.colors.panel_alt))
-                                        })
+                                        element
+                                            .hover(|element| element.bg(rgb(self.colors.panel_alt)))
                                     })
                                     .on_click(cx.listener(move |settings, _, _, cx| {
                                         if settings.recording.is_some() {
@@ -1293,313 +1102,73 @@ impl gpui::Render for SettingsWindow {
                             })),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .flex_col()
-                            .child(
+                        div().flex().flex_1().min_w_0().min_h_0().flex_col().child(
+                            div().relative().flex_1().min_h_0().child(
                                 div()
-                                    .relative()
-                                    .flex_1()
+                                    .id("settings-scroll-content")
+                                    .size_full()
                                     .min_h_0()
+                                    .overflow_x_hidden()
+                                    .overflow_y_scroll()
+                                    .scrollbar_width(px(SETTINGS_SCROLLBAR_WIDTH))
+                                    .track_scroll(&self.settings_scroll_handle)
                                     .child(
                                         div()
-                                            .id("settings-scroll-content")
-                                            .size_full()
-                                            .min_h_0()
-                                            .overflow_x_hidden()
-                                            .overflow_y_scroll()
-                                            .scrollbar_width(px(SETTINGS_SCROLLBAR_WIDTH))
-                                            .track_scroll(&self.settings_scroll_handle)
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_none()
-                                                    .flex_col()
-                                                    .mx_auto()
-                                                    .w_full()
-                                                    .max_w(px(640.))
-                                                    .p_5()
-                                                    .gap_5()
-                                                    .when_some(config_error, |element, error| {
-                                                        element.child(
-                                                            div()
-                                                                .rounded_lg()
-                                                                .p_3()
-                                                                .bg(rgb(self.colors.panel_alt))
-                                                                .text_color(rgb(self.colors.accent))
-                                                                .child(format!("init.lua: {error}")),
-                                                        )
-                                                    })
-                                                    // The "About" panel has its own branded header
-                                                    // (logo + name), so it skips the shared section
-                                                    // title to avoid a redundant "About Eggie" line.
-                                                    .when(
-                                                        self.selected_section != SettingsSection::About,
-                                                        |element| {
-                                                            element.child(
-                                                                div()
-                                                                    .text_size(px(18.))
-                                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                                    .child(match self.selected_section {
-                                                                        SettingsSection::General => language.general_section(),
-                                                                        SettingsSection::Appearance => language.appearance_section(),
-                                                                        SettingsSection::Profiles => language.profiles_section(),
-                                                                        SettingsSection::Keybindings => language.keybindings_section(),
-                                                                        SettingsSection::Advanced => language.advanced_section(),
-                                                                        SettingsSection::About => language.about_eggie(),
-                                                                    }),
-                                                            )
-                                                        },
+                                            .flex()
+                                            .flex_none()
+                                            .flex_col()
+                                            .mx_auto()
+                                            .w_full()
+                                            .max_w(px(640.))
+                                            .p_5()
+                                            .gap_5()
+                                            .when_some(config_error, |element, error| {
+                                                element.child(
+                                                    div()
+                                                        .rounded_lg()
+                                                        .p_3()
+                                                        .bg(rgb(self.colors.panel_alt))
+                                                        .text_color(rgb(self.colors.accent))
+                                                        .child(format!("init.lua: {error}")),
+                                                )
+                                            })
+                                            // The "About" panel has its own branded header
+                                            // (logo + name), so it skips the shared section
+                                            // title to avoid a redundant "About Eggie" line.
+                                            .when(
+                                                self.selected_section != SettingsSection::About,
+                                                |element| {
+                                                    element.child(
+                                                        div()
+                                                            .text_size(px(18.))
+                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                            .child(match self.selected_section {
+                                                                SettingsSection::General => {
+                                                                    language.general_section()
+                                                                }
+                                                                SettingsSection::Appearance => {
+                                                                    language.appearance_section()
+                                                                }
+                                                                SettingsSection::Profiles => {
+                                                                    language.profiles_section()
+                                                                }
+                                                                SettingsSection::Keybindings => {
+                                                                    language.keybindings_section()
+                                                                }
+                                                                SettingsSection::Advanced => {
+                                                                    language.advanced_section()
+                                                                }
+                                                                SettingsSection::About => {
+                                                                    language.about_eggie()
+                                                                }
+                                                            }),
                                                     )
-                                                    .children(match self.selected_section {
-                                                        SettingsSection::General => vec![
-                                                            settings_section(
-                                                                // The pane title above already reads
-                                                                // "General"; a caption here would
-                                                                // repeat it on the very next line.
-                                                                None,
-                                                                vec![settings_row(
-                                                                    language.language_row(),
-                                                                    language.language_description(),
-                                                                    language_control,
-                                                                    self.colors,
-                                                                )],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.terminal_behavior_section()),
-                                                                vec![settings_row(
-                                                                    language.scrollback_lines_row(),
-                                                                    language.scrollback_lines_description(),
-                                                                    scrollback_control,
-                                                                    self.colors,
-                                                                )],
-                                                                self.colors,
-                                                            ),
-                                                        ],
-                                                        SettingsSection::Appearance => vec![
-                                                            settings_section(
-                                                                Some(language.theme_section()),
-                                                                theme_rows,
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.terminal_text_section()),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.font_row(),
-                                                                        language.font_description(),
-                                                                        font_selector,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.font_bold_row(),
-                                                                        language.font_bold_description(),
-                                                                        font_bold_selector,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.font_italic_row(),
-                                                                        language.font_italic_description(),
-                                                                        font_italic_selector,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.font_bold_italic_row(),
-                                                                        language.font_bold_italic_description(),
-                                                                        font_bold_italic_selector,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.synthetic_bold_row(),
-                                                                        language.synthetic_bold_description(),
-                                                                        synthetic_bold_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.synthetic_italic_row(),
-                                                                        language.synthetic_italic_description(),
-                                                                        synthetic_italic_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.synthetic_bold_italic_row(),
-                                                                        language.synthetic_bold_italic_description(),
-                                                                        synthetic_bold_italic_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.ligatures_row(),
-                                                                        language.ligatures_description(),
-                                                                        ligatures_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.shaping_break_row(),
-                                                                        language.shaping_break_description(),
-                                                                        shaping_break_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.font_thicken_row(),
-                                                                        language.font_thicken_description(),
-                                                                        font_thicken_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.font_thicken_strength_row(),
-                                                                        language.font_thicken_strength_description(),
-                                                                        font_thicken_strength_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.font_size_row(),
-                                                                        language.font_size_description(),
-                                                                        font_size_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.cursor_section()),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.cursor_shape_row(),
-                                                                        language.cursor_shape_description(),
-                                                                        cursor_shape_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.cursor_blink_row(),
-                                                                        language.cursor_blink_description(),
-                                                                        cursor_blink_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.terminal_layout_section()),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.horizontal_padding_row(),
-                                                                        language.horizontal_padding_description(),
-                                                                        horizontal_padding_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.vertical_padding_row(),
-                                                                        language.vertical_padding_description(),
-                                                                        vertical_padding_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.font_metrics_section()),
-                                                                metric_rows,
-                                                                self.colors,
-                                                            ),
-                                                        ],
-                                                        SettingsSection::Advanced => vec![
-                                                            settings_section(
-                                                                Some(language.progress_indicators_section()),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.completed_timeout_row(),
-                                                                        language.completed_timeout_description(),
-                                                                        progress_complete_timeout_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.inactive_timeout_row(),
-                                                                        language.inactive_timeout_description(),
-                                                                        progress_stale_timeout_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.terminal_behavior_section()),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.detect_urls_row(),
-                                                                        language.detect_urls_description(),
-                                                                        detect_urls_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.copy_on_select_row(),
-                                                                        language.copy_on_select_description(),
-                                                                        copy_on_select_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.bell_row(),
-                                                                        language.bell_description(),
-                                                                        bell_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.terminal_security_section()),
-                                                                vec![settings_row(
-                                                                    language.osc_clipboard_read_row(),
-                                                                    language.osc_clipboard_read_description(),
-                                                                    osc_clipboard_read_control,
-                                                                    self.colors,
-                                                                )],
-                                                                self.colors,
-                                                            ),
-                                                            settings_section(
-                                                                Some(language.shell_section()),
-                                                                vec![
-                                                                    settings_row(
-                                                                        language.shell_program_row(),
-                                                                        language.shell_program_description(),
-                                                                        shell_program_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.shell_args_row(),
-                                                                        language.shell_args_description(),
-                                                                        shell_args_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                    settings_row(
-                                                                        language.shell_integration_path_row(),
-                                                                        language.shell_integration_path_description(),
-                                                                        shell_integration_path_control,
-                                                                        self.colors,
-                                                                    ),
-                                                                ],
-                                                                self.colors,
-                                                            ),
-                                                        ],
-                                                        SettingsSection::Keybindings => {
-                                                            self.render_keybindings_section(language, cx)
-                                                        }
-                                                        SettingsSection::Profiles => {
-                                                            self.render_profiles_section(language, window, cx)
-                                                        }
-                                                        SettingsSection::About => {
-                                                            self.render_about_section(language, cx)
-                                                        }
-                                                    }),
-                                            ),
+                                                },
+                                            )
+                                            .children(section_content),
                                     ),
-                            )
-                            .when(self.selected_section == SettingsSection::Appearance, |element| {
-                                element.child(terminal_preview)
-                            }),
+                            ),
+                        ),
                     ),
             )
     }
@@ -1692,7 +1261,7 @@ fn settings_card(rows: Vec<AnyElement>, colors: UiColors) -> AnyElement {
 
 fn settings_row(
     label: &'static str,
-    description: &'static str,
+    description: Option<&'static str>,
     control: AnyElement,
     colors: UiColors,
 ) -> AnyElement {
@@ -1701,7 +1270,7 @@ fn settings_row(
         .items_center()
         .justify_between()
         .gap_6()
-        .min_h(px(64.))
+        .min_h(px(if description.is_some() { 64. } else { 52. }))
         .px_4()
         .py_3()
         .child(
@@ -1712,12 +1281,14 @@ fn settings_row(
                 .flex_col()
                 .gap_1()
                 .child(label)
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(colors.muted))
-                        .child(description),
-                ),
+                .when_some(description, |element, description| {
+                    element.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.muted))
+                            .child(description),
+                    )
+                }),
         )
         .child(div().flex_none().child(control))
         .into_any_element()

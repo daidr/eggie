@@ -6,6 +6,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eggie-completion = { workspace = true, features = ["local-providers"] }
 eggie-ipc.workspace = true
 eggie-lua.workspace = true
 eggie-storage.workspace = true

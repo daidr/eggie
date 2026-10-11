@@ -89,7 +89,7 @@ impl DaemonState {
             }),
             ClientRequest::CreateSession {
                 project_id,
-                window_id,
+
                 cwd,
                 size,
                 appearance,
@@ -104,7 +104,7 @@ impl DaemonState {
             } => {
                 let session = Arc::new(TerminalSession::spawn(SessionSpawnConfig {
                     project_id,
-                    window_id,
+
                     cwd,
                     size,
                     appearance,
@@ -161,6 +161,25 @@ impl DaemonState {
                     },
                 })
             }
+            ClientRequest::WaitForRenderFrame {
+                session_id,
+                after_revision,
+                timeout_ms,
+            } => {
+                let session = self.session(session_id)?;
+                let timeout = Duration::from_millis(u64::from(timeout_ms)).min(MAX_SNAPSHOT_WAIT);
+                Ok(
+                    if session.events.wait_for_revision(after_revision, timeout) {
+                        DaemonResponse::Snapshot {
+                            snapshot: session.snapshot(),
+                        }
+                    } else {
+                        DaemonResponse::SnapshotUnchanged {
+                            revision: after_revision,
+                        }
+                    },
+                )
+            }
             ClientRequest::WaitForProgress {
                 session_id,
                 after_revision,
@@ -189,6 +208,18 @@ impl DaemonState {
                         session_id,
                         revision: session.osc_event_revision(),
                     },
+                })
+            }
+            ClientRequest::TerminalCompletions {
+                session_id,
+                input,
+                native,
+            } => {
+                let items = self.session(session_id)?.completions(input.clone(), native);
+                Ok(DaemonResponse::TerminalCompletions {
+                    session_id,
+                    input,
+                    items,
                 })
             }
             ClientRequest::GetShellIntegrationState { session_id } => {
@@ -370,31 +401,6 @@ impl DaemonState {
                 session.terminate();
                 Ok(DaemonResponse::Ok)
             }
-            ClientRequest::ClaimSession {
-                session_id,
-                window_id,
-            } => {
-                let session = self.session(session_id)?;
-                *session.window_id.lock() = Some(window_id);
-                Ok(DaemonResponse::SessionClaimed {
-                    session: session.summary(),
-                })
-            }
-            ClientRequest::DetachWindow { window_id } => {
-                // Collect the matching ids under the read lock, then clear ownership one session at a
-                // time. This avoids holding the sessions lock across the per-session `window_id` locks.
-                let detached: Vec<Arc<TerminalSession>> = self
-                    .sessions
-                    .read()
-                    .values()
-                    .filter(|session| *session.window_id.lock() == Some(window_id))
-                    .cloned()
-                    .collect();
-                for session in detached {
-                    *session.window_id.lock() = None;
-                }
-                Ok(DaemonResponse::Ok)
-            }
             ClientRequest::ForwardPort { session_id, spec } => {
                 let session = self.session(session_id)?;
                 session.forward_port(&spec)?;
@@ -458,6 +464,8 @@ pub(super) fn serve_connection(stream: UnixStream, state: &DaemonState) -> Resul
     let mut request = Vec::with_capacity(512);
     let mut response = Vec::with_capacity(8 * 1024);
     let mut latency_sensitive = false;
+    #[cfg(unix)]
+    let mut grid = eggie_ipc::GridWriter::default();
     loop {
         let Some(request) = read_wire_message::<ClientRequest>(&mut stream, &mut request)
             .context("failed to read request")?
@@ -468,6 +476,7 @@ pub(super) fn serve_connection(stream: UnixStream, state: &DaemonState) -> Resul
             && matches!(
                 &request,
                 ClientRequest::WaitForSnapshot { .. }
+                    | ClientRequest::WaitForRenderFrame { .. }
                     | ClientRequest::WaitForProgress { .. }
                     | ClientRequest::WaitForOscEvents { .. }
                     | ClientRequest::TerminalImage { .. }
@@ -486,6 +495,21 @@ pub(super) fn serve_connection(stream: UnixStream, state: &DaemonState) -> Resul
             latency_sensitive = true;
         }
         match request {
+            request @ ClientRequest::WaitForRenderFrame { after_revision, .. } => {
+                let result = state.handle(request);
+                #[cfg(unix)]
+                if let DaemonResponse::Snapshot { snapshot } = &result {
+                    if grid.send(
+                        stream.get_mut(),
+                        &mut response,
+                        snapshot.clone(),
+                        after_revision,
+                    )? {
+                        continue;
+                    }
+                }
+                write_wire_message(stream.get_mut(), &mut response, &result)?;
+            }
             ClientRequest::TerminalImage {
                 session_id,
                 key,

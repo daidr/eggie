@@ -15,7 +15,7 @@ use gpui::Action;
 
 use crate::actions::{
     About, CheckForUpdates, CloseAllWindows, HelpDocs, Hide, HideOthers, NewTabWithProfile,
-    ShowAll, SplitLeft, SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
+    QuitAndTerminate, ShowAll, SplitLeft, SplitUp, ToggleSecureKeyboardEntry, ZoomWindow,
 };
 use crate::keybindings::{ACTION_SPECS, display_keystroke, effective_keystroke};
 use crate::settings::{AppSettings, Language};
@@ -31,6 +31,10 @@ struct MenuCommand {
 
 /// Menu-only commands, in the order they appear across the menu bar (Eggie → File → Window → Help).
 const MENU_ONLY_COMMANDS: &[MenuCommand] = &[
+    MenuCommand {
+        label: Language::quit_and_terminate,
+        make_action: || Box::new(QuitAndTerminate),
+    },
     MenuCommand {
         label: Language::about_eggie,
         make_action: || Box::new(About),

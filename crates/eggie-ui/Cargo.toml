@@ -6,6 +6,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eggie-completion.workspace = true
 tiny-skia = "0.11.4"
 eggie-build-info.workspace = true
 eggie-ui-kit.workspace = true
@@ -44,3 +45,6 @@ raw-window-handle = "0.6.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

@@ -25,6 +25,14 @@ impl EggieApp {
         let colors = self.colors;
         let placeholder = match mode {
             PaletteMode::Commands => self.language.command_palette_placeholder(),
+            PaletteMode::Terminals => self.language.terminal_switcher(),
+            PaletteMode::Windows | PaletteMode::MoveToWindow(_) => {
+                if self.language == Language::SimplifiedChinese {
+                    "选择窗口…"
+                } else {
+                    "Choose a window…"
+                }
+            }
             PaletteMode::Profiles => self.language.profile_picker_placeholder(),
             PaletteMode::ProjectDefaultProfile(_) => {
                 self.language.project_default_profile_placeholder()
@@ -132,6 +140,10 @@ impl EggieApp {
     pub(super) fn palette_row_count(&self, cx: &App) -> usize {
         match self.command_palette.as_ref().map(|palette| palette.mode) {
             Some(PaletteMode::Commands) => self.filtered_palette_entries(cx).len(),
+            Some(PaletteMode::Terminals) => self.filtered_terminal_entries(cx).len(),
+            Some(PaletteMode::Windows) | Some(PaletteMode::MoveToWindow(_)) => {
+                self.filtered_window_entries(cx).len()
+            }
             Some(PaletteMode::Profiles) | Some(PaletteMode::ProjectDefaultProfile(_)) => {
                 self.filtered_profiles(cx).len()
             }
@@ -182,6 +194,24 @@ impl EggieApp {
                     })
                     .collect()
             }
+            Some(PaletteMode::Terminals) => self
+                .filtered_terminal_entries(cx)
+                .into_iter()
+                .map(|(_, label, location)| PaletteRow {
+                    label,
+                    trailing: Some(location),
+                    badge_color: None,
+                })
+                .collect(),
+            Some(PaletteMode::Windows) | Some(PaletteMode::MoveToWindow(_)) => self
+                .filtered_window_entries(cx)
+                .into_iter()
+                .map(|(_, label)| PaletteRow {
+                    label,
+                    trailing: None,
+                    badge_color: None,
+                })
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -221,6 +251,30 @@ impl EggieApp {
         let mode = palette.mode;
         let index = palette.selected_index;
         match mode {
+            PaletteMode::Terminals => {
+                let entries = self.filtered_terminal_entries(cx);
+                if let Some((id, _, _)) = entries.get(index.min(entries.len().saturating_sub(1))) {
+                    let id = *id;
+                    self.close_command_palette(window, cx);
+                    self.navigate_terminal(id, window, cx);
+                }
+            }
+            PaletteMode::Windows | PaletteMode::MoveToWindow(_) => {
+                let entries = self.filtered_window_entries(cx);
+                if let Some((id, _)) = entries.get(index.min(entries.len().saturating_sub(1))) {
+                    let id = *id;
+                    self.close_command_palette(window, cx);
+                    if let PaletteMode::MoveToWindow(source) = mode {
+                        self.move_tab_to_window(source, id, cx);
+                    } else if let Some(handle) =
+                        self.window_manager.read(cx).handles.get(&id).copied()
+                    {
+                        cx.defer(move |cx| {
+                            let _ = handle.update(cx, |_, window, _| window.activate_window());
+                        });
+                    }
+                }
+            }
             PaletteMode::Commands => {
                 let mut entries = self.filtered_palette_entries(cx);
                 if entries.is_empty() {
@@ -273,7 +327,10 @@ impl EggieApp {
         let rows = self.palette_rows(cx);
         let selected = palette.selected_index.min(rows.len().saturating_sub(1));
         let empty_text = match palette.mode {
-            PaletteMode::Commands => self.language.command_palette_empty(),
+            PaletteMode::Commands
+            | PaletteMode::Terminals
+            | PaletteMode::Windows
+            | PaletteMode::MoveToWindow(_) => self.language.command_palette_empty(),
             PaletteMode::Profiles | PaletteMode::ProjectDefaultProfile(_) => {
                 self.language.profile_picker_empty()
             }

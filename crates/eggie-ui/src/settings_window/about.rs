@@ -120,13 +120,13 @@ impl SettingsWindow {
             vec![
                 settings_row(
                     language.auto_check_updates_row(),
-                    language.auto_check_updates_description(),
+                    Some(language.auto_check_updates_description()),
                     auto_check_updates_control,
                     colors,
                 ),
                 settings_row(
                     language.update_channel_row(),
-                    language.update_channel_description(),
+                    Some(language.update_channel_description()),
                     update_channel_control,
                     colors,
                 ),

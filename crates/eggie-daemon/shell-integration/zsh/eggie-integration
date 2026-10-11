@@ -91,6 +91,7 @@ eggie-integration() {
     # regardless of who owns PS1, so this works with Powerlevel10k et al.
     eggie_line_init() {
         builtin print -nu $_eggie_fd '\e]133;B\a'
+        eggie_report_input
     }
 
     # `eggie-integration` runs from .zshenv, i.e. BEFORE .zshrc, when ZLE is not yet
@@ -120,7 +121,98 @@ eggie-integration() {
             builtin zle -N zle-line-init eggie_line_init
         fi
 
+        eggie_completion_init
         eggie_precmd
+    }
+
+    eggie_escape() {
+        REPLY=$1
+        REPLY=${REPLY//\%/%25}
+        REPLY=${REPLY//;/%3B}
+        REPLY=${REPLY//$'\e'/%1B}
+        REPLY=${REPLY//$'\a'/%07}
+        REPLY=${REPLY//$'\n'/%0A}
+        REPLY=${REPLY//$'\r'/%0D}
+        REPLY=${REPLY//$'\t'/%09}
+    }
+    eggie_report_input() {
+        builtin local text="${PREBUFFER}${BUFFER}" cursor=$(( ${#PREBUFFER} + CURSOR ))
+        builtin local cwd path_value home_value encoded
+        eggie_escape "$PWD"; cwd=$REPLY
+        eggie_escape "$PATH"; path_value=$REPLY
+        eggie_escape "$HOME"; home_value=$REPLY
+        eggie_escape "$text"; encoded=$REPLY
+        builtin print -rn -- $'\e]1337;EggieInput=zsh;'"${cursor};${cwd};${path_value};${home_value};1;${encoded}"$'\a'
+    }
+    eggie_collect_completion() {
+        builtin local saved_compadd="${functions[compadd]-}"
+        builtin local -a _eggie_matches
+        compadd() {
+            builtin local -a _eggie_capture
+            builtin local -A _eggie_compadd_flags
+            builtin zparseopts -E -A _eggie_compadd_flags p: P: 2>/dev/null
+            # Keep all original options for compadd, including the file prefix.
+
+            # Array-only calls probe matches and must retain their native semantics.
+            if [[ " ${*} " == *' -O '* || " ${*} " == *' -A '* || " ${*} " == *' -D '* ]]; then
+                builtin compadd "$@"; return
+            fi
+            builtin compadd -A _eggie_capture "$@"
+            builtin local value
+            for value in "${_eggie_capture[@]}"; do
+                _eggie_matches+=("${(Q)IPREFIX}${(Q)_eggie_compadd_flags[-p]}${(Q)value}${(Q)ISUFFIX}")
+            done
+            builtin compadd "$@"
+        }
+        _main_complete 2>/dev/null
+        if [[ -n "$saved_compadd" ]]; then functions[compadd]=$saved_compadd; else unfunction compadd; fi
+        compstate[insert]=''; compstate[list]=''
+        eggie_report_input
+        builtin local packet encoded value count=0
+        eggie_escape "${PREBUFFER}${BUFFER}"; packet=$REPLY
+        packet+=";$(( ${#PREBUFFER} + CURSOR ))"
+        for value in "${(u)_eggie_matches[@]}"; do
+            (( count++ >= 2000 )) && break
+            eggie_escape "$value"; packet+=";${REPLY}"
+        done
+        builtin print -rn -- $'\e]1337;EggieCompletions='"$packet"$'\a'
+    }
+    eggie_apply_completion() {
+        builtin local packet='' character expected position from to insert prefix_length=$(( ${#PREBUFFER} ))
+        while builtin read -r -k 1 -t 1 character; do
+            [[ "$character" == $'\n' ]] && break
+            packet+="$character"
+            (( ${#packet} > 200000 )) && return
+        done
+        builtin local -a fields
+        fields=("${(@s:;:)packet}")
+        (( ${#fields} == 5 )) || return
+        expected=${fields[1]//\\/\\\\}; expected=${expected//\%/\\x}
+        builtin printf -v expected '%b' "$expected"
+        position=${fields[2]}; from=${fields[3]}; to=${fields[4]}
+        [[ "$position$from$to" == *[^0-9]* ]] && return
+        if [[ "$expected" == "${PREBUFFER}${BUFFER}" ]] && (( position == prefix_length + CURSOR && from >= prefix_length && to >= from && to <= ${#expected} )); then
+            insert=${fields[5]//\\/\\\\}; insert=${insert//\%/\\x}
+            builtin printf -v insert '%b' "$insert"
+            (( from -= prefix_length, to -= prefix_length ))
+            BUFFER="${BUFFER:0:$from}${insert}${BUFFER:$to}"
+            CURSOR=$(( from + ${#insert} ))
+        fi
+        eggie_report_input
+    }
+    eggie_completion_init() {
+        if (( ! $+functions[_main_complete] )); then
+            builtin autoload -Uz compinit
+            compinit -i
+        fi
+        builtin autoload -Uz add-zle-hook-widget
+        add-zle-hook-widget zle-line-pre-redraw eggie_report_input
+        builtin zle -N eggie-apply-completion eggie_apply_completion
+        builtin bindkey -M emacs $'\x18\x1e' eggie-apply-completion
+        builtin bindkey -M viins $'\x18\x1e' eggie-apply-completion
+        builtin zle -C eggie-collect-completion complete-word eggie_collect_completion
+        builtin bindkey -M emacs $'\x18\x1f' eggie-collect-completion
+        builtin bindkey -M viins $'\x18\x1f' eggie-collect-completion
     }
 
     builtin typeset -ag precmd_functions

@@ -1,6 +1,59 @@
-use crate::settings::{Language, UpdateChannel};
+use crate::settings::{Language, SidebarLayout, UpdateChannel};
 
 impl Language {
+    pub(crate) fn terminal_suggest(self) -> &'static str {
+        match self {
+            Self::English => "Command completion",
+            Self::SimplifiedChinese => "命令补全",
+        }
+    }
+    pub(crate) fn sidebar_layout_row(self) -> &'static str {
+        match self {
+            Self::English => "Sidebar layout",
+            Self::SimplifiedChinese => "侧边栏布局",
+        }
+    }
+
+    pub(crate) fn sidebar_layout_label(self, layout: SidebarLayout) -> &'static str {
+        match (self, layout) {
+            (Self::English, SidebarLayout::AllProjects) => "All projects",
+            (Self::English, SidebarLayout::SingleProject) => "Single project",
+            (Self::SimplifiedChinese, SidebarLayout::AllProjects) => "全部项目",
+            (Self::SimplifiedChinese, SidebarLayout::SingleProject) => "单个项目",
+        }
+    }
+
+    pub(crate) fn select_project(self) -> &'static str {
+        match self {
+            Self::English => "Switch project",
+            Self::SimplifiedChinese => "切换项目",
+        }
+    }
+
+    pub(crate) fn terminal_switcher(self) -> &'static str {
+        match self {
+            Self::English => "Search All Terminals…",
+            Self::SimplifiedChinese => "搜索全部终端…",
+        }
+    }
+    pub(crate) fn window_switcher(self) -> &'static str {
+        match self {
+            Self::English => "Switch Window…",
+            Self::SimplifiedChinese => "切换窗口…",
+        }
+    }
+    pub(crate) fn undo_window_operation(self) -> &'static str {
+        match self {
+            Self::English => "Undo Window / Tab Move",
+            Self::SimplifiedChinese => "撤销窗口关闭或标签页移动",
+        }
+    }
+    pub(crate) fn quit_and_terminate(self) -> &'static str {
+        match self {
+            Self::English => "Terminate All Terminals and Quit…",
+            Self::SimplifiedChinese => "结束全部终端并退出…",
+        }
+    }
     // --- Common dialog buttons ---------------------------------------------------------------
 
     pub(crate) fn ok(self) -> &'static str {
@@ -42,8 +95,8 @@ impl Language {
 
     pub(crate) fn url_open_detail(self) -> &'static str {
         match self {
-            Self::English => "A process in this terminal wants to open:",
-            Self::SimplifiedChinese => "此终端中的某个进程想要打开：",
+            Self::English => "URL:",
+            Self::SimplifiedChinese => "地址：",
         }
     }
 
@@ -56,8 +109,8 @@ impl Language {
 
     pub(crate) fn hyperlink_open_detail(self) -> &'static str {
         match self {
-            Self::English => "A link in this terminal points to:",
-            Self::SimplifiedChinese => "此终端中的链接指向：",
+            Self::English => "URL:",
+            Self::SimplifiedChinese => "地址：",
         }
     }
 
@@ -68,33 +121,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn close_window_title(self) -> &'static str {
-        match self {
-            Self::English => "Close this Eggie window?",
-            Self::SimplifiedChinese => "关闭此 Eggie 窗口？",
-        }
-    }
-
-    pub(crate) fn close_window_message(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Choose whether its terminal sessions should terminate or stay attached to the daemon."
-            }
-            Self::SimplifiedChinese => "选择其终端会话应终止还是保持连接到守护进程。",
-        }
-    }
-
     pub(crate) fn terminate_all(self) -> &'static str {
         match self {
             Self::English => "Terminate All",
-            Self::SimplifiedChinese => "全部终止",
-        }
-    }
-
-    pub(crate) fn detach(self) -> &'static str {
-        match self {
-            Self::English => "Detach",
-            Self::SimplifiedChinese => "分离",
+            Self::SimplifiedChinese => "结束全部",
         }
     }
 
@@ -102,13 +132,6 @@ impl Language {
         match self {
             Self::English => "New Project",
             Self::SimplifiedChinese => "新建项目",
-        }
-    }
-
-    pub(crate) fn new_project_message(self) -> &'static str {
-        match self {
-            Self::English => "Enter a name for the project.",
-            Self::SimplifiedChinese => "输入项目名称。",
         }
     }
 
@@ -130,13 +153,6 @@ impl Language {
         match self {
             Self::English => "Rename Project",
             Self::SimplifiedChinese => "重命名项目",
-        }
-    }
-
-    pub(crate) fn rename_project_message(self) -> &'static str {
-        match self {
-            Self::English => "Enter a new name for the project.",
-            Self::SimplifiedChinese => "输入项目的新名称。",
         }
     }
 
@@ -167,8 +183,8 @@ impl Language {
 
     pub(crate) fn custom_title_prompt_message(self) -> &'static str {
         match self {
-            Self::English => "Enter a custom title for this tab. Leave empty to use the process title.",
-            Self::SimplifiedChinese => "为该标签输入自定义标题。留空则使用进程标题。",
+            Self::English => "Leave empty to use the process title",
+            Self::SimplifiedChinese => "留空则使用进程标题",
         }
     }
 
@@ -189,13 +205,6 @@ impl Language {
     }
 
     /// Group heading in the detached-session popover for sessions whose project no longer exists.
-    pub(crate) fn detached_other_group(self) -> &'static str {
-        match self {
-            Self::English => "Other",
-            Self::SimplifiedChinese => "其它",
-        }
-    }
-
     pub(crate) fn collapse_sidebar_tooltip(self) -> &'static str {
         match self {
             Self::English => "Collapse sidebar",
@@ -224,31 +233,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn detached_sessions_tooltip(self) -> &'static str {
-        match self {
-            Self::English => "Detached sessions",
-            Self::SimplifiedChinese => "游离会话",
-        }
-    }
-
     pub(crate) fn add_project_tooltip(self) -> &'static str {
         match self {
             Self::English => "Add project",
             Self::SimplifiedChinese => "添加项目",
-        }
-    }
-
-    pub(crate) fn claim_session_tooltip(self) -> &'static str {
-        match self {
-            Self::English => "Claim to this window",
-            Self::SimplifiedChinese => "接管到此窗口",
-        }
-    }
-
-    pub(crate) fn destroy_session_tooltip(self) -> &'static str {
-        match self {
-            Self::English => "Destroy session",
-            Self::SimplifiedChinese => "销毁会话",
         }
     }
 
@@ -268,8 +256,12 @@ impl Language {
 
     pub(crate) fn forward_port_prompt(self) -> &'static str {
         match self {
-            Self::English => "Enter a port forward: L 8080 localhost:80, R 8080 localhost:80, or D 1080",
-            Self::SimplifiedChinese => "输入端口映射：L 8080 localhost:80（本地）、R 8080 localhost:80（远程）或 D 1080（动态）",
+            Self::English => {
+                "Enter a port forward: L 8080 localhost:80, R 8080 localhost:80, or D 1080"
+            }
+            Self::SimplifiedChinese => {
+                "输入端口映射：L 8080 localhost:80（本地）、R 8080 localhost:80（远程）或 D 1080（动态）"
+            }
         }
     }
 
@@ -342,15 +334,15 @@ impl Language {
 
     pub(crate) fn loading_ports(self) -> &'static str {
         match self {
-            Self::English => "Loading port information…",
-            Self::SimplifiedChinese => "正在加载端口信息…",
+            Self::English => "Loading ports…",
+            Self::SimplifiedChinese => "正在加载端口…",
         }
     }
 
     pub(crate) fn loading_process_info(self) -> &'static str {
         match self {
-            Self::English => "Loading process information…",
-            Self::SimplifiedChinese => "正在加载进程信息…",
+            Self::English => "Loading processes…",
+            Self::SimplifiedChinese => "正在加载进程…",
         }
     }
 
@@ -365,26 +357,22 @@ impl Language {
 
     pub(crate) fn snippets_label(self) -> &'static str {
         match self {
-            Self::English => "SNIPPETS",
-            Self::SimplifiedChinese => "代码片段",
+            Self::English => "COMMAND SNIPPETS",
+            Self::SimplifiedChinese => "命令片段",
         }
     }
 
     pub(crate) fn command_history_empty(self) -> &'static str {
         match self {
-            Self::English => "No commands yet.",
-            Self::SimplifiedChinese => "暂无命令。",
+            Self::English => "No commands yet",
+            Self::SimplifiedChinese => "暂无命令",
         }
     }
 
     pub(crate) fn shell_integration_unavailable(self) -> &'static str {
         match self {
-            Self::English => {
-                "Shell integration is not active. Command history appears once your shell reports OSC 133 prompts."
-            }
-            Self::SimplifiedChinese => {
-                "Shell 集成尚未启用。当你的 shell 上报 OSC 133 提示符后,命令历史才会出现。"
-            }
+            Self::English => "Enable shell integration to view command history",
+            Self::SimplifiedChinese => "启用 Shell 集成后可查看命令历史",
         }
     }
 
@@ -404,15 +392,15 @@ impl Language {
 
     pub(crate) fn snippets_empty(self) -> &'static str {
         match self {
-            Self::English => "No snippets yet. Add one to reuse commands.",
-            Self::SimplifiedChinese => "暂无片段。添加一个以复用命令。",
+            Self::English => "No command snippets yet",
+            Self::SimplifiedChinese => "暂无命令片段",
         }
     }
 
     pub(crate) fn add_snippet(self) -> &'static str {
         match self {
-            Self::English => "Add snippet",
-            Self::SimplifiedChinese => "新增片段",
+            Self::English => "Add command snippet",
+            Self::SimplifiedChinese => "新增命令片段",
         }
     }
 
@@ -425,36 +413,43 @@ impl Language {
 
     pub(crate) fn edit_snippet(self) -> &'static str {
         match self {
-            Self::English => "Edit snippet",
-            Self::SimplifiedChinese => "编辑片段",
+            Self::English => "Edit command snippet",
+            Self::SimplifiedChinese => "编辑命令片段",
         }
     }
 
     pub(crate) fn delete_snippet(self) -> &'static str {
         match self {
-            Self::English => "Delete snippet",
-            Self::SimplifiedChinese => "删除片段",
+            Self::English => "Delete command snippet",
+            Self::SimplifiedChinese => "删除命令片段",
         }
     }
 
     pub(crate) fn snippet_name_placeholder(self) -> &'static str {
         match self {
-            Self::English => "Name",
-            Self::SimplifiedChinese => "名称",
+            Self::English => "Snippet name",
+            Self::SimplifiedChinese => "片段名称",
         }
     }
 
-    pub(crate) fn snippet_content_placeholder(self) -> &'static str {
+    pub(crate) fn snippet_description(self) -> &'static str {
         match self {
-            Self::English => "Command to inject when this snippet runs",
-            Self::SimplifiedChinese => "运行该片段时注入的命令",
+            Self::English => "Click a snippet to fill its command into the current terminal",
+            Self::SimplifiedChinese => "点击片段可将命令填入当前终端",
+        }
+    }
+
+    pub(crate) fn snippet_command_label(self) -> &'static str {
+        match self {
+            Self::English => "Command, e.g. npm run dev",
+            Self::SimplifiedChinese => "命令，例如 npm run dev",
         }
     }
 
     pub(crate) fn auto_run_label(self) -> &'static str {
         match self {
-            Self::English => "Run automatically (send Enter)",
-            Self::SimplifiedChinese => "自动执行(发送回车)",
+            Self::English => "Run when used",
+            Self::SimplifiedChinese => "使用时自动执行",
         }
     }
 
@@ -467,15 +462,15 @@ impl Language {
 
     pub(crate) fn delete_snippet_confirm_title(self) -> &'static str {
         match self {
-            Self::English => "Delete snippet?",
-            Self::SimplifiedChinese => "删除片段?",
+            Self::English => "Delete command snippet?",
+            Self::SimplifiedChinese => "删除命令片段？",
         }
     }
 
     pub(crate) fn delete_snippet_confirm_message(self) -> &'static str {
         match self {
-            Self::English => "This snippet will be permanently removed.",
-            Self::SimplifiedChinese => "该片段将被永久删除。",
+            Self::English => "This cannot be undone.",
+            Self::SimplifiedChinese => "删除后无法恢复。",
         }
     }
 
@@ -490,15 +485,15 @@ impl Language {
 
     pub(crate) fn notes_placeholder(self) -> &'static str {
         match self {
-            Self::English => "Jot anything here — it is saved automatically and shared across windows.",
-            Self::SimplifiedChinese => "在此随手记录 —— 自动保存并跨窗口共享。",
+            Self::English => "Saved automatically; Shared across windows",
+            Self::SimplifiedChinese => "自动保存，所有窗口共享",
         }
     }
 
     pub(crate) fn no_running_processes(self) -> &'static str {
         match self {
-            Self::English => "No running processes.",
-            Self::SimplifiedChinese => "没有正在运行的进程。",
+            Self::English => "No running processes",
+            Self::SimplifiedChinese => "暂无运行中的进程",
         }
     }
 
@@ -534,8 +529,8 @@ impl Language {
 
     pub(crate) fn progress_indeterminate(self) -> &'static str {
         match self {
-            Self::English => "Indeterminate",
-            Self::SimplifiedChinese => "不确定",
+            Self::English => "In progress",
+            Self::SimplifiedChinese => "进行中",
         }
     }
 
@@ -655,8 +650,11 @@ impl Language {
 
     pub(crate) fn close_tabs(self, count: usize) -> String {
         match self {
-            Self::English => format!("Close {count} tab{}", if count == 1 { "" } else { "s" }),
-            Self::SimplifiedChinese => format!("关闭 {} 个标签页", count),
+            Self::English => format!(
+                "Terminate {count} project terminal{}…",
+                if count == 1 { "" } else { "s" }
+            ),
+            Self::SimplifiedChinese => format!("结束项目的 {} 个终端…", count),
         }
     }
 
@@ -873,15 +871,15 @@ impl Language {
 
     pub(crate) fn update_up_to_date(self) -> &'static str {
         match self {
-            Self::English => "Eggie is up to date.",
-            Self::SimplifiedChinese => "当前已是最新版本。",
+            Self::English => "Up to date",
+            Self::SimplifiedChinese => "已是最新版本",
         }
     }
 
     pub(crate) fn update_no_pending(self) -> &'static str {
         match self {
-            Self::English => "No update in progress.",
-            Self::SimplifiedChinese => "暂无进行中的更新。",
+            Self::English => "No pending update",
+            Self::SimplifiedChinese => "暂无待处理更新",
         }
     }
 
@@ -915,33 +913,29 @@ impl Language {
 
     pub(crate) fn update_restart_with_daemon(self) -> &'static str {
         match self {
-            Self::English => "Restart and Update Daemon",
-            Self::SimplifiedChinese => "重启并更新 daemon",
+            Self::English => "Restart and Update",
+            Self::SimplifiedChinese => "重启并更新",
         }
     }
 
     pub(crate) fn update_ready_restart(self) -> &'static str {
         match self {
-            Self::English => "The update is ready. Restart Eggie to apply it.",
-            Self::SimplifiedChinese => "更新已就绪,重启 Eggie 后生效。",
+            Self::English => "Update ready. Restart to apply.",
+            Self::SimplifiedChinese => "更新已就绪，重启后生效。",
         }
     }
 
     pub(crate) fn update_ready_restart_with_daemon(self) -> &'static str {
         match self {
-            Self::English => {
-                "The update is ready. Restarting will also replace the background service."
-            }
-            Self::SimplifiedChinese => "更新已就绪,重启将同时替换后台服务。",
+            Self::English => "Update ready. Restart to update the background service.",
+            Self::SimplifiedChinese => "更新已就绪，重启将更新后台服务。",
         }
     }
 
     pub(crate) fn update_daemon_warning(self) -> &'static str {
         match self {
-            Self::English => {
-                "This update requires restarting the background service. All terminal sessions will be closed."
-            }
-            Self::SimplifiedChinese => "本次更新需要重启后台服务,当前所有终端会话将被关闭。",
+            Self::English => "Updating the background service will end all terminal sessions.",
+            Self::SimplifiedChinese => "更新后台服务将结束全部终端会话。",
         }
     }
 
@@ -968,8 +962,8 @@ impl Language {
 
     pub(crate) fn update_ready_tooltip(self) -> &'static str {
         match self {
-            Self::English => "Update ready — restart to apply",
-            Self::SimplifiedChinese => "更新已就绪,重启后生效",
+            Self::English => "Restart to apply update",
+            Self::SimplifiedChinese => "重启以完成更新",
         }
     }
 
@@ -982,8 +976,8 @@ impl Language {
 
     pub(crate) fn auto_check_updates_description(self) -> &'static str {
         match self {
-            Self::English => "Check for new versions on launch and notify in the sidebar.",
-            Self::SimplifiedChinese => "启动时检查新版本,并在侧边栏提示。",
+            Self::English => "Check for updates on launch",
+            Self::SimplifiedChinese => "启动时检查新版本",
         }
     }
 
@@ -1003,10 +997,8 @@ impl Language {
 
     pub(crate) fn update_channel_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Stable receives final releases only; Beta also receives prereleases."
-            }
-            Self::SimplifiedChinese => "稳定版仅接收正式版本;测试版还会接收预发布版本。",
+            Self::English => "Beta includes prereleases",
+            Self::SimplifiedChinese => "测试版包含预发布版本",
         }
     }
 
@@ -1208,24 +1200,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn language_description(self) -> &'static str {
-        match self {
-            Self::English => "Choose the interface language.",
-            Self::SimplifiedChinese => "选择界面语言。",
-        }
-    }
-
     pub(crate) fn theme_row(self) -> &'static str {
         match self {
             Self::English => "Interface theme",
             Self::SimplifiedChinese => "界面主题",
-        }
-    }
-
-    pub(crate) fn theme_description(self) -> &'static str {
-        match self {
-            Self::English => "Choose dark, light, or follow the macOS appearance.",
-            Self::SimplifiedChinese => "选择深色、浅色，或跟随 macOS 外观。",
         }
     }
 
@@ -1236,15 +1214,6 @@ impl Language {
         }
     }
 
-    pub(crate) fn interface_dark_theme_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Colors for Eggie's own interface in Dark mode, and when the system appearance is dark."
-            }
-            Self::SimplifiedChinese => "深色模式和系统外观为深色时，Eggie 界面自身的配色。",
-        }
-    }
-
     pub(crate) fn interface_light_theme_row(self) -> &'static str {
         match self {
             Self::English => "Interface light theme",
@@ -1252,31 +1221,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn interface_light_theme_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Colors for Eggie's own interface in Light mode, and when the system appearance is light."
-            }
-            Self::SimplifiedChinese => "浅色模式和系统外观为浅色时，Eggie 界面自身的配色。",
-        }
-    }
-
     pub(crate) fn terminal_theme_source_row(self) -> &'static str {
         match self {
             Self::English => "Terminal theme",
             Self::SimplifiedChinese => "终端主题",
-        }
-    }
-
-    pub(crate) fn terminal_theme_source_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Whether terminal colors follow the interface theme or use their own pair. \
-                 Individual profiles can override the terminal theme either way."
-            }
-            Self::SimplifiedChinese => {
-                "终端配色是跟随界面主题，还是使用自己的一对主题。无论哪种，单个配置都可以覆写终端主题。"
-            }
         }
     }
 
@@ -1301,24 +1249,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn terminal_dark_theme_description(self) -> &'static str {
-        match self {
-            Self::English => "Terminal colors when the dark appearance is in effect.",
-            Self::SimplifiedChinese => "深色外观生效时的终端配色。",
-        }
-    }
-
     pub(crate) fn terminal_light_theme_row(self) -> &'static str {
         match self {
             Self::English => "Terminal light theme",
             Self::SimplifiedChinese => "终端浅色主题",
-        }
-    }
-
-    pub(crate) fn terminal_light_theme_description(self) -> &'static str {
-        match self {
-            Self::English => "Terminal colors when the light appearance is in effect.",
-            Self::SimplifiedChinese => "浅色外观生效时的终端配色。",
         }
     }
 
@@ -1331,12 +1265,8 @@ impl Language {
 
     pub(crate) fn minimum_contrast_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Minimum WCAG contrast ratio between text and each cell background. Emoji and terminal graphics are unchanged."
-            }
-            Self::SimplifiedChinese => {
-                "文本与每个单元格背景之间的最小 WCAG 对比度。Emoji 和终端图形不受影响。"
-            }
+            Self::English => "Text only; excludes emoji and graphics",
+            Self::SimplifiedChinese => "仅调整文字，不影响 Emoji 和图形",
         }
     }
 
@@ -1349,8 +1279,8 @@ impl Language {
 
     pub(crate) fn font_description(self) -> &'static str {
         match self {
-            Self::English => "Only installed monospaced fonts are listed.",
-            Self::SimplifiedChinese => "仅列出已安装的等宽字体。",
+            Self::English => "Installed monospaced fonts",
+            Self::SimplifiedChinese => "已安装的等宽字体",
         }
     }
 
@@ -1368,13 +1298,6 @@ impl Language {
         }
     }
 
-    pub(crate) fn font_bold_description(self) -> &'static str {
-        match self {
-            Self::English => "Font for bold text. Falls back to the regular font when unset.",
-            Self::SimplifiedChinese => "粗体文本使用的字体。未设置时跟随常规字体。",
-        }
-    }
-
     pub(crate) fn font_italic_row(self) -> &'static str {
         match self {
             Self::English => "Italic font",
@@ -1382,26 +1305,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn font_italic_description(self) -> &'static str {
-        match self {
-            Self::English => "Font for italic text. Falls back to the regular font when unset.",
-            Self::SimplifiedChinese => "斜体文本使用的字体。未设置时跟随常规字体。",
-        }
-    }
-
     pub(crate) fn font_bold_italic_row(self) -> &'static str {
         match self {
             Self::English => "Bold italic font",
             Self::SimplifiedChinese => "粗斜体字体",
-        }
-    }
-
-    pub(crate) fn font_bold_italic_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Font for bold italic text. Falls back to the regular font when unset."
-            }
-            Self::SimplifiedChinese => "粗斜体文本使用的字体。未设置时跟随常规字体。",
         }
     }
 
@@ -1414,10 +1321,8 @@ impl Language {
 
     pub(crate) fn synthetic_bold_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Fake bold by thickening strokes when the font lacks a bold face and no bold family is set."
-            }
-            Self::SimplifiedChinese => "当字体没有粗体且未指定粗体字体时，通过加粗笔画模拟粗体。",
+            Self::English => "Simulate bold when no bold font is available",
+            Self::SimplifiedChinese => "无可用粗体字体时模拟粗体",
         }
     }
 
@@ -1430,10 +1335,8 @@ impl Language {
 
     pub(crate) fn synthetic_italic_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Fake italic by skewing glyphs when the font lacks an italic face and no italic family is set."
-            }
-            Self::SimplifiedChinese => "当字体没有斜体且未指定斜体字体时，通过倾斜字形模拟斜体。",
+            Self::English => "Simulate italic when no italic font is available",
+            Self::SimplifiedChinese => "无可用斜体字体时模拟斜体",
         }
     }
 
@@ -1446,8 +1349,8 @@ impl Language {
 
     pub(crate) fn synthetic_bold_italic_description(self) -> &'static str {
         match self {
-            Self::English => "Synthesize the bold italic style when the font and families lack it.",
-            Self::SimplifiedChinese => "当字体与所选字体族都缺少粗斜体时，合成粗斜体样式。",
+            Self::English => "Simulate bold italic when no matching font is available",
+            Self::SimplifiedChinese => "无可用粗斜体字体时模拟粗斜体",
         }
     }
 
@@ -1460,10 +1363,8 @@ impl Language {
 
     pub(crate) fn ligatures_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Combine sequences like -> and ==> into single glyphs (requires a font with programming ligatures)."
-            }
-            Self::SimplifiedChinese => "将 -> 、==> 等序列合并为连字（需字体本身包含编程连字）。",
+            Self::English => "Combine symbols such as ->; Requires a font with ligatures",
+            Self::SimplifiedChinese => "合并 -> 等符号，需字体支持连字",
         }
     }
 
@@ -1474,26 +1375,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn shaping_break_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Render the character under the cursor un-ligated so editing sees individual characters."
-            }
-            Self::SimplifiedChinese => "光标所在字符不参与连字，便于编辑时看清单个字符。",
-        }
-    }
-
     pub(crate) fn font_thicken_row(self) -> &'static str {
         match self {
             Self::English => "Thicken",
             Self::SimplifiedChinese => "字体加粗",
-        }
-    }
-
-    pub(crate) fn font_thicken_description(self) -> &'static str {
-        match self {
-            Self::English => "Thicken glyph strokes via macOS font smoothing.",
-            Self::SimplifiedChinese => "通过 macOS 字体平滑加粗字形笔画。",
         }
     }
 
@@ -1504,24 +1389,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn font_thicken_strength_description(self) -> &'static str {
-        match self {
-            Self::English => "How much to thicken (0–255) when thickening is enabled.",
-            Self::SimplifiedChinese => "开启加粗时的强度（0–255）。",
-        }
-    }
-
     pub(crate) fn font_size_row(self) -> &'static str {
         match self {
             Self::English => "Font size",
             Self::SimplifiedChinese => "字号",
-        }
-    }
-
-    pub(crate) fn font_size_description(self) -> &'static str {
-        match self {
-            Self::English => "Applied to every terminal and used when calculating the PTY grid.",
-            Self::SimplifiedChinese => "应用于所有终端，并用于计算 PTY 网格。",
         }
     }
 
@@ -1532,24 +1403,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn horizontal_padding_description(self) -> &'static str {
-        match self {
-            Self::English => "Left and right padding around the terminal grid.",
-            Self::SimplifiedChinese => "终端网格左右两侧的内边距。",
-        }
-    }
-
     pub(crate) fn vertical_padding_row(self) -> &'static str {
         match self {
             Self::English => "Vertical padding",
             Self::SimplifiedChinese => "垂直内边距",
-        }
-    }
-
-    pub(crate) fn vertical_padding_description(self) -> &'static str {
-        match self {
-            Self::English => "Top and bottom padding around the terminal grid.",
-            Self::SimplifiedChinese => "终端网格上下两侧的内边距。",
         }
     }
 
@@ -1569,8 +1426,8 @@ impl Language {
 
     pub(crate) fn adjust_cell_width_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to each cell's width. Changes the grid columns.",
-            Self::SimplifiedChinese => "对每个单元格宽度的像素微调，会改变网格列数。",
+            Self::English => "Adjust in pixels; changes the column count",
+            Self::SimplifiedChinese => "按像素调整，会改变终端列数",
         }
     }
 
@@ -1583,8 +1440,8 @@ impl Language {
 
     pub(crate) fn adjust_cell_height_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to each cell's height. Changes the grid rows.",
-            Self::SimplifiedChinese => "对每个单元格高度的像素微调，会改变网格行数。",
+            Self::English => "Adjust in pixels; changes the row count",
+            Self::SimplifiedChinese => "按像素调整，会改变终端行数",
         }
     }
 
@@ -1597,8 +1454,8 @@ impl Language {
 
     pub(crate) fn adjust_font_baseline_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to the text baseline within each cell.",
-            Self::SimplifiedChinese => "对单元格内文本基线位置的像素微调。",
+            Self::English => "Move text vertically, in pixels",
+            Self::SimplifiedChinese => "按像素调整文字的垂直位置",
         }
     }
 
@@ -1611,8 +1468,8 @@ impl Language {
 
     pub(crate) fn adjust_underline_position_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to how far down the underline sits.",
-            Self::SimplifiedChinese => "对下划线下沉距离的像素微调。",
+            Self::English => "Move the underline vertically, in pixels",
+            Self::SimplifiedChinese => "按像素调整下划线的垂直位置",
         }
     }
 
@@ -1625,8 +1482,8 @@ impl Language {
 
     pub(crate) fn adjust_underline_thickness_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to the underline stroke thickness.",
-            Self::SimplifiedChinese => "对下划线笔画粗细的像素微调。",
+            Self::English => "Adjust line thickness in pixels",
+            Self::SimplifiedChinese => "按像素调整线条粗细",
         }
     }
 
@@ -1639,8 +1496,8 @@ impl Language {
 
     pub(crate) fn adjust_strikethrough_position_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to how far down the strikethrough sits.",
-            Self::SimplifiedChinese => "对删除线下沉距离的像素微调。",
+            Self::English => "Move the strikethrough vertically, in pixels",
+            Self::SimplifiedChinese => "按像素调整删除线的垂直位置",
         }
     }
 
@@ -1653,8 +1510,8 @@ impl Language {
 
     pub(crate) fn adjust_strikethrough_thickness_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to the strikethrough stroke thickness.",
-            Self::SimplifiedChinese => "对删除线笔画粗细的像素微调。",
+            Self::English => "Adjust line thickness in pixels",
+            Self::SimplifiedChinese => "按像素调整线条粗细",
         }
     }
 
@@ -1667,22 +1524,22 @@ impl Language {
 
     pub(crate) fn adjust_cursor_thickness_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to the bar/underline/hollow cursor stroke.",
-            Self::SimplifiedChinese => "对竖线/下划线/空心光标笔画粗细的像素微调。",
+            Self::English => "Adjust bar, underline, or hollow cursor strokes in pixels",
+            Self::SimplifiedChinese => "按像素调整竖线、下划线或空心光标的粗细",
         }
     }
 
     pub(crate) fn adjust_box_thickness_row(self) -> &'static str {
         match self {
             Self::English => "Box-drawing thickness",
-            Self::SimplifiedChinese => "制表符线条粗细",
+            Self::SimplifiedChinese => "框线粗细",
         }
     }
 
     pub(crate) fn adjust_box_thickness_description(self) -> &'static str {
         match self {
-            Self::English => "Pixel adjustment to box-drawing line thickness.",
-            Self::SimplifiedChinese => "对制表符（框线）线条粗细的像素微调。",
+            Self::English => "Adjust box-drawing strokes in pixels",
+            Self::SimplifiedChinese => "按像素调整框线字符的线条粗细",
         }
     }
 
@@ -1695,38 +1552,22 @@ impl Language {
 
     pub(crate) fn adjust_icon_height_description(self) -> &'static str {
         match self {
-            Self::English => "Percentage or pixel adjustment to Nerd Font icon height.",
-            Self::SimplifiedChinese => "对 Nerd Font 图标高度的百分比或像素微调。",
+            Self::English => "Adjust in pixels or percent",
+            Self::SimplifiedChinese => "按像素或百分比调整",
         }
     }
 
     pub(crate) fn completed_timeout_row(self) -> &'static str {
         match self {
-            Self::English => "Completed timeout",
-            Self::SimplifiedChinese => "完成超时",
-        }
-    }
-
-    pub(crate) fn completed_timeout_description(self) -> &'static str {
-        match self {
-            Self::English => "Hide completed OSC 9;4 progress after this delay.",
-            Self::SimplifiedChinese => "在此延迟后隐藏已完成的 OSC 9;4 进度。",
+            Self::English => "Hide completed progress after",
+            Self::SimplifiedChinese => "完成后隐藏",
         }
     }
 
     pub(crate) fn inactive_timeout_row(self) -> &'static str {
         match self {
-            Self::English => "Inactive timeout",
-            Self::SimplifiedChinese => "不活动超时",
-        }
-    }
-
-    pub(crate) fn inactive_timeout_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Hide running, error, paused, or indeterminate progress when no update arrives for this long."
-            }
-            Self::SimplifiedChinese => "当长时间没有更新时，隐藏运行中、错误、已暂停或不确定的进度。",
+            Self::English => "Hide inactive progress after",
+            Self::SimplifiedChinese => "无更新时隐藏",
         }
     }
 
@@ -1739,12 +1580,8 @@ impl Language {
 
     pub(crate) fn osc_clipboard_read_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Allow terminal programs to read the system clipboard through OSC 52 or OSC 5522. Writes remain enabled."
-            }
-            Self::SimplifiedChinese => {
-                "允许终端程序通过 OSC 52 或 OSC 5522 读取系统剪贴板。写入保持启用。"
-            }
+            Self::English => "Controls reading only; writing stays enabled",
+            Self::SimplifiedChinese => "仅控制读取，写入始终可用",
         }
     }
 
@@ -1792,12 +1629,8 @@ impl Language {
 
     pub(crate) fn detect_urls_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Highlight bare URLs in terminal output so they can be hovered and opened with Cmd/Ctrl+click."
-            }
-            Self::SimplifiedChinese => {
-                "高亮终端输出中的裸露 URL，可悬停并用 Cmd/Ctrl+点击打开。"
-            }
+            Self::English => "Cmd/Ctrl+click to open links",
+            Self::SimplifiedChinese => "Cmd/Ctrl+点击打开链接",
         }
     }
 
@@ -1805,17 +1638,6 @@ impl Language {
         match self {
             Self::English => "Copy on select",
             Self::SimplifiedChinese => "选中即复制",
-        }
-    }
-
-    pub(crate) fn copy_on_select_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Automatically copy text to the clipboard as soon as it is selected with the mouse."
-            }
-            Self::SimplifiedChinese => {
-                "鼠标选中文本后自动复制到剪贴板。"
-            }
         }
     }
 
@@ -1835,12 +1657,8 @@ impl Language {
 
     pub(crate) fn cursor_shape_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "The default cursor shape. Programs can still override it at runtime (DECSCUSR)."
-            }
-            Self::SimplifiedChinese => {
-                "默认光标形状。程序仍可在运行时覆盖（DECSCUSR）。"
-            }
+            Self::English => "Default shape; programs may override it",
+            Self::SimplifiedChinese => "默认形状，程序可自行更改",
         }
     }
 
@@ -1853,12 +1671,8 @@ impl Language {
 
     pub(crate) fn scrollback_lines_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "How many lines of terminal history to keep (0 disables scrollback). Applies to all terminals immediately."
-            }
-            Self::SimplifiedChinese => {
-                "保留的终端历史行数（0 表示禁用回滚）。立即应用到所有终端。"
-            }
+            Self::English => "0 disables history",
+            Self::SimplifiedChinese => "0 表示不保留历史",
         }
     }
 
@@ -1878,12 +1692,8 @@ impl Language {
 
     pub(crate) fn shell_program_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Path to the shell to launch. Leave empty to use $SHELL. Applies to newly created terminals only."
-            }
-            Self::SimplifiedChinese => {
-                "要启动的 shell 路径。留空则使用 $SHELL。仅对新建终端生效。"
-            }
+            Self::English => "Leave empty to use $SHELL; Applies to new terminals",
+            Self::SimplifiedChinese => "留空使用 $SHELL，仅对新建终端生效",
         }
     }
 
@@ -1897,11 +1707,9 @@ impl Language {
     pub(crate) fn shell_args_description(self) -> &'static str {
         match self {
             Self::English => {
-                "Space-separated arguments passed to the shell. Leave empty for the default. Applies to newly created terminals only."
+                "Separate arguments with spaces; Leave empty for defaults; Applies to new terminals"
             }
-            Self::SimplifiedChinese => {
-                "传给 shell 的参数，以空格分隔。留空则使用默认值。仅对新建终端生效。"
-            }
+            Self::SimplifiedChinese => "参数以空格分隔，留空使用默认值；仅对新建终端生效",
         }
     }
 
@@ -1914,12 +1722,8 @@ impl Language {
 
     pub(crate) fn shell_integration_path_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Append Eggie's binary directory to the shell PATH so `eggie +version` and other CLI commands work in the terminal. Applies to newly created terminals only."
-            }
-            Self::SimplifiedChinese => {
-                "将 Eggie 二进制所在目录追加到 shell PATH，使 `eggie +version` 等命令行命令可在终端内直接调用。仅对新建终端生效。"
-            }
+            Self::English => "Make the eggie command available in new terminals",
+            Self::SimplifiedChinese => "在新建终端中可直接使用 eggie 命令",
         }
     }
 
@@ -1972,17 +1776,6 @@ impl Language {
         }
     }
 
-    pub(crate) fn cursor_blink_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Whether the cursor blinks. Follow lets programs decide (DECSCUSR / DEC Mode 12)."
-            }
-            Self::SimplifiedChinese => {
-                "光标是否闪烁。「跟随程序」由程序决定（DECSCUSR / DEC Mode 12）。"
-            }
-        }
-    }
-
     pub(crate) fn cursor_blink_program(self) -> &'static str {
         match self {
             Self::English => "Follow",
@@ -2001,13 +1794,6 @@ impl Language {
         match self {
             Self::English => "Off",
             Self::SimplifiedChinese => "关",
-        }
-    }
-
-    pub(crate) fn terminal_preview_label(self) -> &'static str {
-        match self {
-            Self::English => "TERMINAL PREVIEW",
-            Self::SimplifiedChinese => "终端预览",
         }
     }
 
@@ -2113,8 +1899,8 @@ impl Language {
 
     pub(crate) fn keybindings_hint(self) -> &'static str {
         match self {
-            Self::English => "Click a shortcut to record a new key combination.",
-            Self::SimplifiedChinese => "点击快捷键即可录制新的组合键。",
+            Self::English => "Click a shortcut to change it",
+            Self::SimplifiedChinese => "点击快捷键进行修改",
         }
     }
 
@@ -2450,13 +2236,10 @@ impl Language {
     pub(crate) fn delete_profile_message(self, name: &str) -> String {
         match self {
             Self::English => format!(
-                "“{name}” will be removed. Terminals already launched from it keep running, \
-                 but fall back to the global appearance. Projects using it as their default \
-                 fall back to the built-in Default profile."
+                "“{name}” will be deleted. Existing terminals keep running with the global appearance. Projects using it as their default switch to Default."
             ),
             Self::SimplifiedChinese => format!(
-                "将删除“{name}”。已经从它启动的终端会继续运行，但外观回落到全局设置；\
-                 以它为默认配置的项目会回落到内置 Default 配置。"
+                "删除「{name}」后，现有终端继续运行并使用全局外观，以此为默认配置的项目改用 Default。"
             ),
         }
     }
@@ -2465,13 +2248,6 @@ impl Language {
         match self {
             Self::English => "Name",
             Self::SimplifiedChinese => "名称",
-        }
-    }
-
-    pub(crate) fn profile_name_description(self) -> &'static str {
-        match self {
-            Self::English => "Shown in the profile picker and as this profile's tab badge tooltip.",
-            Self::SimplifiedChinese => "显示在配置选择器中，也作为该配置的标签徽章提示。",
         }
     }
 
@@ -2492,11 +2268,10 @@ impl Language {
     pub(crate) fn profile_cwd_description(self) -> &'static str {
         match self {
             Self::English => {
-                "Directory new terminals start in. Leave empty to inherit the active terminal's directory, \
-                 then the project root. For a remote profile this is a path on the remote host."
+                "Leave empty to use the current directory, then the project root; Remote profiles use a remote path"
             }
             Self::SimplifiedChinese => {
-                "新终端的起始目录。留空则继承当前终端的目录，其次是项目根目录。远程配置下这是远端主机上的路径。"
+                "留空使用当前终端目录，其次是项目根目录；远程配置请填写远端路径"
             }
         }
     }
@@ -2518,11 +2293,10 @@ impl Language {
     pub(crate) fn profile_env_description(self) -> &'static str {
         match self {
             Self::English => {
-                "One NAME=value per line. Names must match [A-Za-z_][A-Za-z0-9_]*; other lines are ignored. \
-                 Eggie's own integration variables always win."
+                "One NAME=value per line; Names: [A-Za-z_][A-Za-z0-9_]*; Eggie integration variables take priority"
             }
             Self::SimplifiedChinese => {
-                "每行一条 NAME=value。名称须匹配 [A-Za-z_][A-Za-z0-9_]*，其余行会被忽略。Eggie 自身的集成变量始终优先。"
+                "每行 NAME=value；名称格式为 [A-Za-z_][A-Za-z0-9_]*；Eggie 集成变量优先"
             }
         }
     }
@@ -2539,10 +2313,10 @@ impl Language {
     pub(crate) fn profile_env_rejected(self, count: usize) -> String {
         match self {
             Self::English => {
-                format!("{count} line(s) ignored: a variable name must match [A-Za-z_][A-Za-z0-9_]*")
+                format!("{count} line(s) ignored. Check NAME=value syntax and variable names.")
             }
             Self::SimplifiedChinese => {
-                format!("已忽略 {count} 行：变量名必须匹配 [A-Za-z_][A-Za-z0-9_]*")
+                format!("已忽略 {count} 行，请检查 NAME=value 格式和变量名。")
             }
         }
     }
@@ -2563,13 +2337,8 @@ impl Language {
 
     pub(crate) fn profile_remote_host_description(self) -> &'static str {
         match self {
-            Self::English => {
-                "Connect over ssh instead of running a local shell. Leave empty for a local profile. \
-                 Eggie offers to install its shell integration on first connect."
-            }
-            Self::SimplifiedChinese => {
-                "通过 ssh 连接，而非启动本地 shell。留空则为本地配置。首次连接时 Eggie 会询问是否安装 shell 集成。"
-            }
+            Self::English => "SSH host; Leave empty for a local terminal",
+            Self::SimplifiedChinese => "SSH 主机，留空使用本地终端",
         }
     }
 
@@ -2589,8 +2358,8 @@ impl Language {
 
     pub(crate) fn profile_remote_user_description(self) -> &'static str {
         match self {
-            Self::English => "Leave empty to let ssh pick (your ssh config, then your local username).",
-            Self::SimplifiedChinese => "留空则由 ssh 决定（先读 ssh 配置，再用本地用户名）。",
+            Self::English => "Leave empty to use SSH defaults",
+            Self::SimplifiedChinese => "留空使用 SSH 默认用户",
         }
     }
 
@@ -2603,8 +2372,8 @@ impl Language {
 
     pub(crate) fn profile_remote_port_description(self) -> &'static str {
         match self {
-            Self::English => "Leave empty for the ssh default (22).",
-            Self::SimplifiedChinese => "留空则使用 ssh 默认端口（22）。",
+            Self::English => "Leave empty to use SSH defaults (usually 22)",
+            Self::SimplifiedChinese => "留空使用 SSH 默认端口（通常为 22）",
         }
     }
 
@@ -2615,16 +2384,14 @@ impl Language {
             Self::English => {
                 "Ignored: a host or user cannot be empty, start with “-”, or contain spaces."
             }
-            Self::SimplifiedChinese => {
-                "已忽略：主机或用户不能为空、不能以“-”开头，也不能含空格。"
-            }
+            Self::SimplifiedChinese => "已忽略：主机或用户不能为空、不能以“-”开头，也不能含空格。",
         }
     }
 
     pub(crate) fn profile_appearance_section(self) -> &'static str {
         match self {
-            Self::English => "Appearance overrides",
-            Self::SimplifiedChinese => "外观覆盖",
+            Self::English => "Appearance",
+            Self::SimplifiedChinese => "外观",
         }
     }
 
@@ -2635,35 +2402,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn profile_terminal_dark_theme_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Terminal colors for this profile when the dark appearance is in effect. Set both \
-                 slots to the same theme to keep a production host marked either way. Applies live \
-                 to this profile's terminals."
-            }
-            Self::SimplifiedChinese => {
-                "深色外观生效时，该配置终端的配色。两个槽填同一个主题，即可让生产主机在两种外观下都保持标记。对该配置的终端实时生效。"
-            }
-        }
-    }
-
     pub(crate) fn profile_terminal_light_theme_row(self) -> &'static str {
         match self {
             Self::English => "Terminal light theme",
             Self::SimplifiedChinese => "终端浅色主题",
-        }
-    }
-
-    pub(crate) fn profile_terminal_light_theme_description(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Terminal colors for this profile when the light appearance is in effect. Applies \
-                 live to this profile's terminals."
-            }
-            Self::SimplifiedChinese => {
-                "浅色外观生效时，该配置终端的配色。对该配置的终端实时生效。"
-            }
         }
     }
 
@@ -2674,13 +2416,6 @@ impl Language {
         }
     }
 
-    pub(crate) fn profile_font_description(self) -> &'static str {
-        match self {
-            Self::English => "Applies live to this profile's terminals.",
-            Self::SimplifiedChinese => "对该配置的终端实时生效。",
-        }
-    }
-
     pub(crate) fn profile_font_size_row(self) -> &'static str {
         match self {
             Self::English => "Font size",
@@ -2688,24 +2423,10 @@ impl Language {
         }
     }
 
-    pub(crate) fn profile_font_size_description(self) -> &'static str {
-        match self {
-            Self::English => "Applies live to this profile's terminals.",
-            Self::SimplifiedChinese => "对该配置的终端实时生效。",
-        }
-    }
-
     pub(crate) fn profile_badge_row(self) -> &'static str {
         match self {
-            Self::English => "Tab badge",
-            Self::SimplifiedChinese => "标签徽章",
-        }
-    }
-
-    pub(crate) fn profile_badge_description(self) -> &'static str {
-        match self {
-            Self::English => "A colored dot on the tabs of terminals launched from this profile.",
-            Self::SimplifiedChinese => "在从该配置启动的终端标签上显示一个彩色圆点。",
+            Self::English => "Tab marker",
+            Self::SimplifiedChinese => "标签标记",
         }
     }
 
@@ -2737,8 +2458,8 @@ impl Language {
 
     pub(crate) fn project_default_profile_placeholder(self) -> &'static str {
         match self {
-            Self::English => "Default profile for this project…",
-            Self::SimplifiedChinese => "此项目的默认配置…",
+            Self::English => "Project default profile…",
+            Self::SimplifiedChinese => "项目默认配置…",
         }
     }
 
@@ -2756,16 +2477,10 @@ impl Language {
     pub(crate) fn remote_install_message(self, destination: &str) -> String {
         match self {
             Self::English => format!(
-                "Eggie can install its shell integration on {destination} \
-                 (in ~/.eggie/) so this terminal reports the working directory, \
-                 command history and prompt positions.\n\n\
-                 Without it the session still works, just without those features. \
-                 Your choice is remembered for {destination}."
+                "Install files in ~/.eggie/ on {destination} for directory tracking, command history, and prompt navigation.\n\nYou can connect without installing. This choice will be remembered."
             ),
             Self::SimplifiedChinese => format!(
-                "Eggie 可以在 {destination} 上安装 shell 集成（位于 ~/.eggie/），\
-                 这样该终端就能报告工作目录、命令历史和提示符位置。\n\n\
-                 不安装也能正常使用，只是没有这些功能。此选择会为 {destination} 记住。"
+                "将在 {destination} 的 ~/.eggie/ 安装集成文件，启用目录跟踪、命令历史和命令跳转。\n\n也可不安装直接连接，此选择将被记住。"
             ),
         }
     }
@@ -2779,8 +2494,8 @@ impl Language {
 
     pub(crate) fn remote_install_skip(self) -> &'static str {
         match self {
-            Self::English => "Connect Without",
-            Self::SimplifiedChinese => "不安装并连接",
+            Self::English => "Skip and Connect",
+            Self::SimplifiedChinese => "跳过并连接",
         }
     }
 
@@ -2790,13 +2505,6 @@ impl Language {
         match self {
             Self::English => "Bell",
             Self::SimplifiedChinese => "响铃",
-        }
-    }
-
-    pub(crate) fn bell_description(self) -> &'static str {
-        match self {
-            Self::English => "How to react when a program rings the terminal bell.",
-            Self::SimplifiedChinese => "程序触发终端响铃时如何提示。",
         }
     }
 

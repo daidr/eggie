@@ -70,10 +70,6 @@ pub struct TerminalProgramStatus {
 pub struct SessionSummary {
     pub id: SessionId,
     pub project_id: ProjectId,
-    /// Owning window, or `None` when the session is detached (survives its window and is claimable
-    /// from any window). Clients filter the flat session list against their own window id using this.
-    #[serde(default)]
-    pub window_id: Option<WindowId>,
     pub title: String,
     pub initial_directory: PathBuf,
     pub current_directory: PathBuf,

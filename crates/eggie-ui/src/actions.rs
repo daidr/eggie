@@ -7,6 +7,27 @@ use crate::{
 use eggie_ipc::DaemonClient;
 use eggie_update::UpdateState;
 use gpui::{App, Entity, Menu, MenuItem, OsAction, SystemMenuType, actions};
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub(crate) struct FocusWindow {
+    pub id: eggie_domain::WindowId,
+}
+impl gpui::Action for FocusWindow {
+    fn boxed_clone(&self) -> Box<dyn gpui::Action> {
+        Box::new(self.clone())
+    }
+    fn partial_eq(&self, other: &dyn gpui::Action) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+    fn name(&self) -> &'static str {
+        "eggie::FocusWindow"
+    }
+    fn name_for_type() -> &'static str {
+        "eggie::FocusWindow"
+    }
+    fn build(value: serde_json::Value) -> anyhow::Result<Box<dyn gpui::Action>> {
+        Ok(Box::new(serde_json::from_value::<Self>(value)?))
+    }
+}
 const EGGIE_HELP_URL: &str = "https://github.com/daidr/eggie";
 actions!(
     eggie,
@@ -21,6 +42,7 @@ actions!(
         TerminalPaste,
         TerminalSelectAll,
         TerminalFind,
+        TerminalSuggest,
         NewTab,
         CloseTab,
         NextTab,
@@ -51,6 +73,10 @@ actions!(
         ToggleFullScreen,
         HelpDocs,
         CommandPalette,
+        TerminalSwitcher,
+        WindowSwitcher,
+        UndoWindowOperation,
+        QuitAndTerminate,
         ToggleLeftSidebar,
         ToggleRightSidebar,
         /// Open the profile picker, then create a terminal from the chosen profile (a one-off
@@ -71,6 +97,7 @@ pub(crate) fn install(
     cx: &mut App,
 ) {
     let settings_for_action = settings.clone();
+    let settings_for_terminate = settings.clone();
     let updates_for_action = updates.clone();
     let profile_store_for_action = profile_store.clone();
     let project_store_for_action = project_store.clone();
@@ -107,6 +134,23 @@ pub(crate) fn install(
             NewWindowInit::Empty,
         );
     });
+    let undo_resources = (
+        client.clone(),
+        settings.clone(),
+        updates.clone(),
+        project_store.clone(),
+        profile_store.clone(),
+        snippet_store.clone(),
+        notes_store.clone(),
+        notification_routes.clone(),
+    );
+    cx.on_action(move |_: &UndoWindowOperation, cx| {
+        let (client, settings, updates, projects, profiles, snippets, notes, routes) =
+            undo_resources.clone();
+        EggieApp::undo_shared_window_operation(
+            client, settings, updates, projects, profiles, snippets, notes, routes, cx,
+        );
+    });
     // Manual update check: surface the update window (which shows the live state) and kick off
     // a check when idle.
     let updates_for_check = updates.clone();
@@ -135,14 +179,113 @@ pub(crate) fn install(
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|action: &FocusWindow, cx| {
+        let handle = crate::workspace::WindowManager::global(cx)
+            .read(cx)
+            .handles
+            .get(&action.id)
+            .copied();
+        if let Some(handle) = handle {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        }
+    });
+    cx.on_action(|_: &Quit, cx| {
+        let manager = crate::workspace::WindowManager::global(cx);
+        manager.update(cx, |manager, _| {
+            manager.persist();
+            manager.quitting = true;
+        });
+        cx.quit();
+    });
+    let terminate_client = client.clone();
+    cx.on_action(move |_: &QuitAndTerminate, cx| {
+        let client = terminate_client.clone();
+        let manager = crate::workspace::WindowManager::global(cx);
+        let Some(handle) = cx.active_window() else {
+            cx.dispatch_action(&NewWindow);
+            cx.defer(|cx| cx.dispatch_action(&QuitAndTerminate));
+            return;
+        };
+        let lang = settings_for_terminate.read(cx).config().language;
+        let _ = handle.update(cx, |_, window, cx| {
+            let prompt = window.prompt(
+                gpui::PromptLevel::Warning,
+                if lang == Language::SimplifiedChinese {
+                    "结束全部终端并退出？"
+                } else {
+                    "Terminate all terminals and quit?"
+                },
+                Some(if lang == Language::SimplifiedChinese {
+                    "其他窗口和后台终端也会结束。"
+                } else {
+                    "Includes other windows and background terminals."
+                }),
+                &[lang.cancel(), lang.terminate_all()],
+                cx,
+            );
+            cx.spawn(async move |cx| {
+                if prompt.await != Ok(1) {
+                    return;
+                }
+                let _ = manager.update(cx, |manager, _| manager.terminating_all = true);
+                let response = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if let Ok(eggie_protocol::DaemonResponse::Sessions { sessions }) =
+                            client.request(eggie_protocol::ClientRequest::ListSessions)
+                        {
+                            for session in sessions {
+                                match client.request(eggie_protocol::ClientRequest::Terminate {
+                                    session_id: session.id,
+                                })? {
+                                    eggie_protocol::DaemonResponse::Ok => {}
+                                    response => {
+                                        anyhow::bail!("Could not terminate terminal: {response:?}")
+                                    }
+                                }
+                            }
+                        } else {
+                            anyhow::bail!("Could not list terminals");
+                        }
+                        eggie_ipc::terminate_daemon_at(&eggie_ipc::daemon_socket_path());
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                let _ = cx.update(|cx| {
+                    manager.update(cx, |manager, _| manager.terminating_all = false);
+                    if let Err(error) = &response {
+                        manager.update(cx, |manager, cx| {
+                            manager.error = Some(error.to_string());
+                            cx.notify();
+                        });
+                    }
+                    if response.is_ok() {
+                        manager.update(cx, |manager, _| {
+                            manager.state = Default::default();
+                            manager.persist();
+                            manager.quitting = true;
+                        });
+                        cx.quit();
+                    }
+                });
+            })
+            .detach();
+        });
+    });
     // App-level menu commands that don't act on a specific terminal window.
     cx.on_action(|_: &About, _cx| crate::system_menu::show_about_panel());
     cx.on_action(|_: &CloseAllWindows, cx| {
-        for handle in cx.windows() {
-            handle
-                .update(cx, |_, window, _| window.remove_window())
-                .ok();
+        let handles = crate::workspace::WindowManager::global(cx)
+            .read(cx)
+            .handles
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.update(cx, |app, window, cx| {
+                app.close_presentation(window, cx);
+                window.remove_window();
+            });
         }
     });
     cx.on_action(|_: &HelpDocs, cx| cx.open_url(EGGIE_HELP_URL));
@@ -158,7 +301,7 @@ pub(crate) fn install(
             .registered
             .clone();
         crate::keybindings::rebuild_keymap(&config, &lua, cx);
-        cx.set_menus(build_menus(config.language));
+        rebuild_menus(config.language, cx);
     });
     // Build the keymap from settings (defaults + user overrides). This also
     // registers the text-input bindings in the correct order to preserve the
@@ -168,7 +311,7 @@ pub(crate) fn install(
     let lua = settings.read(cx).lua_config().registered.clone();
     crate::keybindings::rebuild_keymap(&config, &lua, cx);
     let language = config.language;
-    cx.set_menus(build_menus(language));
+    rebuild_menus(language, cx);
 
     let settings_for_observer = settings.clone();
     cx.observe(&settings, move |_, cx| {
@@ -182,9 +325,32 @@ pub(crate) fn install(
             .registered
             .clone();
         crate::keybindings::rebuild_keymap(&config, &lua, cx);
-        cx.set_menus(build_menus(config.language));
+        rebuild_menus(config.language, cx);
     })
     .detach();
+}
+
+pub(crate) fn rebuild_menus(language: Language, cx: &mut App) {
+    let mut menus = build_menus(language);
+    if let Some(global) = cx.try_global::<crate::workspace::SharedWindows>() {
+        let manager = global.0.read(cx);
+        if let Some(menu) = menus
+            .iter_mut()
+            .find(|menu| menu.name.as_ref() == language.window_menu())
+        {
+            menu.items.push(MenuItem::separator());
+            for window in manager.state.windows.values() {
+                menu.items.push(
+                    MenuItem::action(
+                        manager.window_label(window.id),
+                        FocusWindow { id: window.id },
+                    )
+                    .checked(manager.state.active_window == Some(window.id)),
+                );
+            }
+        }
+    }
+    cx.set_menus(menus);
 }
 
 fn build_menus(language: Language) -> Vec<Menu> {
@@ -206,6 +372,7 @@ fn build_menus(language: Language) -> Vec<Menu> {
             MenuItem::action(language.show_all(), ShowAll),
             MenuItem::separator(),
             MenuItem::action(language.quit_eggie(), Quit),
+            MenuItem::action(language.quit_and_terminate(), QuitAndTerminate),
         ]),
         Menu::new(language.file_menu()).items([
             MenuItem::action(language.action_new_tab(), NewTab).icon("macwindow"),
@@ -270,6 +437,10 @@ fn build_menus(language: Language) -> Vec<Menu> {
             MenuItem::action(language.action_clear_screen(), ClearScreen).icon("clear"),
         ]),
         Menu::new(language.window_menu()).items([
+            MenuItem::action(language.window_switcher(), WindowSwitcher),
+            MenuItem::action(language.terminal_switcher(), TerminalSwitcher),
+            MenuItem::action(language.undo_window_operation(), UndoWindowOperation),
+            MenuItem::separator(),
             MenuItem::action(language.action_minimize_window(), MinimizeWindow)
                 .icon("minus.rectangle"),
             MenuItem::action(language.zoom_menu_item(), ZoomWindow)

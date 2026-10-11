@@ -14,13 +14,16 @@ pub const MAX_IMAGE_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_SHM_IMAGE_BYTES: usize = 400 * 1024 * 1024;
 pub const RAW_TERMINAL_IMAGE_WIRE_FLAG: u32 = 1 << 31;
 pub const SHM_TERMINAL_IMAGE_WIRE_FLAG: u32 = 1 << 30;
-pub const WIRE_HEADER_FLAG_MASK: u32 = RAW_TERMINAL_IMAGE_WIRE_FLAG | SHM_TERMINAL_IMAGE_WIRE_FLAG;
+pub const SHM_GRID_WIRE_FLAG: u32 = 1 << 29;
+pub const WIRE_HEADER_FLAG_MASK: u32 =
+    RAW_TERMINAL_IMAGE_WIRE_FLAG | SHM_TERMINAL_IMAGE_WIRE_FLAG | SHM_GRID_WIRE_FLAG;
 pub const RAW_TERMINAL_IMAGE_METADATA_SIZE: usize = 28;
 /// How a peer should interpret a wire frame, decoded from its 4-byte length-prefix header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireFrameKind {
     /// No flag bits set — a length-prefixed MessagePack message.
     Message,
+    ShmGrid,
     /// [`RAW_TERMINAL_IMAGE_WIRE_FLAG`] set — raw image pixels follow inline.
     RawImage,
     /// [`SHM_TERMINAL_IMAGE_WIRE_FLAG`] set — an shm segment reference follows (no inline pixels).
@@ -35,6 +38,8 @@ pub fn classify_wire_header(header: u32) -> (WireFrameKind, usize) {
         WireFrameKind::RawImage
     } else if header & SHM_TERMINAL_IMAGE_WIRE_FLAG != 0 {
         WireFrameKind::ShmImage
+    } else if header & SHM_GRID_WIRE_FLAG != 0 {
+        WireFrameKind::ShmGrid
     } else {
         WireFrameKind::Message
     };
@@ -510,7 +515,84 @@ pub fn read_image_shm_segment(
     bail!("shared-memory image transport is only supported on unix")
 }
 
+#[cfg(unix)]
+pub(crate) fn write_grid_update(
+    writer: &mut impl Write,
+    buffer: &mut Vec<u8>,
+    update: &crate::shared_grid::GridUpdate,
+) -> Result<()> {
+    buffer.clear();
+    rmp_serde::encode::write_named(&mut *buffer, update)?;
+    ensure_grid_message_length(buffer.len())?;
+    writer.write_all(&((buffer.len() as u32) | SHM_GRID_WIRE_FLAG).to_le_bytes())?;
+    writer.write_all(buffer)?;
+    Ok(())
+}
+fn ensure_grid_message_length(length: usize) -> Result<()> {
+    if length > MAX_WIRE_MESSAGE_SIZE {
+        bail!("shared grid metadata exceeds wire bound");
+    }
+    Ok(())
+}
+
 pub fn read_daemon_response(
+    reader: &mut impl Read,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<DaemonResponse>> {
+    #[cfg(unix)]
+    {
+        read_daemon_response_with_grid(reader, buffer, &mut crate::GridReader::default())
+    }
+    #[cfg(not(unix))]
+    {
+        read_daemon_response_inner(reader, buffer)
+    }
+}
+
+#[cfg(unix)]
+pub fn read_daemon_response_with_grid(
+    reader: &mut impl Read,
+    buffer: &mut Vec<u8>,
+    grid: &mut crate::GridReader,
+) -> Result<Option<DaemonResponse>> {
+    let Some(header) = read_wire_header(reader)? else {
+        return Ok(None);
+    };
+    let (kind, length) = classify_wire_header(header);
+    if kind == WireFrameKind::ShmGrid {
+        ensure_grid_message_length(length)?;
+        let started = crate::client::render_metrics_enabled().then(std::time::Instant::now);
+        buffer.resize(length, 0);
+        reader.read_exact(buffer)?;
+        let read_at = started.map(|_| std::time::Instant::now());
+        let update = rmp_serde::from_slice(buffer).context("invalid shared grid metadata")?;
+        let decoded_at = started.map(|_| std::time::Instant::now());
+        let snapshot = grid.receive(update)?;
+        if let Some(started) = started.filter(|_| snapshot.revision.is_multiple_of(30)) {
+            eprintln!(
+                "[eggie-grid] receive revision={} socket_bytes={} read_body_ms={:.3} decode_metadata_ms={:.3} acquire_rows_ms={:.3}",
+                snapshot.revision,
+                length + 4,
+                read_at.unwrap().duration_since(started).as_secs_f64() * 1000.,
+                decoded_at
+                    .unwrap()
+                    .duration_since(read_at.unwrap())
+                    .as_secs_f64()
+                    * 1000.,
+                decoded_at.unwrap().elapsed().as_secs_f64() * 1000.
+            );
+        }
+        return Ok(Some(DaemonResponse::Snapshot { snapshot }));
+    }
+    let response = read_response_body(reader, buffer, kind, length)?;
+    if let Some(DaemonResponse::Snapshot { snapshot }) = &response {
+        grid.accept_owned(snapshot.clone());
+    }
+    Ok(response)
+}
+
+#[cfg(not(unix))]
+fn read_daemon_response_inner(
     reader: &mut impl Read,
     buffer: &mut Vec<u8>,
 ) -> Result<Option<DaemonResponse>> {
@@ -518,11 +600,20 @@ pub fn read_daemon_response(
         return Ok(None);
     };
     let (kind, length) = classify_wire_header(header);
+    read_response_body(reader, buffer, kind, length)
+}
+fn read_response_body(
+    reader: &mut impl Read,
+    buffer: &mut Vec<u8>,
+    kind: WireFrameKind,
+    length: usize,
+) -> Result<Option<DaemonResponse>> {
     let mut bytes = Vec::new();
     let metadata = match kind {
         WireFrameKind::Message => return read_message_body(reader, buffer, length).map(Some),
         WireFrameKind::RawImage => read_terminal_image_wire_into(reader, length, &mut bytes)?,
         WireFrameKind::ShmImage => read_terminal_image_shm_wire_into(reader, length, &mut bytes)?,
+        WireFrameKind::ShmGrid => bail!("shared grid transport is unavailable"),
     };
     Ok(Some(DaemonResponse::TerminalImage {
         key: metadata.key,

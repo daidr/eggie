@@ -1,123 +1,90 @@
 use super::*;
 
 impl EggieApp {
+    pub(crate) fn deliver_osc_without_window(
+        session_id: SessionId,
+        payload: TerminalOscEventPayload,
+        client: DaemonClient,
+        routes: &NotificationRoutes,
+        cx: &mut App,
+    ) {
+        match payload {
+            TerminalOscEventPayload::Notification { notification } => {
+                let tag = notification_tag(session_id, &notification.id);
+                routes.borrow_mut().insert(
+                    tag.clone(),
+                    NotificationRoute {
+                        client,
+                        session_id,
+                        notification_id: notification.id,
+                    },
+                );
+                cx.show_system_notification(SystemNotification {
+                    tag: tag.into(),
+                    title: notification.title.into(),
+                    body: notification.body.into(),
+                    actions: vec![],
+                });
+            }
+            TerminalOscEventPayload::NotificationClose { id } => {
+                let tag = notification_tag(session_id, &id);
+                cx.dismiss_system_notification(&tag);
+                routes.borrow_mut().remove(&tag);
+            }
+            TerminalOscEventPayload::ClipboardWrite { contents, .. } => {
+                if let Some(item) = clipboard_item_from_contents(contents) {
+                    cx.write_to_clipboard(item);
+                }
+            }
+            TerminalOscEventPayload::ClipboardRead {
+                request_id,
+                mime_types,
+                ..
+            } => {
+                let contents = cx
+                    .read_from_clipboard()
+                    .map(|item| clipboard_contents_from_item(item, &mime_types))
+                    .unwrap_or_default();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = client.request(ClientRequest::CompleteClipboardRead {
+                            session_id,
+                            request_id,
+                            contents,
+                        });
+                    })
+                    .detach();
+            }
+            TerminalOscEventPayload::FocusRequest => {
+                cx.dispatch_action(&crate::actions::NewWindow);
+                cx.defer(move |cx| {
+                    let manager = WindowManager::global(cx);
+                    if let Some(handle) = manager.read(cx).handles.values().next().copied() {
+                        let _ = handle.update(cx, |app, window, cx| {
+                            app.navigate_terminal(session_id, window, cx)
+                        });
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
     pub(super) fn start_polling(&mut self, cx: &mut Context<Self>) {
         self.ensure_snapshot_watchers(cx);
-        self.start_session_polling(cx);
         self.ensure_progress_watchers(cx);
         self.ensure_osc_watchers(cx);
     }
 
     pub(super) fn ensure_progress_watchers(&mut self, cx: &mut Context<Self>) {
-        let live_sessions = self
-            .window_session_ids()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        self.session_feed
-            .progress_updates
-            .retain(|session_id, _| live_sessions.contains(session_id));
-        self.session_feed
-            .pending_progress_updates
-            .retain(|session_id, _| live_sessions.contains(session_id));
-        self.session_feed
-            .progress_watchers
-            .retain(|session_id| live_sessions.contains(session_id));
-
-        for session_id in live_sessions {
-            if !self.session_feed.progress_watchers.insert(session_id) {
-                continue;
-            }
-            self.start_progress_watching(session_id, cx);
-        }
-    }
-
-    pub(super) fn ensure_osc_watchers(&mut self, cx: &mut Context<Self>) {
-        let live_sessions = self
-            .window_session_ids()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        self.session_feed
-            .osc_watchers
-            .retain(|session_id| live_sessions.contains(session_id));
-        for session_id in live_sessions {
-            if self.session_feed.osc_watchers.insert(session_id) {
-                self.start_osc_watching(session_id, cx);
-            }
-        }
-    }
-
-    pub(super) fn start_osc_watching(&self, session_id: SessionId, cx: &mut Context<Self>) {
         let client = self.client.clone();
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
-            let mut connection = None;
-            let mut after_revision = 0;
-            loop {
-                let session_exists = this
-                    .update(cx, |app, _| {
-                        app.session_feed
-                            .sessions
-                            .iter()
-                            .any(|session| session.id == session_id)
-                    })
-                    .unwrap_or(false);
-                if !session_exists {
-                    break;
-                }
-
-                let request_client = client.clone();
-                let (next_connection, result) = executor
-                    .spawn(async move {
-                        let mut connected = match connection.take() {
-                            Some(connected) => connected,
-                            None => match request_client.connect() {
-                                Ok(connected) => connected,
-                                Err(error) => return (None, Err(error)),
-                            },
-                        };
-                        let result = connected.request(ClientRequest::WaitForOscEvents {
-                            session_id,
-                            after_revision,
-                            timeout_ms: OSC_EVENT_WAIT_TIMEOUT.as_millis() as u32,
-                        });
-                        if result.is_ok() {
-                            (Some(connected), result)
-                        } else {
-                            (None, result)
-                        }
-                    })
-                    .await;
-                connection = next_connection;
-                let failed = result.is_err();
-                let update = this.update_in(cx, |app, window, cx| match result {
-                    Ok(DaemonResponse::OscEvents { update }) if update.session_id == session_id => {
-                        after_revision = update.revision;
-                        for event in update.events {
-                            app.handle_osc_event(session_id, event.payload, window, cx);
-                        }
-                    }
-                    Ok(DaemonResponse::OscEventsUnchanged { revision, .. }) => {
-                        after_revision = after_revision.max(revision);
-                    }
-                    Ok(response) => {
-                        eprintln!("unexpected OSC event response for {session_id}: {response:?}");
-                    }
-                    Err(error) => {
-                        eprintln!("OSC event polling failed for {session_id}: {error:#}");
-                    }
-                });
-                if update.is_err() {
-                    break;
-                }
-                if failed {
-                    executor.timer(Duration::from_millis(25)).await;
-                }
-            }
-        })
-        .detach();
+        self.window_manager
+            .update(cx, |manager, cx| manager.ensure_streams(client, cx));
+    }
+    pub(super) fn ensure_osc_watchers(&mut self, cx: &mut Context<Self>) {
+        self.ensure_progress_watchers(cx);
     }
 
-    pub(super) fn handle_osc_event(
+    pub(crate) fn handle_osc_event(
         &mut self,
         session_id: SessionId,
         payload: TerminalOscEventPayload,
@@ -126,7 +93,7 @@ impl EggieApp {
     ) {
         match payload {
             TerminalOscEventPayload::Notification { notification } => {
-                if window.is_window_active() {
+                if window.is_window_active() && self.is_visible_active_session(session_id) {
                     let client = self.client.clone();
                     let notification_id = notification.id;
                     cx.background_executor()
@@ -144,7 +111,6 @@ impl EggieApp {
                 self.notification_routes.borrow_mut().insert(
                     tag.clone(),
                     NotificationRoute {
-                        app: cx.weak_entity(),
                         client: self.client.clone(),
                         session_id,
                         notification_id: notification.id.clone(),
@@ -242,7 +208,7 @@ impl EggieApp {
             TerminalOscEventPayload::FocusRequest => {
                 cx.activate(true);
                 window.activate_window();
-                self.activate_session_by_id(session_id, window, cx);
+                self.navigate_terminal(session_id, window, cx);
             }
             TerminalOscEventPayload::Bell => {
                 let bell_mode = self.settings.read(cx).config().bell_mode;
@@ -267,7 +233,7 @@ impl EggieApp {
             TerminalOscEventPayload::FileTransfer { offer } => {
                 let directory = self
                     .session_feed
-                    .sessions
+                    .global_sessions
                     .iter()
                     .find(|session| session.id == session_id)
                     .map(|session| {
@@ -335,104 +301,8 @@ impl EggieApp {
         }
     }
 
-    pub(super) fn start_progress_watching(&self, session_id: SessionId, cx: &mut Context<Self>) {
-        let client = self.client.clone();
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
-            let mut connection = None;
-            let mut after_revision = 0;
-            loop {
-                let session_exists = this
-                    .update(cx, |app, _| {
-                        app.session_feed
-                            .sessions
-                            .iter()
-                            .any(|session| session.id == session_id)
-                    })
-                    .unwrap_or(false);
-                if !session_exists {
-                    break;
-                }
-
-                let request_client = client.clone();
-                let (next_connection, result) = executor
-                    .spawn(async move {
-                        let mut connected = match connection.take() {
-                            Some(connected) => connected,
-                            None => match request_client.connect() {
-                                Ok(connected) => connected,
-                                Err(error) => return (None, Err(error)),
-                            },
-                        };
-                        let result = connected.request(ClientRequest::WaitForProgress {
-                            session_id,
-                            after_revision,
-                            timeout_ms: PROGRESS_WAIT_TIMEOUT.as_millis() as u32,
-                        });
-                        if result.is_ok() {
-                            (Some(connected), result)
-                        } else {
-                            (None, result)
-                        }
-                    })
-                    .await;
-                connection = next_connection;
-                let request_failed = result.is_err();
-                let update = this.update_in(cx, |app, window, cx| match result {
-                    Ok(DaemonResponse::Progress { update }) if update.session_id == session_id => {
-                        after_revision = update.revision;
-                        let should_replace = app
-                            .session_feed
-                            .pending_progress_updates
-                            .get(&session_id)
-                            .or_else(|| app.session_feed.progress_updates.get(&session_id))
-                            .is_none_or(|current| current.revision < update.revision);
-                        if should_replace {
-                            app.session_feed
-                                .pending_progress_updates
-                                .insert(session_id, update);
-                            app.schedule_progress_frame(window, cx);
-                        }
-                    }
-                    Ok(DaemonResponse::ProgressUnchanged { revision, .. }) => {
-                        after_revision = after_revision.max(revision);
-                    }
-                    Ok(response) => {
-                        eprintln!("unexpected progress response for {session_id}: {response:?}");
-                    }
-                    Err(error) => {
-                        eprintln!("progress polling failed for {session_id}: {error:#}");
-                    }
-                });
-                if update.is_err() {
-                    break;
-                }
-                if request_failed {
-                    executor.timer(Duration::from_millis(25)).await;
-                }
-            }
-        })
-        .detach();
-    }
-
-    pub(super) fn schedule_progress_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.progress_frame_scheduled {
-            return;
-        }
-        self.progress_frame_scheduled = true;
-        cx.on_next_frame(window, |app, window, cx| {
-            app.progress_frame_scheduled = false;
-            for (session_id, update) in app.session_feed.pending_progress_updates.drain() {
-                app.session_feed.progress_updates.insert(session_id, update);
-            }
-            app.ensure_progress_animation(window, cx);
-            cx.notify();
-        });
-        window.refresh();
-    }
-
     pub(super) fn has_animated_icon_indicator(&self) -> bool {
-        self.session_feed.sessions.iter().any(|session| {
+        self.session_feed.global_sessions.iter().any(|session| {
             icon_indicator(
                 session.program_status.as_ref(),
                 self.session_feed
@@ -599,7 +469,7 @@ impl EggieApp {
             ItemKind::Terminal => session_id
                 .and_then(|id| {
                     self.session_feed
-                        .sessions
+                        .global_sessions
                         .iter()
                         .find(|session| session.id == id)
                 })
@@ -1020,6 +890,14 @@ impl EggieApp {
 
     pub(super) fn ensure_snapshot_watchers(&mut self, cx: &mut Context<Self>) {
         for session_id in self.visible_active_session_ids() {
+            if !self
+                .session_feed
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id)
+            {
+                continue;
+            }
             if let Some(snapshot) = self.session_feed.snapshots.get(&session_id).cloned() {
                 self.schedule_terminal_images(&snapshot, cx);
             }
@@ -1032,11 +910,18 @@ impl EggieApp {
     pub(super) fn start_snapshot_watching(&self, session_id: SessionId, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let executor = cx.background_executor().clone();
+        let shared_grid = !std::env::var_os("EGGIE_SHARED_GRID").is_some_and(|v| v == "0");
         cx.spawn(async move |this, cx| {
             let mut connection = None;
             while let Some(after_revision) = this
                 .update(cx, |app, _| {
-                    app.is_visible_active_session(session_id).then(|| {
+                    (app.is_visible_active_session(session_id)
+                        && app
+                            .session_feed
+                            .sessions
+                            .iter()
+                            .any(|session| session.id == session_id))
+                    .then(|| {
                         app.session_feed
                             .snapshots
                             .get(&session_id)
@@ -1056,10 +941,18 @@ impl EggieApp {
                                 Err(error) => return (None, Err(error)),
                             },
                         };
-                        let result = connected.request(ClientRequest::WaitForSnapshot {
-                            session_id,
-                            after_revision,
-                            timeout_ms: SNAPSHOT_WAIT_TIMEOUT.as_millis() as u32,
+                        let result = connected.request(if !shared_grid {
+                            ClientRequest::WaitForSnapshot {
+                                session_id,
+                                after_revision,
+                                timeout_ms: SNAPSHOT_WAIT_TIMEOUT.as_millis() as u32,
+                            }
+                        } else {
+                            ClientRequest::WaitForRenderFrame {
+                                session_id,
+                                after_revision,
+                                timeout_ms: SNAPSHOT_WAIT_TIMEOUT.as_millis() as u32,
+                            }
                         });
                         if result.is_ok() {
                             (Some(connected), result)
@@ -1151,6 +1044,7 @@ impl EggieApp {
                             }
                         }
                     }
+                    app.sync_completion(session_id, cx);
                     if changed && app.is_visible_active_session(session_id) {
                         app.schedule_terminal_frame(window, cx);
                     }
@@ -1175,91 +1069,27 @@ impl EggieApp {
         .detach();
     }
 
-    pub(super) fn start_session_polling(&mut self, cx: &mut Context<Self>) {
-        let client = self.client.clone();
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
-            loop {
-                let request_client = client.clone();
-                let result = executor
-                    .spawn(async move { request_client.request(ClientRequest::ListSessions) })
-                    .await;
-                let update = this.update_in(cx, |app, window, cx| match result {
-                    Ok(DaemonResponse::Sessions { sessions }) => {
-                        app.apply_session_list(sessions, cx);
-                        app.ensure_progress_animation(window, cx);
-                    }
-                    Ok(response) => eprintln!("unexpected sessions response: {response:?}"),
-                    Err(error) => eprintln!("session polling failed: {error:#}"),
-                });
-                if update.is_err() {
-                    eprintln!("session polling lost its window");
-                    break;
-                }
-                executor.timer(SESSION_LIST_INTERVAL).await;
-            }
-        })
-        .detach();
-    }
-
-    /// Classify the daemon's flat session list into this window's own sessions and the detached
-    /// (unowned) ones, then reconcile local state. Sessions owned by other windows are ignored.
-    ///
-    /// A session this window previously owned can vanish from its own set here — either terminated
-    /// elsewhere, or (R10) claimed by another window between polls. In that case its tabs are pruned
-    /// from every project layout so the window never renders a terminal the daemon no longer assigns
-    /// to it.
+    /// Project the global catalog onto local layout IDs while retaining ended tab metadata.
     pub(super) fn apply_session_list(
         &mut self,
         sessions: Vec<SessionSummary>,
         cx: &mut Context<Self>,
     ) {
-        let mut owned = Vec::new();
-        let mut detached = Vec::new();
-        for session in sessions {
-            match session.window_id {
-                Some(window_id) if window_id == self.window_id => owned.push(session),
-                None => detached.push(session),
-                Some(_) => {} // owned by another window — not visible here
-            }
-        }
-
+        self.session_feed.global_sessions = sessions.clone();
+        let local: HashSet<_> = self.window_session_ids().into_iter().collect();
+        let owned: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| local.contains(&s.id))
+            .collect();
         let mut changed = false;
         for session in &owned {
             changed |= self.synchronize_session_title(session.id, &session.title);
-        }
-
-        // Prune tabs for sessions this window no longer owns (terminated or claimed away).
-        let owned_ids: HashSet<SessionId> = owned.iter().map(|session| session.id).collect();
-        let vanished: Vec<SessionId> = self
-            .session_feed
-            .sessions
-            .iter()
-            .filter(|session| !owned_ids.contains(&session.id))
-            .map(|session| session.id)
-            .collect();
-        for session_id in vanished {
-            if self
-                .sidebar
-                .sidebar_preview
-                .as_ref()
-                .map(|preview| preview.session_id)
-                == Some(session_id)
-            {
-                self.dismiss_sidebar_preview(cx);
-            }
-            changed |= self.prune_session_from_layouts(session_id);
         }
 
         if self.session_feed.sessions != owned {
             self.session_feed.sessions = owned;
             changed = true;
         }
-        if self.session_feed.detached_sessions != detached {
-            self.session_feed.detached_sessions = detached;
-            changed = true;
-        }
-
         if changed {
             self.ensure_snapshot_watchers(cx);
             self.ensure_progress_watchers(cx);
@@ -1267,75 +1097,6 @@ impl EggieApp {
             self.sync_terminal_focus();
             cx.notify();
         }
-    }
-
-    /// Remove every tab backed by `session_id` from all project layouts, dropping any per-session
-    /// caches. Returns whether anything changed. Used when a session leaves this window's ownership.
-    pub(super) fn prune_session_from_layouts(&mut self, session_id: SessionId) -> bool {
-        let mut changed = false;
-        // Collect (project_id, group_id, item_id) for every tab of this session across all views.
-        let targets: Vec<(ProjectId, GroupId, ItemId)> = self
-            .workspace_state
-            .project_views
-            .iter()
-            .filter_map(|(project_id, view)| {
-                view.layout
-                    .find_terminal_item(session_id)
-                    .map(|(group_id, item_id)| (*project_id, group_id, item_id))
-            })
-            .collect();
-        for (project_id, group_id, item_id) in targets {
-            if let Some(view) = self.workspace_state.project_views.get_mut(&project_id) {
-                view.layout.close_item(group_id, item_id);
-                self.sidebar
-                    .marquee_states
-                    .borrow_mut()
-                    .remove(&format!("tab-title-{item_id}"));
-                if view.layout.find_group(group_id).is_none() {
-                    view.active_group_id = view.layout.first_group_id();
-                }
-                changed = true;
-            }
-        }
-        if changed {
-            if self.terminal_focused_session == Some(session_id) {
-                self.terminal_focused_session = None;
-            }
-            self.session_feed.snapshots.remove(&session_id);
-            self.terminal_sizes.remove(&session_id);
-            self.terminal_resize_in_flight.remove(&session_id);
-            self.terminal_ime_states.remove(&session_id);
-            self.session_feed.session_inspections.remove(&session_id);
-            self.session_feed
-                .session_inspection_errors
-                .remove(&session_id);
-            self.sidebar
-                .tab_icon_states
-                .borrow_mut()
-                .remove(&session_id);
-            self.sidebar
-                .sidebar_status_rows
-                .borrow_mut()
-                .remove(&session_id);
-            self.sidebar
-                .sidebar_row_bounds
-                .borrow_mut()
-                .remove(&session_id);
-            self.sidebar
-                .marquee_states
-                .borrow_mut()
-                .remove(&format!("sidebar-title-{session_id}"));
-            self.sidebar
-                .marquee_states
-                .borrow_mut()
-                .remove(&format!("sidebar-subtitle-{session_id}"));
-            self.session_feed.shell_integration.remove(&session_id);
-            self.notification_routes
-                .borrow_mut()
-                .retain(|_, route| route.session_id != session_id);
-            self.reconcile_layout_caches();
-        }
-        changed
     }
 
     pub(super) fn start_inspection_polling(&mut self, cx: &mut Context<Self>) {

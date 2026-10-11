@@ -31,8 +31,8 @@ impl SettingsWindow {
         });
     }
 
-    /// Light up `name` as a transient hover preview across the app (real terminals + the settings
-    /// preview), attributed to `kind`'s slot so it resolves through the same layering the committed
+    /// Light up `name` as a transient hover preview across the interface and real terminals,
+    /// attributed to `kind`'s slot so it resolves through the same layering the committed
     /// value would. No-op if the name doesn't resolve to a known theme, or if `kind` picks a font.
     pub(super) fn preview_theme(&mut self, kind: SelectorKind, name: &str, cx: &mut Context<Self>) {
         if self.lua_manages_selector(kind, cx) {

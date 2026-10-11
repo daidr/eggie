@@ -7,6 +7,9 @@ pub(crate) enum NativeTabMenuCommand {
     Move(Direction),
     SetCustomTitle,
     ClearCustomTitle,
+    Background,
+    MoveToNewWindow,
+    MoveToWindow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +160,10 @@ impl NativeProcessMenu {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn prepare_process_menu(_: &Window, _: crate::settings::Language) -> Option<NativeProcessMenu> {
+pub(crate) fn prepare_process_menu(
+    _: &Window,
+    _: crate::settings::Language,
+) -> Option<NativeProcessMenu> {
     None
 }
 
@@ -172,7 +178,10 @@ impl NativeSnippetMenu {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn prepare_snippet_menu(_: &Window, _: crate::settings::Language) -> Option<NativeSnippetMenu> {
+pub(crate) fn prepare_snippet_menu(
+    _: &Window,
+    _: crate::settings::Language,
+) -> Option<NativeSnippetMenu> {
     None
 }
 
@@ -223,7 +232,7 @@ mod macos {
     use cocoa::{
         appkit::{NSApp, NSMenu, NSMenuItem},
         base::{NO, YES, id, nil},
-        foundation::{NSAutoreleasePool, NSString, NSPoint},
+        foundation::{NSAutoreleasePool, NSPoint, NSString},
     };
     use eggie_domain::Direction;
     use gpui::Window;
@@ -332,7 +341,8 @@ mod macos {
     unsafe fn pop_up_menu(menu: id, event: id, view: id) {
         let window_point: NSPoint = msg_send![event, locationInWindow];
         let menu_point: NSPoint = msg_send![view, convertPoint: window_point fromView: nil];
-        let _: bool = msg_send![menu, popUpMenuPositioningItem: nil atLocation: menu_point inView: view];
+        let _: bool =
+            msg_send![menu, popUpMenuPositioningItem: nil atLocation: menu_point inView: view];
     }
 
     fn show_tab_menu(
@@ -355,7 +365,11 @@ mod macos {
                 (Direction::Up, language.split_up(), language.move_up()),
                 (Direction::Down, language.split_down(), language.move_down()),
                 (Direction::Left, language.split_left(), language.move_left()),
-                (Direction::Right, language.split_right(), language.move_right()),
+                (
+                    Direction::Right,
+                    language.split_right(),
+                    language.move_right(),
+                ),
             ];
             for (index, (_, split_label, _)) in directions.iter().enumerate() {
                 submenu.addItem_(menu_item(split_label, index as isize, true, target));
@@ -385,6 +399,38 @@ mod macos {
                 language.remove_custom_title(),
                 9,
                 clear_title_enabled,
+                target,
+            ));
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            let zh = language == crate::settings::Language::SimplifiedChinese;
+            menu.addItem_(menu_item(
+                if zh {
+                    "移到其他窗口…"
+                } else {
+                    "Move to Window…"
+                },
+                10,
+                true,
+                target,
+            ));
+            menu.addItem_(menu_item(
+                if zh {
+                    "移到新窗口"
+                } else {
+                    "Move to New Window"
+                },
+                11,
+                true,
+                target,
+            ));
+            menu.addItem_(menu_item(
+                if zh {
+                    "后台运行"
+                } else {
+                    "Run in Background"
+                },
+                12,
+                true,
                 target,
             ));
 
@@ -435,6 +481,9 @@ mod macos {
         match tag {
             8 => return Some(NativeTabMenuCommand::SetCustomTitle),
             9 => return Some(NativeTabMenuCommand::ClearCustomTitle),
+            10 => return Some(NativeTabMenuCommand::MoveToWindow),
+            11 => return Some(NativeTabMenuCommand::MoveToNewWindow),
+            12 => return Some(NativeTabMenuCommand::Background),
             _ => {}
         }
         let direction = match tag.rem_euclid(4) {
@@ -572,7 +621,11 @@ mod macos {
                 let _: id = msg_send![view, retain];
                 let _: id = msg_send![event, retain];
             }
-            Some(Self { view, event, language })
+            Some(Self {
+                view,
+                event,
+                language,
+            })
         }
 
         pub(crate) fn show(self) -> Option<NativeProcessMenuCommand> {
@@ -717,7 +770,6 @@ mod macos {
         (tag >= 0).then(|| NativeProfileMenuCommand::PickProfile(tag as usize))
     }
 
-
     // --- Snippet context menu ---------------------------------------------------------------
 
     pub(crate) struct NativeSnippetMenu {
@@ -744,7 +796,11 @@ mod macos {
                 let _: id = msg_send![view, retain];
                 let _: id = msg_send![event, retain];
             }
-            Some(Self { view, event, language })
+            Some(Self {
+                view,
+                event,
+                language,
+            })
         }
 
         pub(crate) fn show(self) -> Option<NativeSnippetMenuCommand> {
@@ -898,8 +954,8 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::{
-            command_from_tag, edit_command_from_tag, profile_command_from_tag, NativeEditMenuCommand,
-            NativeProfileMenuCommand,
+            NativeEditMenuCommand, NativeProfileMenuCommand, command_from_tag,
+            edit_command_from_tag, profile_command_from_tag,
         };
         use crate::native_menu::NativeTabMenuCommand;
         use eggie_domain::Direction;
@@ -914,14 +970,26 @@ mod macos {
                 command_from_tag(4),
                 Some(NativeTabMenuCommand::Move(Direction::Up))
             );
-            assert_eq!(command_from_tag(8), Some(NativeTabMenuCommand::SetCustomTitle));
+            assert_eq!(
+                command_from_tag(8),
+                Some(NativeTabMenuCommand::SetCustomTitle)
+            );
             assert_eq!(
                 command_from_tag(9),
                 Some(NativeTabMenuCommand::ClearCustomTitle)
             );
             // NO_SELECTION(-1) and out-of-range tags decode to None.
             assert_eq!(command_from_tag(-1), None);
-            assert_eq!(command_from_tag(10), None);
+            assert_eq!(
+                command_from_tag(10),
+                Some(NativeTabMenuCommand::MoveToWindow)
+            );
+            assert_eq!(
+                command_from_tag(11),
+                Some(NativeTabMenuCommand::MoveToNewWindow)
+            );
+            assert_eq!(command_from_tag(12), Some(NativeTabMenuCommand::Background));
+            assert_eq!(command_from_tag(13), None);
         }
 
         #[test]

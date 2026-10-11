@@ -68,13 +68,13 @@ flowchart TD
 
 ## 工作区与页面组织
 
-`EggieApp` 保持一个 GPUI Entity，负责窗口事件与功能之间的协调。内部状态明确分组：
+`WindowManager` 是应用级 GPUI Entity，管理全部窗口的位置、全局终端目录、后台标签页、撤销与持久化。每个 `EggieApp` 是窗口的投影，负责输入、绘制与窗口内交互。内部状态明确分组：
 
 - `WorkspaceState` 持有项目镜像、每个项目的布局、活跃项目与收起状态；活跃布局访问器由它维护。
 - `SessionFeedState` 持有会话、快照、检查结果、订阅集合和状态更新缓存。
 - `SidebarState` 持有拖拽、独立弹窗、预览、跑马灯和图标过渡状态。
 
-`app/` 内分别组织启动、会话订阅、项目操作、侧栏、标签、布局、终端输入、搜索、命令面板、悬停交互和右侧面板。移动方法不增加新的 Entity、订阅、计时器或绘制层。
+`app/` 内分别组织启动、会话订阅、项目操作、侧栏、标签、布局、终端输入、搜索、命令面板、悬停交互和右侧面板。`app/windows/` 按窗口生命周期、导航、转移和选择器组织。终端转移是纯展示事务，失败保留源位置；窗口发布携带版本号，过期的本地投影不能重新认领已移走的终端。OSC 和进度在 `workspace/session_streams.rs` 每个终端只订阅一次，阻塞 IPC 使用独立 IO 线程；快照按窗口可见内容订阅。
 
 `actions.rs` 负责应用命令和原生菜单。设置窗口通过页面模块组织 `profiles`、`gallery`、`selector`、`keybindings`、`about`、`controls` 和 `editing`。`settings/` 分开 GUI 选项模型、外观叠加解析和持久化 store。GUI 表单校验与 GPUI 快捷键解析继续归属 GUI；字体解析及其他共享契约归属 `eggie-config`。
 
@@ -84,9 +84,9 @@ UI 的 `div` 统一来自 `eggie-ui-kit::continuous_corners`，普通 radius 辅
 
 `TerminalInputTarget` 定义读取 composition、提交文字、更新 composition 和取消 composition 四个操作。工作区实现接口，渲染器只持有一个弱 Entity 适配器；窗口销毁后更新自然失效，不形成引用环。
 
-cell 属性由 `eggie-domain::TerminalCellFlags` 定义。daemon 在编译期检查 Alacritty 的各个属性位与稳定协议一致，随后直接发送原有 `u16`，无需每个 cell 执行映射循环。终端视图不再依赖 Alacritty，协议版本及序列化形式保持不变。
+cell 属性由 `eggie-domain::TerminalCellFlags` 定义。daemon 在编译期检查 Alacritty 的各个属性位与稳定协议一致，随后直接发送原有 `u16`，无需每个 cell 执行映射循环。终端视图不再依赖 Alacritty，cell 的序列化形式保持不变。窗口重构删除 daemon 中的窗口归属、认领与分离接口；文字共享行将应用协议升级为 v4。
 
-Metal 内部按字形 atlas/cache、后端与图片上传、字体 shaping/rasterizer 分模块，shader 是独立 `.metal` 资源。共享内存的句柄与帧解析属于 IPC，共享内存映射和回收也属于 IPC，GPU 消费属于视图。
+Metal 内部按字形 atlas/cache、后端与图片上传、字体 shaping/rasterizer 分模块，shader 是独立 `.metal` 资源。共享内存的句柄与帧解析属于 IPC，共享内存映射和回收也属于 IPC，GPU 消费属于视图。协议只定义不可变行存储和借用 cell 视图；`eggie-ipc` 实现映射行租约，视图无需依赖 IPC 或 daemon。传输与生命周期见 [terminal-transport.md](terminal-transport.md)。
 
 ## daemon 模块
 

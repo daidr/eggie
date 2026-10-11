@@ -6,6 +6,8 @@ mod profile;
 pub use profile::*;
 mod layout;
 pub use layout::*;
+mod presentation;
+pub use presentation::*;
 mod appearance;
 pub use appearance::{DEFAULT_PALETTE, TerminalAppearance};
 
@@ -21,8 +23,7 @@ pub type SessionId = Uuid;
 /// Identity of a [`Profile`]. Terminals record the profile they were launched from, and projects
 /// name a default profile for new terminals.
 pub type ProfileId = Uuid;
-/// Identity of a GUI window. A session in the daemon is tagged with the id of the window that owns
-/// it so that each window sees only its own sessions; `None` ownership marks a detached session.
+/// Stable identity of a presentation window, independent of a process or native window handle.
 pub type WindowId = Uuid;
 /// Identity of a split node in a [`LayoutNode`] tree. Distinct from [`GroupId`] so a split is never
 /// confused with the groups it contains.

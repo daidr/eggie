@@ -98,13 +98,15 @@ fragment float4 terminal_fragment(
         return in.color;
     }
     if (in.kind == 1) {
-        float coverage = mask_atlas.sample(atlas_sampler, in.uv).r;
+        float2 size = float2(mask_atlas.get_width(), mask_atlas.get_height());
+        float coverage = mask_atlas.sample(atlas_sampler, in.uv / size).r;
         return float4(in.color.rgb, in.color.a * coverage);
     }
 
     // CoreGraphics produces premultiplied RGBA. The render pipeline uses source-alpha blending,
     // so restore straight RGB here to avoid dark halos around antialiased color glyph edges.
-    float4 glyph = color_atlas.sample(atlas_sampler, in.uv);
+    float2 size = float2(color_atlas.get_width(), color_atlas.get_height());
+    float4 glyph = color_atlas.sample(atlas_sampler, in.uv / size);
     float3 straight_rgb = glyph.a > 0.0 ? glyph.rgb / glyph.a : float3(0.0);
     return float4(straight_rgb, glyph.a * in.color.a);
 }

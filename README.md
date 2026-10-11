@@ -11,23 +11,37 @@ selectable terminal character.
 Eggie implements the Kitty graphics protocol used by Ghostty: RGB/RGBA/PNG transmission over
 direct, file, temporary-file, and POSIX shared-memory media; zlib and chunked payloads; image
 queries, IDs/numbers, placements, cropping, z-ordering, deletion, scrolling, and Unicode virtual
-placements. Decoded pixels are fetched from the daemon in generation-checked chunks and uploaded
-to a dedicated Metal texture cache only once. The daemon wire carries image chunks as MessagePack
-binary rather than Base64, unchanged image metadata is omitted from snapshot deltas, offscreen
+placements. Decoded pixels are fetched from the daemon through generation-checked shared-memory mappings
+and uploaded to a dedicated Metal texture cache only once, with an inline binary fallback.
+Unchanged image metadata is omitted from snapshot deltas, offscreen
 placements are culled from render snapshots, and consecutive placements of one texture are drawn
 with one instanced Metal call. Layering and same-z ordering follow Kitty's internal image/reference
 order; high-frequency snapshots carry visible descriptors and placements rather than pixel
 payloads.
 
 The application is split into a GPUI client and a persistent local daemon. The
-daemon owns PTYs and terminal state, so closing or reopening the same build can
-detach without interrupting running commands. During development, the UI embeds
-a source build identifier; starting a rebuilt binary terminates a daemon with a
-different identifier and starts a clean one. This intentionally trades session
-continuity for deterministic renderer/terminal-core testing until the update
-compatibility contract is finalized.
+daemon owns PTYs and terminal state, so closing or reopening the GUI can detach
+without interrupting running commands. Protocol version is the compatibility
+gate; build identifiers are diagnostic. Starting a binary with a new protocol
+version terminates the incompatible daemon and creates a clean one.
+
+Visible terminal text uses leased shared-memory rows; the Unix socket carries frame metadata,
+control requests, and wakeups. Unchanged rows are shared across snapshots, and exhausted pools
+fall back to owned socket frames. See [terminal transport](docs/architecture/terminal-transport.md)
+for ownership, memory bounds, diagnostics, and repeatable latency benchmarks.
+
+## Command completion
+
+Suggestions appear while typing in a shell prompt. Ctrl-Space opens the list, Tab inserts,
+arrow keys navigate, and Escape dismisses. Enter runs the command unless you have navigated
+the list. Disable completion in Settings → Advanced to use the shell's native Tab binding.
+See [completion architecture and tests](docs/architecture/completion.md).
 
 ## Development
+
+macOS builds require Xcode with its Metal compiler toolchain (`xcrun -f metal`).
+GPUI and terminal shaders are compiled into the application during the build,
+so opening a window does not compile shader source at runtime.
 
 ```sh
 cargo run -p eggie
@@ -40,7 +54,7 @@ Open the independent settings window from **Eggie → Settings…** or with
 <kbd>⌘</kbd><kbd>,</kbd>. Appearance, the separate dark/light Ghostty themes,
 terminal font, font size, minimum contrast, and horizontal/vertical terminal
 padding are persisted in `~/Library/Application Support/Eggie/preferences.json`.
-Every change is shown in the fixed preview and applied live to every Eggie window.
+Changes and temporary theme hover previews are applied live to every Eggie window.
 
 Eggie also supports a Rex-inspired, API-style Lua configuration at
 `~/.config/eggie/init.lua`. Lua settings take precedence over the corresponding

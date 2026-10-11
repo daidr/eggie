@@ -118,6 +118,15 @@ impl EggieApp {
                     NativeTabMenuCommand::ClearCustomTitle => {
                         app.set_custom_title(group_id, item_id, None, cx);
                     }
+                    NativeTabMenuCommand::Background => app.background_tab(group_id, item_id, cx),
+                    NativeTabMenuCommand::MoveToNewWindow => {
+                        let source = app.item_location(group_id, item_id);
+                        app.move_tab_to_new_window(source, cx);
+                    }
+                    NativeTabMenuCommand::MoveToWindow => {
+                        let source = app.item_location(group_id, item_id);
+                        app.open_palette(PaletteMode::MoveToWindow(source), window, cx);
+                    }
                 }
             })
             .ok();
@@ -196,7 +205,7 @@ impl EggieApp {
                 let receiver = prompt_for_text(
                     window,
                     language.custom_title_prompt_title(),
-                    language.custom_title_prompt_message(),
+                    Some(language.custom_title_prompt_message()),
                     Some(language.custom_title_placeholder()),
                     Some(&current),
                     language.ok(),
@@ -320,6 +329,42 @@ impl EggieApp {
         let Some(target) = self.tab_drop_target.take() else {
             return;
         };
+        if dragged_tab.source_window_id != self.window_id {
+            self.publish_window_state(cx);
+            let source = eggie_domain::ItemLocation {
+                window_id: dragged_tab.source_window_id,
+                project_id: dragged_tab.project_id,
+                group_id: dragged_tab.source_group_id,
+                item_id: dragged_tab.item_id,
+            };
+            // A drop keeps the terminal's project while adding its view to the target window.
+            let group = if dragged_tab.project_id == self.workspace_state.active_project {
+                target.group_id
+            } else {
+                self.window_manager.read(cx).state.windows[&self.window_id].views
+                    [&dragged_tab.project_id]
+                    .active_group_id
+            };
+            let destination = eggie_domain::PresentationTarget {
+                window_id: self.window_id,
+                project_id: dragged_tab.project_id,
+                group_id: group,
+                insertion_index: match target.zone {
+                    TabDropZone::TabBar { insertion_index } => Some(insertion_index),
+                    _ => None,
+                },
+                split: match target.zone {
+                    TabDropZone::Edge(direction) => Some(direction),
+                    _ => None,
+                },
+            };
+            self.window_manager
+                .update(cx, |manager, cx| manager.move_item(source, destination, cx));
+            self.pull_window_state(cx);
+            self.project_picker = false;
+            cx.notify();
+            return;
+        }
         let workspace = self.workspace_state.workspace_mut();
         let destination_group = match target.zone {
             TabDropZone::Center => workspace.layout.move_item(

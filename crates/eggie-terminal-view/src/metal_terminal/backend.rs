@@ -59,10 +59,9 @@ pub(super) fn image_zero_copy_enabled() -> bool {
 impl MetalBackend {
     pub(crate) fn new(device: &DeviceRef) -> Result<Self> {
         let device = device.to_owned();
-        let options = CompileOptions::new();
         let library = device
-            .new_library_with_source(SHADER, &options)
-            .map_err(|error| anyhow!("compile terminal Metal shader: {error}"))?;
+            .new_library_with_data(SHADER_LIBRARY)
+            .map_err(|error| anyhow!("load terminal Metal shader: {error}"))?;
         let vertex = library
             .get_function("terminal_vertex", None)
             .map_err(|error| anyhow!("load terminal vertex shader: {error}"))?;
@@ -518,10 +517,6 @@ impl MetalBackend {
                 stats.atlas_misses += usize::from(!lookup.hit);
                 stats.raster_time += lookup.raster_time;
                 let cached = lookup.glyph;
-                let atlas_size = match cached.kind {
-                    GlyphTextureKind::Mask => MASK_ATLAS_SIZE,
-                    GlyphTextureKind::Color => COLOR_ATLAS_SIZE,
-                } as f32;
                 Ok(Instance {
                     origin: [
                         pixel_origin[0] + f32::from(cached.offset[0]),
@@ -529,14 +524,8 @@ impl MetalBackend {
                     ],
                     size: [cached.entry.width as f32, cached.entry.height as f32],
                     color: rgba_components(*color),
-                    uv_origin: [
-                        cached.entry.x as f32 / atlas_size,
-                        cached.entry.y as f32 / atlas_size,
-                    ],
-                    uv_size: [
-                        cached.entry.width as f32 / atlas_size,
-                        cached.entry.height as f32 / atlas_size,
-                    ],
+                    uv_origin: [cached.entry.x as f32, cached.entry.y as f32],
+                    uv_size: [cached.entry.width as f32, cached.entry.height as f32],
                     metadata: [
                         cached.kind as u32,
                         *background,

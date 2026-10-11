@@ -6,18 +6,24 @@ pub(crate) use view_state::{NewWindowInit, NotificationRoutes, tooltip_text};
 mod native_alert;
 use native_alert::*;
 mod chrome;
+mod completion;
 mod hover;
 mod layout;
+use completion::CompletionUi;
 mod palette;
+mod project_icons;
 mod projects;
+use project_icons::*;
 mod right_sidebar;
 mod search;
 mod session_feed;
 mod sidebar;
+mod sidebar_selector;
 mod startup;
 mod state;
 mod tabs;
 mod terminal_io;
+mod windows;
 mod workspace_controller;
 use state::*;
 mod helpers;
@@ -26,7 +32,8 @@ use crate::actions::{
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab,
     NewTabWithProfile, NextTab, PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown,
     SplitLeft, SplitRight, SplitUp, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
-    ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar, ZoomWindow,
+    TerminalSuggest, TerminalSwitcher, ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar,
+    UndoWindowOperation, WindowSwitcher, ZoomWindow,
 };
 use crate::command_history::{CommandStatus, format_relative_time};
 use crate::command_palette::{PaletteEntry, command_matches, palette_entries};
@@ -46,7 +53,7 @@ use crate::project_drag::{self, DraggedProject, ProjectDragState, ProjectDropTar
 use crate::project_store::ProjectStore;
 use crate::settings::{
     CursorBlink, CursorShapeSetting, DEFAULT_FONT_SIZE, Language, OpenWith, SettingsStore,
-    TerminalTheme, UiColors,
+    SidebarLayout, TerminalTheme, UiColors,
 };
 use crate::snippet_store::{Snippet, SnippetStore};
 use crate::terminal_renderer::{
@@ -55,7 +62,7 @@ use crate::terminal_renderer::{
     TerminalTextureKey, terminal_background, terminal_cell_metrics,
 };
 use crate::text_input::{TextInput, TextInputEvent, TextInputStyle};
-use crate::workspace::{SidebarRestoreState, WindowProjectView, WorkspaceRestoreState};
+use crate::workspace::{SidebarRestoreState, WindowManager, WindowProjectView};
 use eggie_domain::{
     Direction, GroupId, ItemId, ItemKind, LayoutNode, Profile, Project, ProjectId, SessionId,
     SplitAxis, SplitId, TabGroup, TabItem, WindowId,
@@ -79,9 +86,9 @@ use gpui::{
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathBuilder, PathPromptOptions, Pixels, Point, PromptLevel, Role, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, SharedString, Stateful, Subscription, SystemNotification,
-    SystemNotificationAction, TitlebarOptions, TouchPhase, WeakEntity, Window, WindowBounds,
-    WindowControlArea, WindowOptions, anchored, canvas, deferred, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, quad, relative, rgb, rgba, size,
+    SystemNotificationAction, TitlebarOptions, TouchPhase, Window, WindowBounds, WindowControlArea,
+    WindowOptions, anchored, canvas, deferred, img, linear_color_stop, linear_gradient, point,
+    prelude::*, px, quad, relative, rgb, rgba, size,
 };
 use std::{
     cell::RefCell,
@@ -174,7 +181,6 @@ pub struct EggieApp {
     terminal_renderer: MetalTerminalRenderer,
     terminal_images_in_flight: HashSet<TerminalImageStreamKey>,
     terminal_frame_scheduled: bool,
-    progress_frame_scheduled: bool,
     progress_animation_scheduled: bool,
     progress_animation_epoch: Instant,
     bell_flash: HashMap<SessionId, Instant>,
@@ -182,15 +188,18 @@ pub struct EggieApp {
     cursor_blink_epoch: Instant,
     cursor_blink_scheduled: bool,
     progress_timeouts: TerminalProgressTimeouts,
-    window_id: WindowId,
+    pub(crate) window_id: WindowId,
+    window_number: u32,
+    window_manager: Entity<WindowManager>,
+    window_revision: u64,
+    window_frame: Option<eggie_domain::WindowFrame>,
+    project_picker: bool,
     project_store: Entity<ProjectStore>,
     // TODO(profiles step 2): read by spawn-config resolution and the tab badge.
     #[allow(dead_code)]
     profile_store: Entity<ProfileStore>,
     snippet_store: Entity<SnippetStore>,
     notes_store: Entity<NotesStore>,
-    detached_popover_open: bool,
-    detached_toggle_bounds: Option<Bounds<Pixels>>,
     update_popover_open: bool,
     update_toggle_bounds: Option<Bounds<Pixels>>,
     open_with_dropdown: Option<DirectoryField>,
@@ -206,6 +215,7 @@ pub struct EggieApp {
     terminal_has_focus: bool,
     terminal_focused_session: Option<SessionId>,
     terminal_ime_states: HashMap<SessionId, TerminalImeState>,
+    completion: CompletionUi,
     right_tab: RightTab,
     command_history_collapsed: bool,
     snippets_collapsed: bool,
@@ -229,6 +239,9 @@ pub struct EggieApp {
     scrollbar_bounds: Rc<RefCell<HashMap<GroupId, Bounds<Pixels>>>>,
     moving_window: bool,
     tab_drop_target: Option<TabDropTarget>,
+    group_drop_bounds: Rc<RefCell<HashMap<GroupId, Bounds<Pixels>>>>,
+    tab_drop_bounds: Rc<RefCell<HashMap<ItemId, Bounds<Pixels>>>>,
+    dragged_tab: Option<DraggedTab>,
     right_sidebar_scroll_handle: ScrollHandle,
     tab_bar_scroll_handles: RefCell<HashMap<GroupId, ScrollHandle>>,
     focus_handle: FocusHandle,
@@ -246,7 +259,7 @@ pub struct EggieApp {
 
 /// A session produced by window seeding, plus the profile it was launched from.
 ///
-/// `profile` is `Some` only for sessions this window just created — an adopted one (claimed back from
+/// `profile` is `Some` only for sessions this window just created — an adopted one (restored from
 /// the daemon after a restart, or inherited from a closed window) was launched by an earlier run, and
 /// the restored layout already records whatever profile its tab carried. Keeping the two apart is what
 /// lets a freshly seeded tab render its profile's appearance instead of the global one.
@@ -382,13 +395,37 @@ impl gpui::Render for EggieApp {
         }
         // Keep the blink timer running while the active cursor blinks; it self-terminates otherwise.
         self.ensure_cursor_blink(cx);
+        if !window.is_window_active()
+            || self.command_palette.is_some()
+            || self.terminal_search.is_some()
+            || !self.settings.read(cx).config().terminal_suggestions
+            || self
+                .completion
+                .panel
+                .as_ref()
+                .is_some_and(|p| self.active_session_id() != Some(p.session))
+        {
+            self.dismiss_completion();
+        }
+        let completion = self
+            .active_session_id()
+            .and_then(|s| self.render_completion(s, window, cx));
         div()
             .id("eggie-workspace")
             .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|app, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && app.sidebar.project_drag.source.is_some() {
+                if app.project_selector_key(event, window, cx)
+                    || app.project_popup_key(event, window, cx)
+                    || app.project_picker_key(event, window, cx)
+                {
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape"
+                    && (app.sidebar.project_drag.source.is_some() || app.dragged_tab.is_some())
+                {
                     cx.stop_active_drag(window);
+                    app.dragged_tab = None;
+                    app.clear_tab_drop_target(cx);
                     app.clear_project_drag(cx);
                     cx.stop_propagation();
                 } else {
@@ -408,6 +445,11 @@ impl gpui::Render for EggieApp {
             }))
             .on_action(cx.listener(|app, _: &TerminalSelectAll, _, cx| {
                 if app.select_all_active_terminal(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &TerminalSuggest, _, cx| {
+                if app.trigger_completion(cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -528,14 +570,25 @@ impl gpui::Render for EggieApp {
                 window.toggle_fullscreen();
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|_, _: &CloseWindow, window, cx| {
-                // Direct close: bypasses the in-app close-confirmation prompt
-                // (`install_close_confirmation`), matching the menu's "close now" intent.
+            .on_action(cx.listener(|app, _: &CloseWindow, window, cx| {
+                app.close_presentation(window, cx);
                 window.remove_window();
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|app, _: &CommandPalette, window, cx| {
                 app.toggle_command_palette(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &TerminalSwitcher, window, cx| {
+                app.open_palette(PaletteMode::Terminals, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &WindowSwitcher, window, cx| {
+                app.open_palette(PaletteMode::Windows, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|app, _: &UndoWindowOperation, _, cx| {
+                app.undo_window_operation(cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|app, action: &LuaAction, window, cx| {
@@ -611,6 +664,7 @@ impl gpui::Render for EggieApp {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|app, _, _, cx| {
+                    app.dragged_tab = None;
                     app.resizing_sidebar = None;
                     app.resizing_split = None;
                     app.dragging_scrollbar = None;
@@ -620,6 +674,19 @@ impl gpui::Render for EggieApp {
                 }),
             )
             .flex()
+            .on_drag_move::<DraggedTab>(cx.listener(
+                |app, event: &DragMoveEvent<DraggedTab>, window, cx| {
+                    app.route_cross_window_drag(
+                        event.event.position + window.bounds().origin,
+                        window,
+                        cx,
+                    )
+                },
+            ))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|app, event, window, cx| app.finish_tab_tear_out(event, window, cx)),
+            )
             .size_full()
             .min_w_0()
             .bg(rgb(self.colors.background))
@@ -635,7 +702,11 @@ impl gpui::Render for EggieApp {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(self.render_layout(&self.workspace_state.workspace().layout, cx)),
+                    .child(if self.project_picker {
+                        self.render_project_picker(cx)
+                    } else {
+                        self.render_layout(&self.workspace_state.workspace().layout, cx)
+                    }),
             )
             .when(!self.right_sidebar_collapsed, |element| {
                 element
@@ -643,6 +714,7 @@ impl gpui::Render for EggieApp {
                     .child(self.render_right_sidebar(cx))
             })
             // Centered modal overlay, painted last so it sits above the whole workspace.
+            .children(completion)
             .children(self.render_command_palette(cx))
     }
 }

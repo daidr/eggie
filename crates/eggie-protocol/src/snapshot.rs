@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalColor {
     Rgb(u32),
@@ -114,12 +114,17 @@ fn is_zero_i32(value: &i32) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
+    /// The shell still owns an editable prompt, even while its input report is in flight.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_editable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_input: Option<crate::PromptInput>,
     #[serde(rename = "id")]
     pub session_id: SessionId,
     #[serde(rename = "s")]
     pub size: TerminalSize,
     #[serde(rename = "c")]
-    pub cells: Vec<TerminalCell>,
+    pub cells: TerminalCells,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     pub color_overrides: Vec<TerminalColorOverride>,
     #[serde(rename = "cl")]
@@ -278,6 +283,10 @@ pub struct TerminalLinkRange {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshotDelta {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_editable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_input: Option<crate::PromptInput>,
     #[serde(rename = "id")]
     pub session_id: SessionId,
     #[serde(rename = "b")]
@@ -333,7 +342,7 @@ fn is_default_input_modes(value: &TerminalInputModes) -> bool {
 impl TerminalSnapshot {
     pub fn plain_lines(&self) -> Vec<String> {
         let mut rows = vec![vec![' '; self.size.columns as usize]; self.size.rows as usize];
-        for cell in &self.cells {
+        for cell in self.cells.iter() {
             if let Some(character) = rows
                 .get_mut(cell.line as usize)
                 .and_then(|row| row.get_mut(cell.column as usize))
@@ -364,7 +373,7 @@ impl TerminalSnapshot {
         let mut window: [char; 7] = [' '; 7];
         let mut len: usize = 0;
         let mut prev: Option<(u16, u16)> = None;
-        for cell in &self.cells {
+        for cell in self.cells.iter() {
             // A gap (new row, or a skipped empty column) breaks character adjacency, so the needle
             // cannot straddle it: reset the run before considering this cell.
             let contiguous = matches!(prev, Some((line, column)) if line == cell.line && column + 1 == cell.column);
@@ -397,40 +406,45 @@ impl TerminalSnapshot {
             return None;
         }
 
-        let mut replaced = delta
-            .cells
-            .iter()
-            .map(|cell| TerminalCellPosition {
-                line: cell.line,
-                column: cell.column,
-            })
-            .chain(delta.cleared.iter().copied())
-            .collect::<Vec<_>>();
-        replaced.sort_unstable();
-        replaced.dedup();
-        let mut cells = Vec::with_capacity(
-            self.cells
-                .len()
-                .saturating_add(delta.cells.len())
-                .saturating_sub(delta.cleared.len()),
-        );
-        cells.extend(
-            self.cells
+        let mut rows = self.cells.rows().to_vec();
+        rows.resize_with(delta.size.rows as usize, || TerminalRow::owned(Vec::new()));
+        let mut changed = std::collections::BTreeMap::<
+            u16,
+            std::collections::BTreeMap<u16, Option<&TerminalCell>>,
+        >::new();
+        for position in &delta.cleared {
+            if position.line >= delta.size.rows || position.column >= delta.size.columns {
+                return None;
+            }
+            changed
+                .entry(position.line)
+                .or_default()
+                .insert(position.column, None);
+        }
+        for cell in &delta.cells {
+            if cell.line >= delta.size.rows || cell.column >= delta.size.columns {
+                return None;
+            }
+            changed
+                .entry(cell.line)
+                .or_default()
+                .insert(cell.column, Some(cell));
+        }
+        for (line, edits) in changed {
+            let mut cells = rows[line as usize]
                 .iter()
-                .filter(|cell| {
-                    replaced
-                        .binary_search(&TerminalCellPosition {
-                            line: cell.line,
-                            column: cell.column,
-                        })
-                        .is_err()
-                })
-                .cloned(),
-        );
-        cells.extend(delta.cells.iter().cloned());
-        cells.sort_unstable_by_key(|cell| (cell.line, cell.column));
+                .filter(|cell| !edits.contains_key(&cell.column))
+                .map(TerminalCellView::to_owned)
+                .collect::<Vec<_>>();
+            cells.extend(edits.into_values().flatten().cloned());
+            cells.sort_unstable_by_key(|cell| cell.column);
+            rows[line as usize] = TerminalRow::owned(cells);
+        }
+        let cells = TerminalCells::from_rows(rows);
 
         Some(Self {
+            prompt_editable: delta.prompt_editable,
+            prompt_input: delta.prompt_input.clone(),
             session_id: delta.session_id,
             size: delta.size,
             cells,

@@ -8,9 +8,13 @@ pub(super) struct WorkspaceState {
 }
 
 pub(super) struct SidebarState {
+    pub(super) project_selector: Option<ProjectSelectorState>,
+    pub(super) project_selector_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     pub(super) project_row_bounds: Rc<RefCell<HashMap<ProjectId, Bounds<Pixels>>>>,
     pub(super) project_drag: ProjectDragState,
     pub(super) project_popover: Option<ProjectPopoverState>,
+    pub(super) hovered_project: Option<ProjectId>,
+    pub(super) project_hover_revision: u64,
     pub(super) sidebar_row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
     pub(super) sidebar_preview: Option<SidebarPreviewState>,
     pub(super) hovered_sidebar_session: Option<SessionId>,
@@ -23,12 +27,9 @@ pub(super) struct SidebarState {
 
 pub(super) struct SessionFeedState {
     pub(super) snapshot_watchers: HashSet<SessionId>,
-    pub(super) progress_watchers: HashSet<SessionId>,
-    pub(super) osc_watchers: HashSet<SessionId>,
     pub(super) progress_updates: HashMap<SessionId, TerminalProgressUpdate>,
-    pub(super) pending_progress_updates: HashMap<SessionId, TerminalProgressUpdate>,
     pub(super) sessions: Vec<SessionSummary>,
-    pub(super) detached_sessions: Vec<SessionSummary>,
+    pub(super) global_sessions: Vec<SessionSummary>,
     pub(super) snapshots: HashMap<SessionId, Arc<TerminalSnapshot>>,
     pub(super) session_inspections: HashMap<SessionId, SessionInspection>,
     pub(super) session_inspection_errors: HashMap<SessionId, String>,

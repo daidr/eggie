@@ -10,6 +10,11 @@ pub(super) enum TerminalJumpDirection {
 }
 
 pub(super) struct ShellIntegrationTracker {
+    pub(super) prompt_input: Option<eggie_completion::PromptInput>,
+    pub(super) input_starts: Vec<(u64, usize)>,
+    pub(super) completion_shell: String,
+    pub(super) completion_native: bool,
+    pub(super) completion_environment: Option<eggie_completion::PromptInput>,
     pub(super) phase: TerminalSemanticPhase,
     /// Grid line where the active prompt started (relative to the top of the visible screen, as
     /// reported with the OSC 133 A/prompt-start marker). Used to clear exactly the prompt region on
@@ -36,6 +41,11 @@ pub(super) struct ShellIntegrationTracker {
 impl Default for ShellIntegrationTracker {
     fn default() -> Self {
         Self {
+            prompt_input: None,
+            input_starts: Vec::new(),
+            completion_shell: String::new(),
+            completion_native: false,
+            completion_environment: None,
             phase: TerminalSemanticPhase::None,
             prompt_start_line: None,
             current_command: None,
@@ -61,6 +71,13 @@ impl ShellIntegrationTracker {
         // Fold the freshly-captured scrollback depth into the coordinate base before recording any
         // jump point, so `record_prompt_jump_point` uses an up-to-date `total_scrolled_lines`.
         self.advance_scroll_base(history_size);
+        if matches!(
+            prompt.action,
+            SemanticPromptAction::FreshLineAndPrompt | SemanticPromptAction::PromptStart
+        ) {
+            self.input_starts.clear();
+            self.prompt_input = None;
+        }
         match prompt.action {
             SemanticPromptAction::FreshLine => {}
             SemanticPromptAction::FreshLineAndPrompt | SemanticPromptAction::PromptStart => {
@@ -106,6 +123,8 @@ impl ShellIntegrationTracker {
                 }
                 // Output has started; the prompt is no longer the active region.
                 self.prompt_start_line = None;
+                self.prompt_input = None;
+                self.input_starts.clear();
                 self.phase = TerminalSemanticPhase::Output;
             }
             SemanticPromptAction::CommandFinished => {
@@ -132,6 +151,8 @@ impl ShellIntegrationTracker {
                     }
                 }
                 self.prompt_start_line = None;
+                self.prompt_input = None;
+                self.input_starts.clear();
                 self.phase = TerminalSemanticPhase::None;
             }
         }

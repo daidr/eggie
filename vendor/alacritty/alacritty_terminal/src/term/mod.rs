@@ -2961,8 +2961,12 @@ impl<T: EventListener> Handler for Term<T> {
         // Capture the scrollback depth synchronously: the parser holds the terminal lock here, so
         // this is the only place a listener can read a coherent history size for this marker.
         let history_size = self.grid.history_size();
-        self.event_proxy
-            .send_event(Event::SemanticPrompt(prompt, cursor_line, history_size));
+        self.event_proxy.send_event(Event::SemanticPrompt(
+            prompt,
+            cursor_line,
+            history_size,
+            self.grid.cursor.point.column.0,
+        ));
     }
 
     #[inline]

@@ -16,10 +16,8 @@
 #       command line base64-encoded (cmdline_b64) for the history panel.
 #   D;<status> (CommandFinished)  — previous command finished with exit status.
 #
-# B (InputStart) is intentionally absent: fish has no event that fires after the
-# prompt is drawn, and C alone opens the command record (D closes it), so command
-# history and prompt jump work without it. The only cost is that a command still
-# being typed has no "current command" record yet.
+# B (InputStart) is emitted by the wrapped prompt after its visible content so
+# the daemon can distinguish editable input from prompt text on fish 3.x too.
 #
 # fish 4.x+ natively emits OSC 133 A/B/C/D (mark-prompt feature, default on), so
 # on 4.x this script double-emits. The daemon's tracker absorbs the duplicates
@@ -90,6 +88,8 @@ function __eggie_prompt --on-event fish_prompt
     # handlers run first), so the cursor is on the prompt's first line. Eggie
     # records this line and clears from it on resize.
     printf '\e]133;A;cl=line\a'
+    __eggie_report_cwd
+    printf '\e]1337;EggieShell=fish;1;%s;%s;%s\a' (string escape --style=url -- "$PWD") (string escape --style=url -- (string join : $PATH)) (string escape --style=url -- "$HOME")
 end
 
 # Report the working directory on every change. --on-variable PWD fires whenever
@@ -100,4 +100,71 @@ function __eggie_report_cwd --on-variable PWD
     # decoder passes non-%XX bytes through verbatim, so only literal `%` needs encoding (as %25) to
     # survive the round-trip; spaces and other punctuation are fine raw.
     printf '\e]7;file://%s%s\a' (hostname | string trim) (string replace -a '%' '%25' -- $PWD)
+end
+
+# Remove only the builtin's output newline; retain newlines inside the editor buffer.
+function __eggie_capture
+    set -l value ($argv | string collect --no-trim-newlines --allow-empty)
+    string match -qr '(?s)^(?<value>.*)\n$' -- "$value"; or return
+    printf '%s' "$value"
+end
+
+function __eggie_report_input
+    set -l buffer (__eggie_capture commandline --current-buffer | string collect --no-trim-newlines --allow-empty)
+    set -l cursor (commandline --cursor)
+    printf '\e]1337;EggieInput=fish;%s;%s;%s;%s;1;%s\a' $cursor (string escape --style=url -- "$PWD") (string escape --style=url -- (string join : $PATH)) (string escape --style=url -- "$HOME") (string escape --style=url -- "$buffer")
+end
+
+function __eggie_complete
+    set -l buffer (__eggie_capture commandline --current-buffer | string collect --no-trim-newlines --allow-empty)
+    set -l cursor (commandline --cursor)
+    set -l packet (string escape --style=url -- "$buffer")';'$cursor
+    __eggie_report_input
+    set -l before (__eggie_capture string sub --start 1 --length $cursor -- "$buffer" | string collect --no-trim-newlines --allow-empty)
+    set -l values (complete --do-complete "$before")
+    for value in $values[1..2000]
+        set -l parts (string split -m 1 \t -- "$value")
+        set -l name (string unescape -- "$parts[1]")
+        set -l description "$parts[2]"
+        set packet "$packet;"(string escape --style=url -- "$name"\t"$description")
+    end
+    printf '\e]1337;EggieCompletions=%s\a' "$packet"
+    commandline -f repaint
+end
+function __eggie_completion_setup --on-event fish_prompt
+    bind --mode default (printf '\030\037') __eggie_complete
+    bind --mode default (printf '\030\036') __eggie_apply_completion
+    bind --mode insert (printf '\030\036') __eggie_apply_completion
+    bind --mode insert (printf '\030\037') __eggie_complete
+    # Install after user config, preserving the original prompt and its status.
+    if not functions -q __eggie_original_prompt
+        functions --copy fish_prompt __eggie_original_prompt
+        function fish_prompt
+            __eggie_original_prompt
+            printf '\e]133;B\a'
+        end
+    end
+    functions --erase __eggie_completion_setup
+end
+
+function __eggie_apply_completion
+    set -l original (__eggie_capture commandline --current-buffer | string collect --no-trim-newlines --allow-empty)
+    set -l original_cursor (commandline --cursor)
+    set -l packet
+    read --null --nchars 200001 --local packet
+    test (string length -- "$packet") -le 200000; or return
+    set -l fields (string split ';' -- "$packet")
+    test (count $fields) -eq 5; or return
+    set -l expected (__eggie_capture string unescape --style=url -- "$fields[1]" | string collect --no-trim-newlines --allow-empty)
+    test "$expected" = "$original"; or return
+    test "$fields[2]" = "$original_cursor"; or return
+    set -l start $fields[3]
+    set -l end $fields[4]
+    string match -rq '^[0-9]+$' -- "$start$end"; or return
+    set -l insert (string unescape --style=url -- "$fields[5]")
+    set -l left (__eggie_capture string sub --start 1 --length $start -- "$original" | string collect --no-trim-newlines --allow-empty)
+    set -l right (__eggie_capture string sub --start (math "$end + 1") -- "$original" | string collect --no-trim-newlines --allow-empty)
+    commandline --replace -- "$left$insert$right"
+    commandline --cursor (math "$start + "(string length -- "$insert"))
+    commandline -f repaint
 end

@@ -5,8 +5,10 @@ use crate::{
 };
 use eggie_config::font::ResolvedMetricAdjustments;
 use eggie_domain::TerminalCellFlags as Flags;
+#[cfg(test)]
+use eggie_protocol::TerminalCell;
 use eggie_protocol::{
-    TerminalCell, TerminalColor, TerminalCursorShape, TerminalImageKey, TerminalLinkRange,
+    TerminalCellView, TerminalColor, TerminalCursorShape, TerminalImageKey, TerminalLinkRange,
     TerminalSearchMatch, TerminalSearchResult, TerminalSnapshot,
 };
 use eggie_themes::{TerminalTheme, minimum_contrast_rgb};
@@ -682,7 +684,7 @@ impl TerminalPalette {
         }
     }
 
-    fn resolve_cell(&self, cell: &TerminalCell, use_cursor_text: bool) -> ResolvedCell {
+    fn resolve_cell(&self, cell: &TerminalCellView<'_>, use_cursor_text: bool) -> ResolvedCell {
         let flags = Flags::from_bits_retain(cell.flags);
         let mut foreground = self.foreground(&cell.foreground, flags);
         let mut background = self.background(&cell.background);
@@ -1333,36 +1335,37 @@ fn prepare_images(
 }
 
 struct TerminalGrid<'a> {
-    cells: Vec<Option<&'a TerminalCell>>,
+    snapshot: &'a TerminalSnapshot,
     columns: usize,
     rows: usize,
 }
 
 impl<'a> TerminalGrid<'a> {
-    fn row(&self, line: usize) -> &[Option<&'a TerminalCell>] {
-        let start = line * self.columns;
-        &self.cells[start..start + self.columns]
+    // Expand only one row at a time. Borrowed cell views are larger than pointers; materializing
+    // the whole dense viewport would undo the memory benefit of mapped immutable rows.
+    fn row<'b>(
+        &self,
+        line: usize,
+        buffer: &'b mut [Option<TerminalCellView<'a>>],
+    ) -> &'b [Option<TerminalCellView<'a>>] {
+        buffer.fill(None);
+        if let Some(row) = self.snapshot.cells.rows().get(line) {
+            for cell in row.iter() {
+                if let Some(slot) = buffer.get_mut(cell.column as usize) {
+                    *slot = Some(cell);
+                }
+            }
+        }
+        buffer
     }
 }
 
 fn terminal_grid(snapshot: &TerminalSnapshot) -> TerminalGrid<'_> {
-    let columns = snapshot.size.columns as usize;
-    let rows = snapshot.size.rows as usize;
-    let mut grid = TerminalGrid {
-        cells: vec![None; columns.saturating_mul(rows)],
-        columns,
-        rows,
-    };
-    for cell in &snapshot.cells {
-        if let Some(index) = (cell.line as usize)
-            .checked_mul(columns)
-            .and_then(|start| start.checked_add(cell.column as usize))
-            && let Some(slot) = grid.cells.get_mut(index)
-        {
-            *slot = Some(cell);
-        }
+    TerminalGrid {
+        snapshot,
+        columns: snapshot.size.columns as usize,
+        rows: snapshot.size.rows as usize,
     }
-    grid
 }
 
 fn prepare_selection(
@@ -1582,8 +1585,9 @@ fn prepare_backgrounds(
     line_height: f32,
     commands: &mut Vec<MetalCommand>,
 ) {
+    let mut row_buffer = vec![None; grid.columns];
     for row_index in 0..grid.rows {
-        let row = grid.row(row_index);
+        let row = grid.row(row_index, &mut row_buffer);
         let mut start = None;
         let mut color = default_background;
         for column in 0..=row.len() {
@@ -1667,8 +1671,9 @@ fn prepare_glyphs(
     let mut commands = Vec::new();
     let cursor_is_block = snapshot.cursor_shape == TerminalCursorShape::Block;
     let ligatures_possible = shaping.ligatures_enabled;
+    let mut row_buffer = vec![None; grid.columns];
     for row_index in 0..grid.rows {
-        let row = grid.row(row_index);
+        let row = grid.row(row_index, &mut row_buffer);
         let cursor_column =
             (snapshot.cursor_line as usize == row_index).then_some(snapshot.cursor_column as usize);
         let mut column = 0;
@@ -1745,7 +1750,7 @@ fn emit_glyph_command(
     column: usize,
     text: &str,
     source_span: usize,
-    cell: &TerminalCell,
+    cell: &TerminalCellView<'_>,
     resolved: ResolvedCell,
     use_cursor_text: bool,
     cell_width: f32,
@@ -1784,7 +1789,7 @@ fn emit_glyph_command(
 /// Whether a cell may participate in a shaping run: a visible, single-cell, non-sprite, non-wide
 /// character with no combining marks. CJK / emoji / box-drawing / combining sequences never ligate
 /// in a terminal, so they always break the run (and use the per-grapheme path).
-fn shapeable_cell(cell: &TerminalCell) -> bool {
+fn shapeable_cell(cell: &TerminalCellView<'_>) -> bool {
     let flags = Flags::from_bits_retain(cell.flags);
     if flags.intersects(
         Flags::WIDE_CHAR
@@ -1814,7 +1819,7 @@ fn shapeable_cell(cell: &TerminalCell) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn try_emit_shaped_run(
     commands: &mut Vec<MetalCommand>,
-    row: &[Option<&TerminalCell>],
+    row: &[Option<TerminalCellView<'_>>],
     row_index: usize,
     start: usize,
     cursor_column: Option<usize>,
@@ -1825,7 +1830,7 @@ fn try_emit_shaped_run(
     minimum_contrast: f32,
     shaping: &ShapingContext<'_>,
 ) -> Option<usize> {
-    let first = row.get(start).and_then(Option::as_ref).copied()?;
+    let first = row.get(start).and_then(Option::as_ref)?;
     if !shapeable_cell(first) {
         return None;
     }
@@ -1833,7 +1838,7 @@ fn try_emit_shaped_run(
     // before the cursor cell when breaking there so it renders un-ligated (Ghostty semantics).
     let mut end = start;
     while end < row.len() && end - start < MAX_SHAPING_RUN_CELLS {
-        let Some(cell) = row.get(end).and_then(Option::as_ref).copied() else {
+        let Some(cell) = row.get(end).and_then(Option::as_ref) else {
             break;
         };
         if !shapeable_cell(cell) || !same_grapheme_style(first, cell) {
@@ -1871,7 +1876,7 @@ fn try_emit_shaped_run(
     // shaped glyph id (a variant that joins its neighbors) instead of re-shaping the character.
     for (offset, glyph_id) in glyph_ids.into_iter().enumerate() {
         let column = start + offset;
-        let cell = row.get(column).and_then(Option::as_ref).copied()?;
+        let cell = row.get(column).and_then(Option::as_ref)?;
         let use_cursor_text = cursor_is_block && cursor_column == Some(column);
         let resolved = palette.resolve_cell(cell, use_cursor_text);
         let (text, source_span) = collect_grapheme(row, column);
@@ -1893,7 +1898,7 @@ fn try_emit_shaped_run(
     Some(cell_count)
 }
 
-fn collect_grapheme(row: &[Option<&TerminalCell>], start: usize) -> (String, usize) {
+fn collect_grapheme(row: &[Option<TerminalCellView<'_>>], start: usize) -> (String, usize) {
     let Some(first) = row.get(start).and_then(Option::as_ref) else {
         return (String::new(), 1);
     };
@@ -1932,7 +1937,7 @@ fn collect_grapheme(row: &[Option<&TerminalCell>], start: usize) -> (String, usi
     (text, source_span)
 }
 
-fn cell_text(cell: &TerminalCell) -> String {
+fn cell_text(cell: &TerminalCellView<'_>) -> String {
     let mut text = String::with_capacity((1 + cell.zerowidth.len()) * 4);
     text.push(if cell.character == '\t' {
         ' '
@@ -1961,7 +1966,7 @@ fn cell_span(flags: Flags) -> usize {
     }
 }
 
-fn same_grapheme_style(first: &TerminalCell, next: &TerminalCell) -> bool {
+fn same_grapheme_style(first: &TerminalCellView<'_>, next: &TerminalCellView<'_>) -> bool {
     const LAYOUT_FLAGS: Flags = Flags::WIDE_CHAR
         .union(Flags::WIDE_CHAR_SPACER)
         .union(Flags::LEADING_WIDE_CHAR_SPACER);
@@ -1995,8 +2000,9 @@ fn prepare_decorations(
         0.,
     );
     let mut commands = Vec::new();
+    let mut row_buffer = vec![None; grid.columns];
     for row_index in 0..grid.rows {
-        let row = grid.row(row_index);
+        let row = grid.row(row_index, &mut row_buffer);
         for (column, cell) in row.iter().enumerate() {
             let Some(cell) = cell else {
                 continue;
@@ -2294,13 +2300,15 @@ mod tests {
 
     fn snapshot(cells: Vec<TerminalCell>) -> TerminalSnapshot {
         TerminalSnapshot {
+            prompt_editable: false,
+            prompt_input: None,
             session_id: Uuid::nil(),
             size: TerminalSize {
                 columns: 8,
                 rows: 1,
                 ..TerminalSize::default()
             },
-            cells,
+            cells: cells.into(),
             color_overrides: Vec::new(),
             cursor_line: 0,
             cursor_column: 0,
@@ -2369,7 +2377,7 @@ mod tests {
             0x426384ff
         );
         let inverse = cell(0, 'x', TerminalColor::Named(1), Flags::INVERSE);
-        let resolved = palette.resolve_cell(&inverse, false);
+        let resolved = palette.resolve_cell(&inverse.view(), false);
         assert_eq!(resolved.foreground, palette.color(257));
         assert_eq!(resolved.background, palette.color(1));
     }

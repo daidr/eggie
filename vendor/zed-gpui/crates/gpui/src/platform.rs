@@ -1806,6 +1806,9 @@ pub struct WindowOptions {
     /// The kind of window to create
     pub kind: WindowKind,
 
+    /// Display buffer capacity. Currently honored by the macOS Metal renderer.
+    pub buffering: WindowBuffering,
+
     /// Whether the window can be moved by the user. When `false`, the user cannot drag
     /// the window (on macOS this sets `NSWindow.isMovable`, which also disables the
     /// Window-menu tiling items); programmatic moves are still allowed.
@@ -1874,6 +1877,9 @@ pub struct WindowParams {
     /// The kind of window to create
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub kind: WindowKind,
+
+    #[cfg(target_os = "macos")]
+    pub buffering: WindowBuffering,
 
     /// Whether the window should be movable by the user
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
@@ -1966,6 +1972,7 @@ impl Default for WindowOptions {
             focus: true,
             show: true,
             kind: WindowKind::Normal,
+            buffering: WindowBuffering::default(),
             is_movable: true,
             app_owns_titlebar_drag: false,
             is_resizable: true,
@@ -1979,6 +1986,16 @@ impl Default for WindowOptions {
             tabbing_identifier: None,
         }
     }
+}
+
+/// Number of display buffers available to the renderer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowBuffering {
+    /// Saves one display texture; suitable for lightweight auxiliary windows.
+    Double,
+    /// Allows an extra frame in flight for busy application windows.
+    #[default]
+    Triple,
 }
 
 /// The options that can be configured for a window's titlebar
