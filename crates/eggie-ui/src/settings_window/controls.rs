@@ -1,6 +1,37 @@
 use super::*;
 
 impl SettingsWindow {
+    pub(super) fn render_terminal_exit_control(
+        &self,
+        selected: TerminalExitBehavior,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let zh = self.settings.read(cx).config().language == Language::SimplifiedChinese;
+        let modes = [
+            TerminalExitBehavior::RemoveTab,
+            TerminalExitBehavior::KeepTab,
+        ];
+        let labels = if zh {
+            ["自动移除标签页", "保留标签页"]
+        } else {
+            ["Remove tab", "Keep tab"]
+        };
+        self.render_segmented(
+            "terminal-exit",
+            modes
+                .into_iter()
+                .zip(labels)
+                .map(|(mode, label)| (format!("{mode:?}").into(), label.into(), mode == selected))
+                .collect(),
+            move |window, index, cx| {
+                window.settings.update(cx, |store, cx| {
+                    store.update(|config| config.terminal_exit_behavior = modes[index], cx)
+                });
+            },
+            cx,
+        )
+    }
+
     pub(super) fn render_sidebar_layout_control(
         &self,
         selected: SidebarLayout,
@@ -640,6 +671,45 @@ impl SettingsWindow {
             "copy-on-select",
             options,
             |settings, index, cx| settings.set_copy_on_select(index == 1, cx),
+            cx,
+        )
+    }
+
+    pub(super) fn render_paste_preview_control(
+        &self,
+        selected: PastePreviewMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let zh = self.settings.read(cx).config().language == Language::SimplifiedChinese;
+        let modes = [
+            PastePreviewMode::WhenUnsafe,
+            PastePreviewMode::Multiline,
+            PastePreviewMode::Never,
+        ];
+        let labels = if zh {
+            ["可能执行时", "多行", "不预览"]
+        } else {
+            ["May execute", "Multiline", "Never"]
+        };
+        let options = modes
+            .into_iter()
+            .zip(labels)
+            .map(|(mode, label)| {
+                (
+                    SharedString::from(label),
+                    SharedString::from(label),
+                    mode == selected,
+                )
+            })
+            .collect();
+        self.render_segmented(
+            "paste-preview",
+            options,
+            move |settings, index, cx| {
+                settings.settings.update(cx, |store, cx| {
+                    store.update(|config| config.paste_preview = modes[index], cx)
+                });
+            },
             cx,
         )
     }

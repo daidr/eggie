@@ -161,6 +161,23 @@ pub(crate) enum BellMode {
     FlashAndSound,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PastePreviewMode {
+    #[default]
+    WhenUnsafe,
+    Multiline,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalExitBehavior {
+    #[default]
+    RemoveTab,
+    KeepTab,
+}
+
 impl BellMode {
     pub(crate) const ALL: [Self; 4] = [Self::Silent, Self::Flash, Self::Sound, Self::FlashAndSound];
 
@@ -390,6 +407,10 @@ pub(crate) struct AppSettings {
     pub(crate) terminal_suggestions: bool,
     pub(crate) detect_urls: bool,
     pub(crate) copy_on_select: bool,
+    #[serde(default)]
+    pub(crate) paste_preview: PastePreviewMode,
+    #[serde(default)]
+    pub(crate) terminal_exit_behavior: TerminalExitBehavior,
     /// Whether to check for app updates on launch. The check is silent; results
     /// surface as a sidebar indicator.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -470,6 +491,8 @@ impl Default for AppSettings {
             terminal_suggestions: true,
             detect_urls: true,
             copy_on_select: true,
+            paste_preview: PastePreviewMode::default(),
+            terminal_exit_behavior: TerminalExitBehavior::default(),
             auto_check_updates: true,
             update_channel: UpdateChannel::default(),
             cursor_shape: CursorShapeSetting::default(),

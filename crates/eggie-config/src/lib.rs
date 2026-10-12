@@ -16,6 +16,7 @@ pub const BUILTIN_ACTIONS: &[&str] = &[
     "quit",
     "terminal_copy",
     "terminal_paste",
+    "terminal_paste_preview",
     "terminal_select_all",
     "terminal_find",
     "terminal_suggest",

@@ -877,6 +877,10 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" && self.cancel_active_paste(cx) {
+            cx.stop_propagation();
+            return;
+        }
         // When the search input or command palette is focused it owns keyboard input; never leak
         // keys into the terminal. The input's own handlers consume the keys; this guard covers the
         // case where the event bubbles up to the workspace root before the input consumes it.

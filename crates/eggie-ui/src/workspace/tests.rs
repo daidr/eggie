@@ -208,3 +208,206 @@ fn undoing_a_tear_out_closes_the_window_created_by_that_gesture(cx: &mut TestApp
     });
     std::fs::remove_file(path).ok();
 }
+
+fn session_summary(id: SessionId, project: ProjectId, exited: bool) -> SessionSummary {
+    SessionSummary {
+        id,
+        project_id: project,
+        title: "shell".into(),
+        initial_directory: "/tmp".into(),
+        current_directory: "/tmp".into(),
+        reported_location: None,
+        shell_pid: 100,
+        current_process: eggie_protocol::ProcessSummary {
+            pid: 100,
+            name: "sh".into(),
+            command_line: None,
+        },
+        active_command: None,
+        program_status: None,
+        status: if exited {
+            eggie_protocol::SessionStatus::Exited { code: Some(0) }
+        } else {
+            eggie_protocol::SessionStatus::Running
+        },
+    }
+}
+
+/// Exercise the real async acknowledgement path without touching the user's daemon.
+fn exit_client(
+    count: usize,
+    response: DaemonResponse,
+) -> (
+    DaemonClient,
+    std::thread::JoinHandle<Vec<SessionId>>,
+    std::path::PathBuf,
+) {
+    use std::os::unix::net::UnixListener;
+    let path = std::path::PathBuf::from(format!("/tmp/egg-exit-{}.sock", SessionId::new_v4()));
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut ids = Vec::new();
+        while ids.len() < count {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut buffer = Vec::new();
+                    let request = eggie_ipc::wire::read_wire_message::<ClientRequest>(
+                        &mut stream,
+                        &mut buffer,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let ClientRequest::Terminate { session_id } = request else {
+                        panic!("unexpected request {request:?}")
+                    };
+                    ids.push(session_id);
+                    eggie_ipc::wire::write_wire_message(&mut stream, &mut buffer, &response)
+                        .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "cleanup request timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        ids
+    });
+    (DaemonClient::new(path.clone(), "exit-test"), worker, path)
+}
+
+#[gpui::test]
+fn automatic_exit_removal_releases_only_finished_tabs_and_repairs_selection(
+    cx: &mut TestAppContext,
+) {
+    let (manager, path) = manager(cx);
+    let (a, b, session, source, _) = setup(cx, &manager);
+    let sibling = SessionId::new_v4();
+    let background = SessionId::new_v4();
+    let summaries = vec![
+        session_summary(session, source.project_id, true),
+        session_summary(sibling, source.project_id, false),
+        session_summary(background, source.project_id, true),
+    ];
+    let (client, worker, socket) = exit_client(2, DaemonResponse::Ok);
+    manager.update(cx, |m, cx| {
+        let mut window = m.state.windows[&a].clone();
+        let group = window
+            .views
+            .get_mut(&source.project_id)
+            .unwrap()
+            .layout
+            .find_group_mut(source.group_id)
+            .unwrap();
+        group.add_item(TabItem::terminal(sibling, "sibling"));
+        group.active_item_id = Some(source.item_id);
+        m.capture(window, Some(m.revisions[&a]), cx).unwrap();
+        m.set_sessions(summaries.clone(), cx);
+        m.reap_exited_sessions(client.clone(), cx);
+        // A second poll must not enqueue duplicate cleanup while awaiting acknowledgement.
+        m.reap_exited_sessions(client, cx);
+        assert_eq!(m.pending_termination.len(), 2);
+    });
+    cx.run_until_parked();
+    let removed = worker.join().unwrap();
+    assert_eq!(removed.len(), 2);
+    assert!(removed.contains(&session) && removed.contains(&background));
+    manager.update(cx, |m, cx| {
+        assert!(m.pending_termination.is_empty());
+        assert!(m.state.locate(session).is_none());
+        assert!(!m.state.background.contains_key(&background));
+        assert_eq!(
+            m.state.windows[&a].views[&source.project_id]
+                .layout
+                .find_group(source.group_id)
+                .unwrap()
+                .active_item()
+                .unwrap()
+                .session_id,
+            Some(sibling)
+        );
+        assert!(m.state.windows.contains_key(&b));
+        m.set_sessions(summaries, cx);
+        assert_eq!(
+            m.sessions.len(),
+            1,
+            "stale catalogs cannot resurrect removed tabs"
+        );
+    });
+    std::fs::remove_file(socket).ok();
+    std::fs::remove_file(path).ok();
+}
+
+#[gpui::test]
+fn keeping_finished_tabs_and_switching_to_removal_work_across_windows(cx: &mut TestAppContext) {
+    let (manager, path) = manager(cx);
+    let (_, b, session, source, target) = setup(cx, &manager);
+    let (client, worker, socket) = exit_client(1, DaemonResponse::Ok);
+    manager.update(cx, |m, cx| {
+        m.move_item(source, target, cx).unwrap();
+        m.set_terminal_exit_behavior(TerminalExitBehavior::KeepTab, client.clone(), cx);
+        m.set_sessions(vec![session_summary(session, source.project_id, true)], cx);
+        m.reap_exited_sessions(client.clone(), cx);
+        assert!(m.pending_termination.is_empty());
+        assert_eq!(m.state.locate(session).unwrap().window_id, b);
+        // A successful empty catalog can mean a daemon restart; absence is not a confirmed exit.
+        m.set_sessions(Vec::new(), cx);
+        m.set_terminal_exit_behavior(TerminalExitBehavior::RemoveTab, client.clone(), cx);
+        assert!(m.state.locate(session).is_some());
+        assert!(m.pending_termination.is_empty());
+        m.set_sessions(vec![session_summary(session, source.project_id, true)], cx);
+        m.reap_exited_sessions(client, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap(), vec![session]);
+    manager.update(cx, |m, cx| {
+        assert!(m.state.locate(session).is_none());
+        assert!(m.state.windows.contains_key(&b));
+        assert!(m.undo(cx));
+        assert!(
+            m.state.locate(session).is_none(),
+            "undo must not revive a finished process"
+        );
+    });
+    std::fs::remove_file(socket).ok();
+    std::fs::remove_file(path).ok();
+}
+
+#[gpui::test]
+fn failed_exit_cleanup_keeps_the_tab_for_retry(cx: &mut TestAppContext) {
+    let (manager, path) = manager(cx);
+    let (_, _, session, source, _) = setup(cx, &manager);
+    let (client, worker, socket) = exit_client(
+        1,
+        DaemonResponse::Error {
+            message: "cleanup failed".into(),
+        },
+    );
+    manager.update(cx, |m, cx| {
+        m.set_sessions(vec![session_summary(session, source.project_id, true)], cx);
+        m.reap_exited_sessions(client, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap(), vec![session]);
+    manager.read_with(cx, |m, _| {
+        assert!(m.pending_termination.is_empty());
+        assert!(m.state.locate(session).is_some());
+        assert!(m.error.as_deref().unwrap().ends_with("cleanup failed"));
+    });
+    let (retry, worker, retry_socket) = exit_client(1, DaemonResponse::Ok);
+    manager.update(cx, |m, cx| m.reap_exited_sessions(retry, cx));
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap(), vec![session]);
+    manager.read_with(cx, |m, _| assert!(m.state.locate(session).is_none()));
+    std::fs::remove_file(retry_socket).ok();
+    std::fs::remove_file(socket).ok();
+    std::fs::remove_file(path).ok();
+}

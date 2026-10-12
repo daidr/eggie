@@ -14,8 +14,9 @@ pub(crate) fn rgba_from_rgb(color: Rgb) -> u32 {
 }
 
 pub(crate) fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = eggie_protocol::sanitize_paste(text);
     if bracketed {
-        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
@@ -43,6 +44,7 @@ pub(crate) fn terminal_input_modes(mode: TermMode) -> TerminalInputModes {
         TerminalMouseEncoding::Legacy
     };
     TerminalInputModes {
+        bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
         mouse_tracking,
         mouse_encoding,
         focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),

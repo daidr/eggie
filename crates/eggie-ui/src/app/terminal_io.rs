@@ -487,43 +487,6 @@ impl EggieApp {
         true
     }
 
-    pub(super) fn paste_into_active_terminal(&mut self, cx: &mut Context<Self>) -> bool {
-        self.dismiss_completion();
-        let Some(session_id) = self.active_session_id() else {
-            return false;
-        };
-        let Some(item) = cx.read_from_clipboard() else {
-            return false;
-        };
-        let paste_events = self
-            .session_feed
-            .snapshots
-            .get(&session_id)
-            .is_some_and(|snapshot| snapshot.input_modes.paste_events);
-        let enqueued = if paste_events {
-            let contents = clipboard_contents_from_item(item, &["*/*".to_owned()]);
-            self.enqueue_terminal_clipboard_paste(
-                session_id,
-                TerminalClipboardSelection::Clipboard,
-                contents,
-            )
-        } else {
-            let Some(text) = item.text() else {
-                return false;
-            };
-            self.enqueue_terminal_paste(session_id, text)
-        };
-        if !enqueued {
-            return false;
-        }
-        let _ = self.input_sender.send_selection_clear(session_id);
-        let ime_changed = self.terminal_ime_states.remove(&session_id).is_some();
-        if ime_changed {
-            cx.notify();
-        }
-        true
-    }
-
     pub(super) fn next_input_sequence() -> u64 {
         NEXT_INPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     }
@@ -577,10 +540,16 @@ impl EggieApp {
     ) -> bool {
         let sequence = Self::next_input_sequence();
         self.input_latency.record_input(session_id, sequence);
-        if let Err(error) = self
-            .input_sender
-            .send_paste_clipboard(session_id, selection, contents, sequence)
-        {
+        if let Err(error) = self.input_sender.send_paste_clipboard(
+            session_id,
+            selection,
+            contents,
+            sequence,
+            self.session_feed
+                .snapshots
+                .get(&session_id)
+                .map(|snapshot| paste::context(snapshot)),
+        ) {
             self.input_latency.discard_input(session_id, sequence);
             eprintln!("failed to enqueue terminal rich paste: {error:#}");
             return false;

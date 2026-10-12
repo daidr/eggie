@@ -74,6 +74,13 @@ pub struct DaemonInputSender {
 
 #[derive(Debug)]
 enum QueuedTerminalInput {
+    PasteText {
+        session_id: SessionId,
+        text: String,
+        sequence: u64,
+        expected_context: Option<TerminalPasteContext>,
+        reply: mpsc::Sender<std::result::Result<TerminalPasteStatus, String>>,
+    },
     Input {
         session_id: SessionId,
         bytes: Vec<u8>,
@@ -89,6 +96,7 @@ enum QueuedTerminalInput {
         selection: TerminalClipboardSelection,
         contents: Vec<TerminalClipboardContent>,
         sequence: u64,
+        expected_context: Option<TerminalPasteContext>,
     },
     Mouse {
         session_id: SessionId,
@@ -206,6 +214,7 @@ impl QueuedTerminalInput {
 
     fn request(self) -> ClientRequest {
         match self {
+            Self::PasteText { .. } => unreachable!("checked paste has a reply channel"),
             Self::Input {
                 session_id,
                 bytes,
@@ -229,11 +238,13 @@ impl QueuedTerminalInput {
                 selection,
                 contents,
                 sequence,
+                expected_context,
             } => ClientRequest::PasteClipboard {
                 session_id,
                 selection,
                 contents,
                 sequence,
+                expected_context,
             },
             Self::Mouse { session_id, event } => ClientRequest::Mouse { session_id, event },
             Self::Scroll { session_id, event } => ClientRequest::Scroll { session_id, event },
@@ -472,6 +483,24 @@ impl DaemonConnection {
 }
 
 impl DaemonInputSender {
+    /// Paste and subsequent keystrokes share the same FIFO, including the start acknowledgement.
+    pub fn send_paste_text(
+        &self,
+        session_id: SessionId,
+        text: String,
+        sequence: u64,
+        expected_context: Option<TerminalPasteContext>,
+    ) -> Result<mpsc::Receiver<std::result::Result<TerminalPasteStatus, String>>> {
+        let (reply, receiver) = mpsc::channel();
+        self.enqueue(QueuedTerminalInput::PasteText {
+            session_id,
+            text,
+            sequence,
+            expected_context,
+            reply,
+        })?;
+        Ok(receiver)
+    }
     /// Hand a queued input to the worker thread, mapping a closed channel to a uniform error. All
     /// the typed `send_*` methods funnel through here so the "worker stopped" context lives once.
     fn enqueue(&self, input: QueuedTerminalInput) -> Result<()> {
@@ -502,12 +531,14 @@ impl DaemonInputSender {
         selection: TerminalClipboardSelection,
         contents: Vec<TerminalClipboardContent>,
         sequence: u64,
+        expected_context: Option<TerminalPasteContext>,
     ) -> Result<()> {
         self.enqueue(QueuedTerminalInput::PasteClipboard {
             session_id,
             selection,
             contents,
             sequence,
+            expected_context,
         })
     }
 
@@ -708,6 +739,39 @@ impl DaemonClient {
                 let mut connection = None;
                 while let Ok(first) = receiver.recv() {
                     for input in receive_input_batch(&receiver, first) {
+                        if let QueuedTerminalInput::PasteText {
+                            session_id,
+                            text,
+                            sequence,
+                            expected_context,
+                            reply,
+                        } = input
+                        {
+                            let large = text.len() >= LARGE_PASTE_BYTES;
+                            let result = (|| {
+                                if connection.is_none() {
+                                    connection = Some(client.connect()?);
+                                }
+                                match connection.as_mut().unwrap().request(
+                                    ClientRequest::PasteText {
+                                        session_id,
+                                        text,
+                                        sequence,
+                                        expected_context,
+                                    },
+                                )? {
+                                    DaemonResponse::PasteStatus { status } => Ok(status),
+                                    response => bail!("unexpected paste response: {response:?}"),
+                                }
+                            })();
+                            // Do not retain the large serialization buffers on the long-lived input stream.
+                            if result.is_err() || large {
+                                connection = None;
+                            }
+                            let _ = reply
+                                .send(result.map_err(|error: anyhow::Error| format!("{error:#}")));
+                            continue;
+                        }
                         if connection.is_none() {
                             match client.connect() {
                                 Ok(connected) => connection = Some(connected),

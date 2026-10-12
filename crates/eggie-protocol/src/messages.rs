@@ -148,11 +148,27 @@ pub enum ClientRequest {
         text: String,
         sequence: u64,
     },
+    PasteText {
+        session_id: SessionId,
+        text: String,
+        sequence: u64,
+        /// A preview is tied to the application that was active when it opened.
+        expected_context: Option<TerminalPasteContext>,
+    },
+    PasteStatus {
+        session_id: SessionId,
+        id: u64,
+    },
+    CancelPaste {
+        session_id: SessionId,
+        id: u64,
+    },
     PasteClipboard {
         session_id: SessionId,
         selection: TerminalClipboardSelection,
         contents: Vec<TerminalClipboardContent>,
         sequence: u64,
+        expected_context: Option<TerminalPasteContext>,
     },
     Mouse {
         session_id: SessionId,
@@ -357,6 +373,9 @@ pub enum DaemonResponse {
     },
     Sessions {
         sessions: Vec<SessionSummary>,
+    },
+    PasteStatus {
+        status: TerminalPasteStatus,
     },
     SessionInspection {
         inspection: SessionInspection,

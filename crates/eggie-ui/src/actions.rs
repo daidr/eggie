@@ -40,6 +40,7 @@ actions!(
         Quit,
         TerminalCopy,
         TerminalPaste,
+        TerminalPastePreview,
         TerminalSelectAll,
         TerminalFind,
         TerminalSuggest,
@@ -397,6 +398,15 @@ fn build_menus(language: Language) -> Vec<Menu> {
             MenuItem::os_action(language.copy(), TerminalCopy, OsAction::Copy).icon("doc.on.doc"),
             MenuItem::os_action(language.paste(), TerminalPaste, OsAction::Paste)
                 .icon("doc.on.clipboard"),
+            MenuItem::action(
+                if language == Language::SimplifiedChinese {
+                    "粘贴预览"
+                } else {
+                    "Paste preview"
+                },
+                TerminalPastePreview,
+            )
+            .icon("doc.text.magnifyingglass"),
             MenuItem::separator(),
             MenuItem::os_action(
                 language.select_all(),

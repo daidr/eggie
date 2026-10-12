@@ -109,6 +109,7 @@ fn request_round_trips_as_a_single_json_line() {
                 data: b"rich paste".to_vec(),
             }],
             sequence: 9,
+            expected_context: None,
         },
         ClientRequest::Mouse {
             session_id: Uuid::nil(),
@@ -662,6 +663,7 @@ fn render_snapshot_round_trips_without_losing_terminal_semantics() {
         revision: 42,
         last_input_sequence: 9,
         input_modes: TerminalInputModes {
+            bracketed_paste: false,
             mouse_tracking: TerminalMouseTracking::Drag,
             mouse_encoding: TerminalMouseEncoding::Sgr,
             focus_reporting: true,

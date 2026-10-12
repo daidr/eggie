@@ -14,6 +14,7 @@ mod urls;
 use urls::*;
 mod session;
 use session::*;
+mod paste;
 mod snapshot;
 use snapshot::*;
 mod search;

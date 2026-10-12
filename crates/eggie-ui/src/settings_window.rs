@@ -19,8 +19,9 @@ use crate::{
         DEFAULT_LIGHT_THEME, Language, MAX_FONT_SIZE, MAX_MINIMUM_CONTRAST,
         MAX_PROGRESS_TIMEOUT_SECS, MAX_SCROLLBACK_LINES, MAX_TERMINAL_PADDING, MIN_FONT_SIZE,
         MIN_MINIMUM_CONTRAST, MIN_PROGRESS_TIMEOUT_SECS, MIN_SCROLLBACK_LINES,
-        MIN_TERMINAL_PADDING, SCROLLBACK_LINES_STEP, SettingsStore, SidebarLayout, TerminalTheme,
-        TerminalThemeSource, ThemeMode, UiColors, UpdateChannel, theme_catalog,
+        MIN_TERMINAL_PADDING, PastePreviewMode, SCROLLBACK_LINES_STEP, SettingsStore,
+        SidebarLayout, TerminalExitBehavior, TerminalTheme, TerminalThemeSource, ThemeMode,
+        UiColors, UpdateChannel, theme_catalog,
     },
     text_input::{TextInput, TextInputEvent, TextInputStyle},
 };

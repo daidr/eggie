@@ -21,6 +21,7 @@ pub(super) struct ListenerState {
     pub(super) revision_wait: Mutex<()>,
     pub(super) revision_changed: Condvar,
     pub(super) sender: Mutex<Option<EventLoopSender>>,
+    pub(super) paste_replies: Mutex<Option<VecDeque<Vec<u8>>>>,
     pub(super) appearance: RwLock<TerminalAppearance>,
     pub(super) last_input_sequence: Arc<AtomicU64>,
     pub(super) published_snapshots: RwLock<VecDeque<Arc<TerminalSnapshot>>>,
@@ -216,6 +217,7 @@ impl ListenerState {
             revision_wait: Mutex::new(()),
             revision_changed: Condvar::new(),
             sender: Mutex::new(None),
+            paste_replies: Mutex::new(None),
             appearance: RwLock::new(appearance),
             last_input_sequence,
             published_snapshots: RwLock::new(VecDeque::with_capacity(PUBLISHED_SNAPSHOT_HISTORY)),
@@ -418,10 +420,34 @@ impl ListenerState {
     }
 
     pub(super) fn write_to_pty(&self, bytes: impl Into<Vec<u8>>) {
-        let Some(sender) = self.sender.lock().clone() else {
-            return;
-        };
-        let _ = sender.send(Msg::Input(bytes.into().into()));
+        let _ = self.enqueue_pty_reply(bytes.into());
+    }
+
+    pub(super) fn enqueue_pty_reply(&self, bytes: Vec<u8>) -> Result<()> {
+        let mut replies = self.paste_replies.lock();
+        if let Some(queue) = replies.as_mut() {
+            queue.push_back(bytes);
+            return Ok(());
+        }
+        let sender = self
+            .sender
+            .lock()
+            .clone()
+            .context("terminal input unavailable")?;
+        sender
+            .send(Msg::Input(bytes.into()))
+            .context("failed to write terminal reply")
+    }
+
+    pub(super) fn release_paste_replies(&self) {
+        let mut replies = self.paste_replies.lock();
+        if let Some(queue) = replies.take()
+            && let Some(sender) = self.sender.lock().clone()
+        {
+            for bytes in queue {
+                let _ = sender.send(Msg::Input(bytes.into()));
+            }
+        }
     }
 
     pub(super) fn report_working_directory(&self, value: &str) {

@@ -4097,6 +4097,7 @@ fn terminal_input_modes_follow_alacritty_mode_precedence() {
     assert_eq!(
         terminal_input_modes(mode),
         TerminalInputModes {
+            bracketed_paste: false,
             mouse_tracking: TerminalMouseTracking::Drag,
             mouse_encoding: TerminalMouseEncoding::Sgr,
             focus_reporting: true,

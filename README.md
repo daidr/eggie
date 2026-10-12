@@ -37,6 +37,19 @@ arrow keys navigate, and Escape dismisses. Enter runs the command unless you hav
 the list. Disable completion in Settings → Advanced to use the shell's native Tab binding.
 See [completion architecture and tests](docs/architecture/completion.md).
 
+## Paste
+
+Cmd-V pastes directly when the receiving program supports bracketed paste. A line break that
+may execute a command opens an editable preview. Cmd-Shift-V always opens the preview;
+Return inserts a line break, Cmd-Return confirms, and Escape cancels. Settings → Advanced →
+Paste preview selects automatic preview for potentially executable text, multiline shell text,
+or neither. Control characters are removed while Unicode, tabs, and indentation are preserved.
+
+Large text is sent with one bracketed-paste delimiter pair and at most 4 KiB in flight.
+An overlay reports bytes written to the PTY and offers Cancel; Escape also cancels.
+Typing stops the remaining paste before sending the new input. Switching tabs leaves the paste
+attached to its original terminal. Applications using Kitty clipboard grants retain rich paste.
+
 ## Development
 
 macOS builds require Xcode with its Metal compiler toolchain (`xcrun -f metal`).

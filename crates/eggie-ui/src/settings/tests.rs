@@ -381,6 +381,8 @@ fn settings_round_trip_and_normalize_font_size() {
         terminal_suggestions: true,
         detect_urls: false,
         copy_on_select: false,
+        paste_preview: PastePreviewMode::WhenUnsafe,
+        terminal_exit_behavior: TerminalExitBehavior::KeepTab,
         auto_check_updates: true,
         update_channel: UpdateChannel::Beta,
         cursor_shape: CursorShapeSetting::Bar,
@@ -434,6 +436,31 @@ fn settings_round_trip_and_normalize_font_size() {
     );
     assert_eq!(loaded.config.interface_light_theme, "Ayu Light");
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn terminal_exit_defaults_and_preferences_round_trip() {
+    assert_eq!(
+        AppSettings::default().terminal_exit_behavior,
+        TerminalExitBehavior::RemoveTab
+    );
+    let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("terminal_exit_behavior");
+    let old: AppSettings = serde_json::from_value(value).unwrap();
+    assert_eq!(old.terminal_exit_behavior, TerminalExitBehavior::RemoveTab);
+    let settings = AppSettings {
+        terminal_exit_behavior: TerminalExitBehavior::KeepTab,
+        ..AppSettings::default()
+    };
+    let restored: AppSettings =
+        serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(
+        restored.terminal_exit_behavior,
+        TerminalExitBehavior::KeepTab
+    );
 }
 
 #[test]

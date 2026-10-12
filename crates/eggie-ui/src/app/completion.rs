@@ -259,7 +259,7 @@ impl EggieApp {
                 })
     }
     fn completion_input(&self, session: SessionId) -> Option<PromptInput> {
-        if !self.completion_editable(session) {
+        if self.paste_transfers.contains_key(&session) || !self.completion_editable(session) {
             return None;
         }
         let frame = self.session_feed.snapshots.get(&session)?;
@@ -272,6 +272,9 @@ impl EggieApp {
         let Some(session) = self.active_session_id() else {
             return false;
         };
+        if self.paste_preview_open || self.paste_transfers.contains_key(&session) {
+            return true;
+        }
         if !self.completion_editable(session) {
             return false;
         }
@@ -386,6 +389,10 @@ impl EggieApp {
         false
     }
     pub(super) fn sync_completion(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if self.paste_preview_open || self.paste_transfers.contains_key(&session) {
+            self.dismiss_completion();
+            return;
+        }
         if self.active_session_id() != Some(session) {
             return;
         }
