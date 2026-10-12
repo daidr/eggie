@@ -1,6 +1,34 @@
 use super::*;
 
 impl EggieApp {
+    pub(in crate::app) fn render_terminal_status_tag(
+        &self,
+        label: &'static str,
+        tint: u32,
+    ) -> AnyElement {
+        div()
+            .flex_none()
+            .h(px(16.))
+            .px_1()
+            .rounded_full()
+            .bg(rgba((tint << 8) | 0x30))
+            .text_size(px(10.))
+            .text_color(rgb(self.colors.text))
+            .child(label)
+            .into_any_element()
+    }
+
+    pub(in crate::app) fn render_exited_terminal_tag(&self) -> AnyElement {
+        self.render_terminal_status_tag(
+            if self.language == Language::SimplifiedChinese {
+                "已结束"
+            } else {
+                "Exited"
+            },
+            self.colors.muted,
+        )
+    }
+
     pub(super) fn start_project_drag(
         &mut self,
         id: ProjectId,
@@ -622,6 +650,7 @@ impl EggieApp {
                 .layout
                 .terminal_display_title(session_id)
                 .unwrap_or(session.title.as_str());
+            let exited = matches!(session.status, SessionStatus::Exited { .. });
             let program_status = session.program_status.as_ref();
             let display_title = view
                 .layout
@@ -643,7 +672,24 @@ impl EggieApp {
             } else {
                 self.colors.panel
             };
-            let label: AnyElement = if let Some(status) = program_status {
+            let label: AnyElement = if exited {
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(self.render_marquee(
+                        title_key.clone(),
+                        display_title.to_owned(),
+                        12.,
+                        17.,
+                        label_background,
+                        cx,
+                    ))
+                    .child(self.render_exited_terminal_tag())
+                    .into_any_element()
+            } else if let Some(status) = program_status {
                 let state_label = program_state_label(status.state, self.language);
                 let mut subtitle = match (&status.title, &status.message) {
                     (Some(title), Some(message)) if title != display_title => {
@@ -690,17 +736,7 @@ impl EggieApp {
                                     TerminalProgramState::Error => self.interface_theme.palette[1],
                                     _ => self.interface_theme.palette[2],
                                 };
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .h(px(16.))
-                                        .px_1()
-                                        .rounded_full()
-                                        .bg(rgba((tint << 8) | 0x30))
-                                        .text_size(px(10.))
-                                        .text_color(rgb(self.colors.text))
-                                        .child(label),
-                                )
+                                row.child(self.render_terminal_status_tag(label, tint))
                             }),
                     )
                     .child(
@@ -730,7 +766,7 @@ impl EggieApp {
                 )
             };
             let height_transition =
-                self.sidebar_status_row_transition(session_id, program_status.is_some());
+                self.sidebar_status_row_transition(session_id, !exited && program_status.is_some());
             let row = div()
                 .id(format!("sidebar-session-{session_id}"))
                 .flex()
@@ -795,7 +831,7 @@ impl EggieApp {
                         )
                         .into_any_element()
                     } else {
-                        row.h(px(if program_status.is_some() {
+                        row.h(px(if !exited && program_status.is_some() {
                             SIDEBAR_STATUS_ROW_HEIGHT
                         } else {
                             SIDEBAR_SESSION_ROW_HEIGHT

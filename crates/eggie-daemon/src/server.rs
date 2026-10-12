@@ -285,10 +285,34 @@ impl DaemonState {
                 selection,
                 contents,
                 sequence,
+                expected_context,
             } => {
-                self.session(session_id)?
-                    .paste_clipboard(selection, contents, sequence)?;
+                self.session(session_id)?.paste_clipboard(
+                    selection,
+                    contents,
+                    sequence,
+                    expected_context,
+                )?;
                 Ok(DaemonResponse::Ok)
+            }
+            ClientRequest::PasteText {
+                session_id,
+                text,
+                sequence,
+                expected_context,
+            } => {
+                let status =
+                    self.session(session_id)?
+                        .paste_text(text, sequence, expected_context)?;
+                Ok(DaemonResponse::PasteStatus { status })
+            }
+            ClientRequest::PasteStatus { session_id, id } => {
+                let status = self.session(session_id)?.paste_status(id)?;
+                Ok(DaemonResponse::PasteStatus { status })
+            }
+            ClientRequest::CancelPaste { session_id, id } => {
+                let status = self.session(session_id)?.cancel_paste(id)?;
+                Ok(DaemonResponse::PasteStatus { status })
             }
             ClientRequest::Mouse { session_id, event } => {
                 self.session(session_id)?.mouse(event)?;

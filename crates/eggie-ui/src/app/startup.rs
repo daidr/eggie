@@ -115,13 +115,36 @@ impl EggieApp {
                 manager.notification_routes = notification_routes.clone();
                 manager.project_store = Some(project_store.clone());
             });
+            windows.update(cx, |manager, cx| {
+                manager.set_terminal_exit_behavior(
+                    settings.read(cx).config().terminal_exit_behavior,
+                    client.clone(),
+                    cx,
+                );
+            });
+            let exit_windows = windows.downgrade();
+            let exit_client = client.clone();
+            cx.observe(&settings, move |settings, cx| {
+                let behavior = settings.read(cx).config().terminal_exit_behavior;
+                let _ = exit_windows.update(cx, |manager, cx| {
+                    manager.set_terminal_exit_behavior(behavior, exit_client.clone(), cx);
+                });
+            })
+            .detach();
             cx.set_global(crate::workspace::SharedWindows(windows.clone()));
             let projects = project_store.read(cx).projects().to_vec();
             windows.update(cx, |manager, cx| manager.reconcile_projects(&projects, cx));
             if let Ok(DaemonResponse::Sessions { sessions }) =
                 client.request(ClientRequest::ListSessions)
             {
-                windows.update(cx, |manager, cx| manager.set_sessions(sessions, cx));
+                windows.update(cx, |manager, cx| {
+                    manager.set_sessions(sessions, cx);
+                    manager.set_terminal_exit_behavior(
+                        settings.read(cx).config().terminal_exit_behavior,
+                        client.clone(),
+                        cx,
+                    );
+                });
             }
             let restore = windows
                 .read(cx)
@@ -1012,6 +1035,8 @@ impl EggieApp {
             terminal_selection_drag: None,
             terminal_search: None,
             command_palette: None,
+            paste_preview_open: false,
+            paste_transfers: HashMap::new(),
             hyperlink_mouse_down: false,
             terminal_hovered_link: None,
             terminal_has_focus: false,

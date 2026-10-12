@@ -14,6 +14,7 @@ mod palette;
 mod project_icons;
 mod projects;
 use project_icons::*;
+mod paste;
 mod right_sidebar;
 mod search;
 mod session_feed;
@@ -23,6 +24,8 @@ mod startup;
 mod state;
 mod tabs;
 mod terminal_io;
+use paste::PasteTransferUi;
+mod native_paste;
 mod windows;
 mod workspace_controller;
 use state::*;
@@ -31,9 +34,9 @@ use crate::actions::{
     ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab,
     NewTabWithProfile, NextTab, PageDown, PageUp, PrevTab, ScrollBottom, ScrollTop, SplitDown,
-    SplitLeft, SplitRight, SplitUp, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll,
-    TerminalSuggest, TerminalSwitcher, ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar,
-    UndoWindowOperation, WindowSwitcher, ZoomWindow,
+    SplitLeft, SplitRight, SplitUp, TerminalCopy, TerminalFind, TerminalPaste,
+    TerminalPastePreview, TerminalSelectAll, TerminalSuggest, TerminalSwitcher, ToggleFullScreen,
+    ToggleLeftSidebar, ToggleRightSidebar, UndoWindowOperation, WindowSwitcher, ZoomWindow,
 };
 use crate::command_history::{CommandStatus, format_relative_time};
 use crate::command_palette::{PaletteEntry, command_matches, palette_entries};
@@ -210,6 +213,8 @@ pub struct EggieApp {
     terminal_selection_drag: Option<TerminalSelectionDrag>,
     terminal_search: Option<TerminalSearchUi>,
     command_palette: Option<CommandPaletteUi>,
+    paste_preview_open: bool,
+    paste_transfers: HashMap<SessionId, PasteTransferUi>,
     hyperlink_mouse_down: bool,
     terminal_hovered_link: Option<(SessionId, eggie_protocol::TerminalLinkRange)>,
     terminal_has_focus: bool,
@@ -438,8 +443,13 @@ impl gpui::Render for EggieApp {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|app, _: &TerminalPaste, _, cx| {
-                if app.paste_into_active_terminal(cx) {
+            .on_action(cx.listener(|app, _: &TerminalPaste, window, cx| {
+                if app.paste_into_active_terminal(false, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &TerminalPastePreview, window, cx| {
+                if app.paste_into_active_terminal(true, window, cx) {
                     cx.stop_propagation();
                 }
             }))

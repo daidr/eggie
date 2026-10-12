@@ -1,6 +1,7 @@
 //! Application-wide window registry, session catalog, and one atomic restore snapshot.
 mod session_streams;
 use crate::app::EggieApp;
+use crate::settings::TerminalExitBehavior;
 pub(crate) use eggie_domain::WindowProjectView;
 use eggie_domain::{
     BackgroundTerminal, ItemLocation, PresentationTarget, PresentationWorkspace, Project,
@@ -47,6 +48,7 @@ impl From<&WindowPresentation> for SidebarRestoreState {
 pub(crate) struct WindowManager {
     pub state: PresentationWorkspace,
     pub sessions: Vec<SessionSummary>,
+    terminal_exit_behavior: TerminalExitBehavior,
     pub progress: HashMap<SessionId, eggie_protocol::TerminalProgressUpdate>,
     streams: HashSet<SessionId>,
     stream_liveness: HashMap<SessionId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -104,6 +106,7 @@ impl WindowManager {
         Self {
             state,
             sessions: Vec::new(),
+            terminal_exit_behavior: TerminalExitBehavior::default(),
             progress: HashMap::new(),
             streams: HashSet::new(),
             stream_liveness: HashMap::new(),
@@ -391,6 +394,34 @@ impl WindowManager {
         })
         .detach();
     }
+    pub fn set_terminal_exit_behavior(
+        &mut self,
+        behavior: TerminalExitBehavior,
+        client: DaemonClient,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_exit_behavior = behavior;
+        self.reap_exited_sessions(client, cx);
+    }
+
+    fn reap_exited_sessions(&mut self, client: DaemonClient, cx: &mut Context<Self>) {
+        if self.terminal_exit_behavior != TerminalExitBehavior::RemoveTab {
+            return;
+        }
+        let exited: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                matches!(session.status, eggie_protocol::SessionStatus::Exited { .. })
+                    && !self.pending_termination.contains(&session.id)
+            })
+            .map(|session| session.id)
+            .collect();
+        // Reuse acknowledged removal so the daemon also releases the finished terminal's buffers.
+        for id in exited {
+            self.terminate(id, client.clone(), cx);
+        }
+    }
     pub fn set_sessions(&mut self, mut sessions: Vec<SessionSummary>, cx: &mut Context<Self>) {
         // An older ListSessions response must not reintroduce a process explicitly terminated here.
         sessions.retain(|session| !self.retired_sessions.contains(&session.id));
@@ -531,6 +562,7 @@ impl WindowManager {
                     Ok(DaemonResponse::Sessions { sessions }) => {
                         manager.connection_error = None;
                         manager.set_sessions(sessions, cx);
+                        manager.reap_exited_sessions(stream_client.clone(), cx);
                         manager.ensure_streams(stream_client, cx);
                     }
                     Err(error) => {

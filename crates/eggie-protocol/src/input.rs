@@ -118,6 +118,8 @@ pub enum TerminalMouseEncoding {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalInputModes {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bracketed_paste: bool,
     pub mouse_tracking: TerminalMouseTracking,
     pub mouse_encoding: TerminalMouseEncoding,
     pub focus_reporting: bool,

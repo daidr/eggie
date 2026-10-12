@@ -387,6 +387,10 @@ impl SettingsWindow {
                 let detect_urls_control = self.render_detect_urls_control(config.detect_urls, cx);
                 let copy_on_select_control =
                     self.render_copy_on_select_control(config.copy_on_select, cx);
+                let paste_preview_control =
+                    self.render_paste_preview_control(config.paste_preview, cx);
+                let terminal_exit_control =
+                    self.render_terminal_exit_control(config.terminal_exit_behavior, cx);
                 let shell_program_control = self.render_shell_input_control(
                     "settings-shell-program",
                     &self.shell_program_input,
@@ -425,6 +429,16 @@ impl SettingsWindow {
                         Some(language.terminal_behavior_section()),
                         vec![
                             settings_row(
+                                if language == Language::SimplifiedChinese {
+                                    "进程结束后"
+                                } else {
+                                    "When the process exits"
+                                },
+                                None,
+                                terminal_exit_control,
+                                self.colors,
+                            ),
+                            settings_row(
                                 language.terminal_suggest(),
                                 None,
                                 completion_control,
@@ -443,6 +457,16 @@ impl SettingsWindow {
                                 self.colors,
                             ),
                             settings_row(language.bell_row(), None, bell_control, self.colors),
+                            settings_row(
+                                if language == Language::SimplifiedChinese {
+                                    "粘贴预览"
+                                } else {
+                                    "Paste preview"
+                                },
+                                None,
+                                paste_preview_control,
+                                self.colors,
+                            ),
                         ],
                         self.colors,
                     ),

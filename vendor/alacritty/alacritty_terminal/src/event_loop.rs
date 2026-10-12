@@ -7,8 +7,9 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -18,8 +19,8 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 use crate::event::{self, Event, EventListener, WindowSize};
 use crate::pipeline_metrics::{self, Stage as PipelineStage};
 use crate::sync::FairMutex;
-use crate::term::Term;
 use crate::term::kitty_graphics::{ApcOutput, ApcSplitter};
+use crate::term::Term;
 use crate::{thread, tty};
 use vte::ansi;
 
@@ -41,6 +42,14 @@ const MAX_PTY_DRAIN: usize = READ_BUFFER_SIZE * PARSER_QUEUE_DEPTH;
 pub enum Msg {
     /// Data that should be written to the PTY.
     Input(Cow<'static, [u8]>),
+
+    /// Bounded paste input with write progress and cancellation of bytes not yet written.
+    TrackedInput {
+        bytes: Cow<'static, [u8]>,
+        written: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    },
 
     /// Indicates that the `EventLoop` should shut down, as Alacritty is shutting down.
     Shutdown,
@@ -131,7 +140,23 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
-                Msg::Input(input) => state.write_list.push_back(input),
+                Msg::Input(input) => state.write_list.push_back(Writing::new(input)),
+                Msg::TrackedInput {
+                    bytes,
+                    written,
+                    cancelled,
+                    finished,
+                } => {
+                    state.write_list.push_back(Writing {
+                        source: bytes,
+                        written: 0,
+                        tracking: Some(InputTracking {
+                            written,
+                            cancelled,
+                            finished,
+                        }),
+                    });
+                }
                 Msg::Resize(window_size) => self.pty.on_resize(window_size),
                 Msg::Shutdown => return false,
             }
@@ -203,6 +228,11 @@ where
 
         'write_many: while let Some(mut current) = state.take_current() {
             'write_one: loop {
+                if current.finished() {
+                    current.complete();
+                    state.goto_next();
+                    break 'write_one;
+                }
                 match self.pty.writer().write(current.remaining_bytes()) {
                     Ok(0) => {
                         state.set_current(Some(current));
@@ -211,6 +241,7 @@ where
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
+                            current.complete();
                             state.goto_next();
                             break 'write_one;
                         }
@@ -360,6 +391,13 @@ where
             }
 
             // The evented instances are not dropped here so deregister them explicitly.
+            // Resolve tracked writes even when the child exits or a PTY error stops the loop.
+            state.abort_writes();
+            while let Some(message) = self.rx.recv() {
+                if let Msg::TrackedInput { finished, .. } = message {
+                    finished.store(true, Ordering::Release);
+                }
+            }
             let _ = self.pty.deregister(&self.poll);
             let _ = parser_tx.send(ParserMsg::Shutdown);
             let _ = parser_thread.join();
@@ -581,6 +619,13 @@ fn execute_kitty_apc<U: EventListener>(
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
+    tracking: Option<InputTracking>,
+}
+
+struct InputTracking {
+    written: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
 }
 
 pub struct Notifier(pub EventLoopSender);
@@ -652,11 +697,19 @@ impl EventLoopSender {
 /// would otherwise be mutated on the `EventLoop` goes here.
 #[derive(Default)]
 pub struct State {
-    write_list: VecDeque<Cow<'static, [u8]>>,
+    write_list: VecDeque<Writing>,
     writing: Option<Writing>,
 }
 
 impl State {
+    fn abort_writes(&mut self) {
+        if let Some(writing) = self.writing.take() {
+            writing.complete();
+        }
+        for writing in self.write_list.drain(..) {
+            writing.complete();
+        }
+    }
     #[inline]
     fn ensure_next(&mut self) {
         if self.writing.is_none() {
@@ -666,7 +719,7 @@ impl State {
 
     #[inline]
     fn goto_next(&mut self) {
-        self.writing = self.write_list.pop_front().map(Writing::new);
+        self.writing = self.write_list.pop_front();
     }
 
     #[inline]
@@ -691,22 +744,49 @@ impl Writing {
         Writing {
             source: c,
             written: 0,
+            tracking: None,
         }
     }
 
     #[inline]
     fn advance(&mut self, n: usize) {
         self.written += n;
+        if let Some(tracking) = &self.tracking {
+            tracking.written.fetch_add(n, Ordering::Release);
+        }
     }
 
     #[inline]
     fn remaining_bytes(&self) -> &[u8] {
-        &self.source[self.written..]
+        if self
+            .tracking
+            .as_ref()
+            .is_some_and(|t| t.cancelled.load(Ordering::Acquire))
+        {
+            let mut end = self.written;
+            while end < self.source.len() && self.source[end] & 0xc0 == 0x80 {
+                end += 1;
+            }
+            &self.source[self.written..end]
+        } else {
+            &self.source[self.written..]
+        }
     }
 
     #[inline]
     fn finished(&self) -> bool {
         self.written >= self.source.len()
+            || (self
+                .tracking
+                .as_ref()
+                .is_some_and(|t| t.cancelled.load(Ordering::Acquire))
+                && self.source[self.written] & 0xc0 != 0x80)
+    }
+
+    fn complete(&self) {
+        if let Some(tracking) = &self.tracking {
+            tracking.finished.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -732,8 +812,33 @@ mod tests {
     use super::*;
 
     use crate::event::VoidListener;
-    use crate::term::Config;
     use crate::term::test::TermSize;
+    use crate::term::Config;
+
+    #[test]
+    fn cancelling_paste_finishes_only_a_partially_written_utf8_character() {
+        let written = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut writing = Writing {
+            source: "中👩next".as_bytes().to_vec().into(),
+            written: 0,
+            tracking: Some(InputTracking {
+                written: written.clone(),
+                cancelled: cancelled.clone(),
+                finished: finished.clone(),
+            }),
+        };
+        writing.advance(1);
+        cancelled.store(true, Ordering::Release);
+        assert!(!writing.finished());
+        assert_eq!(writing.remaining_bytes(), &"中".as_bytes()[1..]);
+        writing.advance(2);
+        assert!(writing.finished());
+        writing.complete();
+        assert_eq!(written.load(Ordering::Acquire), 3);
+        assert!(finished.load(Ordering::Acquire));
+    }
 
     #[test]
     fn kitty_apc_observes_cursor_moves_inside_synchronized_updates() {

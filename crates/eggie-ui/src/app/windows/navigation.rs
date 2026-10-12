@@ -68,19 +68,11 @@ impl EggieApp {
                 rows.push(self.render_terminal_section_label(label));
                 previous_location = Some(location);
             }
-            let live = manager.sessions.iter().find(|s| s.id == session);
-            let title = if live.is_none() {
-                format!(
-                    "{title} · {}",
-                    if self.language == Language::SimplifiedChinese {
-                        "已结束"
-                    } else {
-                        "Ended"
-                    }
-                )
-            } else {
-                title
-            };
+            let exited = manager
+                .sessions
+                .iter()
+                .find(|s| s.id == session)
+                .is_none_or(|s| matches!(s.status, SessionStatus::Exited { .. }));
             rows.push(
                 div()
                     .id(format!("external-terminal-{session}"))
@@ -113,6 +105,7 @@ impl EggieApp {
                             .line_height(px(17.))
                             .child(title),
                     )
+                    .when(exited, |row| row.child(self.render_exited_terminal_tag()))
                     .child(
                         div()
                             .id(format!("bring-terminal-{session}"))
@@ -184,16 +177,9 @@ impl EggieApp {
                                 .truncate()
                                 .line_height(px(17.))
                                 .text_color(rgb(self.colors.muted))
-                                .child(format!(
-                                    "{} · {}",
-                                    item.display_title(),
-                                    if self.language == Language::SimplifiedChinese {
-                                        "已结束"
-                                    } else {
-                                        "Ended"
-                                    }
-                                )),
+                                .child(item.display_title().to_owned()),
                         )
+                        .child(self.render_exited_terminal_tag())
                         .into_any_element(),
                 );
             }

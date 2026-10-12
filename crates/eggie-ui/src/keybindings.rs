@@ -19,9 +19,9 @@ use crate::actions::{
     ClearScreen, CloseTab, CloseWindow, CommandPalette, FindNext, FindPrevious, FontDecrease,
     FontIncrease, FontReset, JumpNextPrompt, JumpPrevPrompt, MinimizeWindow, NewTab, NewWindow,
     NextTab, OpenSettings, PageDown, PageUp, PrevTab, Quit, ScrollBottom, ScrollTop, SplitDown,
-    SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalSelectAll, TerminalSuggest,
-    TerminalSwitcher, ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar, UndoWindowOperation,
-    WindowSwitcher,
+    SplitRight, TerminalCopy, TerminalFind, TerminalPaste, TerminalPastePreview, TerminalSelectAll,
+    TerminalSuggest, TerminalSwitcher, ToggleFullScreen, ToggleLeftSidebar, ToggleRightSidebar,
+    UndoWindowOperation, WindowSwitcher,
 };
 use crate::settings::{AppSettings, Language};
 
@@ -83,6 +83,18 @@ fn load_binding(keystrokes: &str, action: Box<dyn gpui::Action>) -> Option<KeyBi
 
 /// The single source of truth for configurable actions.
 pub(crate) const ACTION_SPECS: &[ActionSpec] = &[
+    ActionSpec {
+        id: "terminal_paste_preview",
+        default_keystroke: "cmd-shift-v",
+        label: |language| {
+            if language == Language::SimplifiedChinese {
+                "粘贴预览"
+            } else {
+                "Paste preview"
+            }
+        },
+        make_action: || Box::new(TerminalPastePreview),
+    },
     ActionSpec {
         id: "terminal_suggest",
         default_keystroke: "ctrl-space",

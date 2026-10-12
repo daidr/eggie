@@ -1098,6 +1098,14 @@ impl EggieApp {
             content_region = content_region.child(overlay);
         }
 
+        if let Some(paste) = group
+            .active_item()
+            .and_then(|item| item.session_id)
+            .and_then(|session| self.render_paste_progress(session, cx))
+        {
+            content_region = content_region.child(paste);
+        }
+
         // Overlay the search bar when it is bound to this group's active session.
         let active_session_id = group.active_item().and_then(|item| item.session_id);
         if let Some(search_bar) = active_session_id

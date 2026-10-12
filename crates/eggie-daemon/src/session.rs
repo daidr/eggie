@@ -176,6 +176,7 @@ pub(super) struct TerminalSession {
     pub(super) events: Arc<ListenerState>,
     pub(super) sender: EventLoopSender,
     pub(super) last_input_sequence: Arc<AtomicU64>,
+    pub(super) paste_state: Mutex<paste::PasteState>,
     pub(super) mouse_state: Mutex<TerminalMouseState>,
     pub(super) search_state: Mutex<TerminalSearchState>,
     /// Live terminal-core config knobs that are rebuilt together on every `set_options`. Kept as the
@@ -426,6 +427,7 @@ impl TerminalSession {
             events: state,
             sender,
             last_input_sequence,
+            paste_state: Mutex::new(paste::PasteState::default()),
             mouse_state: Mutex::new(TerminalMouseState::default()),
             search_state: Mutex::new(TerminalSearchState::default()),
             config_state: Mutex::new(TerminalConfigState {
@@ -689,6 +691,15 @@ impl TerminalSession {
     }
 
     pub(super) fn input(&self, bytes: Vec<u8>, sequence: u64) -> Result<()> {
+        let mut paste = self.paste_state.lock();
+        if bytes.starts_with(b"\x18\x1e") && paste.is_sending() {
+            anyhow::bail!("paste is still in progress");
+        }
+        self.finish_paste_locked(&mut paste, true)?;
+        self.input_unchecked(bytes, sequence)
+    }
+
+    pub(super) fn input_unchecked(&self, bytes: Vec<u8>, sequence: u64) -> Result<()> {
         // Serialize private completion queries with input; Enter blocks them until the next prompt.
         let _gate = self.events.completion_input_gate.lock();
         if bytes.len() > 2
@@ -739,9 +750,16 @@ impl TerminalSession {
         selection: TerminalClipboardSelection,
         contents: Vec<TerminalClipboardContent>,
         sequence: u64,
+        expected_context: Option<eggie_protocol::TerminalPasteContext>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            expected_context.is_none_or(|expected| expected == self.paste_context()),
+            "paste target changed"
+        );
         let mode = *self.terminal.lock().mode();
         if mode.contains(TermMode::PASTE_EVENTS) {
+            let mut paste = self.paste_state.lock();
+            self.finish_paste_locked(&mut paste, true)?;
             self.last_input_sequence.store(sequence, Ordering::Release);
             self.events.paste_clipboard(selection, contents);
             return Ok(());
@@ -770,6 +788,11 @@ impl TerminalSession {
         drop(terminal);
 
         if let Some(bytes) = mouse_report_bytes(mode, display_offset, event) {
+            let mut paste = self.paste_state.lock();
+            if paste.is_sending() && event.action == TerminalMouseAction::Move {
+                return Ok(());
+            }
+            self.finish_paste_locked(&mut paste, true)?;
             self.sender
                 .send(Msg::Input(bytes.into()))
                 .context("failed to write terminal mouse input")?;
@@ -852,8 +875,8 @@ impl TerminalSession {
                 }
             }
             if !bytes.is_empty() {
-                self.sender
-                    .send(Msg::Input(bytes.into()))
+                self.events
+                    .enqueue_pty_reply(bytes)
                     .context("failed to write terminal scroll input")?;
             }
         } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
@@ -869,8 +892,8 @@ impl TerminalSession {
                 bytes.extend_from_slice(&[0x1b, b'O', column_command]);
             }
             if !bytes.is_empty() {
-                self.sender
-                    .send(Msg::Input(bytes.into()))
+                self.events
+                    .enqueue_pty_reply(bytes)
                     .context("failed to write alternate-screen scroll input")?;
             }
         } else if lines != 0 {
@@ -1186,6 +1209,12 @@ impl TerminalSession {
         let report_focus = terminal.mode().contains(TermMode::FOCUS_IN_OUT);
         drop(terminal);
         if report_focus {
+            // A focus change must not turn its escape sequence into pasted document text.
+            let mut paste = self.paste_state.lock();
+            if paste.is_sending() {
+                paste.deferred_focus = Some(focused);
+                return Ok(());
+            }
             let bytes = if focused { b"\x1b[I" } else { b"\x1b[O" };
             self.sender
                 .send(Msg::Input(bytes.to_vec().into()))
