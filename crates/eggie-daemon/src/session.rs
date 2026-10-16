@@ -44,7 +44,7 @@ impl EventListener for DaemonEventListener {
                     serde_json::json!({ "pwd": directory }),
                 );
             }
-            Event::SemanticPrompt(prompt, cursor_line, history_size, column) => {
+            Event::SemanticPrompt(prompt, cursor_line, history_size, column, scroll_position) => {
                 if matches!(
                     prompt.action,
                     SemanticPromptAction::PromptStart | SemanticPromptAction::FreshLineAndPrompt
@@ -76,10 +76,9 @@ impl EventListener for DaemonEventListener {
                         );
                     }
                 }
-                self.0
-                    .shell_integration
-                    .lock()
-                    .update(prompt, cursor_line, history_size);
+                let mut tracker = self.0.shell_integration.lock();
+                tracker.follow_grid_scroll(scroll_position);
+                tracker.update(prompt, cursor_line, history_size);
             }
             Event::ProgramStatus(payload, terminator) => {
                 self.0.handle_program_status(&payload, &terminator);
@@ -394,8 +393,20 @@ impl TerminalSession {
         let pty_fd = pty.file().as_raw_fd();
         state.publish_terminal(&mut terminal.lock());
         let publisher = state.clone();
+        let resize_state = state.clone();
         let event_loop = EventLoop::new(terminal.clone(), listener, pty, true, false)
             .context("failed to create Alacritty event loop")?
+            .with_terminal_resize(move |terminal, size| {
+                resize_state.resize_terminal(
+                    terminal,
+                    TerminalSize {
+                        columns: size.num_cols,
+                        rows: size.num_lines,
+                        cell_width: size.cell_width,
+                        cell_height: size.cell_height,
+                    },
+                );
+            })
             .with_terminal_update(move |terminal| publisher.publish_terminal(terminal))
             .with_terminal_update_interval(TERMINAL_FRAME_INTERVAL);
         let sender = event_loop.channel();
@@ -1180,29 +1191,25 @@ impl TerminalSession {
     }
 
     pub(super) fn resize(&self, size: TerminalSize) -> Result<()> {
-        let mut terminal = self.terminal.lock();
-        // Match the PTY publisher's terminal -> metadata lock ordering. Taking the size lock
-        // first can deadlock when sustained output publishes while a resize is waiting.
-        *self.events.size.write() = size;
-        // Read the semantic phase and prompt-start line under the same terminal ->
-        // shell_integration lock order used by `send_event`, so this can never deadlock. Together
-        // they decide whether — and where — the active prompt region is cleared before reflow.
-        // A column change reflows the whole buffer, invalidating every stored jump-point line
-        // coordinate, so the index is dropped and rebuilt from subsequent prompts.
-        let columns_changed = terminal.columns() != size.columns as usize;
-        let (phase, prompt_start_line) = {
-            let mut shell = self.events.shell_integration.lock();
-            if columns_changed || terminal.mode().contains(TermMode::ALT_SCREEN) {
-                shell.clear_jump_points();
+        // Keep only the latest width during a prompt shrink, so a slow shell cannot paint every
+        // intermediate old-width prompt into a progressively narrower grid.
+        let settle = {
+            let terminal = self.terminal.lock();
+            let prompt = matches!(
+                self.events.shell_integration.lock().phase,
+                TerminalSemanticPhase::Prompt | TerminalSemanticPhase::Input
+            );
+            if (size.columns as usize) < terminal.columns()
+                && prompt
+                && !terminal.mode().contains(TermMode::ALT_SCREEN)
+            {
+                Duration::from_millis(100)
+            } else {
+                Duration::ZERO
             }
-            (shell.phase, shell.prompt_start_line)
         };
-        resize_terminal_with_history_reflow(&mut terminal, size, phase, prompt_start_line);
-        terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
-        self.events.publish_terminal(&mut terminal);
-        drop(terminal);
         self.sender
-            .send(Msg::Resize(window_size(size)))
+            .send(Msg::ResizeQueued(window_size(size), settle))
             .context("failed to resize PTY")
     }
 
@@ -1384,5 +1391,37 @@ impl TerminalSession {
     pub(super) fn terminate(&self) {
         self.events.progress.report(None);
         let _ = self.sender.send(Msg::Shutdown);
+    }
+}
+
+impl ListenerState {
+    fn resize_terminal(&self, terminal: &mut Term<DaemonEventListener>, size: TerminalSize) {
+        // Match the PTY publisher's terminal -> metadata lock ordering. Taking the size lock
+        // first can deadlock when sustained output publishes while a resize is waiting.
+        *self.size.write() = size;
+        // Read the semantic phase and prompt-start line under the same terminal ->
+        // shell_integration lock order used by `send_event`, so this can never deadlock. Together
+        // they decide whether — and where — the active prompt region is cleared before reflow.
+        // A column change reflows the whole buffer, invalidating every stored jump-point line
+        // coordinate, so the index is dropped and rebuilt from subsequent prompts.
+        let columns_changed = terminal.columns() != size.columns as usize;
+        let old_cursor_line = terminal.grid().cursor.point.line.0;
+        let (phase, prompt_start_line) = {
+            let mut shell = self.shell_integration.lock();
+            shell.follow_grid_scroll(terminal.grid().scroll_position());
+            shell.advance_scroll_base(terminal.grid().history_size());
+            if columns_changed || terminal.mode().contains(TermMode::ALT_SCREEN) {
+                shell.clear_jump_points();
+                shell.input_starts.clear();
+            }
+            (shell.phase, shell.prompt_start_line)
+        };
+        resize_terminal_with_history_reflow(terminal, size, phase, prompt_start_line);
+        self.shell_integration.lock().rebase_after_resize(
+            terminal.grid().cursor.point.line.0 - old_cursor_line,
+            terminal.grid().history_size(),
+            terminal.grid().scroll_position(),
+        );
+        terminal.set_kitty_graphics_cell_size(size.cell_width, size.cell_height);
     }
 }

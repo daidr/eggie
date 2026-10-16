@@ -3113,6 +3113,11 @@ fn resizing_a_session_updates_its_snapshot_grid_and_revision() {
 
     session.resize(size).unwrap();
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.snapshot().size != size {
+        assert!(Instant::now() < deadline, "queued resize did not publish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let snapshot = session.snapshot();
     assert_eq!(snapshot.size, size);
     assert!(snapshot.revision > previous_revision);
