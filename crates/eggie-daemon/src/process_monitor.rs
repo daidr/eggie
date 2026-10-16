@@ -158,6 +158,7 @@ const REMOTE_LSOF_MARKER: &str = "===EGGIE-LSOF===";
 pub(crate) fn parse_remote_inspection(output: &str) -> (Vec<ProcessInfo>, Vec<ListeningPort>) {
     let empty = (Vec::new(), Vec::new());
     let mut root = None;
+    let mut session_root = None;
     let mut self_pid = None;
     let mut ps_lines: Vec<&str> = Vec::new();
     let mut lsof = String::new();
@@ -165,6 +166,8 @@ pub(crate) fn parse_remote_inspection(output: &str) -> (Vec<ProcessInfo>, Vec<Li
     for line in output.lines() {
         if let Some(value) = line.strip_prefix("ROOT ") {
             root = value.trim().parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("SESSION ") {
+            session_root = value.trim().parse::<u32>().ok();
         } else if let Some(value) = line.strip_prefix("SELF ") {
             self_pid = value.trim().parse::<u32>().ok();
         } else if line.trim() == REMOTE_LSOF_MARKER {
@@ -176,7 +179,7 @@ pub(crate) fn parse_remote_inspection(output: &str) -> (Vec<ProcessInfo>, Vec<Li
             ps_lines.push(line);
         }
     }
-    let Some(root) = root else {
+    let Some(root) = session_root.or(root) else {
         return empty;
     };
 
@@ -199,7 +202,7 @@ pub(crate) fn parse_remote_inspection(output: &str) -> (Vec<ProcessInfo>, Vec<Li
     };
     let mut processes = filter_descendant_processes(root, all);
     processes.retain(|process| {
-        process.pid != root && !probe_pids.contains(&process.pid)
+        (session_root.is_some() || process.pid != root) && !probe_pids.contains(&process.pid)
     });
 
     let pids: HashSet<u32> = processes.iter().map(|process| process.pid).collect();

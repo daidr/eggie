@@ -87,7 +87,12 @@ impl SettingsWindow {
             return;
         };
         let language = self.settings.read(cx).config().language;
-        let fields = crate::profile_editor::ProfileFields::from_profile(&profile);
+        let mut fields = crate::profile_editor::ProfileFields::from_profile(&profile);
+        if let Some([host, user, port]) = self.profile_store.read(cx).remote_draft(id) {
+            fields.remote_host = host.clone();
+            fields.remote_user = user.clone();
+            fields.remote_port = port.clone();
+        }
         // Record the owner *before* seeding. `set_content` emits `Changed`, and although delivery is
         // deferred, it must find the inputs already attributed to this profile — otherwise the
         // write-through would attribute the seeded text to whichever profile was selected before.
@@ -237,9 +242,17 @@ impl SettingsWindow {
             edited.env = env;
         }
         // The three remote fields build one value, so any of them moving re-derives it from all three.
-        if changed(5) || changed(6) || changed(7) {
-            edited.remote =
-                crate::profile_editor::parse_remote(&current[5], &current[6], &current[7]);
+        if stored.remote.is_some() && (changed(5) || changed(6) || changed(7)) {
+            let parsed = crate::profile_editor::parse_remote(&current[5], &current[6], &current[7]);
+            let draft = parsed
+                .as_ref()
+                .err()
+                .map(|_| [current[5].clone(), current[6].clone(), current[7].clone()]);
+            self.profile_store
+                .update(cx, |store, cx| store.set_remote_draft(id, draft, cx));
+            if let Ok(remote) = parsed {
+                edited.remote = Some(remote);
+            }
         }
         // Baseline moves only now, and only for text that was actually consumed above. Set before the
         // no-op return below so a keystroke that parses to the same profile (typing then deleting a
@@ -538,35 +551,111 @@ impl SettingsWindow {
             self.profile_inputs.remote_user.read(cx).content(),
             self.profile_inputs.remote_port.read(cx).content(),
         );
-        // Surface the same judgement the launch path makes: an unusable target is dropped there, so
-        // saying so here is the difference between "my profile connects" and a silent local shell.
-        let remote_warning = remote_target
-            .as_ref()
-            .is_some_and(|target| !target.is_usable())
-            .then(|| language.profile_remote_invalid());
-        let remote_rows = vec![
-            self.render_profile_remote_host_row(language, remote_warning),
-            settings_row(
-                language.profile_remote_user_row(),
-                Some(language.profile_remote_user_description()),
-                self.render_profile_input(
-                    "settings-profile-remote-user",
-                    &self.profile_inputs.remote_user,
-                    160.,
-                ),
-                self.colors,
+        // Invalid drafts stay visible and block launch until corrected.
+        let remote_error = remote_target.err();
+        let remote_warning = (remote_error
+            == Some(crate::profile_editor::RemoteInputError::Target))
+        .then(|| language.profile_remote_invalid());
+        let remote_mode = settings_row(
+            if language == Language::SimplifiedChinese {
+                "连接方式"
+            } else {
+                "Connection"
+            },
+            None,
+            self.render_segmented(
+                "profile-connection",
+                vec![
+                    (
+                        "local".into(),
+                        if language == Language::SimplifiedChinese {
+                            "本地 Shell"
+                        } else {
+                            "Local shell"
+                        }
+                        .into(),
+                        profile.remote.is_none(),
+                    ),
+                    ("ssh".into(), "SSH".into(), profile.remote.is_some()),
+                ],
+                move |settings, index, cx| {
+                    let fields = [
+                        settings
+                            .profile_inputs
+                            .remote_host
+                            .read(cx)
+                            .content()
+                            .to_owned(),
+                        settings
+                            .profile_inputs
+                            .remote_user
+                            .read(cx)
+                            .content()
+                            .to_owned(),
+                        settings
+                            .profile_inputs
+                            .remote_port
+                            .read(cx)
+                            .content()
+                            .to_owned(),
+                    ];
+                    settings.profile_store.update(cx, |store, cx| {
+                        store.set_remote_draft(selected_id, Some(fields.clone()), cx);
+                        let remote = (index == 1).then(|| {
+                            crate::profile_editor::parse_remote(&fields[0], &fields[1], &fields[2])
+                                .unwrap_or_else(|_| eggie_domain::RemoteTarget::new(String::new()))
+                        });
+                        store.update(selected_id, |profile| profile.remote = remote, cx);
+                    });
+                    settings.profile_inputs_for = None;
+                    cx.notify();
+                },
+                cx,
             ),
-            settings_row(
-                language.profile_remote_port_row(),
-                Some(language.profile_remote_port_description()),
-                self.render_profile_input(
-                    "settings-profile-remote-port",
-                    &self.profile_inputs.remote_port,
-                    80.,
+            self.colors,
+        );
+        let mut remote_rows = vec![remote_mode];
+        if profile.remote.is_some() {
+            remote_rows.extend(vec![
+                self.render_profile_remote_host_row(language, remote_warning),
+                settings_row(
+                    language.profile_remote_user_row(),
+                    Some(language.profile_remote_user_description()),
+                    self.render_profile_input(
+                        "settings-profile-remote-user",
+                        &self.profile_inputs.remote_user,
+                        160.,
+                    ),
+                    self.colors,
                 ),
-                self.colors,
-            ),
-        ];
+                settings_row(
+                    language.profile_remote_port_row(),
+                    Some(language.profile_remote_port_description()),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(self.render_profile_input(
+                            "settings-profile-remote-port",
+                            &self.profile_inputs.remote_port,
+                            80.,
+                        ))
+                        .when(
+                            remote_error == Some(crate::profile_editor::RemoteInputError::Port),
+                            |element| {
+                                element.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(WARNING_TEXT))
+                                        .child(language.profile_remote_port_invalid()),
+                                )
+                            },
+                        )
+                        .into_any_element(),
+                    self.colors,
+                ),
+            ]);
+        }
 
         let appearance_rows = vec![
             settings_row(
@@ -692,7 +781,7 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// The remote host row, with the "this target is ignored" warning appended when it applies.
+    /// The remote host row with validation feedback.
     pub(super) fn render_profile_remote_host_row(
         &self,
         language: Language,

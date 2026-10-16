@@ -48,6 +48,7 @@ impl From<&WindowPresentation> for SidebarRestoreState {
 pub(crate) struct WindowManager {
     pub state: PresentationWorkspace,
     pub sessions: Vec<SessionSummary>,
+    pub port_connections: Vec<eggie_protocol::PortMappingsSnapshot>,
     terminal_exit_behavior: TerminalExitBehavior,
     pub progress: HashMap<SessionId, eggie_protocol::TerminalProgressUpdate>,
     streams: HashSet<SessionId>,
@@ -55,6 +56,7 @@ pub(crate) struct WindowManager {
     stream_notify_scheduled: bool,
     pub notification_routes: crate::app::NotificationRoutes,
     pub pending_termination: HashSet<SessionId>,
+    pub reconnect_errors: HashMap<SessionId, String>,
     pub pending_projects: HashSet<eggie_domain::ProjectId>,
     pub terminating_all: bool,
     retired_sessions: HashSet<SessionId>,
@@ -106,6 +108,7 @@ impl WindowManager {
         Self {
             state,
             sessions: Vec::new(),
+            port_connections: Vec::new(),
             terminal_exit_behavior: TerminalExitBehavior::default(),
             progress: HashMap::new(),
             streams: HashSet::new(),
@@ -113,6 +116,7 @@ impl WindowManager {
             stream_notify_scheduled: false,
             notification_routes: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             pending_termination: HashSet::new(),
+            reconnect_errors: HashMap::new(),
             pending_projects: HashSet::new(),
             terminating_all: false,
             retired_sessions: HashSet::new(),
@@ -353,6 +357,7 @@ impl WindowManager {
     }
     pub fn remove_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.retired_sessions.insert(id);
+        self.reconnect_errors.remove(&id);
         if let Some(alive) = self.stream_liveness.remove(&id) {
             alive.store(false, std::sync::atomic::Ordering::Release);
         }
@@ -369,6 +374,62 @@ impl WindowManager {
         }
         self.changed(cx);
     }
+    pub fn reconnect(&mut self, id: SessionId, client: DaemonClient, cx: &mut Context<Self>) {
+        if !self.pending_termination.insert(id) { return; }
+        self.reconnect_errors.remove(&id);
+        let executor = cx.background_executor().clone();
+        let request_client = client.clone();
+        cx.notify();
+        cx.spawn(async move |manager, cx| {
+            let result = executor.spawn(async move {
+                request_client.request(ClientRequest::ReconnectSession { session_id: id })
+            }).await;
+            let replaced = manager.update(cx, |manager, cx| {
+                manager.pending_termination.remove(&id);
+                match result {
+                    Ok(DaemonResponse::SessionCreated { session }) => {
+                        manager.replace_session(id, session, cx);
+                        true
+                    }
+                    Ok(DaemonResponse::Error { message }) => { manager.reconnect_errors.insert(id, message); cx.notify(); false }
+                    Err(error) => { manager.reconnect_errors.insert(id, error.to_string()); cx.notify(); false }
+                    _ => { manager.reconnect_errors.insert(id, "Unexpected reconnect response".into()); cx.notify(); false },
+                }
+            }).unwrap_or(false);
+            if replaced {
+                let _ = executor.spawn(async move { client.request(ClientRequest::Terminate { session_id: id }) }).await;
+            }
+        }).detach();
+    }
+
+    fn replace_session(&mut self, previous: SessionId, session: SessionSummary, cx: &mut Context<Self>) {
+        // Keep item identity, custom title, profile, group and selection while replacing the process.
+        self.state.remove_session(session.id);
+        for window in self.state.windows.values_mut() {
+            for view in window.views.values_mut() {
+                if let Some((group_id, item_id)) = view.layout.find_terminal_item(previous) {
+                    let item = view.layout.find_group_mut(group_id).unwrap().items.iter_mut().find(|item| item.id == item_id).unwrap();
+                    item.session_id = Some(session.id);
+                    item.title.clone_from(&session.title);
+                }
+            }
+        }
+        if let Some(mut background) = self.state.background.remove(&previous) {
+            background.item.session_id = Some(session.id);
+            background.item.title.clone_from(&session.title);
+            self.state.background.insert(session.id, background);
+        }
+        if self.state.locate(session.id).is_none() && !self.state.background.contains_key(&session.id) {
+            self.state.background.insert(session.id, BackgroundTerminal {
+                project_id: session.project_id,
+                item: TabItem::terminal(session.id, session.title.clone()),
+            });
+        }
+        self.sessions.retain(|existing| existing.id != session.id);
+        self.sessions.push(session);
+        self.remove_session(previous, cx);
+    }
+
     pub fn terminate(&mut self, id: SessionId, client: DaemonClient, cx: &mut Context<Self>) {
         self.pending_termination.insert(id);
         let executor = cx.background_executor().clone();
@@ -413,6 +474,7 @@ impl WindowManager {
             .iter()
             .filter(|session| {
                 matches!(session.status, eggie_protocol::SessionStatus::Exited { .. })
+                    && !session.needs_remote_recovery()
                     && !self.pending_termination.contains(&session.id)
             })
             .map(|session| session.id)
@@ -578,6 +640,17 @@ impl WindowManager {
             }
         })
         .detach();
+    }
+
+    pub fn merge_port_snapshot(&mut self, snapshot: eggie_protocol::PortMappingsSnapshot) -> bool {
+        if let Some(current) = self.port_connections.iter_mut().find(|c| c.connection_id == snapshot.connection_id) {
+            if current.revision > snapshot.revision || *current == snapshot { return false; }
+            *current = snapshot;
+        } else {
+            self.port_connections.push(snapshot);
+            self.port_connections.sort_by(|a, b| a.destination.cmp(&b.destination));
+        }
+        true
     }
 }
 

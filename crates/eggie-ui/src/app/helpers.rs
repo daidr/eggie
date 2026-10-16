@@ -174,24 +174,7 @@ pub(super) fn resolve_spawn_config(
         }
         .to_env_string(),
         env,
-        // A target whose host/user could be mistaken for an ssh option is dropped, not defanged: the
-        // profile is malformed, and connecting to a *different* place than the user wrote would be
-        // worse than not connecting. Dropping it makes the profile launch a plain local shell, which
-        // is visible and harmless.
-        remote: profile
-            .remote
-            .as_ref()
-            .filter(|target| {
-                let usable = target.is_usable();
-                if !usable {
-                    eprintln!(
-                        "profile {:?}: ignoring unusable remote target {:?}",
-                        profile.name, target.host
-                    );
-                }
-                usable
-            })
-            .cloned(),
+        remote: profile.remote.clone(),
         // Only meaningful for a remote profile; a local one's cwd already went into `cwd` above.
         remote_cwd: profile
             .is_remote()
@@ -729,12 +712,7 @@ pub(super) fn process_section(
 }
 
 pub(super) fn process_section_header(colors: UiColors, language: Language) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .text_size(px(10.))
-        .text_color(rgb(colors.muted))
-        .child(language.processes_label())
+    section_label(language.processes_label(), colors)
 }
 
 pub(super) fn ports_section(
@@ -776,36 +754,13 @@ pub(super) fn info_row(label: &'static str, value: String, colors: UiColors) -> 
         .child(div().min_w_0().truncate().child(value))
 }
 
-/// Parse a port forward spec from the prompt: `L 8080 localhost:80`, `R 8080 localhost:80`, or
-/// `D 1080`. Returns None for a malformed spec.
-pub(super) fn parse_forward_spec(text: &str) -> Option<eggie_protocol::PortForwardSpec> {
-    let mut parts = text.split_whitespace();
-    let kind = match parts.next()?.to_ascii_uppercase().as_str() {
-        "L" => eggie_protocol::PortForwardKind::Local,
-        "R" => eggie_protocol::PortForwardKind::Remote,
-        "D" => eggie_protocol::PortForwardKind::Dynamic,
-        _ => return None,
-    };
-    let port = parts.next()?.parse::<u16>().ok()?;
-    let destination = parts.next().map(str::to_owned);
-    if matches!(
-        kind,
-        eggie_protocol::PortForwardKind::Local | eggie_protocol::PortForwardKind::Remote
-    ) && destination.is_none()
-    {
-        return None;
-    }
-    Some(eggie_protocol::PortForwardSpec {
-        kind,
-        bind_address: "127.0.0.1".to_owned(),
-        port,
-        destination,
-    })
-}
-
 /// The directory to display for a session: the remote cwd when the session is remote, otherwise the
 /// local cwd. A remote path is shown as `user@host:path` so it is not mistaken for a local path.
 pub(super) fn displayed_directory(session: &eggie_protocol::SessionSummary) -> String {
+    if let Some(remote) = &session.remote {
+        return session.remote_directory().map(str::to_owned)
+            .unwrap_or_else(|| remote.target.destination());
+    }
     if let Some(location) = session.reported_location.as_ref()
         && !location.local
         && !location.path.is_empty()
@@ -1040,6 +995,23 @@ pub(super) fn listening_port_owner(pid: u32, process_name: Option<&str>) -> Stri
     process_name
         .map(|name| format!("{name}({pid})"))
         .unwrap_or_else(|| pid.to_string())
+}
+
+pub(super) fn terminal_overlay_surface(
+    id: impl Into<gpui::ElementId>,
+    colors: UiColors,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(colors.border))
+        .bg(rgb(colors.panel))
+        .text_color(rgb(colors.text))
+        .shadow_md()
+        .cursor_default()
+        // Prevent all mouse events on overlay chrome from reaching the terminal behind it.
+        .occlude()
 }
 
 pub(super) fn placeholder(text: impl Into<SharedString>, colors: UiColors) -> impl IntoElement {

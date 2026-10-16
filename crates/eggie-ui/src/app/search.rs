@@ -203,7 +203,7 @@ impl EggieApp {
         };
         let no_matches = !query_is_empty && total == 0;
 
-        let bar = div()
+        let bar = terminal_overlay_surface(format!("terminal-search-{}", search.session_id), colors)
             .absolute()
             .top(px(8.))
             .right(px(12.))
@@ -216,16 +216,6 @@ impl EggieApp {
             .w(px(340.))
             .max_w(relative(0.9))
             .px_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(colors.border))
-            .bg(rgb(colors.panel))
-            .shadow_md()
-            // Floating overlay over the terminal: occlude blocks every mouse event type (down/up/move/
-            // scroll) plus hover/tooltip for the content region behind, so presses on the bar's chrome
-            // (icon, counter, padding) can't bubble down to terminal_mouse_down and steal focus. One
-            // call, all event types — replaces the earlier left-mouse-down-only stop_propagation patch.
-            .occlude()
             .child(
                 div()
                     .flex_none()

@@ -32,7 +32,7 @@ impl EggieApp {
                 .gap(px(TAB_GAP)),
             |tabs, (tab, title, tab_icon)| {
                 // Info/Commands are disabled while notes are forced (no live shell).
-                let disabled = forced && tab != RightTab::Notes;
+                let disabled = forced && matches!(tab, RightTab::Info | RightTab::Commands);
                 tabs.child(
                     div()
                         .id(format!("right-tab-{title}"))
@@ -54,8 +54,11 @@ impl EggieApp {
                                         .bg(rgb(self.colors.panel_alt))
                                         .text_color(rgb(self.colors.accent))
                                 })
-                                .on_click(cx.listener(move |app, _, _, cx| {
+                                .on_click(cx.listener(move |app, _, window, cx| {
                                     app.right_tab = tab;
+                                    if tab != RightTab::Info {
+                                        app.close_port_editor(window, cx);
+                                    }
                                     cx.notify();
                                 }))
                         })
@@ -163,12 +166,11 @@ impl EggieApp {
                 let mut content = div().flex().flex_col().gap_4();
                 if let Some(session) = session {
                     content = content
-                        .child(process_summary(
-                            &session.current_process,
-                            self.colors,
-                            self.language,
-                        ))
-                        .child(
+                        .children(self.render_ssh_identity(session))
+                        .when(session.remote.is_none(), |element| element.child(process_summary(
+                            &session.current_process, self.colors, self.language,
+                        )))
+                        .when(session.remote.is_none() || session.remote_directory().is_some(), |element| element.child(
                             div()
                                 .flex()
                                 .flex_col()
@@ -181,7 +183,7 @@ impl EggieApp {
                                 // A remote path cannot be opened locally, so the Finder/VS Code
                                 // buttons are omitted for a remote session.
                                 .when(
-                                    session
+                                    session.remote.is_none() && session
                                         .reported_location
                                         .as_ref()
                                         .is_none_or(|location| location.local),
@@ -193,68 +195,51 @@ impl EggieApp {
                                         ))
                                     },
                                 ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(info_row(
-                                    self.language.initial_directory(),
-                                    session.initial_directory.display().to_string(),
-                                    self.colors,
-                                ))
-                                .child(self.render_directory_actions(
-                                    DirectoryField::Initial,
-                                    &session.initial_directory,
-                                    cx,
-                                )),
-                        );
+                        ))
+                        .when(session.remote.is_none(), |element| element.child(
+                            div().flex().flex_col().gap_2()
+                                .child(info_row(self.language.initial_directory(), session.initial_directory.display().to_string(), self.colors))
+                                .child(self.render_directory_actions(DirectoryField::Initial, &session.initial_directory, cx)),
+                        ))
+                        .when_some(session.remote.as_ref().and_then(|remote| remote.initial_directory.as_ref()), |element, path| {
+                            element.child(info_row(self.language.initial_directory(), path.clone(), self.colors))
+                        });
                     if let Some(inspection) = self.session_feed.session_inspections.get(&session.id)
                     {
-                        let is_remote = session
-                            .reported_location
-                            .as_ref()
-                            .is_some_and(|location| !location.local);
-                        content = content.child(process_section(
-                            &inspection.processes,
-                            self.colors,
-                            self.language,
-                            is_remote,
-                            cx,
-                        ));
-                        if let Some(ports) = ports_section(inspection, self.colors, self.language) {
+                        let is_remote = inspection.port_mappings.is_some()
+                            || session
+                                .reported_location
+                                .as_ref()
+                                .is_some_and(|location| !location.local);
+                        if session.remote.as_ref().is_none_or(|remote| remote.phase == eggie_protocol::RemoteSessionPhase::Connected) {
+                            content = content.child(process_section(&inspection.processes, self.colors, self.language, is_remote, cx));
+                        }
+                        if !is_remote
+                            && let Some(ports) =
+                                ports_section(inspection, self.colors, self.language)
+                        {
                             content = content.child(ports);
                         }
-                        // A remote session can open a port forward over its ssh master.
-                        if is_remote {
-                            content =
-                                content.child(self.render_forward_port_button(session.id, cx));
+                        if let Some(connection) = self.active_port_connection(cx)
+                            && (session.remote.as_ref().is_none_or(|remote| remote.phase == eggie_protocol::RemoteSessionPhase::Connected) || !connection.mappings.is_empty())
+                        {
+                            content = content.child(self.render_port_section(&connection, cx));
                         }
-                    } else {
+                    } else if session.remote.as_ref().is_none_or(|remote| remote.phase == eggie_protocol::RemoteSessionPhase::Connected) {
                         let status = self
                             .session_feed
                             .session_inspection_errors
                             .get(&session.id)
                             .cloned()
                             .unwrap_or_else(|| self.language.loading_process_info().to_owned());
-                        content = content
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(process_section_header(self.colors, self.language))
-                                    .child(placeholder(status, self.colors)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(section_label(self.language.ports_label(), self.colors))
-                                    .child(placeholder(self.language.loading_ports(), self.colors)),
-                            );
+                        content = content.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(process_section_header(self.colors, self.language))
+                                .child(placeholder(status, self.colors)),
+                        );
                     }
                 }
                 content.into_any_element()

@@ -6,6 +6,7 @@ pub(super) struct DaemonState {
     pub(super) config: config_service::ConfigService,
     pub(super) events: Arc<event_bus::EventBus>,
     pub(super) preferences: preferences_service::PreferencesService,
+    pub(super) ssh_connections: Arc<ssh::SshConnections>,
 }
 
 impl DaemonState {
@@ -102,34 +103,59 @@ impl DaemonState {
                 remote_install_consented,
                 remote_cwd,
             } => {
-                let session = Arc::new(TerminalSession::spawn(SessionSpawnConfig {
-                    project_id,
+                if let Some(target) = &remote {
+                    anyhow::ensure!(target.is_usable(), "Invalid SSH target");
+                }
+                let connection = remote
+                    .as_ref()
+                    .map(|target| self.ssh_connections.connection(target))
+                    .transpose()?;
+                let session = Arc::new(TerminalSession::spawn_with_connection(
+                    SessionSpawnConfig {
+                        project_id,
 
-                    cwd,
-                    size,
-                    appearance,
-                    scrollback_limit,
-                    shell_program: (!shell_program.is_empty()).then_some(shell_program),
-                    shell_args: (!shell_args.is_empty()).then_some(shell_args),
-                    shell_features,
-                    profile_env: env,
-                    remote,
-                    remote_install_consented,
-                    remote_cwd,
-                    event_bus: Some(self.events.clone()),
-                })?);
+                        cwd,
+                        size,
+                        appearance,
+                        scrollback_limit,
+                        shell_program: (!shell_program.is_empty()).then_some(shell_program),
+                        shell_args: (!shell_args.is_empty()).then_some(shell_args),
+                        shell_features,
+                        profile_env: env,
+                        remote,
+                        remote_install_consented,
+                        remote_cwd,
+                        event_bus: Some(self.events.clone()),
+                    },
+                    connection,
+                )?);
                 let summary = session.summary();
                 self.sessions.write().insert(session.id, session);
                 Ok(DaemonResponse::SessionCreated { session: summary })
             }
-            ClientRequest::ListSessions => Ok(DaemonResponse::Sessions {
-                sessions: self
-                    .sessions
-                    .read()
-                    .values()
-                    .map(|session| session.summary())
-                    .collect(),
-            }),
+            ClientRequest::ReconnectSession { session_id } => {
+                let previous = self.session(session_id)?;
+                // Repeated requests return the same replacement until the old terminal is retired.
+                let mut replacement = previous.reconnected_session.lock();
+                if let Some(id) = *replacement
+                    && let Ok(session) = self.session(id)
+                {
+                    return Ok(DaemonResponse::SessionCreated { session: session.summary() });
+                }
+                let config = previous.reconnect_config()?;
+                let connection = self.ssh_connections.connection(config.remote.as_ref().context("Not an SSH session")?)?;
+                let session = Arc::new(TerminalSession::spawn_with_connection(config, Some(connection))?);
+                let summary = session.summary();
+                self.sessions.write().insert(session.id, session);
+                *replacement = Some(summary.id);
+                Ok(DaemonResponse::SessionCreated { session: summary })
+            }
+            ClientRequest::ListSessions => {
+                let sessions = self.sessions.read().values().cloned().collect::<Vec<_>>();
+                Ok(DaemonResponse::Sessions {
+                    sessions: sessions.iter().map(|s| s.summary()).collect(),
+                })
+            }
             ClientRequest::InspectSession { session_id } => {
                 let session = self.session(session_id)?;
                 Ok(DaemonResponse::SessionInspection {
@@ -425,15 +451,67 @@ impl DaemonState {
                 session.terminate();
                 Ok(DaemonResponse::Ok)
             }
-            ClientRequest::ForwardPort { session_id, spec } => {
-                let session = self.session(session_id)?;
-                session.forward_port(&spec)?;
-                Ok(DaemonResponse::Ok)
+            ClientRequest::SshConnections => {
+                let (revision, connections) = self.ssh_connections.snapshots();
+                Ok(DaemonResponse::SshConnections {
+                    revision,
+                    connections,
+                })
             }
-            ClientRequest::CancelPort { session_id, spec } => {
-                let session = self.session(session_id)?;
-                session.cancel_port(&spec)?;
-                Ok(DaemonResponse::Ok)
+            ClientRequest::PortMappings {
+                connection_id,
+                discover,
+            } => {
+                let connection = self.ssh_connections.by_id(&connection_id)?;
+                if discover {
+                    let _ = connection.inspection_output();
+                }
+                Ok(DaemonResponse::PortMappings {
+                    snapshot: connection.snapshot(),
+                })
+            }
+            ClientRequest::CreatePortMapping {
+                connection_id,
+                request,
+            } => {
+                let connection = self.ssh_connections.by_id(&connection_id)?;
+                let mapping = connection.create(request)?;
+                Ok(DaemonResponse::PortMapping {
+                    mapping,
+                    snapshot: connection.snapshot(),
+                })
+            }
+            ClientRequest::StartPortMapping { connection_id, id } => {
+                let connection = self.ssh_connections.by_id(&connection_id)?;
+                let mapping = connection.start(&id)?;
+                Ok(DaemonResponse::PortMapping {
+                    mapping,
+                    snapshot: connection.snapshot(),
+                })
+            }
+            ClientRequest::StopPortMapping {
+                connection_id,
+                id,
+                remove,
+            } => {
+                let connection = self.ssh_connections.by_id(&connection_id)?;
+                let mapping = connection.stop(&id, remove)?;
+                Ok(DaemonResponse::PortMapping {
+                    mapping,
+                    snapshot: connection.snapshot(),
+                })
+            }
+            ClientRequest::RememberPortMapping {
+                connection_id,
+                id,
+                remember,
+            } => {
+                let connection = self.ssh_connections.by_id(&connection_id)?;
+                let mapping = connection.remember(&id, remember)?;
+                Ok(DaemonResponse::PortMapping {
+                    mapping,
+                    snapshot: connection.snapshot(),
+                })
             }
         }
     }
@@ -465,7 +543,12 @@ pub fn run_daemon(socket_path: &Path, build_id: &str) -> Result<()> {
         config: config_service::ConfigService::new(eggie_storage::config_path()),
         events: Arc::new(event_bus::EventBus::new()),
         preferences: preferences_service::PreferencesService::new(),
+        ssh_connections: Arc::new(ssh::SshConnections::load(Some(
+            eggie_storage::data_file_path("port-mappings.json"),
+        ))),
     });
+
+    ssh::SshConnections::start_maintenance(&state.ssh_connections);
 
     for connection in listener.incoming() {
         match connection {

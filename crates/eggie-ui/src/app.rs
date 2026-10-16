@@ -15,8 +15,11 @@ mod project_icons;
 mod projects;
 use project_icons::*;
 mod paste;
+mod ports;
 mod right_sidebar;
+use ports::PortsUi;
 mod search;
+mod ssh;
 mod session_feed;
 mod sidebar;
 mod sidebar_selector;
@@ -214,6 +217,7 @@ pub struct EggieApp {
     terminal_search: Option<TerminalSearchUi>,
     command_palette: Option<CommandPaletteUi>,
     paste_preview_open: bool,
+    ports_ui: PortsUi,
     paste_transfers: HashMap<SessionId, PasteTransferUi>,
     hyperlink_mouse_down: bool,
     terminal_hovered_link: Option<(SessionId, eggie_protocol::TerminalLinkRange)>,
@@ -399,6 +403,8 @@ impl gpui::Render for EggieApp {
             self.applied_config = Some(config);
         }
         // Keep the blink timer running while the active cursor blinks; it self-terminates otherwise.
+        self.sync_port_editor_context(window, cx);
+        self.sync_port_editor_appearance(cx);
         self.ensure_cursor_blink(cx);
         if !window.is_window_active()
             || self.command_palette.is_some()
@@ -661,7 +667,8 @@ impl gpui::Render for EggieApp {
                 app.toggle_left_sidebar(cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|app, _: &ToggleRightSidebar, _, cx| {
+            .on_action(cx.listener(|app, _: &ToggleRightSidebar, window, cx| {
+                app.close_port_editor(window, cx);
                 app.toggle_right_sidebar(cx);
                 cx.stop_propagation();
             }))

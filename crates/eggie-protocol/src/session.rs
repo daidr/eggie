@@ -36,6 +36,7 @@ pub struct SessionInspection {
     pub session_id: SessionId,
     pub processes: Vec<ProcessInfo>,
     pub ports: Vec<ListeningPort>,
+    pub port_mappings: Option<PortMappingsSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +84,61 @@ pub struct SessionSummary {
     /// Most relevant OSC 7501 record for this terminal, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<TerminalProgramStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteSessionInfo>,
     pub status: SessionStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSessionPhase {
+    Connecting,
+    Connected,
+    Disconnected,
+    Failed,
+    Exited,
+}
+
+impl RemoteSessionPhase {
+    pub fn from_process(status: &SessionStatus, ready: bool) -> Self {
+        match status {
+            SessionStatus::Running if ready => Self::Connected,
+            SessionStatus::Running => Self::Connecting,
+            SessionStatus::Exited { code: Some(0) } if ready => Self::Exited,
+            SessionStatus::Exited {
+                code: Some(255) | None,
+            } if ready => Self::Disconnected,
+            SessionStatus::Exited { .. } => Self::Failed,
+        }
+    }
+
+    pub fn needs_recovery(self) -> bool {
+        matches!(self, Self::Disconnected | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSessionInfo {
+    pub target: eggie_domain::RemoteTarget,
+    pub phase: RemoteSessionPhase,
+    pub initial_directory: Option<String>,
+}
+
+impl SessionSummary {
+    pub fn remote_directory(&self) -> Option<&str> {
+        self.remote.as_ref()?;
+        self.reported_location
+            .as_ref()
+            .filter(|location| !location.local && !location.path.is_empty())
+            .map(|location| location.path.as_str())
+            .or_else(|| self.remote.as_ref()?.initial_directory.as_deref())
+    }
+
+    pub fn needs_remote_recovery(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.phase.needs_recovery())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

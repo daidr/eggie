@@ -50,6 +50,26 @@ An overlay reports bytes written to the PTY and offers Cancel; Escape also cance
 Typing stops the remaining paste before sending the new input. Switching tabs leaves the paste
 attached to its original terminal. Applications using Kitty clipboard grants retain rich paste.
 
+## SSH
+
+Select Local shell or SSH in a profile's connection settings. Clearing an SSH host keeps the
+profile in SSH mode and blocks launch until corrected. SSH uses the system OpenSSH client,
+including its host aliases, keys and jump hosts. Invalid host, user or port input blocks launch; an unfinished edit remains in the settings window
+without replacing the last saved connection. Managed connections use a 15-second connection
+timeout and encrypted keepalive messages every 15 seconds, with three unanswered messages before
+disconnecting. Authentication remains in the terminal.
+
+The information panel shows the remote identity and directories. New tabs and splits on the same
+target inherit the remote directory unless their profile specifies one. Discovered services appear
+as compact port rows; mappings, actual local addresses and browser actions remain in that terminal's
+information panel. Process and port inspection runs while the information panel or a terminal
+preview is visible, with a shared cache for terminals on the same host.
+
+SSH connection failures retain their output even when normal process exits are configured to
+remove tabs. Reconnect reuses the original launch recipe and last remote directory, preserving the
+tab's position and custom title. It starts a new remote shell; it does not resume a previous remote
+process after a network interruption. Connecting terminals offer Cancel.
+
 ## Development
 
 macOS builds require Xcode with its Metal compiler toolchain (`xcrun -f metal`).

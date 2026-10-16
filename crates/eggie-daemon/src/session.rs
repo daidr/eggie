@@ -133,7 +133,11 @@ impl EventListener for DaemonEventListener {
                 );
             }
             Event::Exit => {
-                *self.0.status.write() = SessionStatus::Exited { code: None };
+                let mut status = self.0.status.write();
+                if matches!(*status, SessionStatus::Running) {
+                    *status = SessionStatus::Exited { code: None };
+                }
+                drop(status);
                 self.0.progress.report(None);
                 for id in self.0.program_status.lock().clear_active() {
                     self.0.publish_event(
@@ -169,7 +173,9 @@ pub(super) struct TerminalSession {
     pub(super) remote: Option<RemoteTarget>,
     /// The ControlPath for this session's ssh master, if multiplexing is enabled. Used by inspection
     /// and tunnels to run commands over the one authenticated connection.
-    pub(super) control_path: Option<PathBuf>,
+    pub(super) remote_connection: Option<Arc<ssh::SshConnection>>,
+    reconnect_config: Option<SessionSpawnConfig>,
+    pub(super) reconnected_session: Mutex<Option<SessionId>>,
     pub(super) runtime_metadata: Mutex<SessionRuntimeMetadata>,
     pub(super) inspection_system: Mutex<System>,
     pub(super) terminal: Arc<FairMutex<Term<DaemonEventListener>>>,
@@ -229,6 +235,7 @@ pub(super) struct SessionRuntimeMetadata {
 /// Everything the client picks per-session at creation time. Grouped into a struct so the growing
 /// set of spawn-time knobs (scrollback depth, shell override, …) does not force every call site to
 /// thread positional arguments.
+#[derive(Clone)]
 pub(super) struct SessionSpawnConfig {
     pub(super) project_id: ProjectId,
 
@@ -258,7 +265,19 @@ pub(super) struct SessionSpawnConfig {
 }
 
 impl TerminalSession {
+    #[cfg(test)]
     pub(super) fn spawn(config: SessionSpawnConfig) -> Result<Self> {
+        Self::spawn_with_connection(config, None)
+    }
+
+    pub(super) fn spawn_with_connection(
+        config: SessionSpawnConfig,
+        connection: Option<Arc<ssh::SshConnection>>,
+    ) -> Result<Self> {
+        if let Some(target) = &config.remote {
+            anyhow::ensure!(target.is_usable(), "Invalid SSH target");
+        }
+        let reconnect_config = config.remote.as_ref().map(|_| config.clone());
         let SessionSpawnConfig {
             project_id,
 
@@ -332,36 +351,17 @@ impl TerminalSession {
         // applies to the *local* `ssh` process (TERM and TERMINFO especially — ssh propagates TERM to
         // the remote end), but the profile's own variables and working directory belong on the far
         // side, so they are carried inside the bootstrap payload instead of the local environment.
-        // The ControlPath for this session's ssh master, if the home directory is short enough. A
-        // longer home directory disables multiplexing rather than breaking the session.
-        let control_path = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .and_then(|home| {
-                let short_id = &id.simple().to_string()[..16];
-                control_path(&home, short_id)
-            });
-        // Create the control socket directory before ssh needs to bind there. ssh cannot create the
-        // directory itself, and a missing directory makes the connection fail.
-        if let Some(path) = control_path.as_ref()
-            && let Some(dir) = path.parent()
-        {
-            let _ = fs::create_dir_all(dir);
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-        }
-        let (program, args) = match remote.as_ref().filter(|target| {
-            // Re-validated here rather than trusting the client: the daemon is a separate process
-            // reachable over a socket, and a host that could pass as an ssh option means local code
-            // execution (`-oProxyCommand=`). The argv also carries a `--` guard; this is the second
-            // of two independent checks.
-            let usable = target.is_usable();
-            if !usable {
-                eprintln!(
-                    "refusing remote session: unusable target {:?}; opening a local shell instead",
-                    target.host
-                );
-            }
-            usable
-        }) {
+        let remote_connection = match remote.as_ref() {
+            Some(target) => Some(match connection {
+                Some(connection) => connection,
+                None => ssh::SshConnections::default().connection(target)?,
+            }),
+            None => None,
+        };
+        let control_path = remote_connection
+            .as_ref()
+            .map(|connection| connection.path.as_path());
+        let (program, args) = match remote.as_ref() {
             Some(target) => {
                 let bootstrap = remote_launch(
                     target,
@@ -375,7 +375,7 @@ impl TerminalSession {
                     &profile_env,
                     remote_cwd.as_deref(),
                     remote_install_consented,
-                    control_path.as_deref(),
+                    control_path,
                 );
                 (bootstrap.program, bootstrap.args)
             }
@@ -410,7 +410,9 @@ impl TerminalSession {
             shell_pid,
             pty_fd,
             remote,
-            control_path,
+            remote_connection,
+            reconnect_config,
+            reconnected_session: Mutex::new(None),
             runtime_metadata: Mutex::new(SessionRuntimeMetadata {
                 system: System::new(),
                 last_foreground_pid: None,
@@ -483,6 +485,7 @@ impl TerminalSession {
             .current_command
             .as_ref()
             .and_then(|command| command.command_line.clone());
+        let status = self.events.status.read().clone();
         SessionSummary {
             id: self.id,
             project_id: self.project_id,
@@ -495,8 +498,27 @@ impl TerminalSession {
             current_process,
             active_command,
             program_status: self.events.program_status.lock().display(),
-            status: self.events.status.read().clone(),
+            remote: self.remote.as_ref().map(|target| {
+                let initial_directory = self.events.remote_ready_directory.read().clone();
+                let ready = initial_directory.is_some();
+                eggie_protocol::RemoteSessionInfo {
+                    target: target.clone(),
+                    phase: eggie_protocol::RemoteSessionPhase::from_process(&status, ready),
+                    initial_directory,
+                }
+            }),
+            status,
         }
+    }
+
+    pub(super) fn reconnect_config(&self) -> Result<SessionSpawnConfig> {
+        anyhow::ensure!(matches!(*self.events.status.read(), SessionStatus::Exited { .. }), "SSH session is still running");
+        let mut config = self.reconnect_config.clone().context("Not an SSH session")?;
+        config.size = *self.events.size.read();
+        config.appearance = *self.events.appearance.read();
+        config.scrollback_limit = self.config_state.lock().scrollback_limit;
+        config.remote_cwd = self.summary().remote_directory().map(str::to_owned).or(config.remote_cwd);
+        Ok(config)
     }
 
     pub(super) fn inspection(&self) -> SessionInspection {
@@ -511,109 +533,43 @@ impl TerminalSession {
             session_id: self.id,
             processes,
             ports,
+            port_mappings: None,
         }
     }
 
-    /// Inspect a remote session by running `ps` and `lsof` over the ssh master in a single round
-    /// trip, then filtering by **process ancestry** rather than by tty.
-    ///
-    /// Filtering by tty (`ps -t pts/N`) is wrong on Linux: when a previous session dies, background
-    /// shells it left behind (powerlevel10k/gitstatus, disowned jobs) get reparented to init but keep
-    /// the controlling terminal open, and pts numbers are recycled — so a tty filter drags in
-    /// zombies from *other* sessions. The reliable anchor is the sshd session process, which is the
-    /// parent (`$PPID`) of the shell the master runs our probe in: everything under it is this
-    /// session, and everything else is not. This mirrors the local inspection's descendant walk.
-    ///
-    /// A remote host that lacks either tool, or whose output cannot be parsed, yields an empty list
-    /// rather than a failed inspection.
+    /// Share one cached host probe, then select this tab's descendants using its reported shell PID.
     pub(super) fn remote_inspection(&self) -> SessionInspection {
         let empty = SessionInspection {
             session_id: self.id,
             processes: Vec::new(),
             ports: Vec::new(),
+            port_mappings: self.remote_connection.as_ref().map(|c| c.snapshot()),
         };
-        // One round trip. ROOT is the sshd session pid (our parent); SELF is the throwaway shell
-        // running this probe — it sits under the same sshd and would otherwise show up as a second
-        // top-level shell, along with the `ps` it forks. `lsof ... || true` keeps a missing lsof from
-        // failing the whole command, so the ps half still comes back.
-        let Some(output) = self.run_over_master(
-            "printf 'ROOT %s\\nSELF %s\\n' \"$PPID\" \"$$\"; \
-             ps -eo pid,ppid,pcpu,rss,comm; \
-             printf '%s\\n' '===EGGIE-LSOF==='; \
-             lsof -nP -iTCP -sTCP:LISTEN -FpcPn 2>/dev/null || true",
-        ) else {
+        let Some(mut output) = self
+            .remote_connection
+            .as_ref()
+            .and_then(|c| c.inspection_output().ok())
+        else {
             return empty;
         };
-
+        if let Some(pid) = self
+            .events
+            .shell_integration
+            .lock()
+            .user_variables
+            .get("eggie_shell_pid")
+            .and_then(|p| p.parse::<u32>().ok())
+        {
+            // A shared master owns multiple shells; keep the process tree anchored to this tab.
+            output.push_str(&format!("\nSESSION {pid}\n"));
+        }
         let (processes, ports) = parse_remote_inspection(&output);
         SessionInspection {
             session_id: self.id,
             processes,
             ports,
+            port_mappings: self.remote_connection.as_ref().map(|c| c.snapshot()),
         }
-    }
-
-    /// Run a command over the session's ssh master, returning stdout. Returns None when the control
-    /// channel is unavailable or the command exits non-zero, so the caller degrades to an empty list.
-    pub(super) fn run_over_master(&self, command: &str) -> Option<String> {
-        let control_path = self.control_path.as_ref()?;
-        let destination = self.remote.as_ref()?.destination();
-        let output = std::process::Command::new("ssh")
-            .arg("-o")
-            .arg(format!("ControlPath={}", control_path.display()))
-            .arg("-o")
-            .arg("ControlMaster=no")
-            .arg("--")
-            .arg(destination)
-            .arg(command)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8(output.stdout).ok()
-    }
-
-    /// Open a port forward on this session's ssh master. The tunnel dies with the session, so no
-    /// daemon-side bookkeeping is needed.
-    pub(super) fn forward_port(&self, spec: &PortForwardSpec) -> Result<()> {
-        self.port_forward_command(spec, "forward")
-    }
-
-    /// Cancel a port forward on this session's ssh master.
-    pub(super) fn cancel_port(&self, spec: &PortForwardSpec) -> Result<()> {
-        self.port_forward_command(spec, "cancel")
-    }
-
-    /// Run `ssh -O forward|cancel` with the spec's tunnel option.
-    pub(super) fn port_forward_command(
-        &self,
-        spec: &PortForwardSpec,
-        operation: &str,
-    ) -> Result<()> {
-        let control_path = self.control_path.as_ref().ok_or_else(|| {
-            anyhow!("port forwarding requires a session with multiplexing enabled")
-        })?;
-        let destination = self
-            .remote
-            .as_ref()
-            .ok_or_else(|| anyhow!("port forwarding requires a remote session"))?
-            .destination();
-        let tunnel_option = spec.tunnel_option();
-        let status = std::process::Command::new("ssh")
-            .arg("-o")
-            .arg(format!("ControlPath={}", control_path.display()))
-            .arg("-O")
-            .arg(operation)
-            .arg(tunnel_option)
-            .arg("--")
-            .arg(destination)
-            .status()
-            .context("failed to run ssh")?;
-        if !status.success() {
-            anyhow::bail!("ssh -{operation} failed");
-        }
-        Ok(())
     }
 
     pub(super) fn refresh_runtime_metadata(&self) {

@@ -941,3 +941,22 @@ fn snapshot_delta_replaces_and_clears_cells_without_losing_metadata() {
     wrong_base.base_revision = 3;
     assert!(snapshot.apply_delta(&wrong_base).is_none());
 }
+
+#[test]
+fn ssh_process_lifecycle_distinguishes_failures_and_normal_exit() {
+    use RemoteSessionPhase as P;
+    assert_eq!(P::from_process(&SessionStatus::Running, false), P::Connecting);
+    assert_eq!(P::from_process(&SessionStatus::Running, true), P::Connected);
+    assert_eq!(P::from_process(&SessionStatus::Exited { code: Some(0) }, true), P::Exited);
+    assert_eq!(P::from_process(&SessionStatus::Exited { code: Some(0) }, false), P::Failed);
+    for code in [Some(255), None] {
+        assert_eq!(P::from_process(&SessionStatus::Exited { code }, true), P::Disconnected);
+        assert_eq!(P::from_process(&SessionStatus::Exited { code }, false), P::Failed);
+    }
+    assert!(P::Disconnected.needs_recovery());
+    assert!(P::Failed.needs_recovery());
+    assert!(!P::Exited.needs_recovery());
+    let request = ClientRequest::ReconnectSession { session_id: SessionId::new_v4() };
+    let bytes = serde_json::to_vec(&request).unwrap();
+    assert_eq!(serde_json::from_slice::<ClientRequest>(&bytes).unwrap(), request);
+}

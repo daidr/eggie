@@ -16,6 +16,7 @@ mod session;
 use session::*;
 mod paste;
 mod snapshot;
+mod ssh;
 use snapshot::*;
 mod search;
 use search::*;
