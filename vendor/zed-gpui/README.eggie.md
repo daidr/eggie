@@ -14,6 +14,8 @@ primitive that is not part of GPUI's public API at that revision. The fork adds:
   cut, while circles and full-radius capsules retain circular caps;
 - a corner mask painted after children and before borders, including custom Metal output, using
   the same contour and the existing border-strip optimization.
+- a public `Window::present_if_needed` for submitting an initially hidden window's first scene
+  before its native window is shown; it uses the existing production presentation path.
 
 The terminal implementation remains in `crates/eggie-terminal-view`; this fork exposes generic
 rendering primitives and styles. Upstream files retain their original Apache-2.0/GPL licensing.

@@ -37,16 +37,34 @@
 - 入场、退出和中途反向从当前可见程度继续；画面、边框、阴影和内容一起位移、淡出
 - 系统减少动态效果设置优先，不能靠额外延迟掩盖闪烁
 
+macOS 使用 AppKit 的 `NSWindow.animator()` 和 `NSAnimationContext` 改变整个窗口的
+`alphaValue` 与 `frame`，GPUI 内容本身保持静态透明度和位置。窗口服务器合成画面、背景、
+边框与阴影，避免原生窗体先出现、内部内容随后渐显。入场 180 ms、退出 160 ms、换目标移动
+150 ms，采用系统 ease-out 曲线；入场与退出带 6 个逻辑像素的纵向位移。
+
+创建时窗口隐藏，GPUI 完成布局并提交首帧后才以零透明度 `orderFront`，不激活窗口或抢占焦点。
+动态尺寸立即重排内容并保留当前顶部位置，移动目标与透明度由 AppKit 从当前呈现值继续。
+AppKit 操作在 GPUI 释放 App 借用后执行，避免系统窗口回调重入。
+
+退出使用系统动画完成回调释放窗口，不使用固定时长计时器猜测结束。回调也可能来自被取消的
+动画，因此以关闭状态和修订号确认归属；恢复、重新定位或父窗口关闭后，旧回调不能移除新状态
+的窗口，已排队的原生操作也不能重新显示已释放的窗口。减少动态效果时直接设置最终位置与透明度，
+关闭立即完成。
+
 预览画面每 300 ms 刷新，进程检查约每 900 ms 更新；停止预览即停止这条轮询。
 原生弹窗只保存展示数据，终端进程仍由 daemon 管理。
 
 ## 实现与验证
 
 - `crates/eggie-ui/src/app/terminal_preview.rs`：入口、尺寸、快照和检查生命周期
-- `crates/eggie-ui-kit/src/popup_window.rs`：原生窗口、位置、动态尺寸和动画
+- `crates/eggie-ui-kit/src/popup_window.rs`：位置、动态尺寸、窗口与回调生命周期
+- `crates/eggie-ui-kit/src/popup_window/macos.rs`：AppKit 窗口级过渡、动画完成与排队操作失效
 - `crates/eggie-terminal-view/src/terminal_renderer.rs`：按网格与真实字体指标缩放
-- vendored GPUI 的 `PaintMetal` 与 terminal Metal backend：继承 UI 透明度
+- vendored GPUI 的 `Window::present_if_needed`：隐藏窗口提交首帧
+- vendored GPUI 的 `PaintMetal` 与 terminal Metal backend：普通 UI 动画仍继承 UI 透明度
 
 自动验证非绘制阶段测量并打开窗口、宽/高网格、有限屏幕、缺失快照、窗口复用、关闭后更新与 Metal 透明度。
+弹窗单元测试以虚拟时钟模拟系统动画完成，覆盖退出、恢复后旧回调、重复关闭、减少动态效果与父窗口关闭，
+并确认静态内容不再请求 GPUI 动画帧。测试后端没有原生窗口，不验证 AppKit 的像素过渡。
 人工检查在多个侧边栏行和标签间快速移动、同一会话跨入口切换、滚动/拖动、屏幕边缘、
 不同字体与缩放倍率，以及退出过程中画面与外框的连续性。自动测试不代替原生弹窗的视觉验证。
