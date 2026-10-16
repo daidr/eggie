@@ -535,6 +535,7 @@ struct SettingsWindow {
     ssh_host_names: Vec<String>,
     ssh_hosts_error: Option<String>,
     ssh_hosts_task: Option<gpui::Task<()>>,
+    ssh_config_expanded: bool,
     ssh_config_task: Option<gpui::Task<()>>,
     ssh_config_result: Option<(
         eggie_domain::ProfileId,
@@ -642,7 +643,8 @@ impl SettingsWindow {
         let settings_search_navigation = cx.intercept_keystrokes(move |event, window, cx| {
             if weak
                 .update(cx, |settings, cx| {
-                    settings.navigate_settings_search(event.keystroke.clone(), window, cx)
+                    settings.handle_ssh_host_key(&event.keystroke, window, cx)
+                        || settings.navigate_settings_search(event.keystroke.clone(), window, cx)
                 })
                 .unwrap_or(false)
             {
@@ -725,6 +727,7 @@ impl SettingsWindow {
             ssh_host_names: Vec::new(),
             ssh_hosts_error: None,
             ssh_hosts_task: None,
+            ssh_config_expanded: false,
             ssh_config_task: None,
             ssh_config_result: None,
             colors,
@@ -763,9 +766,10 @@ impl SettingsWindow {
         &mut self,
         _input: &Entity<TextInput>,
         event: &TextInputEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ssh_host = self.open_selector == Some(SelectorKind::SshHost);
         match event {
             TextInputEvent::Changed => {
                 self.selector_scroll_handle
@@ -774,10 +778,24 @@ impl SettingsWindow {
             }
             TextInputEvent::Confirm | TextInputEvent::ConfirmReverse => {
                 self.apply_first_selector_match(cx);
+                if ssh_host && self.open_selector.is_none() {
+                    self.profile_inputs
+                        .remote_host
+                        .read(cx)
+                        .focus_handle()
+                        .focus(window, cx);
+                }
             }
             TextInputEvent::Cancel => {
                 self.open_selector = None;
                 self.clear_theme_preview(cx);
+                if ssh_host {
+                    self.profile_inputs
+                        .remote_host
+                        .read(cx)
+                        .focus_handle()
+                        .focus(window, cx);
+                }
                 cx.notify();
             }
         }

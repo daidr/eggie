@@ -362,6 +362,9 @@ impl EggieApp {
             if let Some(progress) = status.as_ref().and_then(|status| status.progress) {
                 status_detail.push_str(&format!(" · {progress}%"));
             }
+            if let Some(remote) = &session.remote {
+                status_detail = format!("{} · {status_detail}", remote.target.consent_key());
+            }
             let snapshot = snapshot_for_popup.borrow().clone();
             let memory = inspection_for_popup
                 .borrow()

@@ -244,6 +244,7 @@ impl SettingsWindow {
         }
         // The three remote fields build one value, so any of them moving re-derives it from all three.
         if stored.remote.is_some() && (changed(5) || changed(6) || changed(7)) {
+            self.reset_ssh_config();
             let parsed = crate::profile_editor::parse_remote(&current[5], &current[6], &current[7]);
             let draft = parsed
                 .as_ref()
@@ -294,6 +295,7 @@ impl SettingsWindow {
             return;
         }
         self.selected_profile = Some(id);
+        self.reset_ssh_config();
         self.open_selector = None;
         self.badge_picker_open = false;
         cx.notify();
@@ -600,6 +602,7 @@ impl SettingsWindow {
                             .content()
                             .to_owned(),
                     ];
+                    settings.reset_ssh_config();
                     settings.profile_store.update(cx, |store, cx| {
                         store.set_remote_draft(selected_id, Some(fields.clone()), cx);
                         let remote = (index == 1).then(|| {
@@ -791,11 +794,42 @@ impl SettingsWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let control = self.render_profile_input(
-            "settings-profile-remote-host",
-            &self.profile_inputs.remote_host,
-            220.,
-        );
+        let control = div()
+            .id("settings-profile-remote-host")
+            .flex()
+            .items_center()
+            .w(px(SELECTOR_WIDTH))
+            .h(px(30.))
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(self.colors.border))
+            .bg(rgb(self.colors.panel_alt))
+            .text_size(px(12.))
+            .hover(|element| element.border_color(rgb(self.colors.accent)))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .px_2()
+                    .child(self.profile_inputs.remote_host.clone()),
+            )
+            .child(
+                self.render_selector(
+                    "settings-ssh-host-alias",
+                    if language == Language::SimplifiedChinese {
+                        "选择 SSH 主机"
+                    } else {
+                        "Choose SSH host"
+                    }
+                    .into(),
+                    None,
+                    SelectorKind::SshHost,
+                    window,
+                    cx,
+                ),
+            );
         let colors = self.colors;
         self.search_anchor(language.profile_remote_host_row())
             .child(
@@ -832,36 +866,7 @@ impl SettingsWindow {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(control)
-                            .child(
-                                self.render_selector(
-                                    "settings-ssh-host-alias",
-                                    if language == Language::SimplifiedChinese {
-                                        "从 SSH 配置选择"
-                                    } else {
-                                        "Choose from SSH config"
-                                    }
-                                    .into(),
-                                    None,
-                                    SelectorKind::SshHost,
-                                    window,
-                                    cx,
-                                ),
-                            )
-                            .children(self.ssh_hosts_error.as_ref().map(|error| {
-                                div()
-                                    .max_w(px(240.))
-                                    .text_size(px(11.))
-                                    .text_color(rgb(WARNING_TEXT))
-                                    .child(error.clone())
-                            })),
-                    ),
+                    .child(control),
             )
             .into_any_element()
     }
