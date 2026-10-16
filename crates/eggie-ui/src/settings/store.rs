@@ -31,6 +31,9 @@ pub(crate) struct SettingsStore {
 }
 
 impl SettingsStore {
+    pub(crate) fn daemon_client(&self) -> Option<eggie_ipc::DaemonClient> {
+        self.daemon.clone()
+    }
     pub(crate) fn load() -> Self {
         Self::load_from(eggie_storage::data_file_path("preferences.json"))
     }

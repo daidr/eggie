@@ -10,6 +10,7 @@ pub(super) enum TerminalJumpDirection {
 }
 
 pub(super) struct ShellIntegrationTracker {
+    pub(super) command_output_ranges: VecDeque<CommandOutputRange>,
     pub(super) prompt_input: Option<eggie_completion::PromptInput>,
     pub(super) input_starts: Vec<(u64, usize)>,
     pub(super) completion_shell: String,
@@ -39,9 +40,19 @@ pub(super) struct ShellIntegrationTracker {
     pub(super) prompt_jump_points: VecDeque<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct CommandOutputRange {
+    pub(super) id: u64,
+    pub(super) start: Option<Point>,
+    pub(super) end: Option<Point>,
+    pub(super) finished: bool,
+    pub(super) empty: bool,
+}
+
 impl Default for ShellIntegrationTracker {
     fn default() -> Self {
         Self {
+            command_output_ranges: VecDeque::new(),
             prompt_input: None,
             input_starts: Vec::new(),
             completion_shell: String::new(),
@@ -62,6 +73,67 @@ impl Default for ShellIntegrationTracker {
 }
 
 impl ShellIntegrationTracker {
+    pub(super) fn output_marker(
+        &mut self,
+        action: SemanticPromptAction,
+        id: Option<u64>,
+        point: Point,
+        columns: usize,
+    ) {
+        let Some(id) = id else {
+            return;
+        };
+        if action == SemanticPromptAction::OutputStart {
+            if self
+                .command_output_ranges
+                .back()
+                .is_none_or(|range| range.id != id)
+            {
+                self.command_output_ranges.push_back(CommandOutputRange {
+                    id,
+                    start: Some(point),
+                    end: None,
+                    finished: false,
+                    empty: false,
+                });
+            }
+            while self.command_output_ranges.len() > COMMAND_HISTORY {
+                self.command_output_ranges.pop_front();
+            }
+        } else if action == SemanticPromptAction::CommandFinished {
+            if let Some(range) = self
+                .command_output_ranges
+                .iter_mut()
+                .rev()
+                .find(|range| range.id == id)
+            {
+                range.end = Some(if point.column.0 > 0 {
+                    Point::new(
+                        point.line,
+                        Column(
+                            point
+                                .column
+                                .0
+                                .saturating_sub(1)
+                                .min(columns.saturating_sub(1)),
+                        ),
+                    )
+                } else {
+                    Point::new(point.line - 1, Column(columns.saturating_sub(1)))
+                });
+                range.finished = true;
+                if range
+                    .start
+                    .zip(range.end)
+                    .is_some_and(|(start, end)| end < start)
+                {
+                    range.empty = true;
+                    range.start = None;
+                    range.end = None;
+                }
+            }
+        }
+    }
     /// Update the tracker from an OSC 133 marker. `cursor_line` is the grid line the cursor was on
     /// when the marker was emitted (relative to the top of the visible screen), used to record
     /// where the active prompt starts. `history_size` is the scrollback depth captured at the same
@@ -213,6 +285,17 @@ impl ShellIntegrationTracker {
 
     pub(super) fn follow_grid_scroll(&mut self, position: i64) {
         let delta = position.wrapping_sub(self.last_grid_scroll_position);
+        if delta == 0 {
+            return;
+        }
+        for range in &mut self.command_output_ranges {
+            for point in [&mut range.start, &mut range.end].into_iter().flatten() {
+                point.line = Line(
+                    (i64::from(point.line.0) - delta)
+                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                );
+            }
+        }
         if let Some(start) = &mut self.prompt_start_line {
             // Viewport-relative anchors follow scrolling even with full or disabled history.
             *start = i64::from(*start)

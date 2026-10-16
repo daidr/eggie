@@ -37,6 +37,9 @@ impl EggieApp {
                     input,
                     regex: false,
                     result: None,
+                    generation: 0,
+                    pending: Default::default(),
+                    task: None,
                     _subscription: subscription,
                 });
             }
@@ -106,46 +109,115 @@ impl EggieApp {
         fresh: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(search) = &self.terminal_search else {
+        let Some(search) = &mut self.terminal_search else {
             return;
         };
-        let session_id = search.session_id;
         let request = TerminalSearchRequest {
             query: search.input.read(cx).content().to_owned(),
             regex: search.regex,
             direction,
             fresh,
         };
-        let result = match self.client.request(ClientRequest::TerminalSearch {
-            session_id,
-            request,
-        }) {
-            Ok(DaemonResponse::SearchResult { result, .. }) => result,
-            Ok(_) => return,
-            Err(error) => {
-                self.poll_error = Some(format!("terminal search failed: {error}"));
-                return;
-            }
-        };
-        // The daemon may have scrolled its viewport to reveal the active match and published a new
-        // snapshot; the match coordinates are relative to THAT snapshot. Pull it synchronously when
-        // it is newer than what we hold, so highlights align with the text instead of being painted
-        // over the pre-scroll frame (the async watcher would otherwise land a frame or more later).
-        let stale = self
-            .session_feed
-            .snapshots
-            .get(&session_id)
-            .is_none_or(|snapshot| snapshot.revision < result.revision);
-        if stale
-            && let Ok(DaemonResponse::Snapshot { snapshot }) =
-                self.client.request(ClientRequest::Snapshot { session_id })
-        {
-            self.session_feed.snapshots.insert(session_id, snapshot);
+        if fresh {
+            search.generation = search.generation.wrapping_add(1);
+            search.pending.clear();
+            search.result = None;
         }
-        if let Some(search) = &mut self.terminal_search {
-            search.result = Some(result);
-        }
+        search.pending.push_back((search.generation, request));
+        self.start_next_terminal_search(cx);
         cx.notify();
+    }
+
+    fn start_next_terminal_search(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.terminal_search else {
+            return;
+        };
+        if search.task.is_some() {
+            return;
+        }
+        let Some((generation, request)) = search.pending.pop_front() else {
+            return;
+        };
+        let session_id = search.session_id;
+        let input_id = search.input.entity_id();
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        search.task = Some(cx.spawn(async move |this, cx| {
+            if request.fresh {
+                executor.timer(Duration::from_millis(16)).await;
+            }
+            let current = this
+                .update(cx, |app, _| {
+                    app.terminal_search.as_ref().is_some_and(|search| {
+                        search.input.entity_id() == input_id && search.generation == generation
+                    })
+                })
+                .unwrap_or(false);
+            let result = if current {
+                Some(
+                    executor
+                        .spawn(async move {
+                            let result = match client.request_with_timeout(
+                                ClientRequest::TerminalSearch {
+                                    session_id,
+                                    request,
+                                },
+                                Duration::from_secs(5),
+                            )? {
+                                DaemonResponse::SearchResult { result, .. } => result,
+                                response => {
+                                    anyhow::bail!("unexpected search response: {response:?}")
+                                }
+                            };
+                            let snapshot = match client.request_with_timeout(
+                                ClientRequest::Snapshot { session_id },
+                                Duration::from_secs(5),
+                            )? {
+                                DaemonResponse::Snapshot { snapshot } => snapshot,
+                                response => {
+                                    anyhow::bail!("unexpected snapshot response: {response:?}")
+                                }
+                            };
+                            anyhow::Ok((result, snapshot))
+                        })
+                        .await,
+                )
+            } else {
+                None
+            };
+            let _ = this.update(cx, |app, cx| {
+                let Some(search) = &mut app.terminal_search else {
+                    return;
+                };
+                if search.input.entity_id() != input_id {
+                    return;
+                }
+                search.task = None;
+                if search.generation == generation
+                    && let Some(result) = result
+                {
+                    match result {
+                        Ok((result, snapshot)) => {
+                            let held_revision = app
+                                .session_feed
+                                .snapshots
+                                .get(&session_id)
+                                .map(|snapshot| snapshot.revision)
+                                .unwrap_or(0);
+                            if snapshot.revision >= held_revision {
+                                app.session_feed.snapshots.insert(session_id, snapshot);
+                            }
+                            search.result = Some(result);
+                        }
+                        Err(error) => {
+                            app.poll_error = Some(format!("terminal search failed: {error:#}"))
+                        }
+                    }
+                }
+                app.start_next_terminal_search(cx);
+                cx.notify();
+            });
+        }));
     }
 
     /// Toggle regex interpretation of the query and re-run the search.
@@ -178,7 +250,12 @@ impl EggieApp {
         if search.session_id != session_id {
             return None;
         }
-        search.result.as_ref()
+        search.result.as_ref().filter(|result| {
+            self.session_feed
+                .snapshots
+                .get(&session_id)
+                .is_some_and(|snapshot| snapshot.revision == result.revision)
+        })
     }
 
     /// Render the floating search bar overlaid on the top-right of the terminal content region.
@@ -203,94 +280,95 @@ impl EggieApp {
         };
         let no_matches = !query_is_empty && total == 0;
 
-        let bar = terminal_overlay_surface(format!("terminal-search-{}", search.session_id), colors)
-            .absolute()
-            .top(px(8.))
-            .right(px(12.))
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .h(px(34.))
-            // Ideal width, but never wider than the container so a narrow split can't overflow it.
-            .w(px(340.))
-            .max_w(relative(0.9))
-            .px_2()
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(colors.muted))
-                    .child(icon(IconName::Search)),
-            )
-            // The reusable text-input component owns focus, selection, caret, and editing.
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(px(48.))
-                    .h_full()
-                    .text_size(px(13.))
-                    .text_color(rgb(colors.text))
-                    .child(search.input.clone()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .min_w(px(38.))
-                    .text_size(px(12.))
-                    .text_color(rgb(if no_matches { 0xE06C75 } else { colors.muted }))
-                    .child(counter_text),
-            )
-            // Regex toggle: `.*` highlighted when active.
-            .child(
-                div()
-                    .id("terminal-search-regex")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(24.))
-                    .rounded_lg()
-                    .text_size(px(12.))
-                    .cursor_pointer()
-                    .text_color(rgb(if regex { colors.accent } else { colors.muted }))
-                    .when(regex, |element| element.bg(rgb(colors.panel_alt)))
-                    .hover(move |element| element.bg(rgb(colors.hover)))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|app, _, _, cx| {
-                        app.toggle_terminal_search_regex(cx);
-                    }))
-                    .child(".*"),
-            )
-            .child(icon_button(
-                IconName::ArrowUp,
-                "terminal-search-prev",
-                colors,
-                None,
-                cx.listener(|app, _, _, cx| {
-                    cx.stop_propagation();
-                    app.navigate_terminal_search(TerminalSearchDirection::Backward, cx);
-                }),
-            ))
-            .child(icon_button(
-                IconName::ArrowDown,
-                "terminal-search-next",
-                colors,
-                None,
-                cx.listener(|app, _, _, cx| {
-                    cx.stop_propagation();
-                    app.navigate_terminal_search(TerminalSearchDirection::Forward, cx);
-                }),
-            ))
-            .child(icon_button(
-                IconName::Close,
-                "terminal-search-close",
-                colors,
-                None,
-                cx.listener(|app, _, window, cx| {
-                    cx.stop_propagation();
-                    app.close_terminal_search(window, cx);
-                }),
-            ));
+        let bar =
+            terminal_overlay_surface(format!("terminal-search-{}", search.session_id), colors)
+                .absolute()
+                .top(px(8.))
+                .right(px(12.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .h(px(34.))
+                // Ideal width, but never wider than the container so a narrow split can't overflow it.
+                .w(px(340.))
+                .max_w(relative(0.9))
+                .px_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(colors.muted))
+                        .child(icon(IconName::Search)),
+                )
+                // The reusable text-input component owns focus, selection, caret, and editing.
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w(px(48.))
+                        .h_full()
+                        .text_size(px(13.))
+                        .text_color(rgb(colors.text))
+                        .child(search.input.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(38.))
+                        .text_size(px(12.))
+                        .text_color(rgb(if no_matches { 0xE06C75 } else { colors.muted }))
+                        .child(counter_text),
+                )
+                // Regex toggle: `.*` highlighted when active.
+                .child(
+                    div()
+                        .id("terminal-search-regex")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.))
+                        .rounded_lg()
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .text_color(rgb(if regex { colors.accent } else { colors.muted }))
+                        .when(regex, |element| element.bg(rgb(colors.panel_alt)))
+                        .hover(move |element| element.bg(rgb(colors.hover)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.toggle_terminal_search_regex(cx);
+                        }))
+                        .child(".*"),
+                )
+                .child(icon_button(
+                    IconName::ArrowUp,
+                    "terminal-search-prev",
+                    colors,
+                    None,
+                    cx.listener(|app, _, _, cx| {
+                        cx.stop_propagation();
+                        app.navigate_terminal_search(TerminalSearchDirection::Backward, cx);
+                    }),
+                ))
+                .child(icon_button(
+                    IconName::ArrowDown,
+                    "terminal-search-next",
+                    colors,
+                    None,
+                    cx.listener(|app, _, _, cx| {
+                        cx.stop_propagation();
+                        app.navigate_terminal_search(TerminalSearchDirection::Forward, cx);
+                    }),
+                ))
+                .child(icon_button(
+                    IconName::Close,
+                    "terminal-search-close",
+                    colors,
+                    None,
+                    cx.listener(|app, _, window, cx| {
+                        cx.stop_propagation();
+                        app.close_terminal_search(window, cx);
+                    }),
+                ));
         Some(bar.into_any_element())
     }
 

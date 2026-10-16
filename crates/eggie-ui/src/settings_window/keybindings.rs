@@ -268,23 +268,26 @@ impl SettingsWindow {
                 )
             });
 
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .min_h(px(48.))
-            .px_4()
-            .py_2()
-            .child(div().flex_1().min_w_0().child(label))
+        self.search_anchor(label)
             .child(
                 div()
-                    .flex_none()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(reset_button)
-                    .child(shortcut_cell),
+                    .justify_between()
+                    .gap_4()
+                    .min_h(px(48.))
+                    .px_4()
+                    .py_2()
+                    .child(div().flex_1().min_w_0().child(label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(reset_button)
+                            .child(shortcut_cell),
+                    ),
             )
             .into_any_element()
     }

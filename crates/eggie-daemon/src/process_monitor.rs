@@ -1,21 +1,69 @@
 //! Descendant-process discovery and listening-port probing for session inspection.
 //!
-//! Pure, stateless helpers driven by the ~1s inspection poll (not a per-frame path). Extracted
-//! verbatim from `lib.rs`; `use super::*` re-exports keep the call sites and tests unchanged.
+//! Local consumers share one lazy process snapshot and short-lived per-root port probes.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
 use eggie_protocol::{ListeningPort, ProcessInfo};
+use parking_lot::Mutex;
+use std::{
+    collections::HashMap,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
-pub(crate) fn descendant_processes(root_pid: u32, system: &mut System) -> Vec<ProcessInfo> {
+const INSPECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct LocalInspection {
+    system: System,
+    refreshed: Option<Instant>,
+    processes: Vec<ProcessInfo>,
+    ports: HashMap<u32, (Instant, Vec<ListeningPort>)>,
+}
+
+pub(crate) fn local_inspection(root_pid: u32) -> (Vec<ProcessInfo>, Vec<ListeningPort>) {
+    static SHARED: OnceLock<Mutex<LocalInspection>> = OnceLock::new();
+    let mut cache = SHARED.get_or_init(Default::default).lock();
+    if cache
+        .refreshed
+        .is_none_or(|last| last.elapsed() >= INSPECTION_INTERVAL)
+    {
+        cache.processes = process_snapshot(&mut cache.system);
+        cache.refreshed = Some(Instant::now());
+    }
+    let processes = filter_descendant_processes(root_pid, cache.processes.clone());
+    cache
+        .ports
+        .retain(|_, (last, _)| last.elapsed() < INSPECTION_INTERVAL);
+    if cache.ports.len() >= 64 && !cache.ports.contains_key(&root_pid) {
+        if let Some(oldest) = cache
+            .ports
+            .iter()
+            .min_by_key(|(_, (last, _))| *last)
+            .map(|(pid, _)| *pid)
+        {
+            cache.ports.remove(&oldest);
+        }
+    }
+    let ports = cache
+        .ports
+        .entry(root_pid)
+        .or_insert_with(|| (Instant::now(), listening_ports(&processes)))
+        .1
+        .clone();
+    (processes, ports)
+}
+
+fn process_snapshot(system: &mut System) -> Vec<ProcessInfo> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         ProcessRefreshKind::new().with_cpu().with_memory(),
     );
-    let all_processes = system
+    system
         .processes()
         .values()
         .map(|process| ProcessInfo {
@@ -25,8 +73,7 @@ pub(crate) fn descendant_processes(root_pid: u32, system: &mut System) -> Vec<Pr
             cpu_usage_tenths_percent: Some(cpu_usage_tenths_percent(process.cpu_usage())),
             memory_bytes: Some(process.memory()),
         })
-        .collect::<Vec<_>>();
-    filter_descendant_processes(root_pid, all_processes)
+        .collect()
 }
 
 pub(crate) fn cpu_usage_tenths_percent(usage: f32) -> u32 {
@@ -37,7 +84,10 @@ pub(crate) fn cpu_usage_tenths_percent(usage: f32) -> u32 {
     }
 }
 
-pub(crate) fn filter_descendant_processes(root_pid: u32, mut processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+pub(crate) fn filter_descendant_processes(
+    root_pid: u32,
+    mut processes: Vec<ProcessInfo>,
+) -> Vec<ProcessInfo> {
     processes.sort_by_key(|process| process.pid);
     let mut included = HashSet::from([root_pid]);
     let mut result = Vec::new();
@@ -253,6 +303,27 @@ pub(crate) fn parse_remote_ps(output: &str) -> Vec<ProcessInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "manual process-inspection latency comparison"]
+    fn shared_inspection_latency() {
+        let root = std::process::id();
+        let mut systems: Vec<_> = (0..3).map(|_| System::new()).collect();
+        let start = Instant::now();
+        for n in 0..12 {
+            let processes =
+                filter_descendant_processes(root, process_snapshot(&mut systems[n % 3]));
+            let _ = listening_ports(&processes);
+        }
+        let previous = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..12 {
+            let _ = local_inspection(root);
+        }
+        eprintln!(
+            "12 inspections across 3 consumers: previous={previous:?}, shared={:?}",
+            start.elapsed()
+        );
+    }
     use super::*;
 
     #[test]
@@ -264,7 +335,11 @@ mod tests {
         assert_eq!(processes.len(), 2, "both processes parse");
         assert_eq!(processes[0].pid, 1);
         assert_eq!(processes[0].parent_pid, Some(0));
-        assert_eq!(processes[0].cpu_usage_tenths_percent, Some(13), "1.3% → 13 tenths");
+        assert_eq!(
+            processes[0].cpu_usage_tenths_percent,
+            Some(13),
+            "1.3% → 13 tenths"
+        );
         assert_eq!(processes[0].memory_bytes, Some(1234 * 1024), "KiB → bytes");
         assert_eq!(processes[0].name, "/sbin/launchd");
         assert_eq!(processes[1].pid, 100);
@@ -277,7 +352,10 @@ mod tests {
                     not-a-pid  0   1.0  1234 /bin/foo\n\
                     200     0   1.0  1234\n";
         let processes = parse_remote_ps(output);
-        assert!(processes.is_empty(), "neither line parses: bad pid, then missing command");
+        assert!(
+            processes.is_empty(),
+            "neither line parses: bad pid, then missing command"
+        );
     }
 
     #[test]
@@ -306,7 +384,11 @@ PIPv4\n\
 n127.0.0.1:9999\n";
         let (processes, ports) = parse_remote_inspection(output);
         let pids: Vec<u32> = processes.iter().map(|p| p.pid).collect();
-        assert_eq!(pids, vec![709], "only the session zsh remains; orphans and the probe are dropped");
+        assert_eq!(
+            pids,
+            vec![709],
+            "only the session zsh remains; orphans and the probe are dropped"
+        );
         // Port of the session zsh survives; the orphan's port (9999) is filtered out.
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, 3000);
@@ -336,6 +418,9 @@ SELF 800\n\
         let (processes, ports) = parse_remote_inspection(output);
         assert_eq!(processes.len(), 1, "the session zsh is still reported");
         assert_eq!(processes[0].pid, 709);
-        assert!(ports.is_empty(), "no lsof output means no ports, not an error");
+        assert!(
+            ports.is_empty(),
+            "no lsof output means no ports, not an error"
+        );
     }
 }

@@ -46,7 +46,8 @@ impl SettingsWindow {
                     | SelectorKind::Font
                     | SelectorKind::FontBold
                     | SelectorKind::FontItalic
-                    | SelectorKind::FontBoldItalic => {}
+                    | SelectorKind::FontBoldItalic
+                    | SelectorKind::SshHost => {}
                 },
                 cx,
             );
@@ -501,7 +502,7 @@ impl SettingsWindow {
             .into_any_element();
 
         // --- The selected profile's fields ---
-        let name_row = settings_row(
+        let name_row = self.setting_row(
             language.profile_name_row(),
             None,
             self.render_profile_input("settings-profile-name", &self.profile_inputs.name, 220.),
@@ -509,7 +510,7 @@ impl SettingsWindow {
         );
 
         let launch_rows = vec![
-            settings_row(
+            self.setting_row(
                 language.shell_program_row(),
                 Some(language.shell_program_description()),
                 self.render_profile_input(
@@ -519,7 +520,7 @@ impl SettingsWindow {
                 ),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.shell_args_row(),
                 Some(language.shell_args_description()),
                 self.render_profile_input(
@@ -529,13 +530,13 @@ impl SettingsWindow {
                 ),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.profile_cwd_row(),
                 Some(language.profile_cwd_description()),
                 self.render_profile_input("settings-profile-cwd", &self.profile_inputs.cwd, 220.),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.shell_integration_path_row(),
                 Some(language.shell_integration_path_description()),
                 self.render_profile_path_control(profile.shell_integration_path, language, cx),
@@ -556,7 +557,7 @@ impl SettingsWindow {
         let remote_warning = (remote_error
             == Some(crate::profile_editor::RemoteInputError::Target))
         .then(|| language.profile_remote_invalid());
-        let remote_mode = settings_row(
+        let remote_mode = self.setting_row(
             if language == Language::SimplifiedChinese {
                 "连接方式"
             } else {
@@ -617,8 +618,8 @@ impl SettingsWindow {
         let mut remote_rows = vec![remote_mode];
         if profile.remote.is_some() {
             remote_rows.extend(vec![
-                self.render_profile_remote_host_row(language, remote_warning),
-                settings_row(
+                self.render_profile_remote_host_row(language, remote_warning, window, cx),
+                self.setting_row(
                     language.profile_remote_user_row(),
                     Some(language.profile_remote_user_description()),
                     self.render_profile_input(
@@ -628,7 +629,7 @@ impl SettingsWindow {
                     ),
                     self.colors,
                 ),
-                settings_row(
+                self.setting_row(
                     language.profile_remote_port_row(),
                     Some(language.profile_remote_port_description()),
                     div()
@@ -655,10 +656,11 @@ impl SettingsWindow {
                     self.colors,
                 ),
             ]);
+            remote_rows.push(self.render_ssh_config(language, &profile, cx));
         }
 
         let appearance_rows = vec![
-            settings_row(
+            self.setting_row(
                 language.profile_terminal_dark_theme_row(),
                 None,
                 self.render_selector(
@@ -675,7 +677,7 @@ impl SettingsWindow {
                 ),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.profile_terminal_light_theme_row(),
                 None,
                 self.render_selector(
@@ -692,7 +694,7 @@ impl SettingsWindow {
                 ),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.profile_font_row(),
                 None,
                 self.render_selector(
@@ -710,13 +712,13 @@ impl SettingsWindow {
                 ),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.profile_font_size_row(),
                 None,
                 self.render_profile_font_size_control(&profile, language, cx),
                 self.colors,
             ),
-            settings_row(
+            self.setting_row(
                 language.profile_badge_row(),
                 None,
                 self.render_profile_badge_control(&profile, language, cx),
@@ -786,6 +788,8 @@ impl SettingsWindow {
         &self,
         language: Language,
         warning: Option<&'static str>,
+        window: &Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let control = self.render_profile_input(
             "settings-profile-remote-host",
@@ -793,40 +797,72 @@ impl SettingsWindow {
             220.,
         );
         let colors = self.colors;
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_6()
-            .min_h(px(64.))
-            .px_4()
-            .py_3()
+        self.search_anchor(language.profile_remote_host_row())
             .child(
                 div()
                     .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .flex_col()
-                    .gap_1()
-                    .child(language.profile_remote_host_row())
+                    .items_center()
+                    .justify_between()
+                    .gap_6()
+                    .min_h(px(64.))
+                    .px_4()
+                    .py_3()
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(rgb(colors.muted))
-                            .child(language.profile_remote_host_description()),
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_col()
+                            .gap_1()
+                            .child(language.profile_remote_host_row())
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(colors.muted))
+                                    .child(language.profile_remote_host_description()),
+                            )
+                            .when_some(warning, |element, warning| {
+                                // Tinted with the bell/attention color so a rejected target reads as a problem
+                                // rather than as more description.
+                                element.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(WARNING_TEXT))
+                                        .child(warning),
+                                )
+                            }),
                     )
-                    .when_some(warning, |element, warning| {
-                        // Tinted with the bell/attention color so a rejected target reads as a problem
-                        // rather than as more description.
-                        element.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(WARNING_TEXT))
-                                .child(warning),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(control)
+                            .child(
+                                self.render_selector(
+                                    "settings-ssh-host-alias",
+                                    if language == Language::SimplifiedChinese {
+                                        "从 SSH 配置选择"
+                                    } else {
+                                        "Choose from SSH config"
+                                    }
+                                    .into(),
+                                    None,
+                                    SelectorKind::SshHost,
+                                    window,
+                                    cx,
+                                ),
+                            )
+                            .children(self.ssh_hosts_error.as_ref().map(|error| {
+                                div()
+                                    .max_w(px(240.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(WARNING_TEXT))
+                                    .child(error.clone())
+                            })),
+                    ),
             )
-            .child(div().flex_none().child(control))
             .into_any_element()
     }
 
@@ -841,49 +877,52 @@ impl SettingsWindow {
         // the bad lines dropped, so it cannot say how many there were.
         let (_, rejected) =
             crate::profile_editor::parse_env(self.profile_inputs.env.read(cx).content());
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_4()
-            .py_3()
+        self.search_anchor(language.profile_env_row())
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(language.profile_env_row())
+                    .gap_2()
+                    .px_4()
+                    .py_3()
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(rgb(colors.muted))
-                            .child(language.profile_env_description()),
-                    ),
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(language.profile_env_row())
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(colors.muted))
+                                    .child(language.profile_env_description()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-profile-env")
+                            .w_full()
+                            .h(px(96.))
+                            .px_2()
+                            .py_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(colors.border))
+                            .bg(rgb(colors.panel_alt))
+                            .text_size(px(12.))
+                            .text_color(rgb(colors.text))
+                            .overflow_hidden()
+                            .child(self.profile_inputs.env.clone()),
+                    )
+                    .when(rejected > 0, |element| {
+                        element.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(WARNING_TEXT))
+                                .child(language.profile_env_rejected(rejected)),
+                        )
+                    }),
             )
-            .child(
-                div()
-                    .id("settings-profile-env")
-                    .w_full()
-                    .h(px(96.))
-                    .px_2()
-                    .py_1()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(colors.border))
-                    .bg(rgb(colors.panel_alt))
-                    .text_size(px(12.))
-                    .text_color(rgb(colors.text))
-                    .overflow_hidden()
-                    .child(self.profile_inputs.env.clone()),
-            )
-            .when(rejected > 0, |element| {
-                element.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(WARNING_TEXT))
-                        .child(language.profile_env_rejected(rejected)),
-                )
-            })
             .into_any_element()
     }
 

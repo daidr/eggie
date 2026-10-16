@@ -376,34 +376,37 @@ impl SettingsWindow {
                     ),
                 ));
         }
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .min_w_0()
-            .w_full()
-            .px_4()
-            .py_3()
+        self.search_anchor(label)
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap_2()
+                    .min_w_0()
                     .w_full()
+                    .px_4()
+                    .py_3()
                     .child(
                         div()
-                            .id(format!("theme-gallery-label-{}", kind.index()))
-                            .text_size(px(12.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(if managed {
-                                format!("{label} · init.lua")
-                            } else {
-                                label.to_owned()
-                            }),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .w_full()
+                            .child(
+                                div()
+                                    .id(format!("theme-gallery-label-{}", kind.index()))
+                                    .text_size(px(12.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(if managed {
+                                        format!("{label} · init.lua")
+                                    } else {
+                                        label.to_owned()
+                                    }),
+                            )
+                            .child(self.render_theme_search(kind, window, cx)),
                     )
-                    .child(self.render_theme_search(kind, window, cx)),
+                    .child(strip_wrapper),
             )
-            .child(strip_wrapper)
             .into_any_element()
     }
 }

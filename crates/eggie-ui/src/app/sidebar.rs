@@ -18,9 +18,15 @@ impl EggieApp {
             .into_any_element()
     }
 
-    pub(in crate::app) fn render_session_end_tag(&self, remote: Option<eggie_protocol::RemoteSessionPhase>) -> AnyElement {
+    pub(in crate::app) fn render_session_end_tag(
+        &self,
+        remote: Option<eggie_protocol::RemoteSessionPhase>,
+    ) -> AnyElement {
         if let Some(phase) = remote.filter(|phase| phase.needs_recovery()) {
-            self.render_terminal_status_tag(ssh::phase_label(phase, self.language), self.interface_theme.palette[1])
+            self.render_terminal_status_tag(
+                ssh::phase_label(phase, self.language),
+                self.interface_theme.palette[1],
+            )
         } else {
             self.render_exited_terminal_tag()
         }
@@ -658,7 +664,11 @@ impl EggieApp {
                         label_background,
                         cx,
                     ))
-                     .child(self.render_session_end_tag(session.remote.as_ref().map(|remote| remote.phase)))
+                    .child(
+                        self.render_session_end_tag(
+                            session.remote.as_ref().map(|remote| remote.phase),
+                        ),
+                    )
                     .into_any_element()
             } else if let Some(status) = program_status {
                 let state_label = program_state_label(status.state, self.language);
@@ -772,7 +782,12 @@ impl EggieApp {
                         *hovered,
                         cx,
                     );
-                    app.terminal_preview_hover(TerminalPreviewAnchor::Sidebar(session_id), *hovered, window, cx);
+                    app.terminal_preview_hover(
+                        TerminalPreviewAnchor::Sidebar(session_id),
+                        *hovered,
+                        window,
+                        cx,
+                    );
                 }))
                 .cursor_pointer()
                 .on_click(cx.listener(move |app, _, window, cx| {
@@ -933,7 +948,7 @@ impl EggieApp {
                             .rounded_md()
                             .mb_1()
                             .when(is_active_project, |element| {
-                                element.bg(rgb(self.colors.panel_alt))
+                                element.text_color(rgb(self.colors.accent))
                             })
                             .hover({
                                 let colors = self.colors;

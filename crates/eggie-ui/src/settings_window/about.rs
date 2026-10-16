@@ -118,13 +118,13 @@ impl SettingsWindow {
         let updates = settings_section(
             Some(language.updates_section()),
             vec![
-                settings_row(
+                self.setting_row(
                     language.auto_check_updates_row(),
                     Some(language.auto_check_updates_description()),
                     auto_check_updates_control,
                     colors,
                 ),
-                settings_row(
+                self.setting_row(
                     language.update_channel_row(),
                     Some(language.update_channel_description()),
                     update_channel_control,

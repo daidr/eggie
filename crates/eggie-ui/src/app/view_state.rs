@@ -37,7 +37,9 @@ pub(super) enum TerminalPreviewAnchor {
 }
 impl TerminalPreviewAnchor {
     pub(super) fn session_id(self) -> SessionId {
-        match self { Self::Sidebar(id) | Self::Tab(_, id) => id }
+        match self {
+            Self::Sidebar(id) | Self::Tab(_, id) => id,
+        }
     }
 }
 
@@ -392,6 +394,9 @@ pub(super) struct TerminalSearchUi {
     pub(super) regex: bool,
     /// The most recent result from the daemon, used to render highlights and the match counter.
     pub(super) result: Option<TerminalSearchResult>,
+    pub(super) generation: u64,
+    pub(super) pending: std::collections::VecDeque<(u64, TerminalSearchRequest)>,
+    pub(super) task: Option<gpui::Task<()>>,
     /// Subscription to the input's events; dropped (unsubscribed) when the search bar closes.
     pub(super) _subscription: Subscription,
 }

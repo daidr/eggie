@@ -5,67 +5,25 @@
 //! `-h`/`--help` 别名。这里只做 argv → action 的分派与调度;各命令的具体
 //! 实现分散在同目录的子模块里。
 
+mod api;
 mod colors;
 mod config;
 mod do_script;
 mod help;
 mod list_colors;
 mod list_themes;
+mod mcp;
 mod tui;
 mod version;
 
-/// 可用的 CLI action。新增命令时在此追加,并同步维护 `ALL`/`from_plus`/`name`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Action {
-    Help,
-    Version,
-    ListColors,
-    ListThemes,
-}
+pub(crate) use eggie_protocol::CliAction as Action;
 
-impl Action {
-    /// `+help` 里遍历展示的全部 action,顺序即展示顺序。
-    const ALL: &'static [Action] = &[
-        Action::Help,
-        Action::Version,
-        Action::ListColors,
-        Action::ListThemes,
-    ];
-
-    /// 把 `+<name>` 里的 name 解析成 action;未知则 `None`。
-    fn from_plus(name: &str) -> Option<Action> {
-        Action::ALL.iter().copied().find(|a| a.name() == name)
-    }
-
-    /// action 的规范名(即 `+<name>` 里的 name)。
-    fn name(self) -> &'static str {
-        match self {
-            Action::Help => "help",
-            Action::Version => "version",
-            Action::ListColors => "list-colors",
-            Action::ListThemes => "list-themes",
-        }
-    }
-
-    /// 一句话中文说明,用于 `+help` 的命令列表。
-    fn summary(self) -> &'static str {
-        match self {
-            Action::Help => "显示本帮助信息",
-            Action::Version => "显示版本与构建信息",
-            Action::ListColors => "列出内置的 X11 命名颜色",
-            Action::ListThemes => "列出可用主题(终端下可交互预览)",
-        }
-    }
-
-    /// 执行该 action,返回进程退出码。`flags` 是 action 之外的剩余参数,
-    /// 由各命令自行解析。
-    fn run(self, flags: &[String]) -> i32 {
-        match self {
-            Action::Help => help::run(flags),
-            Action::Version => version::run(flags),
-            Action::ListColors => list_colors::run(flags),
-            Action::ListThemes => list_themes::run(flags),
-        }
+fn run_action(action: Action, flags: &[String]) -> i32 {
+    match action {
+        Action::Help => help::run(flags),
+        Action::Version => version::run(flags),
+        Action::ListColors => list_colors::run(flags),
+        Action::ListThemes => list_themes::run(flags),
     }
 }
 
@@ -93,6 +51,23 @@ enum CliError {
 /// 返回 `None` 表示没有 CLI action(继续走 GUI);`Some(code)` 表示 CLI 已经
 /// 处理(含出错),调用方应以该退出码结束进程。
 pub(crate) fn try_run_cli(arguments: &[String]) -> Option<i32> {
+    match arguments.get(1).map(String::as_str) {
+        Some("api") => return Some(api::run(&arguments[2..])),
+        Some("mcp") => return Some(mcp::run(&arguments[2..])),
+        Some(
+            group @ ("projects" | "tabs" | "panes" | "terminal" | "commands" | "windows"
+            | "profiles"),
+        ) => {
+            let mut args = arguments[2..].to_vec();
+            if let Some(operation) = args.first_mut()
+                && !operation.starts_with('-')
+            {
+                *operation = format!("{group}.{operation}");
+            }
+            return Some(api::run(&args));
+        }
+        _ => {}
+    }
     if arguments.get(1).map(String::as_str) == Some("config") {
         return Some(config::run(&arguments[2..]));
     }
@@ -101,7 +76,7 @@ pub(crate) fn try_run_cli(arguments: &[String]) -> Option<i32> {
     }
     match parse_invocation(arguments) {
         Invocation::None => None,
-        Invocation::Run(action, flags) => Some(action.run(&flags)),
+        Invocation::Run(action, flags) => Some(run_action(action, &flags)),
         Invocation::Error(error) => {
             match error {
                 CliError::MultipleActions => {

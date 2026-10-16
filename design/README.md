@@ -22,6 +22,9 @@
 | 功能 | [SSH 与端口转发](features/ssh.md) | 连接恢复、目录继承、服务发现和信息面板 |
 | 功能 | [终端悬停预览](features/terminal-preview.md) | 侧边栏与标签栏、动态尺寸和原生弹窗动画 |
 | 功能 | [终端尺寸与 prompt 重绘](features/terminal-resize.md) | 活动 prompt 锚点、滚屏与连续 resize 回归 |
+| 功能 | [终端查找](features/terminal-search.md) | 后台查询、导航顺序、过期结果与统计缓存 |
+| 功能 | [本地控制与 MCP](features/local-control.md) | CLI、类型化控制、MCP、输入与生命周期边界 |
+| 功能 | [设置查找与命令历史](features/settings-and-command-history.md) | 搜索定位、输出范围、复制和信息层级 |
 | 决策 | [决策索引](decisions/README.md) | 已确认的取舍、待实现方向和后续变更记录 |
 | 调查 | [内存调查](investigations/memory.md) | 历史实测、缓存预算、采样方法与撤回的实验 |
 | 验证 | [主题选择器历史验证](validation/theme-gallery.md) | 参考图、交互验证及历史对比结果 |

@@ -18,6 +18,32 @@ It uses a virtual list, a bounded result set and the existing UI palette and con
 - UI owns debounce, request cancellation, selection, viewport placement and keyboard routing.
   Results carry the original text and cursor; an obsolete request cannot reopen the panel.
 
+## Eggie commands
+
+Local `eggie` prompts complete built-in `+action` commands, CLI options, `config`, `do`,
+`mcp`, and every local-control resource group and operation. The `api` form and the
+short resource form share `automation_methods()`; built-in actions share `CliAction`
+with the actual dispatcher. Both definitions and the pure completion function live in
+`eggie-protocol`, without filesystem access or process execution.
+
+The GUI supplies names and IDs from its existing project, profile, window and terminal
+catalogs, including background tabs. Cached command records supply command IDs when
+available; completion does not fetch command output. Current project/window/terminal
+are offered first. Window-specific panes and terminal-specific commands respect the
+IDs already entered in the JSON object.
+
+Local-control parameters remain one JSON shell argument. Suggestions fill required
+fields and complete property names, IDs, enum values and booleans, preserving fields
+already entered. Names accompany IDs in the candidate descriptions. Tab inserts a
+quoted argument through the existing checked-edit contract and never executes it.
+Script and configuration path positions fall through to the normal file providers.
+
+This app-owned provider is synchronous and in memory: it cancels pending shell queries
+for a managed CLI context instead of launching Eggie or waiting for a daemon round trip.
+SSH prompts and locations reported as remote keep their remote shell providers; local
+IDs are never offered there. This is in-app completion, not installation of global
+shell completion files or the deferred SSH-to-local CLI bridge.
+
 ## Input and edits
 
 OSC 133 anchors identify editable input. `OSC 1337;EggieShell` reports shell capabilities and
@@ -46,8 +72,9 @@ close the panel.
 ## Controls
 
 Suggestions appear while typing. Ctrl-Space requests them explicitly; it is configurable as
-`terminal_suggest` through the action registry. Tab inserts the selected candidate. Down starts
-list navigation, Up retains shell history until list navigation has started, Page Up/Down moves
+`terminal_suggest` through the action registry. Tab inserts the selected candidate. The first
+candidate is selected when the panel opens; Down immediately advances to the next candidate and
+starts list navigation. Up retains shell history until list navigation has started, Page Up/Down moves
 by a page, Shift-Tab moves upward, and Escape dismisses. Enter submits the original command
 unless the user has navigated the list; accepting a candidate never executes it. Clicking outside
 closes the panel. Settings → Advanced → Command completion disables the feature and restores

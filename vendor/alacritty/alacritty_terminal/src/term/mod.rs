@@ -932,6 +932,11 @@ impl<T> Term<T> {
 
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
+        self.resize_with_primary_anchors(size, &mut []);
+    }
+
+    /// Resize while carrying caller-owned primary-grid positions through the same reflow as images.
+    pub fn resize_with_primary_anchors<S: Dimensions>(&mut self, size: S, anchors: &mut [Option<Point>]) {
         let old_cols = self.columns();
         let old_lines = self.screen_lines();
 
@@ -960,6 +965,7 @@ impl<T> Term<T> {
             !is_alt,
             num_lines,
             num_cols,
+            if !is_alt { &mut *anchors } else { &mut [] },
         );
         resize_grid_with_kitty_anchors(
             &mut self.inactive_grid,
@@ -968,6 +974,7 @@ impl<T> Term<T> {
             is_alt,
             num_lines,
             num_cols,
+            if is_alt { anchors } else { &mut [] },
         );
 
         // Invalidate selection and tabs only when necessary.
@@ -1410,8 +1417,30 @@ fn resize_grid_with_kitty_anchors(
     reflow: bool,
     lines: usize,
     columns: usize,
+    anchors: &mut [Option<Point>],
 ) {
-    let original_anchors = graphics.reflow_anchors(alternate);
+    let mut original_anchors = graphics.reflow_anchors(alternate);
+    let image_anchor_count = original_anchors.len();
+    original_anchors.extend(anchors.iter().map(|point| point.map(|point| (point.line.0, point.column.0 as u32))));
+    // Height-only changes translate every row equally; do not scan scrollback for tracked positions.
+    if grid.columns() == columns {
+        let previous_cursor = grid.cursor.point.line;
+        grid.resize(reflow, lines, columns);
+        let delta = grid.cursor.point.line - previous_cursor;
+        let minimum = -(grid.history_size() as i32);
+        for anchor in &mut original_anchors {
+            *anchor = anchor.and_then(|(line, column)| {
+                let line = line + delta.0;
+                (line >= minimum && line < lines as i32).then_some((line, column))
+            });
+        }
+        for (target, point) in anchors.iter_mut().zip(&original_anchors[image_anchor_count..]) {
+            *target = point.map(|(line, column)| Point::new(Line(line), Column(column as usize)));
+        }
+        original_anchors.truncate(image_anchor_count);
+        graphics.apply_reflow_anchors(alternate, original_anchors);
+        return;
+    }
     if !original_anchors.iter().any(Option::is_some) {
         grid.resize(reflow, lines, columns);
         return;
@@ -1456,6 +1485,10 @@ fn resize_grid_with_kitty_anchors(
             }
         }
     }
+    for (target, point) in anchors.iter_mut().zip(&remapped[image_anchor_count..]) {
+        *target = point.map(|(line, column)| Point::new(Line(line), Column(column as usize)));
+    }
+    remapped.truncate(image_anchor_count);
     graphics.apply_reflow_anchors(alternate, remapped);
 }
 
@@ -2961,11 +2994,13 @@ impl<T: EventListener> Handler for Term<T> {
         // Capture the scrollback depth synchronously: the parser holds the terminal lock here, so
         // this is the only place a listener can read a coherent history size for this marker.
         let history_size = self.grid.history_size();
+        let column = self.grid.cursor.point.column.0
+            + usize::from(prompt.action == ansi::SemanticPromptAction::CommandFinished && self.grid.cursor.input_needs_wrap);
         self.event_proxy.send_event(Event::SemanticPrompt(
             prompt,
             cursor_line,
             history_size,
-            self.grid.cursor.point.column.0,
+            column,
             self.grid.scroll_position(),
         ));
     }

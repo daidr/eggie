@@ -241,6 +241,86 @@ impl CompletionUi {
     }
 }
 impl EggieApp {
+    fn eggie_cli_completions(
+        &self,
+        session: SessionId,
+        input: &PromptInput,
+        cx: &App,
+    ) -> Option<Vec<CompletionItem>> {
+        use eggie_protocol::{CliCompletionResources, eggie_completions, is_eggie_command};
+        if !is_eggie_command(input) {
+            return None;
+        }
+        let manager = self.window_manager.read(cx);
+        let current = manager.sessions.iter().find(|s| s.id == session)?;
+        if current.remote.is_some() || current.reported_location.as_ref().is_some_and(|l| !l.local)
+        {
+            return None;
+        }
+        let mut resources = CliCompletionResources::default();
+        let mut projects: Vec<_> = self.project_store.read(cx).projects().iter().collect();
+        projects.sort_by_key(|p| p.id != current.project_id);
+        for project in projects {
+            resources.push("project_id", project.id.to_string(), &project.name);
+        }
+        let mut windows: Vec<_> = manager.state.windows.values().collect();
+        windows.sort_by_key(|w| (w.id != self.window_id, w.number));
+        for window in windows {
+            resources.push(
+                "window_id",
+                window.id.to_string(),
+                format!("窗口 {}", window.number),
+            );
+            for view in window.views.values() {
+                for group in view.layout.group_ids() {
+                    resources.push_scoped(
+                        "group_id",
+                        group.to_string(),
+                        format!("窗口 {} · 窗格", window.number),
+                        "window_id",
+                        window.id.to_string(),
+                    );
+                }
+            }
+        }
+        for profile in self.profile_store.read(cx).profiles() {
+            resources.push("profile_id", profile.id.to_string(), &profile.name);
+        }
+        let mut sessions: Vec<_> = manager.sessions.iter().collect();
+        sessions.sort_by_key(|s| (s.id != session, s.id));
+        for terminal in sessions {
+            let item = manager
+                .state
+                .locate(terminal.id)
+                .and_then(|location| manager.state.item(location))
+                .or_else(|| manager.state.background.get(&terminal.id).map(|t| &t.item));
+            let title = item.map_or(terminal.title.as_str(), |item| item.display_title());
+            let project = self
+                .project_store
+                .read(cx)
+                .projects()
+                .iter()
+                .find(|p| p.id == terminal.project_id)
+                .map_or("", |p| p.name.as_str());
+            resources.push(
+                "session_id",
+                terminal.id.to_string(),
+                format!("{project} · {title}"),
+            );
+            if let Some(state) = self.session_feed.shell_integration.get(&terminal.id) {
+                for command in state.history.iter().rev() {
+                    resources.push_scoped(
+                        "command_id",
+                        command.id,
+                        command.command_line.as_deref().unwrap_or(""),
+                        "session_id",
+                        terminal.id.to_string(),
+                    );
+                }
+            }
+        }
+        eggie_completions(input, &resources)
+    }
     pub(super) fn dismiss_completion(&mut self) {
         self.completion.dismiss();
     }
@@ -320,11 +400,7 @@ impl EggieApp {
                     let p = self.completion.panel.as_mut().unwrap();
                     let count = p.matches.len();
                     p.selected = if key == "down" {
-                        if !p.navigated {
-                            0
-                        } else {
-                            (p.selected + 1).min(count - 1)
-                        }
+                        (p.selected + 1).min(count - 1)
                     } else {
                         p.selected.saturating_sub(1)
                     };
@@ -415,6 +491,21 @@ impl EggieApp {
         let generation = self
             .completion
             .begin_request(session, &input, native_refresh);
+        // GUI-owned CLI metadata is immediately available without querying the shell or daemon.
+        if let Some(items) = self.eggie_cli_completions(session, &input, cx) {
+            self.completion.task = None;
+            self.completion.native_task = None;
+            self.completion.native_pending = false;
+            if self.completion.apply_results(session, &input, items) {
+                if let Some(panel) = self.completion.panel.as_ref() {
+                    self.completion
+                        .scroll
+                        .scroll_to_item(panel.selected, ScrollStrategy::Nearest);
+                }
+                cx.notify();
+            }
+            return;
+        }
         let explicit = self.completion.explicit;
         let native_client = self.client.clone();
         let native_executor = cx.background_executor().clone();

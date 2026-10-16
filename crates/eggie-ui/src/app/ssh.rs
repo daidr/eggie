@@ -97,6 +97,42 @@ pub(super) fn phase_label(phase: RemoteSessionPhase, language: Language) -> &'st
     }
 }
 
+fn failure_label(kind: eggie_protocol::SshFailureKind, language: Language) -> &'static str {
+    use eggie_protocol::SshFailureKind::*;
+    match (kind, language == Language::SimplifiedChinese) {
+        (Authentication, true) => "身份验证失败",
+        (Authentication, false) => "Authentication failed",
+        (HostKey, true) => "主机密钥验证失败",
+        (HostKey, false) => "Host key verification failed",
+        (NameResolution, true) => "无法解析主机名",
+        (NameResolution, false) => "Host name could not be resolved",
+        (Timeout, true) => "连接超时",
+        (Timeout, false) => "Connection timed out",
+        (Refused, true) => "连接被拒绝",
+        (Refused, false) => "Connection refused",
+        (Network, true) => "网络连接中断",
+        (Network, false) => "Network connection interrupted",
+    }
+}
+
+fn failure_hint(kind: eggie_protocol::SshFailureKind, language: Language) -> &'static str {
+    use eggie_protocol::SshFailureKind::*;
+    match (kind, language == Language::SimplifiedChinese) {
+        (Authentication, true) => "检查用户名、密钥或 SSH Agent",
+        (Authentication, false) => "Check the user, identity key or SSH agent",
+        (HostKey, true) => "核对主机指纹和 known_hosts",
+        (HostKey, false) => "Verify the host fingerprint and known_hosts",
+        (NameResolution, true) => "检查 Host 别名或主机地址",
+        (NameResolution, false) => "Check the Host alias or address",
+        (Timeout, true) => "检查网络、VPN 和跳板机",
+        (Timeout, false) => "Check the network, VPN and jump host",
+        (Refused, true) => "检查端口和远端 SSH 服务",
+        (Refused, false) => "Check the port and remote SSH service",
+        (Network, true) => "恢复网络后重新连接",
+        (Network, false) => "Reconnect when the network is available",
+    }
+}
+
 impl EggieApp {
     pub(super) fn source_session(
         &self,
@@ -219,9 +255,12 @@ impl EggieApp {
                     .flex_col()
                     .gap(px(2.))
                     .child(
-                        div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(phase_label(remote.phase, self.language)),
+                        div().font_weight(gpui::FontWeight::MEDIUM).child(
+                            remote
+                                .failure
+                                .map(|kind| failure_label(kind, self.language))
+                                .unwrap_or_else(|| phase_label(remote.phase, self.language)),
+                        ),
                     )
                     .child(
                         div()
@@ -266,6 +305,12 @@ impl EggieApp {
         Some(
             status_surface(session_id, colors, top)
                 .child(row)
+                .children(remote.failure.map(|kind| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(colors.muted))
+                        .child(failure_hint(kind, self.language))
+                }))
                 .children(error.map(|error| {
                     div()
                         .text_size(px(11.))

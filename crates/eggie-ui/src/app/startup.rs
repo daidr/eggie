@@ -347,21 +347,39 @@ impl EggieApp {
                 return;
             }
         };
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<crate::gui_ipc::GuiEvent>();
         std::thread::Builder::new()
             .name("eggie-gui-wake".to_owned())
             .spawn(move || {
-                crate::gui_ipc::serve(listener, |message| match message {
-                    crate::gui_ipc::GuiWakeMessage::OpenWindow { cwd } => {
-                        let _ = tx.unbounded_send(cwd);
-                    }
+                crate::gui_ipc::serve(listener, |event| {
+                    let _ = tx.unbounded_send(event);
                 });
             })
             .expect("failed to start GUI wake listener thread");
 
         cx.spawn(async move |cx: &mut gpui::AsyncApp| {
             use futures::StreamExt;
-            while let Some(cwd) = rx.next().await {
+            while let Some(event) = rx.next().await {
+                if std::time::Instant::now() >= event.deadline {
+                    continue;
+                }
+                let cwd = match event.message {
+                    crate::gui_ipc::GuiWakeMessage::OpenWindow { cwd } => cwd,
+                    crate::gui_ipc::GuiWakeMessage::Control { request } => {
+                        let response = Self::dispatch_automation(
+                            request,
+                            client.clone(),
+                            project_store.clone(),
+                            profile_store.clone(),
+                            cx,
+                        )
+                        .await;
+                        if let Some(reply) = event.reply {
+                            let _ = reply.send(response);
+                        }
+                        continue;
+                    }
+                };
                 let client = client.clone();
                 let settings = settings.clone();
                 let updates = updates.clone();
@@ -923,6 +941,37 @@ impl EggieApp {
                 scroll_handle,
             }
         };
+        let command_history_search = cx.new(|cx| {
+            let mut input = TextInput::new(
+                window,
+                cx,
+                TextInputStyle {
+                    text_color: (colors.text << 8) | 0xff,
+                    placeholder_color: (colors.muted << 8) | 0xff,
+                    cursor_color: (colors.accent << 8) | 0xff,
+                    selection_color: (colors.accent << 8) | 0x55,
+                },
+            );
+            input.set_language(config.language);
+            input.set_placeholder(if config.language == Language::SimplifiedChinese {
+                "搜索命令"
+            } else {
+                "Search commands"
+            });
+            input
+        });
+        let command_history_search_subscription = cx.subscribe_in(
+            &command_history_search,
+            window,
+            |app, _, event, window, cx| {
+                if matches!(event, TextInputEvent::Cancel) {
+                    app.command_history_search
+                        .update(cx, |input, cx| input.set_content(String::new(), cx));
+                    app.focus_handle.focus(window, cx);
+                }
+                cx.notify();
+            },
+        );
         let mut app = Self {
             workspace_state: WorkspaceState {
                 projects,
@@ -1046,10 +1095,13 @@ impl EggieApp {
             completion: CompletionUi::default(),
             right_tab: RightTab::Info,
             command_history_collapsed: false,
+            command_history_search,
+            _command_history_search_subscription: command_history_search_subscription,
             snippets_collapsed: false,
             notes_editor: Some(notes_editor),
             left_sidebar_width: restored_sidebar.left_width,
             right_sidebar_width: restored_sidebar.right_width,
+            initial_directory_expanded: false,
             left_sidebar_collapsed: restored_sidebar.left_collapsed,
             right_sidebar_collapsed: restored_sidebar.right_collapsed,
             resizing_sidebar: None,

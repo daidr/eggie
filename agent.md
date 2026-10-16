@@ -48,7 +48,7 @@ shell 补全变更可使用 `python3 scripts/tests/shell-completion.py`。视觉
 
 - 开发构建：`env -u NO_COLOR scripts/make-app.sh --debug`
 - 开发应用：当前仓库 `target/app/Eggie.app`，启动时明确这个路径，避免误启 `/Applications/Eggie.app`
-- 本地 dev 使用 `me.daidr.Eggie.dev` bundle ID；打包脚本重建后需设置该 ID 并重新签名，再启动
+- 本地 dev 使用 `me.daidr.Eggie.dev` bundle ID；`make-app.sh --debug` 自动设置该 ID 并签名
 - GUI 与 daemon 的运行环境均不能包含 `NO_COLOR`；构建命令去掉它不能证明继承中的旧 daemon 已清除
 - 使用当前环境允许的 GUI 工具操作和验证应用；不要通过重启 daemon 来代替单纯 GUI 重启
 

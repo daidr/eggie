@@ -447,20 +447,54 @@ fn reconnect_preserves_tab_identity_and_rejects_stale_catalogs(cx: &mut TestAppC
     let replacement = SessionId::new_v4();
     manager.update(cx, |manager, cx| {
         let profile = manager.state.item(location).unwrap().profile_id;
-        manager.state.windows.get_mut(&window).unwrap().views.get_mut(&location.project_id).unwrap()
-            .layout.find_group_mut(location.group_id).unwrap().items.iter_mut().find(|item| item.id == location.item_id).unwrap().custom_title = Some("Build server".into());
+        manager
+            .state
+            .windows
+            .get_mut(&window)
+            .unwrap()
+            .views
+            .get_mut(&location.project_id)
+            .unwrap()
+            .layout
+            .find_group_mut(location.group_id)
+            .unwrap()
+            .items
+            .iter_mut()
+            .find(|item| item.id == location.item_id)
+            .unwrap()
+            .custom_title = Some("Build server".into());
         let session = session_summary(replacement, location.project_id, false);
-        manager.set_sessions(vec![session_summary(previous, location.project_id, true), session.clone()], cx);
+        manager.set_sessions(
+            vec![
+                session_summary(previous, location.project_id, true),
+                session.clone(),
+            ],
+            cx,
+        );
         manager.replace_session(previous, session.clone(), cx);
         let placed = manager.state.locate(replacement).unwrap();
         assert_eq!(placed.window_id, window);
         assert_eq!(placed.item_id, location.item_id);
         assert_eq!(placed.group_id, location.group_id);
         assert_eq!(manager.state.item(placed).unwrap().profile_id, profile);
-        assert_eq!(manager.state.item(placed).unwrap().custom_title.as_deref(), Some("Build server"));
+        assert_eq!(
+            manager.state.item(placed).unwrap().custom_title.as_deref(),
+            Some("Build server")
+        );
         assert!(!manager.state.background.contains_key(&replacement));
-        manager.set_sessions(vec![session_summary(previous, location.project_id, true), session], cx);
-        assert!(!manager.sessions.iter().any(|session| session.id == previous));
+        manager.set_sessions(
+            vec![
+                session_summary(previous, location.project_id, true),
+                session,
+            ],
+            cx,
+        );
+        assert!(
+            !manager
+                .sessions
+                .iter()
+                .any(|session| session.id == previous)
+        );
         assert_eq!(manager.state.locate(replacement).unwrap(), placed);
     });
     std::fs::remove_file(path).ok();
@@ -474,6 +508,7 @@ fn failed_ssh_tabs_survive_automatic_exit_cleanup(cx: &mut TestAppContext) {
     manager.update(cx, |manager, cx| {
         let mut session = session_summary(id, location.project_id, true);
         session.remote = Some(eggie_protocol::RemoteSessionInfo {
+            failure: None,
             target: eggie_domain::RemoteTarget::new("devbox".into()),
             phase: eggie_protocol::RemoteSessionPhase::Failed,
             initial_directory: None,
@@ -487,7 +522,9 @@ fn failed_ssh_tabs_survive_automatic_exit_cleanup(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn reconnect_acknowledgement_replaces_once_and_releases_the_previous_process(cx: &mut TestAppContext) {
+fn reconnect_acknowledgement_replaces_once_and_releases_the_previous_process(
+    cx: &mut TestAppContext,
+) {
     use std::os::unix::net::UnixListener;
     let (manager, path) = manager(cx);
     let (_, _, previous, location, _) = setup(cx, &manager);
@@ -502,17 +539,37 @@ fn reconnect_acknowledgement_replaces_once_and_releases_the_previous_process(cx:
         while count < 2 {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
                     let mut buffer = Vec::new();
-                    let request = eggie_ipc::wire::read_wire_message::<ClientRequest>(&mut stream, &mut buffer).unwrap().unwrap();
+                    let request = eggie_ipc::wire::read_wire_message::<ClientRequest>(
+                        &mut stream,
+                        &mut buffer,
+                    )
+                    .unwrap()
+                    .unwrap();
                     let response = if count == 0 {
-                        assert_eq!(request, ClientRequest::ReconnectSession { session_id: previous });
-                        DaemonResponse::SessionCreated { session: next.clone() }
+                        assert_eq!(
+                            request,
+                            ClientRequest::ReconnectSession {
+                                session_id: previous
+                            }
+                        );
+                        DaemonResponse::SessionCreated {
+                            session: next.clone(),
+                        }
                     } else {
-                        assert_eq!(request, ClientRequest::Terminate { session_id: previous });
+                        assert_eq!(
+                            request,
+                            ClientRequest::Terminate {
+                                session_id: previous
+                            }
+                        );
                         DaemonResponse::Ok
                     };
-                    eggie_ipc::wire::write_wire_message(&mut stream, &mut buffer, &response).unwrap();
+                    eggie_ipc::wire::write_wire_message(&mut stream, &mut buffer, &response)
+                        .unwrap();
                     count += 1;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -532,7 +589,10 @@ fn reconnect_acknowledgement_replaces_once_and_releases_the_previous_process(cx:
     worker.join().unwrap();
     manager.update(cx, |manager, _| {
         assert!(manager.pending_termination.is_empty());
-        assert_eq!(manager.state.locate(next_id).unwrap().item_id, location.item_id);
+        assert_eq!(
+            manager.state.locate(next_id).unwrap().item_id,
+            location.item_id
+        );
         assert!(manager.state.locate(previous).is_none());
     });
     std::fs::remove_file(socket).ok();

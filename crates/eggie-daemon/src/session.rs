@@ -78,7 +78,20 @@ impl EventListener for DaemonEventListener {
                 }
                 let mut tracker = self.0.shell_integration.lock();
                 tracker.follow_grid_scroll(scroll_position);
+                let action = prompt.action;
+                let previous = tracker.current_command.as_ref().map(|command| command.id);
                 tracker.update(prompt, cursor_line, history_size);
+                let id = if action == SemanticPromptAction::CommandFinished {
+                    previous
+                } else {
+                    tracker.current_command.as_ref().map(|command| command.id)
+                };
+                tracker.output_marker(
+                    action,
+                    id,
+                    Point::new(Line(cursor_line), Column(column)),
+                    self.0.size.read().columns as usize,
+                );
             }
             Event::ProgramStatus(payload, terminator) => {
                 self.0.handle_program_status(&payload, &terminator);
@@ -170,13 +183,13 @@ pub(super) struct TerminalSession {
     /// Set for a remote profile: the session runs `ssh` instead of a local shell, and inspection and
     /// tunnels go through the control channel rather than local syscalls.
     pub(super) remote: Option<RemoteTarget>,
+    ssh_failure: OnceLock<Option<eggie_protocol::SshFailureKind>>,
     /// The ControlPath for this session's ssh master, if multiplexing is enabled. Used by inspection
     /// and tunnels to run commands over the one authenticated connection.
     pub(super) remote_connection: Option<Arc<ssh::SshConnection>>,
     reconnect_config: Option<SessionSpawnConfig>,
     pub(super) reconnected_session: Mutex<Option<SessionId>>,
     pub(super) runtime_metadata: Mutex<SessionRuntimeMetadata>,
-    pub(super) inspection_system: Mutex<System>,
     pub(super) terminal: Arc<FairMutex<Term<DaemonEventListener>>>,
     pub(super) events: Arc<ListenerState>,
     pub(super) sender: EventLoopSender,
@@ -209,6 +222,9 @@ pub(super) struct TerminalSearchState {
     /// the full-buffer enumeration; the end is where forward navigation advances from (and the
     /// start where backward navigation does), so overlapping matches are not re-found.
     pub(super) active: Option<RangeInclusive<Point>>,
+    pub(super) total: usize,
+    pub(super) index: usize,
+    pub(super) revision: u64,
 }
 
 pub(super) enum TerminalSnapshotUpdate {
@@ -422,6 +438,7 @@ impl TerminalSession {
             pty_fd,
             remote,
             remote_connection,
+            ssh_failure: OnceLock::new(),
             reconnect_config,
             reconnected_session: Mutex::new(None),
             runtime_metadata: Mutex::new(SessionRuntimeMetadata {
@@ -435,7 +452,6 @@ impl TerminalSession {
                 current_directory: cwd,
                 last_refresh: None,
             }),
-            inspection_system: Mutex::new(System::new()),
             terminal,
             events: state,
             sender,
@@ -512,10 +528,21 @@ impl TerminalSession {
             remote: self.remote.as_ref().map(|target| {
                 let initial_directory = self.events.remote_ready_directory.read().clone();
                 let ready = initial_directory.is_some();
+                let phase = eggie_protocol::RemoteSessionPhase::from_process(&status, ready);
+                let failure = if phase.needs_recovery() {
+                    *self.ssh_failure.get_or_init(|| {
+                        self.read_terminal_text(40)
+                            .ok()
+                            .and_then(|(text, _)| ssh::config::diagnose(&text))
+                    })
+                } else {
+                    None
+                };
                 eggie_protocol::RemoteSessionInfo {
                     target: target.clone(),
-                    phase: eggie_protocol::RemoteSessionPhase::from_process(&status, ready),
+                    phase,
                     initial_directory,
+                    failure,
                 }
             }),
             status,
@@ -523,12 +550,22 @@ impl TerminalSession {
     }
 
     pub(super) fn reconnect_config(&self) -> Result<SessionSpawnConfig> {
-        anyhow::ensure!(matches!(*self.events.status.read(), SessionStatus::Exited { .. }), "SSH session is still running");
-        let mut config = self.reconnect_config.clone().context("Not an SSH session")?;
+        anyhow::ensure!(
+            matches!(*self.events.status.read(), SessionStatus::Exited { .. }),
+            "SSH session is still running"
+        );
+        let mut config = self
+            .reconnect_config
+            .clone()
+            .context("Not an SSH session")?;
         config.size = *self.events.size.read();
         config.appearance = *self.events.appearance.read();
         config.scrollback_limit = self.config_state.lock().scrollback_limit;
-        config.remote_cwd = self.summary().remote_directory().map(str::to_owned).or(config.remote_cwd);
+        config.remote_cwd = self
+            .summary()
+            .remote_directory()
+            .map(str::to_owned)
+            .or(config.remote_cwd);
         Ok(config)
     }
 
@@ -538,8 +575,7 @@ impl TerminalSession {
         if self.remote.is_some() {
             return self.remote_inspection();
         }
-        let processes = descendant_processes(self.shell_pid, &mut self.inspection_system.lock());
-        let ports = listening_ports(&processes);
+        let (processes, ports) = local_inspection(self.shell_pid);
         SessionInspection {
             session_id: self.id,
             processes,
@@ -1008,13 +1044,27 @@ impl TerminalSession {
 
         // Decide whether we are continuing to navigate the same query or starting over. A changed
         // query/mode, an explicit `fresh` flag, or the very first search all reset the cursor.
-        let previous_active = {
+        let (previous_active, cached_count) = {
             let state = self.search_state.lock();
             let same_query = state.query == request.query && state.regex == request.regex;
             if request.fresh || !same_query {
-                None
+                (None, None)
             } else {
-                state.active.clone()
+                let cached = (state.active.is_some()
+                    && state.total > 0
+                    && state.revision == self.events.revision.load(Ordering::Acquire))
+                .then(|| {
+                    (
+                        state.total,
+                        match request.direction {
+                            TerminalSearchDirection::Forward => (state.index + 1) % state.total,
+                            TerminalSearchDirection::Backward => {
+                                (state.index + state.total - 1) % state.total
+                            }
+                        },
+                    )
+                });
+                (state.active.clone(), cached)
             }
         };
 
@@ -1066,17 +1116,9 @@ impl TerminalSession {
 
         let active_start = *active_match.start();
 
-        // Count every match across the whole buffer and find the active match's ordinal. The
-        // terminal core caps regex complexity internally, so this stays bounded.
-        let (total, index) = count_all_matches(&*terminal, &mut regex, active_start);
-
-        // Remember where we are so the next navigation keypress advances from here.
-        {
-            let mut state = self.search_state.lock();
-            state.query = request.query.clone();
-            state.regex = request.regex;
-            state.active = Some(active_match.clone());
-        }
+        // Navigation reuses the count until output or another terminal mutation changes its revision.
+        let (total, index) =
+            cached_count.unwrap_or_else(|| count_all_matches(&*terminal, &mut regex, active_start));
 
         // Scroll so the active match is on screen, if it is not already.
         let target_offset = active_match_display_offset(&*terminal, active_start);
@@ -1095,6 +1137,15 @@ impl TerminalSession {
             viewport_match_inner(active_match.clone(), final_offset, screen_lines, columns);
 
         let revision = self.events.revision.load(Ordering::Acquire);
+        {
+            let mut state = self.search_state.lock();
+            state.query = request.query;
+            state.regex = request.regex;
+            state.active = Some(active_match);
+            state.total = total;
+            state.index = index;
+            state.revision = revision;
+        }
         drop(terminal);
         Ok(TerminalSearchResult {
             active,
@@ -1395,7 +1446,11 @@ impl TerminalSession {
 }
 
 impl ListenerState {
-    fn resize_terminal(&self, terminal: &mut Term<DaemonEventListener>, size: TerminalSize) {
+    pub(super) fn resize_terminal(
+        &self,
+        terminal: &mut Term<DaemonEventListener>,
+        size: TerminalSize,
+    ) {
         // Match the PTY publisher's terminal -> metadata lock ordering. Taking the size lock
         // first can deadlock when sustained output publishes while a resize is waiting.
         *self.size.write() = size;
@@ -1416,7 +1471,40 @@ impl ListenerState {
             }
             (shell.phase, shell.prompt_start_line)
         };
-        resize_terminal_with_history_reflow(terminal, size, phase, prompt_start_line);
+        let mut anchors: Vec<_> = self
+            .shell_integration
+            .lock()
+            .command_output_ranges
+            .iter()
+            .flat_map(|range| [range.start, range.end])
+            .collect();
+        if !terminal.mode().contains(TermMode::ALT_SCREEN) {
+            use alacritty_terminal::term::cell::LineLength;
+            for point in anchors.iter_mut().skip(1).step_by(2).flatten() {
+                if point.line >= terminal.topmost_line() && point.line <= terminal.bottommost_line()
+                {
+                    point.column = Column(
+                        point.column.0.min(
+                            terminal.grid()[point.line]
+                                .line_length()
+                                .0
+                                .saturating_sub(1),
+                        ),
+                    );
+                }
+            }
+        }
+        resize_terminal_with_anchors(terminal, size, phase, prompt_start_line, &mut anchors);
+        for (range, points) in self
+            .shell_integration
+            .lock()
+            .command_output_ranges
+            .iter_mut()
+            .zip(anchors.chunks_exact(2))
+        {
+            range.start = points[0];
+            range.end = points[1];
+        }
         self.shell_integration.lock().rebase_after_resize(
             terminal.grid().cursor.point.line.0 - old_cursor_line,
             terminal.grid().history_size(),

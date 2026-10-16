@@ -5,8 +5,10 @@ mod editing;
 mod gallery;
 mod keybindings;
 mod profiles;
+mod search;
 mod sections;
 mod selector;
+mod ssh;
 use std::sync::{Arc, OnceLock};
 
 use crate::{
@@ -121,13 +123,14 @@ enum SelectorKind {
     ProfileTerminalLight,
     /// The selected profile's font-family override, clearable back to "follow global".
     ProfileFont,
+    SshHost,
 }
 
 impl SelectorKind {
     /// Every variant, in `index()` order. A test pins that `index()` is a bijection onto
     /// `0..ALL.len()` and that `selector_bounds` is exactly this long — both are hand-maintained, and
     /// an out-of-range `index()` panics when the dropdown reads or writes its bounds slot.
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::InterfaceDark,
         Self::InterfaceLight,
         Self::TerminalDark,
@@ -139,6 +142,7 @@ impl SelectorKind {
         Self::ProfileTerminalDark,
         Self::ProfileTerminalLight,
         Self::ProfileFont,
+        Self::SshHost,
     ];
 
     const fn index(self) -> usize {
@@ -154,6 +158,7 @@ impl SelectorKind {
             Self::ProfileTerminalDark => 8,
             Self::ProfileTerminalLight => 9,
             Self::ProfileFont => 10,
+            Self::SshHost => 11,
         }
     }
 
@@ -180,7 +185,7 @@ impl SelectorKind {
 
     /// Whether this selector picks a theme (as opposed to a font). Gates the live hover preview.
     const fn is_theme(self) -> bool {
-        !self.is_font()
+        !self.is_font() && !matches!(self, Self::SshHost)
     }
 
     /// Whether this selector picks from the dark half of the catalog. Only meaningful for theme
@@ -211,7 +216,8 @@ impl SelectorKind {
             | Self::FontBold
             | Self::FontItalic
             | Self::FontBoldItalic
-            | Self::ProfileFont => None,
+            | Self::ProfileFont
+            | Self::SshHost => None,
         }
     }
 }
@@ -526,10 +532,23 @@ struct SettingsWindow {
     dark_theme_names: Vec<String>,
     light_theme_names: Vec<String>,
     font_names: Vec<String>,
+    ssh_host_names: Vec<String>,
+    ssh_hosts_error: Option<String>,
+    ssh_hosts_task: Option<gpui::Task<()>>,
+    ssh_config_task: Option<gpui::Task<()>>,
+    ssh_config_result: Option<(
+        eggie_domain::ProfileId,
+        eggie_domain::RemoteTarget,
+        Result<eggie_protocol::SshEffectiveConfig, String>,
+    )>,
     colors: UiColors,
     colors_for_theme: &'static TerminalTheme,
     open_selector: Option<SelectorKind>,
     selector_search_input: Entity<TextInput>,
+    settings_search_input: Entity<TextInput>,
+    settings_search_selected: usize,
+    _settings_search_navigation: gpui::Subscription,
+    search_target: std::rc::Rc<std::cell::RefCell<Option<&'static str>>>,
     /// Persistent inputs for the shell override (Advanced → Shell). Seeded once from config; edits
     /// write straight back to settings. Spawn-only, so no live push to running terminals.
     shell_program_input: Entity<TextInput>,
@@ -616,6 +635,20 @@ impl SettingsWindow {
         let colors = UiColors::from_theme(theme);
         let input_style = settings_input_style(colors);
         let selector_search_input = cx.new(|cx| TextInput::new(window, cx, input_style));
+        let settings_search_input = cx.new(|cx| TextInput::new(window, cx, input_style));
+        cx.subscribe_in(&settings_search_input, window, Self::on_settings_search)
+            .detach();
+        let weak = cx.weak_entity();
+        let settings_search_navigation = cx.intercept_keystrokes(move |event, window, cx| {
+            if weak
+                .update(cx, |settings, cx| {
+                    settings.navigate_settings_search(event.keystroke.clone(), window, cx)
+                })
+                .unwrap_or(false)
+            {
+                cx.stop_propagation();
+            }
+        });
         cx.subscribe_in(
             &selector_search_input,
             window,
@@ -689,10 +722,19 @@ impl SettingsWindow {
             dark_theme_names: theme_catalog().dark_names(),
             light_theme_names: theme_catalog().light_names(),
             font_names,
+            ssh_host_names: Vec::new(),
+            ssh_hosts_error: None,
+            ssh_hosts_task: None,
+            ssh_config_task: None,
+            ssh_config_result: None,
             colors,
             colors_for_theme: theme,
             open_selector: None,
             selector_search_input,
+            settings_search_input,
+            settings_search_selected: 0,
+            _settings_search_navigation: settings_search_navigation,
+            search_target: Default::default(),
             shell_program_input,
             shell_args_input,
             selector_scroll_handle: ScrollHandle::new(),
@@ -817,6 +859,7 @@ impl SettingsWindow {
             | SelectorKind::FontItalic
             | SelectorKind::FontBoldItalic
             | SelectorKind::ProfileFont => &self.font_names,
+            SelectorKind::SshHost => &self.ssh_host_names,
         }
     }
 
@@ -845,6 +888,12 @@ impl SettingsWindow {
         if self.lua_manages_selector(kind, cx) {
             return;
         }
+        if kind == SelectorKind::SshHost {
+            self.profile_inputs
+                .remote_host
+                .update(cx, |input, cx| input.set_content(choice, cx));
+            return;
+        }
         if kind.is_profile() {
             self.apply_profile_selector_choice(kind, Some(choice), cx);
             return;
@@ -863,7 +912,8 @@ impl SettingsWindow {
                     // Handled above: these write to the profile store, not to AppSettings.
                     SelectorKind::ProfileTerminalDark
                     | SelectorKind::ProfileTerminalLight
-                    | SelectorKind::ProfileFont => {}
+                    | SelectorKind::ProfileFont
+                    | SelectorKind::SshHost => {}
                 },
                 cx,
             )
@@ -922,6 +972,8 @@ impl gpui::Render for SettingsWindow {
             let style = settings_input_style(colors);
             self.selector_search_input
                 .update(cx, |input, cx| input.set_style(style, cx));
+            self.settings_search_input
+                .update(cx, |input, cx| input.set_style(style, cx));
             self.shell_program_input
                 .update(cx, |input, cx| input.set_style(style, cx));
             self.shell_args_input
@@ -937,6 +989,14 @@ impl gpui::Render for SettingsWindow {
         // Keep every input field's edit-menu labels in sync with the current language.
         self.selector_search_input
             .update(cx, |input, _| input.set_language(language));
+        self.settings_search_input.update(cx, |input, _| {
+            input.set_language(language);
+            input.set_placeholder(if language == Language::SimplifiedChinese {
+                "搜索设置"
+            } else {
+                "Search settings"
+            });
+        });
         self.shell_program_input
             .update(cx, |input, _| input.set_language(language));
         self.shell_args_input
@@ -948,7 +1008,17 @@ impl gpui::Render for SettingsWindow {
         // the selected profile was deleted elsewhere (reading the store here is what subscribes this
         // view to it, so that mutation repaints us and the stale id resolves to the built-in Default).
         self.sync_profile_inputs(cx);
-        let section_content = self.render_current_section(&config, window, cx);
+        let searching = !self
+            .settings_search_input
+            .read(cx)
+            .content()
+            .trim()
+            .is_empty();
+        let section_content = if searching {
+            self.render_settings_results(language, cx)
+        } else {
+            self.render_current_section(&config, window, cx)
+        };
         div()
             .relative()
             .flex()
@@ -1038,6 +1108,17 @@ impl gpui::Render for SettingsWindow {
                             .border_r_1()
                             .border_color(rgb(self.colors.border))
                             .bg(rgb(self.colors.panel))
+                            .child(
+                                div()
+                                    .id("settings-search")
+                                    .h(px(30.))
+                                    .px_2()
+                                    .py_1()
+                                    .mb_2()
+                                    .rounded_md()
+                                    .bg(rgb(self.colors.panel_alt))
+                                    .child(self.settings_search_input.clone()),
+                            )
                             .children(SettingsSection::ALL.map(|section| {
                                 let (id, label, icon_name) = match section {
                                     SettingsSection::General => (
@@ -1095,6 +1176,10 @@ impl gpui::Render for SettingsWindow {
                                             settings.cancel_recording(cx);
                                         }
                                         settings.bell_dropdown_open = false;
+                                        settings.settings_search_input.update(cx, |input, cx| {
+                                            input.set_content(String::new(), cx)
+                                        });
+                                        settings.search_target.borrow_mut().take();
                                         settings.selected_section = section;
                                         cx.notify();
                                     }))
@@ -1137,7 +1222,9 @@ impl gpui::Render for SettingsWindow {
                                             // (logo + name), so it skips the shared section
                                             // title to avoid a redundant "About Eggie" line.
                                             .when(
-                                                self.selected_section != SettingsSection::About,
+                                                !searching
+                                                    && self.selected_section
+                                                        != SettingsSection::About,
                                                 |element| {
                                                     element.child(
                                                         div()

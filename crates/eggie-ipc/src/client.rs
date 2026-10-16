@@ -25,11 +25,45 @@ pub(crate) fn render_metrics_enabled() -> bool {
     })
 }
 
-pub fn daemon_socket_path() -> PathBuf {
+pub fn runtime_directory() -> PathBuf {
+    legacy_runtime_directory().join(if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "stable"
+    })
+}
+
+fn legacy_runtime_directory() -> PathBuf {
     let uid = unsafe { libc::getuid() };
-    std::env::temp_dir()
-        .join(format!("eggie-{uid}"))
-        .join(format!("daemon-v{PROTOCOL_VERSION}.sock"))
+    std::env::temp_dir().join(format!("eggie-{uid}"))
+}
+
+pub fn daemon_socket_path() -> PathBuf {
+    runtime_directory().join(format!("daemon-v{PROTOCOL_VERSION}.sock"))
+}
+
+fn legacy_socket_for_current_binary() -> Option<PathBuf> {
+    let path = legacy_runtime_directory().join(format!("daemon-v{PROTOCOL_VERSION}.sock"));
+    let stream = UnixStream::connect(&path).ok()?;
+    let pid = unix_peer_pid(&stream)?;
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0u8; 4096];
+        let length =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if length <= 0 {
+            return None;
+        }
+        let end = buffer.iter().position(|byte| *byte == 0)?;
+        let executable = std::env::current_exe().ok()?;
+        use std::os::unix::ffi::OsStrExt;
+        (executable.as_os_str().as_bytes() == &buffer[..end]).then_some(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 pub fn is_daemon_invocation(arguments: &[String]) -> Option<PathBuf> {
@@ -631,17 +665,38 @@ impl DaemonClient {
     }
 
     pub fn connect_default(build_id: impl Into<Arc<str>>) -> Result<Self> {
-        let client = Self::new(daemon_socket_path(), build_id);
-        client.terminate_obsolete_daemons();
+        let mut path = daemon_socket_path();
+        // Adopt a compatible legacy daemon only when its authenticated peer runs this exact binary.
+        if !path.exists()
+            && let Some(legacy) = legacy_socket_for_current_binary()
+        {
+            path = legacy;
+        }
+        let client = Self::new(path, build_id);
         client.ensure_running()?;
         Ok(client)
     }
 
     pub fn ensure_running(&self) -> Result<()> {
-        if self.handshake().is_ok() {
-            return Ok(());
+        match self.handshake() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Only an absent listener permits startup; an unresponsive live daemon owns sessions.
+                let absent = error
+                    .chain()
+                    .filter_map(|error| error.downcast_ref::<std::io::Error>())
+                    .any(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        )
+                    });
+                if !absent {
+                    return Err(error
+                        .context("Eggie daemon is unavailable; existing sessions were preserved"));
+                }
+            }
         }
-        self.terminate_stale_daemon();
         let executable = std::env::current_exe().context("cannot locate Eggie executable")?;
         let mut command = Command::new(executable);
         command
@@ -667,33 +722,11 @@ impl DaemonClient {
         bail!("Eggie daemon did not become ready within {CONNECT_TIMEOUT:?}")
     }
 
-    fn terminate_stale_daemon(&self) {
-        terminate_daemon_at(self.socket_path.as_path());
-    }
-
-    fn terminate_obsolete_daemons(&self) {
-        let Some(directory) = self.socket_path.parent() else {
-            return;
-        };
-        let Ok(entries) = fs::read_dir(directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path == self.socket_path.as_path() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with("daemon-v") && name.ends_with(".sock") {
-                terminate_daemon_at(&path);
-            }
-        }
-    }
-
     pub fn handshake(&self) -> Result<()> {
-        match self.request(ClientRequest::Handshake {
+        let stream = UnixStream::connect(self.socket_path.as_path())?;
+        stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+        match DaemonConnection::from_stream(stream).request(ClientRequest::Handshake {
             protocol_version: PROTOCOL_VERSION,
         })? {
             DaemonResponse::HandshakeAccepted {
@@ -799,6 +832,18 @@ impl DaemonClient {
     pub fn request(&self, request: ClientRequest) -> Result<DaemonResponse> {
         self.connect()?.request(request)
     }
+
+    /// A dedicated bounded request, for interactive queries that must never strand a worker.
+    pub fn request_with_timeout(
+        &self,
+        request: ClientRequest,
+        timeout: Duration,
+    ) -> Result<DaemonResponse> {
+        let stream = UnixStream::connect(self.socket_path.as_path())?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        DaemonConnection::from_stream(stream).request(request)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -826,23 +871,41 @@ fn unix_peer_pid(_stream: &UnixStream) -> Option<libc::pid_t> {
 mod tests {
     use super::*;
     #[test]
-    fn default_client_removes_only_obsolete_protocol_sockets() {
-        let directory = std::env::temp_dir().join(format!(
-            "eggie-daemon-cleanup-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+    fn failed_handshake_preserves_live_daemon_and_other_protocols() {
+        let directory =
+            std::env::temp_dir().join(format!("ec-{:x}", uuid::Uuid::new_v4().as_u128() as u64));
         fs::create_dir_all(&directory).unwrap();
         let current = directory.join(format!("daemon-v{PROTOCOL_VERSION}.sock"));
         let obsolete = directory.join("daemon-v999.sock");
         let unrelated = directory.join("keep-me.sock");
-        fs::write(&current, []).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&current).unwrap();
         fs::write(&obsolete, []).unwrap();
         fs::write(&unrelated, []).unwrap();
-
-        DaemonClient::new(current.clone(), "test").terminate_obsolete_daemons();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: ClientRequest = read_wire_message(&mut stream, &mut Vec::new())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(request, ClientRequest::Handshake { .. }));
+            write_wire_message(
+                &mut stream,
+                &mut Vec::new(),
+                &DaemonResponse::Error {
+                    message: "protocol mismatch".into(),
+                },
+            )
+            .unwrap();
+            listener
+        });
+        assert!(
+            DaemonClient::new(current.clone(), "test")
+                .ensure_running()
+                .is_err()
+        );
+        let _listener = server.join().unwrap();
 
         assert!(current.exists());
-        assert!(!obsolete.exists());
+        assert!(obsolete.exists());
         assert!(unrelated.exists());
         fs::remove_dir_all(directory).unwrap();
     }

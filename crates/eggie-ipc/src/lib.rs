@@ -7,7 +7,8 @@ mod client;
 pub mod wire;
 pub use client::{
     DaemonClient, DaemonConnection, DaemonInputSender, configure_latency_sensitive_thread,
-    daemon_socket_path, handshake_accepted, is_daemon_invocation, terminate_daemon_at,
+    daemon_socket_path, handshake_accepted, is_daemon_invocation, runtime_directory,
+    terminate_daemon_at,
 };
 use eggie_protocol::TerminalImageKey;
 

@@ -48,17 +48,16 @@ fn selector_indices_are_a_bijection_onto_the_bounds_array() {
 
 #[test]
 fn every_theme_selector_belongs_to_exactly_one_half() {
-    // Each theme slot offers one half of the catalog, so `is_dark` has to partition them. A font
-    // selector is not a theme selector and never previews.
+    let themes = [
+        SelectorKind::InterfaceDark,
+        SelectorKind::InterfaceLight,
+        SelectorKind::TerminalDark,
+        SelectorKind::TerminalLight,
+        SelectorKind::ProfileTerminalDark,
+        SelectorKind::ProfileTerminalLight,
+    ];
     for kind in SelectorKind::ALL {
-        if kind.is_font() {
-            assert!(
-                !kind.is_theme(),
-                "{kind:?} cannot be both a font and a theme selector"
-            );
-        } else {
-            assert!(kind.is_theme(), "{kind:?} must be a theme selector");
-        }
+        assert_eq!(kind.is_theme(), themes.contains(&kind), "{kind:?}");
     }
     assert!(SelectorKind::InterfaceDark.is_dark());
     assert!(!SelectorKind::InterfaceLight.is_dark());

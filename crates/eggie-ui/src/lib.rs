@@ -32,4 +32,5 @@ mod workspace;
 pub fn launch(project_root: std::path::PathBuf, client: eggie_ipc::DaemonClient) {
     app::EggieApp::launch(project_root, client);
 }
+pub use gui_ipc::control_running_gui;
 pub use gui_ipc::try_wake_existing;
