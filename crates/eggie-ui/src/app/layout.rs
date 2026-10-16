@@ -477,6 +477,7 @@ impl EggieApp {
             .track_scroll(&scroll_handle);
         for (tab_index, item) in group.items.iter().enumerate() {
             let item_id = item.id;
+            let session_id = item.session_id;
             let active = group.active_item_id == Some(item.id);
             let title_key = format!("tab-title-{item_id}");
             let label_background = if active {
@@ -538,14 +539,18 @@ impl EggieApp {
                                 |element, tint| element.bg(rgba(tint)),
                             )
                             .cursor_pointer()
-                            .on_hover(cx.listener(move |app, hovered: &bool, _, cx| {
+                            .on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
                                 app.set_marquee_hover(
                                     &[format!("tab-title-{item_id}")],
                                     *hovered,
                                     cx,
                                 );
+                                if let Some(session_id) = session_id {
+                                    app.terminal_preview_hover(TerminalPreviewAnchor::Tab(item_id, session_id), *hovered, window, cx);
+                                }
                             }))
                             .on_click(cx.listener(move |app, _, window, cx| {
+                                app.dismiss_terminal_preview(cx);
                                 app.activate_item(group_id, item_id, window, cx)
                             }))
                             .on_mouse_down(
@@ -556,6 +561,7 @@ impl EggieApp {
                             )
                             .on_drag(dragged_tab, move |tab, _, _, cx| {
                                 let _ = drag_owner.update(cx, |app, cx| {
+                                    app.dismiss_terminal_preview(cx);
                                     app.publish_window_state(cx);
                                     app.dragged_tab = Some(tab.clone());
                                 });
@@ -580,25 +586,21 @@ impl EggieApp {
                             ))
                             .when_some(
                                 self.tab_profile_badge(item, cx),
-                                |element, (color, name)| {
+                                |element, color| {
                                     element.child(
                                         div()
-                                            // `tooltip` requires a stateful (identified) element.
                                             .id(format!("tab-badge-{item_id}"))
                                             .flex_none()
                                             .size(px(TAB_BADGE_SIZE))
                                             .rounded_full()
-                                            .bg(rgb(color))
-                                            // The dot alone says "this tab is special" but not which profile;
-                                            // the tooltip names it, which is the whole point of the marker.
-                                            .tooltip(tooltip_text(name, self.colors)),
+                                            .bg(rgb(color)),
                                     )
                                 },
                             )
-                            .when_some(item.session_id.and_then(|id| self.session_feed.global_sessions.iter().find(|session| session.id == id)).and_then(|session| session.remote.as_ref()), |element, remote| {
+                            .when_some(item.session_id.and_then(|id| self.session_feed.global_sessions.iter().find(|session| session.id == id)).and_then(|session| session.remote.as_ref()), |element, _remote| {
                                 element.child(div().id(format!("ssh-host-{item_id}"))
                                     .text_size(px(9.)).text_color(rgb(self.colors.muted))
-                                    .tooltip(tooltip_text(remote.target.consent_key(), self.colors)).child("SSH"))
+                                    .child("SSH"))
                             })
                             .child(self.render_marquee(
                                 title_key,

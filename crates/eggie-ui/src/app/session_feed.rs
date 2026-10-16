@@ -442,7 +442,7 @@ impl EggieApp {
         .detach();
     }
 
-    /// The badge color and profile name for a tab, or `None` when it should carry no badge.
+    /// The badge color for a tab, or `None` when it should carry no badge.
     ///
     /// Uses [`ProfileStore::profile`] rather than `resolve`: a tab whose profile was deleted while it
     /// ran must lose its badge, not inherit the built-in Default's. That matches
@@ -452,12 +452,9 @@ impl EggieApp {
         &self,
         item: &TabItem,
         cx: &App,
-    ) -> Option<(u32, SharedString)> {
+    ) -> Option<u32> {
         let profile = self.profile_store.read(cx).profile(item.profile_id?)?;
-        Some((
-            profile.badge_color?,
-            SharedString::from(profile.name.clone()),
-        ))
+        profile.badge_color
     }
 
     pub(super) fn icon_for_item(
@@ -1108,7 +1105,7 @@ impl EggieApp {
                 // is no active session right now, so keep polling. Folding both into `None` here
                 // would make the `break` below unreachable and leak this 1Hz task forever.
                 let session_id = match this.update(cx, |app, _| {
-                    app.sidebar.sidebar_preview.as_ref().map(|preview| preview.session_id)
+                    app.sidebar.terminal_preview.as_ref().map(|preview| preview.session_id)
                         .or_else(|| (!app.right_sidebar_collapsed && app.right_tab == RightTab::Info).then(|| app.active_session_id()).flatten())
                         .filter(|id| app.session_feed.sessions.iter().any(|session| session.id == *id && matches!(session.status, SessionStatus::Running)))
                 }) {

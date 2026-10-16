@@ -44,7 +44,7 @@ impl EggieApp {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_project_popover(cx);
-        self.dismiss_sidebar_preview(cx);
+        self.dismiss_terminal_preview(cx);
         self.sidebar.project_drag.source = Some(id);
         self.sidebar.project_drag.target = None;
         self.sidebar.project_drag.bounds = None;
@@ -772,11 +772,11 @@ impl EggieApp {
                         *hovered,
                         cx,
                     );
-                    app.sidebar_preview_hover(session_id, *hovered, window, cx);
+                    app.terminal_preview_hover(TerminalPreviewAnchor::Sidebar(session_id), *hovered, window, cx);
                 }))
                 .cursor_pointer()
                 .on_click(cx.listener(move |app, _, window, cx| {
-                    app.dismiss_sidebar_preview(cx);
+                    app.dismiss_terminal_preview(cx);
                     app.activate_session(project_id, session_id, window, cx)
                 }))
                 .child(self.render_item_icon(

@@ -47,7 +47,7 @@ impl EggieApp {
                 let _ = handle.update(cx, |app, window, cx| {
                     app.closing = true;
                     app.dismiss_project_popover(cx);
-                    app.dismiss_sidebar_preview(cx);
+                    app.dismiss_terminal_preview(cx);
                     window.remove_window();
                 });
                 manager.update(cx, |manager, _| {
@@ -181,11 +181,11 @@ impl EggieApp {
             .retain(|id, _| local.contains(id));
         if self
             .sidebar
-            .sidebar_preview
+            .terminal_preview
             .as_ref()
             .is_some_and(|p| !local.contains(&p.session_id))
         {
-            self.dismiss_sidebar_preview(cx);
+            self.dismiss_terminal_preview(cx);
         }
         self.poll_error = error;
         self.reconcile_layout_caches();
@@ -216,7 +216,7 @@ impl EggieApp {
             if let Some(popover) = &app.sidebar.project_popover {
                 let _ = popover.window.update(cx, |_, _, cx| cx.notify());
             }
-            if let Some(preview) = &app.sidebar.sidebar_preview {
+            if let Some(preview) = &app.sidebar.terminal_preview {
                 let _ = preview.window.update(cx, |_, _, cx| cx.notify());
             }
             app.update_window_title(window, cx);
@@ -267,7 +267,7 @@ impl EggieApp {
         self.publish_window_state(cx);
         self.closing = true;
         self.dismiss_project_popover(cx);
-        self.dismiss_sidebar_preview(cx);
+        self.dismiss_terminal_preview(cx);
         self.window_manager
             .update(cx, |manager, cx| manager.close(self.window_id, cx));
     }

@@ -30,7 +30,19 @@ pub(super) fn marquee_offset(state: MarqueeState, now: Instant) -> f32 {
     state.from + (state.to - state.from) * gpui::ease_in_out(progress)
 }
 
-pub(super) struct SidebarPreviewState {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TerminalPreviewAnchor {
+    Sidebar(SessionId),
+    Tab(ItemId, SessionId),
+}
+impl TerminalPreviewAnchor {
+    pub(super) fn session_id(self) -> SessionId {
+        match self { Self::Sidebar(id) | Self::Tab(_, id) => id }
+    }
+}
+
+pub(super) struct TerminalPreviewState {
+    pub(super) anchor: TerminalPreviewAnchor,
     pub(super) session_id: SessionId,
     pub(super) content_revision: u64,
     pub(super) window: gpui::WindowHandle<PopupWindow>,
@@ -39,9 +51,9 @@ pub(super) struct SidebarPreviewState {
     pub(super) leave_revision: u64,
 }
 
-impl SidebarPreviewState {
-    pub(super) fn is_current_target(&self, session_id: SessionId, revision: u64) -> bool {
-        self.session_id == session_id && self.content_revision == revision
+impl TerminalPreviewState {
+    pub(super) fn is_current_target(&self, anchor: TerminalPreviewAnchor, revision: u64) -> bool {
+        self.anchor == anchor && self.content_revision == revision
     }
 }
 

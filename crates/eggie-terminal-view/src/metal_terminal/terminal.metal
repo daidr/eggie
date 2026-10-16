@@ -116,5 +116,6 @@ fragment float4 terminal_image_fragment(
     texture2d<float> image [[texture(0)]],
     sampler image_sampler [[sampler(0)]])
 {
-    return image.sample(image_sampler, in.uv);
+    float4 color = image.sample(image_sampler, in.uv);
+    return float4(color.rgb, color.a * in.color.a);
 }

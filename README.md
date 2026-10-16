@@ -27,7 +27,7 @@ version terminates the incompatible daemon and creates a clean one.
 
 Visible terminal text uses leased shared-memory rows; the Unix socket carries frame metadata,
 control requests, and wakeups. Unchanged rows are shared across snapshots, and exhausted pools
-fall back to owned socket frames. See [terminal transport](docs/architecture/terminal-transport.md)
+fall back to owned socket frames. See [terminal transport](design/architecture/terminal-transport.md)
 for ownership, memory bounds, diagnostics, and repeatable latency benchmarks.
 
 ## Command completion
@@ -35,7 +35,7 @@ for ownership, memory bounds, diagnostics, and repeatable latency benchmarks.
 Suggestions appear while typing in a shell prompt. Ctrl-Space opens the list, Tab inserts,
 arrow keys navigate, and Escape dismisses. Enter runs the command unless you have navigated
 the list. Disable completion in Settings → Advanced to use the shell's native Tab binding.
-See [completion architecture and tests](docs/architecture/completion.md).
+See [completion architecture and tests](design/architecture/completion.md).
 
 ## Paste
 
@@ -94,7 +94,7 @@ Eggie also supports a Rex-inspired, API-style Lua configuration at
 GUI controls; GUI preferences remain available when a Lua setting is removed.
 Use `eggie config check [path]` to validate a file and `eggie config reload`
 to apply changes. `eggie do script.lua` runs a separate event script. See the
-[Lua configuration guide](docs/architecture/lua-configuration.md) for examples
+[Lua configuration guide](design/architecture/lua-configuration.md) for examples
 and the current API.
 
 The interface palette carries each terminal theme's hue into its surfaces while
@@ -125,7 +125,11 @@ cargo test --release -p eggie-terminal-view benchmark_dense_terminal_preparation
 
 ## Architecture
 
-See [crate boundaries and UI organization](docs/architecture/workspace.md).
+See the [design index](design/README.md) for architecture, interaction principles, feature
+designs and product decisions. Agent contributors should read [agent.md](agent.md) and update
+the relevant design documents in the same change as the implementation.
+
+See [crate boundaries and UI organization](design/architecture/workspace.md).
 
 Run `python3 scripts/check-architecture.py` to check dependency boundaries, and
 `cargo test --workspace` for regression tests. The `eggie` crate owns the executable;

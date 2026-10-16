@@ -15,13 +15,34 @@ use std::{
 };
 
 const IN_DURATION: Duration = Duration::from_millis(180);
-const OUT_DURATION: Duration = Duration::from_millis(120);
+const OUT_DURATION: Duration = Duration::from_millis(160);
 const MOVE_DURATION: Duration = Duration::from_millis(150);
 const INSET: f32 = 12.;
 const GAP: f32 = 5.;
 
 type Content = Rc<dyn Fn(&mut Window, &mut Context<PopupWindow>) -> AnyElement>;
 type Hover = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+
+#[derive(Clone, Copy)]
+struct PopupVisibility {
+    from: f32,
+    to: f32,
+    started_at: Instant,
+    duration: Duration,
+}
+impl PopupVisibility {
+    fn value(self, now: Instant) -> f32 {
+        let progress = (now.saturating_duration_since(self.started_at).as_secs_f32()
+            / self.duration.as_secs_f32())
+        .clamp(0., 1.);
+        let eased = if self.to > self.from {
+            gpui::ease_out_quint()(progress)
+        } else {
+            gpui::ease_in_out(progress)
+        };
+        self.from + (self.to - self.from) * eased
+    }
+}
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // The window shell supports menu and tooltip placement before those callers exist.
@@ -64,7 +85,10 @@ pub struct PopupWindow {
     background: u32,
     border: u32,
     content_size: Size<Pixels>,
+    anchor: Bounds<Pixels>,
+    placement: PopupPlacement,
     closing: bool,
+    visibility: PopupVisibility,
     pointer_pressed: bool,
     revision: u64,
     motion: Option<PopupMotion>,
@@ -104,7 +128,15 @@ impl PopupWindow {
                     background: options.background,
                     border: options.border,
                     content_size: options.content_size,
+                    anchor: options.anchor,
+                    placement: options.placement,
                     closing: false,
+                    visibility: PopupVisibility {
+                        from: 0.,
+                        to: 1.,
+                        started_at: Instant::now(),
+                        duration: IN_DURATION,
+                    },
                     pointer_pressed: false,
                     revision: 0,
                     motion: None,
@@ -139,7 +171,44 @@ impl PopupWindow {
         self.background = options.background;
         self.border = options.border;
         self.content_size = options.content_size;
+        self.anchor = options.anchor;
+        self.placement = options.placement;
         self.restore(cx);
+        self.update_bounds(bounds, window, cx);
+    }
+
+    /// Reflow live content without replacing its callbacks or restarting its visibility animation.
+    pub fn resize_content(
+        &mut self,
+        parent: &Window,
+        content_size: Size<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing || self.content_size == content_size {
+            return;
+        }
+        self.content_size = content_size;
+        let bounds = popup_bounds(
+            parent,
+            &PopupWindowOptions {
+                anchor: self.anchor,
+                content_size,
+                placement: self.placement,
+                background: self.background,
+                border: self.border,
+            },
+            cx,
+        );
+        self.update_bounds(bounds, window, cx);
+    }
+
+    fn update_bounds(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if window.bounds().size != bounds.size {
             window.resize(bounds.size);
         }
@@ -167,6 +236,13 @@ impl PopupWindow {
             return;
         }
         self.revision += 1;
+        let now = Instant::now();
+        self.visibility = PopupVisibility {
+            from: self.visibility.value(now),
+            to: 0.,
+            started_at: now,
+            duration: OUT_DURATION,
+        };
         let revision = self.revision;
         cx.notify();
         let executor = cx.background_executor().clone();
@@ -188,6 +264,13 @@ impl PopupWindow {
     pub fn restore(&mut self, cx: &mut Context<Self>) {
         if self.closing {
             self.closing = false;
+            let now = Instant::now();
+            self.visibility = PopupVisibility {
+                from: self.visibility.value(now),
+                to: 1.,
+                started_at: now,
+                duration: IN_DURATION,
+            };
             self.revision += 1;
             cx.notify();
         }
@@ -210,7 +293,7 @@ impl Render for PopupWindow {
             }
         }
         let content = (self.content.clone())(window, cx);
-        let closing = self.closing;
+        let visibility = self.visibility;
         let revision = self.revision;
         let hover = self.on_hover.clone();
         let release_outside = self.on_hover.clone();
@@ -247,15 +330,14 @@ impl Render for PopupWindow {
                     .child(content)
                     .with_animation(
                         format!("popup-window-{revision}"),
-                        Animation::new(if closing { OUT_DURATION } else { IN_DURATION })
-                            .with_easing(gpui::ease_out_quint()),
+                        Animation::new(visibility.duration),
                         move |surface, progress| {
                             let visible = if reduced_motion {
-                                1.
-                            } else if closing {
-                                1. - progress
+                                visibility.to
+                            } else if progress >= 1. {
+                                visibility.to
                             } else {
-                                progress
+                                visibility.value(Instant::now())
                             };
                             surface
                                 .opacity(visible)
@@ -388,6 +470,36 @@ fn place_popup(
 mod tests {
     use super::*;
 
+    #[test]
+    fn reversing_popup_visibility_keeps_opacity_and_translation_continuous() {
+        let start = Instant::now();
+        let entering = PopupVisibility {
+            from: 0.,
+            to: 1.,
+            started_at: start,
+            duration: IN_DURATION,
+        };
+        let dismissed = start + IN_DURATION / 3;
+        let exiting = PopupVisibility {
+            from: entering.value(dismissed),
+            to: 0.,
+            started_at: dismissed,
+            duration: OUT_DURATION,
+        };
+        assert_eq!(entering.value(dismissed), exiting.value(dismissed));
+        let middle = dismissed + OUT_DURATION / 2;
+        assert!(exiting.value(middle) < exiting.from && exiting.value(middle) > 0.);
+        let restored = PopupVisibility {
+            from: exiting.value(middle),
+            to: 1.,
+            started_at: middle,
+            duration: IN_DURATION,
+        };
+        assert_eq!(exiting.value(middle), restored.value(middle));
+        assert_eq!(exiting.value(dismissed + OUT_DURATION), 0.);
+        assert_eq!(restored.value(middle + IN_DURATION), 1.);
+    }
+
     struct Parent;
 
     impl Render for Parent {
@@ -404,6 +516,48 @@ mod tests {
             background: 0xffffff,
             border: 0xdddddd,
         }
+    }
+
+    #[gpui::test]
+    fn resizing_live_content_keeps_identity_and_visibility(cx: &mut gpui::TestAppContext) {
+        let parent = cx.add_window(|_, _| Parent);
+        let popup = cx.update(|cx| {
+            parent
+                .update(cx, |_, window, cx| {
+                    PopupWindow::open(
+                        cx,
+                        window,
+                        options(20.),
+                        |_, _| div().into_any_element(),
+                        |_, _, _| {},
+                    )
+                })
+                .unwrap()
+                .unwrap()
+        });
+        let original_id = popup.window_id();
+        cx.update(|cx| {
+            parent
+                .update(cx, |_, parent, cx| {
+                    popup
+                        .update(cx, |popup, window, cx| {
+                            let visibility = popup.visibility;
+                            popup.resize_content(parent, size(px(240.), px(250.)), window, cx);
+                            assert_eq!(popup.content_size, size(px(240.), px(250.)));
+                            assert_eq!(popup.visibility.started_at, visibility.started_at);
+                            assert_eq!(popup.revision, 0);
+                            assert!(!popup.closing);
+                            popup.dismiss(window, cx);
+                            popup.resize_content(parent, size(px(200.), px(160.)), window, cx);
+                            assert!(popup.closing);
+                            assert_eq!(popup.content_size, size(px(240.), px(250.)));
+                        })
+                        .unwrap();
+                })
+                .unwrap()
+        });
+        assert_eq!(popup.window_id(), original_id);
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
     }
 
     #[gpui::test]

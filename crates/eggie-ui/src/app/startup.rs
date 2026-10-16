@@ -827,7 +827,7 @@ impl EggieApp {
                 .is_some_and(|config| config.sidebar_layout != layout)
             {
                 app.dismiss_project_popover(cx);
-                app.dismiss_sidebar_preview(cx);
+                app.dismiss_terminal_preview(cx);
                 app.clear_project_drag(cx);
                 app.sidebar
                     .project_drag
@@ -872,14 +872,14 @@ impl EggieApp {
         cx.observe_window_bounds(window, |app, _, cx| {
             app.dismiss_project_selector(cx);
             app.dismiss_project_popover(cx);
-            app.dismiss_sidebar_preview(cx);
+            app.dismiss_terminal_preview(cx);
         })
         .detach();
         cx.observe_window_activation(window, |app, window, cx| {
             if !window.is_window_active() {
                 app.dismiss_project_selector(cx);
                 app.dismiss_project_popover(cx);
-                app.dismiss_sidebar_preview(cx);
+                app.dismiss_terminal_preview(cx);
             }
         })
         .detach();
@@ -942,9 +942,9 @@ impl EggieApp {
                 hovered_project: None,
                 project_hover_revision: 0,
                 sidebar_row_bounds: Rc::new(RefCell::new(HashMap::new())),
-                sidebar_preview: None,
-                hovered_sidebar_session: None,
-                sidebar_preview_revision: 0,
+                terminal_preview: None,
+                hovered_terminal_preview: None,
+                terminal_preview_revision: 0,
                 marquee_states: Rc::new(RefCell::new(HashMap::new())),
                 project_icon_states: RefCell::new(HashMap::new()),
                 tab_icon_states: RefCell::new(HashMap::new()),
