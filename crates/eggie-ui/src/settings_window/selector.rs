@@ -10,6 +10,7 @@ impl SettingsWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let compact = kind == SelectorKind::SshHost;
         let managed = self.lua_manages_selector(kind, cx);
         let dropdown_position = self.selector_dropdown_position(kind, window);
         let selector = cx.entity().downgrade();
@@ -35,8 +36,8 @@ impl SettingsWindow {
             })
             .id(format!("{id}-container"))
             .relative()
-            .w(px(SELECTOR_WIDTH))
-            .h(px(32.))
+            .w(px(if compact { 30. } else { SELECTOR_WIDTH }))
+            .h(px(if compact { 28. } else { 32. }))
             .child(
                 div()
                     .id(id)
@@ -45,83 +46,44 @@ impl SettingsWindow {
                     .justify_between()
                     .gap_3()
                     .size_full()
-                    .px_3()
-                    .rounded_lg()
-                    .border_1()
+                    .when(!compact, |element| {
+                        element
+                            .rounded_lg()
+                            .px_3()
+                            .border_1()
+                            .bg(rgb(self.colors.panel_alt))
+                    })
+                    .when(compact, |element| {
+                        element
+                            .justify_center()
+                            .border_l_1()
+                            .tooltip(tooltip_text(SharedString::from(value.clone()), self.colors))
+                    })
                     .border_color(rgb(self.colors.border))
-                    .bg(rgb(self.colors.panel_alt))
                     .when(!managed, |element| {
                         element
                             .cursor_pointer()
                             .hover(|element| element.border_color(rgb(self.colors.accent)))
                     })
                     .on_click(cx.listener(move |settings, _, window, cx| {
-                        if settings.lua_manages_selector(kind, cx) {
-                            return;
-                        }
-                        if settings.open_selector == Some(kind) {
-                            settings.open_selector = None;
-                            settings.clear_theme_preview(cx);
-                        } else {
-                            settings.open_selector = Some(kind);
-                            if kind == SelectorKind::SshHost {
-                                settings.load_ssh_hosts(cx);
-                            }
-                            let language = settings.settings.read(cx).config().language;
-                            let placeholder = match kind {
-                                SelectorKind::SshHost => {
-                                    if language == Language::SimplifiedChinese {
-                                        "搜索 SSH Host"
-                                    } else {
-                                        "Search SSH hosts"
-                                    }
-                                }
-                                // Every theme slot searches one half of the catalog, so the placeholder
-                                // follows the slot's darkness rather than naming the layer.
-                                SelectorKind::InterfaceDark
-                                | SelectorKind::InterfaceLight
-                                | SelectorKind::TerminalDark
-                                | SelectorKind::TerminalLight
-                                | SelectorKind::ProfileTerminalDark
-                                | SelectorKind::ProfileTerminalLight => {
-                                    if kind.is_dark() {
-                                        language.search_dark_themes()
-                                    } else {
-                                        language.search_light_themes()
-                                    }
-                                }
-                                SelectorKind::Font
-                                | SelectorKind::FontBold
-                                | SelectorKind::FontItalic
-                                | SelectorKind::FontBoldItalic
-                                | SelectorKind::ProfileFont => language.search_fonts(),
-                            };
-                            settings.selector_search_input.update(cx, |input, cx| {
-                                input.set_placeholder(placeholder);
-                                input.set_content("", cx);
-                            });
-                            settings
-                                .selector_scroll_handle
-                                .set_offset(point(px(0.), px(0.)));
-                            let handle = settings.selector_search_input.read(cx).focus_handle();
-                            handle.focus(window, cx);
-                        }
-                        cx.notify();
+                        settings.toggle_selector(kind, window, cx)
                     }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .when_some(font_family, |element, family| {
-                                element.font_family(SharedString::from(family))
-                            })
-                            .child(if managed {
-                                format!("{value} · init.lua")
-                            } else {
-                                value
-                            }),
-                    )
+                    .when(!compact, |element| {
+                        element.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .when_some(font_family, |element, family| {
+                                    element.font_family(SharedString::from(family))
+                                })
+                                .child(if managed {
+                                    format!("{value} · init.lua")
+                                } else {
+                                    value
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -144,6 +106,64 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    pub(super) fn toggle_selector(
+        &mut self,
+        kind: SelectorKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.lua_manages_selector(kind, cx) {
+            return;
+        }
+        if self.open_selector == Some(kind) {
+            self.open_selector = None;
+            self.clear_theme_preview(cx);
+        } else {
+            self.open_selector = Some(kind);
+            if kind == SelectorKind::SshHost {
+                self.load_ssh_hosts(cx);
+            }
+            let language = self.settings.read(cx).config().language;
+            let placeholder = match kind {
+                SelectorKind::SshHost => {
+                    if language == Language::SimplifiedChinese {
+                        "搜索 SSH Host"
+                    } else {
+                        "Search SSH hosts"
+                    }
+                }
+                // Every theme slot searches one half of the catalog, so the placeholder
+                // follows the slot's darkness rather than naming the layer.
+                SelectorKind::InterfaceDark
+                | SelectorKind::InterfaceLight
+                | SelectorKind::TerminalDark
+                | SelectorKind::TerminalLight
+                | SelectorKind::ProfileTerminalDark
+                | SelectorKind::ProfileTerminalLight => {
+                    if kind.is_dark() {
+                        language.search_dark_themes()
+                    } else {
+                        language.search_light_themes()
+                    }
+                }
+                SelectorKind::Font
+                | SelectorKind::FontBold
+                | SelectorKind::FontItalic
+                | SelectorKind::FontBoldItalic
+                | SelectorKind::ProfileFont => language.search_fonts(),
+            };
+            self.selector_search_input.update(cx, |input, cx| {
+                input.set_placeholder(placeholder);
+                input.set_content("", cx);
+            });
+            self.selector_scroll_handle
+                .set_offset(point(px(0.), px(0.)));
+            let handle = self.selector_search_input.read(cx).focus_handle();
+            handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn selector_dropdown_position(
         &self,
         kind: SelectorKind,
@@ -160,7 +180,12 @@ impl SettingsWindow {
             } else {
                 bounds.top() - dropdown_height - gap
             };
-            point(bounds.left(), y)
+            let x = if kind == SelectorKind::SshHost {
+                bounds.right() - px(SELECTOR_WIDTH)
+            } else {
+                bounds.left()
+            };
+            point(x, y)
         })
     }
 
@@ -356,12 +381,20 @@ impl SettingsWindow {
                             }
                         }))
                     })
-                    .on_click(cx.listener(move |settings, _, _, cx| {
+                    .on_click(cx.listener(move |settings, _, window, cx| {
                         // Committing supersedes the preview: clear it so the resolved theme falls back
                         // to the now-persisted value (identical pixels, but no stale override left).
                         settings.clear_theme_preview(cx);
                         settings.commit_selector_choice(kind, selected_item.clone(), cx);
                         settings.open_selector = None;
+                        if kind == SelectorKind::SshHost {
+                            settings
+                                .profile_inputs
+                                .remote_host
+                                .read(cx)
+                                .focus_handle()
+                                .focus(window, cx);
+                        }
                         cx.notify();
                     }))
                     .child(div().min_w_0().truncate().child(item)),
@@ -375,7 +408,29 @@ impl SettingsWindow {
                     .items_center()
                     .justify_center()
                     .text_color(rgb(self.colors.muted))
-                    .child(language.no_matches()),
+                    .child(
+                        if kind == SelectorKind::SshHost && self.ssh_hosts_task.is_some() {
+                            if language == Language::SimplifiedChinese {
+                                "读取中"
+                            } else {
+                                "Loading"
+                            }
+                        } else if kind == SelectorKind::SshHost && self.ssh_hosts_error.is_some() {
+                            if language == Language::SimplifiedChinese {
+                                "无法读取 SSH 配置"
+                            } else {
+                                "Could not read SSH config"
+                            }
+                        } else if kind == SelectorKind::SshHost && self.ssh_host_names.is_empty() {
+                            if language == Language::SimplifiedChinese {
+                                "未找到 SSH 主机"
+                            } else {
+                                "No SSH hosts found"
+                            }
+                        } else {
+                            language.no_matches()
+                        },
+                    ),
             );
         }
 

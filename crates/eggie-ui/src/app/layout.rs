@@ -546,7 +546,12 @@ impl EggieApp {
                                     cx,
                                 );
                                 if let Some(session_id) = session_id {
-                                    app.terminal_preview_hover(TerminalPreviewAnchor::Tab(item_id, session_id), *hovered, window, cx);
+                                    app.terminal_preview_hover(
+                                        TerminalPreviewAnchor::Tab(item_id, session_id),
+                                        *hovered,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             }))
                             .on_click(cx.listener(move |app, _, window, cx| {
@@ -579,29 +584,31 @@ impl EggieApp {
                             .on_drop(cx.listener(|app, dragged_tab: &DraggedTab, _, cx| {
                                 app.handle_tab_drop(dragged_tab, cx)
                             }))
-                            .child(self.render_item_icon(
-                                item.kind,
-                                item.session_id,
-                                format!("tab-progress-{item_id}"),
-                            ))
-                            .when_some(
-                                self.tab_profile_badge(item, cx),
-                                |element, color| {
-                                    element.child(
-                                        div()
-                                            .id(format!("tab-badge-{item_id}"))
-                                            .flex_none()
-                                            .size(px(TAB_BADGE_SIZE))
-                                            .rounded_full()
-                                            .bg(rgb(color)),
-                                    )
-                                },
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.render_item_icon(
+                                        item.kind,
+                                        item.session_id,
+                                        format!("tab-progress-{item_id}"),
+                                    ))
+                                    .when_some(
+                                        self.tab_profile_badge(item, cx),
+                                        |element, color| {
+                                            element.child(
+                                                div()
+                                                    .id(format!("tab-badge-{item_id}"))
+                                                    .flex_none()
+                                                    .size(px(TAB_BADGE_SIZE))
+                                                    .rounded_full()
+                                                    .bg(rgb(color)),
+                                            )
+                                        },
+                                    ),
                             )
-                            .when_some(item.session_id.and_then(|id| self.session_feed.global_sessions.iter().find(|session| session.id == id)).and_then(|session| session.remote.as_ref()), |element, _remote| {
-                                element.child(div().id(format!("ssh-host-{item_id}"))
-                                    .text_size(px(9.)).text_color(rgb(self.colors.muted))
-                                    .child("SSH"))
-                            })
                             .child(self.render_marquee(
                                 title_key,
                                 item.display_title().to_owned(),
