@@ -23,13 +23,13 @@ impl SettingsWindow {
                         // repeat it on the very next line.
                         None,
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 language.language_row(),
                                 None,
                                 language_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.sidebar_layout_row(),
                                 None,
                                 sidebar_layout_control,
@@ -40,7 +40,7 @@ impl SettingsWindow {
                     ),
                     settings_section(
                         Some(language.terminal_behavior_section()),
-                        vec![settings_row(
+                        vec![self.setting_row(
                             language.scrollback_lines_row(),
                             Some(language.scrollback_lines_description()),
                             scrollback_control,
@@ -179,10 +179,10 @@ impl SettingsWindow {
                 // the terminal follows it by default), then the terminal's own source and — only when it has
                 // one — its pair.
                 let mut theme_rows = vec![
-                    settings_row(language.theme_row(), None, mode_control, self.colors),
+                    self.setting_row(language.theme_row(), None, mode_control, self.colors),
                     interface_light_gallery,
                     interface_dark_gallery,
-                    settings_row(
+                    self.setting_row(
                         language.terminal_theme_source_row(),
                         None,
                         terminal_theme_source_control,
@@ -195,7 +195,7 @@ impl SettingsWindow {
                     theme_rows.push(terminal_light_gallery);
                     theme_rows.push(terminal_dark_gallery);
                 }
-                theme_rows.push(settings_row(
+                theme_rows.push(self.setting_row(
                     language.minimum_contrast_row(),
                     Some(language.minimum_contrast_description()),
                     minimum_contrast_control,
@@ -216,7 +216,7 @@ impl SettingsWindow {
                     .into_iter()
                     .map(|kind| {
                         let (label, description) = Self::metric_adjustment_labels(language, kind);
-                        settings_row(
+                        self.setting_row(
                             label,
                             Some(description),
                             self.render_metric_adjustment_control(kind, cx),
@@ -229,73 +229,73 @@ impl SettingsWindow {
                     settings_section(
                         Some(language.terminal_text_section()),
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 language.font_row(),
                                 Some(language.font_description()),
                                 font_selector,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.font_bold_row(),
                                 None,
                                 font_bold_selector,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.font_italic_row(),
                                 None,
                                 font_italic_selector,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.font_bold_italic_row(),
                                 None,
                                 font_bold_italic_selector,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.synthetic_bold_row(),
                                 Some(language.synthetic_bold_description()),
                                 synthetic_bold_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.synthetic_italic_row(),
                                 Some(language.synthetic_italic_description()),
                                 synthetic_italic_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.synthetic_bold_italic_row(),
                                 Some(language.synthetic_bold_italic_description()),
                                 synthetic_bold_italic_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.ligatures_row(),
                                 Some(language.ligatures_description()),
                                 ligatures_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.shaping_break_row(),
                                 None,
                                 shaping_break_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.font_thicken_row(),
                                 None,
                                 font_thicken_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.font_thicken_strength_row(),
                                 None,
                                 font_thicken_strength_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.font_size_row(),
                                 None,
                                 font_size_control,
@@ -307,13 +307,13 @@ impl SettingsWindow {
                     settings_section(
                         Some(language.cursor_section()),
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 language.cursor_shape_row(),
                                 Some(language.cursor_shape_description()),
                                 cursor_shape_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.cursor_blink_row(),
                                 None,
                                 cursor_blink_control,
@@ -325,13 +325,13 @@ impl SettingsWindow {
                     settings_section(
                         Some(language.terminal_layout_section()),
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 language.horizontal_padding_row(),
                                 None,
                                 horizontal_padding_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.vertical_padding_row(),
                                 None,
                                 vertical_padding_control,
@@ -410,13 +410,13 @@ impl SettingsWindow {
                     settings_section(
                         Some(language.progress_indicators_section()),
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 language.completed_timeout_row(),
                                 None,
                                 progress_complete_timeout_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.inactive_timeout_row(),
                                 None,
                                 progress_stale_timeout_control,
@@ -428,7 +428,7 @@ impl SettingsWindow {
                     settings_section(
                         Some(language.terminal_behavior_section()),
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 if language == Language::SimplifiedChinese {
                                     "进程结束后"
                                 } else {
@@ -438,26 +438,26 @@ impl SettingsWindow {
                                 terminal_exit_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.terminal_suggest(),
                                 None,
                                 completion_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.detect_urls_row(),
                                 Some(language.detect_urls_description()),
                                 detect_urls_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.copy_on_select_row(),
                                 None,
                                 copy_on_select_control,
                                 self.colors,
                             ),
-                            settings_row(language.bell_row(), None, bell_control, self.colors),
-                            settings_row(
+                            self.setting_row(language.bell_row(), None, bell_control, self.colors),
+                            self.setting_row(
                                 if language == Language::SimplifiedChinese {
                                     "粘贴预览"
                                 } else {
@@ -472,7 +472,7 @@ impl SettingsWindow {
                     ),
                     settings_section(
                         Some(language.terminal_security_section()),
-                        vec![settings_row(
+                        vec![self.setting_row(
                             language.osc_clipboard_read_row(),
                             Some(language.osc_clipboard_read_description()),
                             osc_clipboard_read_control,
@@ -483,19 +483,19 @@ impl SettingsWindow {
                     settings_section(
                         Some(language.shell_section()),
                         vec![
-                            settings_row(
+                            self.setting_row(
                                 language.shell_program_row(),
                                 Some(language.shell_program_description()),
                                 shell_program_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.shell_args_row(),
                                 Some(language.shell_args_description()),
                                 shell_args_control,
                                 self.colors,
                             ),
-                            settings_row(
+                            self.setting_row(
                                 language.shell_integration_path_row(),
                                 Some(language.shell_integration_path_description()),
                                 shell_integration_path_control,

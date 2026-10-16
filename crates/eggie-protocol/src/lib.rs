@@ -3,6 +3,10 @@ mod events;
 pub use events::*;
 mod messages;
 pub use messages::*;
+mod cli_completion;
+pub use cli_completion::*;
+mod automation;
+pub use automation::*;
 mod input;
 pub use input::*;
 mod session;
@@ -16,7 +20,7 @@ pub use snapshot::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 mod ports;
 pub use ports::*;

@@ -64,8 +64,18 @@ impl SettingsWindow {
                             settings.clear_theme_preview(cx);
                         } else {
                             settings.open_selector = Some(kind);
+                            if kind == SelectorKind::SshHost {
+                                settings.load_ssh_hosts(cx);
+                            }
                             let language = settings.settings.read(cx).config().language;
                             let placeholder = match kind {
+                                SelectorKind::SshHost => {
+                                    if language == Language::SimplifiedChinese {
+                                        "搜索 SSH Host"
+                                    } else {
+                                        "Search SSH hosts"
+                                    }
+                                }
                                 // Every theme slot searches one half of the catalog, so the placeholder
                                 // follows the slot's darkness rather than naming the layer.
                                 SelectorKind::InterfaceDark
@@ -166,6 +176,12 @@ impl SettingsWindow {
         // "what is the current value". Exhaustive on purpose: a catch-all would let a new slot read
         // another slot's field, which compiles and silently shows the wrong selection.
         let current = match kind {
+            SelectorKind::SshHost => self
+                .profile_inputs
+                .remote_host
+                .read(cx)
+                .content()
+                .to_owned(),
             SelectorKind::InterfaceDark => config.interface_dark_theme.clone(),
             SelectorKind::InterfaceLight => config.interface_light_theme.clone(),
             SelectorKind::TerminalDark => config.terminal_dark_theme.clone(),
@@ -287,7 +303,8 @@ impl SettingsWindow {
                                         // Handled above: these write to the profile store.
                                         SelectorKind::ProfileTerminalDark
                                         | SelectorKind::ProfileTerminalLight
-                                        | SelectorKind::ProfileFont => {}
+                                        | SelectorKind::ProfileFont
+                                        | SelectorKind::SshHost => {}
                                     },
                                     cx,
                                 )

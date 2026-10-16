@@ -122,6 +122,29 @@ pub struct RemoteSessionInfo {
     pub target: eggie_domain::RemoteTarget,
     pub phase: RemoteSessionPhase,
     pub initial_directory: Option<String>,
+    #[serde(default)]
+    pub failure: Option<SshFailureKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshFailureKind {
+    Authentication,
+    HostKey,
+    NameResolution,
+    Timeout,
+    Refused,
+    Network,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshEffectiveConfig {
+    pub hostname: String,
+    pub user: String,
+    pub port: u16,
+    pub identity_files: Vec<String>,
+    pub proxy_jump: Option<String>,
+    pub uses_proxy_command: bool,
 }
 
 impl SessionSummary {

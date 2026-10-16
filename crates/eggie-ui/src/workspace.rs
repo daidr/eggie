@@ -374,41 +374,102 @@ impl WindowManager {
         }
         self.changed(cx);
     }
+    pub fn rename_session(
+        &mut self,
+        id: SessionId,
+        title: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if let Some(location) = self.state.locate(id) {
+            self.state
+                .windows
+                .get_mut(&location.window_id)
+                .unwrap()
+                .views
+                .get_mut(&location.project_id)
+                .unwrap()
+                .layout
+                .set_custom_title(location.group_id, location.item_id, title);
+        } else if let Some(tab) = self.state.background.get_mut(&id) {
+            tab.item.custom_title = title;
+        } else {
+            anyhow::bail!("Unknown tab");
+        }
+        self.changed(cx);
+        Ok(())
+    }
     pub fn reconnect(&mut self, id: SessionId, client: DaemonClient, cx: &mut Context<Self>) {
-        if !self.pending_termination.insert(id) { return; }
+        if !self.pending_termination.insert(id) {
+            return;
+        }
         self.reconnect_errors.remove(&id);
         let executor = cx.background_executor().clone();
         let request_client = client.clone();
         cx.notify();
         cx.spawn(async move |manager, cx| {
-            let result = executor.spawn(async move {
-                request_client.request(ClientRequest::ReconnectSession { session_id: id })
-            }).await;
-            let replaced = manager.update(cx, |manager, cx| {
-                manager.pending_termination.remove(&id);
-                match result {
-                    Ok(DaemonResponse::SessionCreated { session }) => {
-                        manager.replace_session(id, session, cx);
-                        true
+            let result = executor
+                .spawn(async move {
+                    request_client.request(ClientRequest::ReconnectSession { session_id: id })
+                })
+                .await;
+            let replaced = manager
+                .update(cx, |manager, cx| {
+                    manager.pending_termination.remove(&id);
+                    match result {
+                        Ok(DaemonResponse::SessionCreated { session }) => {
+                            manager.replace_session(id, session, cx);
+                            true
+                        }
+                        Ok(DaemonResponse::Error { message }) => {
+                            manager.reconnect_errors.insert(id, message);
+                            cx.notify();
+                            false
+                        }
+                        Err(error) => {
+                            manager.reconnect_errors.insert(id, error.to_string());
+                            cx.notify();
+                            false
+                        }
+                        _ => {
+                            manager
+                                .reconnect_errors
+                                .insert(id, "Unexpected reconnect response".into());
+                            cx.notify();
+                            false
+                        }
                     }
-                    Ok(DaemonResponse::Error { message }) => { manager.reconnect_errors.insert(id, message); cx.notify(); false }
-                    Err(error) => { manager.reconnect_errors.insert(id, error.to_string()); cx.notify(); false }
-                    _ => { manager.reconnect_errors.insert(id, "Unexpected reconnect response".into()); cx.notify(); false },
-                }
-            }).unwrap_or(false);
+                })
+                .unwrap_or(false);
             if replaced {
-                let _ = executor.spawn(async move { client.request(ClientRequest::Terminate { session_id: id }) }).await;
+                let _ = executor
+                    .spawn(
+                        async move { client.request(ClientRequest::Terminate { session_id: id }) },
+                    )
+                    .await;
             }
-        }).detach();
+        })
+        .detach();
     }
 
-    fn replace_session(&mut self, previous: SessionId, session: SessionSummary, cx: &mut Context<Self>) {
+    fn replace_session(
+        &mut self,
+        previous: SessionId,
+        session: SessionSummary,
+        cx: &mut Context<Self>,
+    ) {
         // Keep item identity, custom title, profile, group and selection while replacing the process.
         self.state.remove_session(session.id);
         for window in self.state.windows.values_mut() {
             for view in window.views.values_mut() {
                 if let Some((group_id, item_id)) = view.layout.find_terminal_item(previous) {
-                    let item = view.layout.find_group_mut(group_id).unwrap().items.iter_mut().find(|item| item.id == item_id).unwrap();
+                    let item = view
+                        .layout
+                        .find_group_mut(group_id)
+                        .unwrap()
+                        .items
+                        .iter_mut()
+                        .find(|item| item.id == item_id)
+                        .unwrap();
                     item.session_id = Some(session.id);
                     item.title.clone_from(&session.title);
                 }
@@ -419,11 +480,16 @@ impl WindowManager {
             background.item.title.clone_from(&session.title);
             self.state.background.insert(session.id, background);
         }
-        if self.state.locate(session.id).is_none() && !self.state.background.contains_key(&session.id) {
-            self.state.background.insert(session.id, BackgroundTerminal {
-                project_id: session.project_id,
-                item: TabItem::terminal(session.id, session.title.clone()),
-            });
+        if self.state.locate(session.id).is_none()
+            && !self.state.background.contains_key(&session.id)
+        {
+            self.state.background.insert(
+                session.id,
+                BackgroundTerminal {
+                    project_id: session.project_id,
+                    item: TabItem::terminal(session.id, session.title.clone()),
+                },
+            );
         }
         self.sessions.retain(|existing| existing.id != session.id);
         self.sessions.push(session);
@@ -643,12 +709,19 @@ impl WindowManager {
     }
 
     pub fn merge_port_snapshot(&mut self, snapshot: eggie_protocol::PortMappingsSnapshot) -> bool {
-        if let Some(current) = self.port_connections.iter_mut().find(|c| c.connection_id == snapshot.connection_id) {
-            if current.revision > snapshot.revision || *current == snapshot { return false; }
+        if let Some(current) = self
+            .port_connections
+            .iter_mut()
+            .find(|c| c.connection_id == snapshot.connection_id)
+        {
+            if current.revision > snapshot.revision || *current == snapshot {
+                return false;
+            }
             *current = snapshot;
         } else {
             self.port_connections.push(snapshot);
-            self.port_connections.sort_by(|a, b| a.destination.cmp(&b.destination));
+            self.port_connections
+                .sort_by(|a, b| a.destination.cmp(&b.destination));
         }
         true
     }

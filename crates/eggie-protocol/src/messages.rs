@@ -59,8 +59,8 @@ pub enum ClientRequest {
         /// Additive, like the shell fields above, so [`PROTOCOL_VERSION`] does not change: a release
         /// daemon predating profiles ignores the field (unknown fields are not denied) and spawns the
         /// shell without the profile's variables. The user-visible effect is a profile's `env` not
-        /// applying until the daemon is restarted onto the new build — the session still starts, and a
-        /// debug build swaps the daemon on every recompile via the build-id check.
+        /// applying until the daemon is explicitly restarted onto the new build. Compatible GUI
+        /// rebuilds preserve the daemon and its running sessions.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         env: std::collections::BTreeMap<String, String>,
         /// When set, the session is an `ssh` connection to this host rather than a local shell, and
@@ -81,6 +81,23 @@ pub enum ClientRequest {
         remote_cwd: Option<String>,
     },
     ListSessions,
+    ListSshHosts,
+    ResolveSshConfig {
+        target: eggie_domain::RemoteTarget,
+    },
+    ReadTerminalText {
+        session_id: SessionId,
+        tail_lines: u32,
+    },
+    ReadCommandOutput {
+        session_id: SessionId,
+        command_id: u64,
+        max_bytes: u32,
+    },
+    LocateCommandOutput {
+        session_id: SessionId,
+        command_id: u64,
+    },
     ReconnectSession {
         session_id: SessionId,
     },
@@ -362,6 +379,12 @@ fn default_shell_features() -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    SshHosts {
+        hosts: Vec<String>,
+    },
+    SshEffectiveConfig {
+        config: SshEffectiveConfig,
+    },
     SshConnections {
         revision: u64,
         connections: Vec<PortMappingsSnapshot>,
@@ -443,6 +466,11 @@ pub enum DaemonResponse {
     SearchResult {
         session_id: SessionId,
         result: TerminalSearchResult,
+    },
+    TerminalText {
+        session_id: SessionId,
+        text: String,
+        truncated: bool,
     },
     /// Reply to [`ClientRequest::TerminalCopySelection`]. `text` is `None` when there is no active
     /// selection or it is empty.

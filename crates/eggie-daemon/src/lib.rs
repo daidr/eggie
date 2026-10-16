@@ -18,6 +18,7 @@ mod paste;
 mod snapshot;
 mod ssh;
 use snapshot::*;
+mod command_output;
 mod search;
 use search::*;
 mod shell;
@@ -105,8 +106,10 @@ mod event_bus;
 mod preferences_service;
 mod process_monitor;
 #[cfg(test)]
+use process_monitor::listening_ports;
+#[cfg(test)]
 use process_monitor::{cpu_usage_tenths_percent, filter_descendant_processes, parse_lsof_ports};
-use process_monitor::{descendant_processes, listening_ports, parse_remote_inspection};
+use process_monitor::{local_inspection, parse_remote_inspection};
 // Re-exported for the test module's `use super::*`; the daemon body no longer names these directly
 // since the process-monitor helpers moved out.
 #[cfg(test)]

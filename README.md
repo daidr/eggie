@@ -22,8 +22,9 @@ payloads.
 The application is split into a GPUI client and a persistent local daemon. The
 daemon owns PTYs and terminal state, so closing or reopening the GUI can detach
 without interrupting running commands. Protocol version is the compatibility
-gate; build identifiers are diagnostic. Starting a binary with a new protocol
-version terminates the incompatible daemon and creates a clean one.
+gate; build identifiers are diagnostic. Development and release runtimes are isolated.
+Startup never terminates a daemon because a handshake fails or a protocol changes;
+ending incompatible sessions requires an explicit restart.
 
 Visible terminal text uses leased shared-memory rows; the Unix socket carries frame metadata,
 control requests, and wakeups. Unchanged rows are shared across snapshots, and exhausted pools
@@ -135,3 +136,10 @@ Run `python3 scripts/check-architecture.py` to check dependency boundaries, and
 `cargo test --workspace` for regression tests. The `eggie` crate owns the executable;
 `eggie-ui` is the workspace library, `eggie-ui-kit` contains reusable controls, and
 `eggie-terminal-view` owns terminal rendering.
+
+## Local control and MCP
+
+`eggie api --help` lists project, tab, pane and terminal operations for a running GUI.
+`eggie tabs list` returns stable session IDs and placement metadata.
+Run `eggie mcp` as a stdio MCP server; add `--allow-write` to expose control operations.
+See [local control](design/features/local-control.md) for schemas, limits and client setup.

@@ -91,6 +91,15 @@ with tempfile.TemporaryDirectory(prefix='eggie-completion-') as tmp:
             os.write(shell.fd,b'\x1b[D'*8);shell.read(.2)
             shell.apply('cat aXX tail',4,4,7,'a\\ file.txt')
             shell.complete('',expected='cat a\\ file.txt tail');shell.clear()
+            # Eggie API JSON stays a single shell word, with literal Unicode and shell metacharacters.
+            original='eggie tabs rename '
+            inserted=r"\{\"session_id\":\"00000000-0000-4000-8000-000000000001\"\,\"title\":\"中文\ name\ \$value\"\}"
+            shell.complete(original)
+            shell.apply(original,len(original),len(original),len(original),inserted)
+            shell.complete('',expected=original+inserted);shell.clear();shell.clear()
+            os.write(shell.fd,("printf '\\nEGGIE_JSON:<%s>\\n' "+inserted+"\n").encode())
+            output=shell.read(.8)
+            assert 'EGGIE_JSON:<{"session_id":"00000000-0000-4000-8000-000000000001","title":"中文 name $value"}>'.encode() in output,(executable,output[-2000:])
             multiline='echo one\ncat a'
             os.write(shell.fd,b'\x1b[200~'+multiline.encode()+b'\x1b[201~');shell.read(.2)
             assert 'a file.txt' in shell.complete('',expected=multiline)

@@ -1,5 +1,6 @@
 //! Shared authenticated SSH transports and their user-visible port mappings.
 mod command;
+pub(super) mod config;
 mod connection;
 #[cfg(test)]
 mod integration_tests;

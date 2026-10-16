@@ -37,6 +37,13 @@ pub(crate) enum NativeSnippetMenuCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeCommandOutputMenuCommand {
+    Locate,
+    CopyOutput,
+    CopyWithCommand,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeEditMenuCommand {
     Cut,
     Copy,
@@ -53,9 +60,32 @@ pub(crate) enum NativeProfileMenuCommand {
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    NativeEditMenu, NativeProcessMenu, NativeProfileMenu, NativeProjectMenu, NativeSnippetMenu,
-    NativeTabMenu,
+    NativeCommandOutputMenu, NativeEditMenu, NativeProcessMenu, NativeProfileMenu,
+    NativeProjectMenu, NativeSnippetMenu, NativeTabMenu,
 };
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_command_output_menu(
+    window: &Window,
+    language: crate::settings::Language,
+) -> Option<NativeCommandOutputMenu> {
+    macos::NativeCommandOutputMenu::prepare(window, language)
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeCommandOutputMenu;
+#[cfg(not(target_os = "macos"))]
+impl NativeCommandOutputMenu {
+    pub(crate) fn show(self) -> Option<NativeCommandOutputMenuCommand> {
+        None
+    }
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_command_output_menu(
+    _: &Window,
+    _: crate::settings::Language,
+) -> Option<NativeCommandOutputMenu> {
+    None
+}
 
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_tab_menu(
@@ -226,8 +256,9 @@ pub(crate) fn prepare_profile_menu(
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{
-        NativeEditMenuCommand, NativeProcessMenuCommand, NativeProfileMenuCommand,
-        NativeProjectMenuCommand, NativeSnippetMenuCommand, NativeTabMenuCommand,
+        NativeCommandOutputMenuCommand, NativeEditMenuCommand, NativeProcessMenuCommand,
+        NativeProfileMenuCommand, NativeProjectMenuCommand, NativeSnippetMenuCommand,
+        NativeTabMenuCommand,
     };
     use cocoa::{
         appkit::{NSApp, NSMenu, NSMenuItem},
@@ -849,6 +880,113 @@ mod macos {
             0 => Some(NativeSnippetMenuCommand::Use),
             1 => Some(NativeSnippetMenuCommand::Edit),
             2 => Some(NativeSnippetMenuCommand::Delete),
+            _ => None,
+        }
+    }
+    pub(crate) struct NativeCommandOutputMenu {
+        view: id,
+        event: id,
+        language: crate::settings::Language,
+    }
+
+    impl NativeCommandOutputMenu {
+        pub(super) fn prepare(
+            window: &Window,
+            language: crate::settings::Language,
+        ) -> Option<Self> {
+            let window_handle = HasWindowHandle::window_handle(window).ok()?;
+            let RawWindowHandle::AppKit(appkit_handle) = window_handle.as_raw() else {
+                return None;
+            };
+            let view = appkit_handle.ns_view.as_ptr() as id;
+            let event: id = unsafe { msg_send![NSApp(), currentEvent] };
+            if view == nil || event == nil {
+                return None;
+            }
+            unsafe {
+                let _: id = msg_send![view, retain];
+                let _: id = msg_send![event, retain];
+            }
+            Some(Self {
+                view,
+                event,
+                language,
+            })
+        }
+
+        pub(crate) fn show(self) -> Option<NativeCommandOutputMenuCommand> {
+            show_command_output_menu(self.view, self.event, self.language)
+        }
+    }
+
+    impl Drop for NativeCommandOutputMenu {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.event, release];
+                let _: () = msg_send![self.view, release];
+            }
+        }
+    }
+
+    fn show_command_output_menu(
+        view: id,
+        event: id,
+        language: crate::settings::Language,
+    ) -> Option<NativeCommandOutputMenuCommand> {
+        let selected = unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let target: id = msg_send![menu_target_class(), new];
+            (*target).set_ivar(SELECTED_COMMAND_IVAR, NO_SELECTION);
+            let menu = NSMenu::new(nil).autorelease();
+            menu.setAutoenablesItems(NO);
+
+            menu.addItem_(menu_item(
+                if language == crate::settings::Language::SimplifiedChinese {
+                    "定位输出"
+                } else {
+                    "Reveal output"
+                },
+                0,
+                true,
+                target,
+            ));
+            menu.addItem_(menu_item(
+                if language == crate::settings::Language::SimplifiedChinese {
+                    "复制输出"
+                } else {
+                    "Copy output"
+                },
+                1,
+                true,
+                target,
+            ));
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+            menu.addItem_(menu_item(
+                if language == crate::settings::Language::SimplifiedChinese {
+                    "复制命令及输出"
+                } else {
+                    "Copy command and output"
+                },
+                2,
+                true,
+                target,
+            ));
+
+            pop_up_menu(menu, event, view);
+            let selected = *(*target).get_ivar::<isize>(SELECTED_COMMAND_IVAR);
+            let _: () = msg_send![target, release];
+            pool.drain();
+            selected
+        };
+
+        command_output_command_from_tag(selected)
+    }
+
+    fn command_output_command_from_tag(tag: isize) -> Option<NativeCommandOutputMenuCommand> {
+        match tag {
+            0 => Some(NativeCommandOutputMenuCommand::Locate),
+            1 => Some(NativeCommandOutputMenuCommand::CopyOutput),
+            2 => Some(NativeCommandOutputMenuCommand::CopyWithCommand),
             _ => None,
         }
     }

@@ -357,18 +357,29 @@ pub(super) fn snapshot_cell_is_empty(cell: &Cell) -> bool {
 /// In every other case (command output, no shell integration, or a row-only resize) we fall back
 /// to Alacritty's native, reversible reflow — the same behavior Ghostty uses when it lacks
 /// semantic information.
+#[cfg(test)]
 pub(super) fn resize_terminal_with_history_reflow(
     terminal: &mut Term<DaemonEventListener>,
     size: TerminalSize,
     phase: TerminalSemanticPhase,
     prompt_start_line: Option<i32>,
 ) {
+    resize_terminal_with_anchors(terminal, size, phase, prompt_start_line, &mut []);
+}
+
+pub(super) fn resize_terminal_with_anchors(
+    terminal: &mut Term<DaemonEventListener>,
+    size: TerminalSize,
+    phase: TerminalSemanticPhase,
+    prompt_start_line: Option<i32>,
+    anchors: &mut [Option<Point>],
+) {
     let dimensions = GridSize(size);
 
     // Alternate-screen apps (vim, less, tmux, …) repaint themselves on resize, so neither
     // reflow nor prompt-clearing applies. Hand straight off to the native resize.
     if terminal.mode().contains(TermMode::ALT_SCREEN) {
-        terminal.resize(dimensions);
+        terminal.resize_with_primary_anchors(dimensions, anchors);
         return;
     }
 
@@ -402,13 +413,13 @@ pub(super) fn resize_terminal_with_history_reflow(
             }
         }
 
-        terminal.resize(dimensions);
+        terminal.resize_with_primary_anchors(dimensions, anchors);
         return;
     }
 
     // Command output, no shell integration, or a row-only resize: native reflow is correct and
     // reversible.
-    terminal.resize(dimensions);
+    terminal.resize_with_primary_anchors(dimensions, anchors);
 }
 
 pub(super) fn snapshot_color(color: Color) -> eggie_protocol::TerminalColor {

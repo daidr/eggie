@@ -8,8 +8,8 @@ use native_alert::*;
 mod chrome;
 mod completion;
 mod hover;
-mod terminal_preview;
 mod layout;
+mod terminal_preview;
 use completion::CompletionUi;
 mod palette;
 mod project_icons;
@@ -19,11 +19,12 @@ mod paste;
 mod ports;
 mod right_sidebar;
 use ports::PortsUi;
+mod automation;
 mod search;
-mod ssh;
 mod session_feed;
 mod sidebar;
 mod sidebar_selector;
+mod ssh;
 mod startup;
 mod state;
 mod tabs;
@@ -228,10 +229,13 @@ pub struct EggieApp {
     completion: CompletionUi,
     right_tab: RightTab,
     command_history_collapsed: bool,
+    command_history_search: Entity<TextInput>,
+    _command_history_search_subscription: Subscription,
     snippets_collapsed: bool,
     notes_editor: Option<NotesEditor>,
     left_sidebar_width: f32,
     right_sidebar_width: f32,
+    initial_directory_expanded: bool,
     left_sidebar_collapsed: bool,
     right_sidebar_collapsed: bool,
     resizing_sidebar: Option<SidebarEdge>,
@@ -396,6 +400,23 @@ impl gpui::Render for EggieApp {
             self.cursor_blink = config.cursor_blink;
             self.language = config.language;
             self.copy_on_select = config.copy_on_select;
+            self.command_history_search.update(cx, |input, cx| {
+                input.set_language(config.language);
+                input.set_placeholder(if config.language == Language::SimplifiedChinese {
+                    "搜索命令"
+                } else {
+                    "Search commands"
+                });
+                input.set_style(
+                    TextInputStyle {
+                        text_color: (self.colors.text << 8) | 0xff,
+                        placeholder_color: (self.colors.muted << 8) | 0xff,
+                        cursor_color: (self.colors.accent << 8) | 0xff,
+                        selection_color: (self.colors.accent << 8) | 0x55,
+                    },
+                    cx,
+                );
+            });
             // Keep the search input's edit-menu labels in sync with the current language. Cheap:
             // clone the handle first to avoid overlapping the `self.terminal_search` borrow with `cx`.
             if let Some(input) = self.terminal_search.as_ref().map(|s| s.input.clone()) {

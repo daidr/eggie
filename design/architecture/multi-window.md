@@ -31,6 +31,10 @@
 
 这次有意采用新恢复格式：daemon 不再知道 WindowId，没有 ClaimSession / DetachWindow，不读取旧单窗口 workspace.json。旧文件保留。GUI 与 daemon 的兼容性由 `eggie-protocol::PROTOCOL_VERSION` 决定，开发 GUI 重建也保留兼容 daemon 的运行进程；build ID 用于诊断，不触发进程销毁。
 
+开发版与正式版使用独立的运行目录（`eggie-<uid>/dev`、`eggie-<uid>/stable`），GUI 唤醒 socket 和 daemon socket 均按通道及协议隔离。启动不终止其他版本的 daemon，握手超时、协议错误和权限错误也不触发进程销毁；只有确认没有监听者时才启动 daemon。daemon 持有独占启动锁，不能替换仍在监听的 socket。显式结束终端或升级导致的会话中断仍须由用户确认。
+
+迁移前的同协议 daemon，仅在 socket 对端运行当前应用的同一路径二进制时复用；避免开发 GUI 重建中断既有会话，也避免连接正式版 daemon。GUI 重连不等于恢复已经结束的进程。
+
 ## 后台事件与弹出窗口
 
 全局目录每 500 ms 同步一次；每个会话的 OSC、进度订阅由应用持有，与窗口关闭、转移无关。OSC 游标随工作区保存，窗口移动不会重新消费通知或剪贴板事件。明确结束的会话有墓碑保护，迟到的目录响应不能重新引入它。

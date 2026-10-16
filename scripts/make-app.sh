@@ -42,6 +42,9 @@ cp "$CARGO_TARGET_DIR/$PROFILE/eggie-updater" "$BUNDLE/Contents/MacOS/eggie-upda
 cp "$ROOT/packaging/Info.plist" "$BUNDLE/Contents/Info.plist"
 
 PLIST="$BUNDLE/Contents/Info.plist"
+if [[ "$PROFILE" == "debug" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier me.daidr.Eggie.dev" "$PLIST"
+fi
 if [[ -n "${EGGIE_VERSION:-}" ]]; then
     echo "==> 注入版本号 CFBundleShortVersionString=$EGGIE_VERSION"
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $EGGIE_VERSION" "$PLIST"

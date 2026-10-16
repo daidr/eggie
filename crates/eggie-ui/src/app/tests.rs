@@ -124,8 +124,6 @@ fn test_session() -> eggie_protocol::SessionSummary {
     }
 }
 
-
-
 #[test]
 fn scrollbar_thumb_sits_at_bottom_and_top_at_the_extremes() {
     let track = 400.;
@@ -947,20 +945,37 @@ fn ssh_directory_inheritance_requires_the_same_target_and_uses_remote_paths() {
     let mut source = test_session();
     let target = eggie_domain::RemoteTarget::new("devbox".into());
     source.remote = Some(eggie_protocol::RemoteSessionInfo {
-        target: target.clone(), phase: eggie_protocol::RemoteSessionPhase::Connected,
+        failure: None,
+        target: target.clone(),
+        phase: eggie_protocol::RemoteSessionPhase::Connected,
         initial_directory: Some("/home/remote".into()),
     });
     source.current_directory = "/Users/local".into();
     let mut profile = Profile::new("SSH".into());
     profile.remote = Some(target);
-    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)).as_deref(), Some("/home/remote"));
+    assert_eq!(
+        ssh::inherited_remote_directory(&profile, Some(&source)).as_deref(),
+        Some("/home/remote")
+    );
     source.reported_location = Some(eggie_protocol::TerminalReportedLocation {
-        path: "/srv/project/subdir".into(), host: Some("devbox".into()), user: None, local: false,
+        path: "/srv/project/subdir".into(),
+        host: Some("devbox".into()),
+        user: None,
+        local: false,
     });
-    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)).as_deref(), Some("/srv/project/subdir"));
+    assert_eq!(
+        ssh::inherited_remote_directory(&profile, Some(&source)).as_deref(),
+        Some("/srv/project/subdir")
+    );
     assert_eq!(displayed_directory(&source), "/srv/project/subdir");
     profile.remote.as_mut().unwrap().host = "another-host".into();
-    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)), None);
+    assert_eq!(
+        ssh::inherited_remote_directory(&profile, Some(&source)),
+        None
+    );
     profile.remote = None;
-    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)), None);
+    assert_eq!(
+        ssh::inherited_remote_directory(&profile, Some(&source)),
+        None
+    );
 }

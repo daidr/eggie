@@ -167,43 +167,99 @@ impl EggieApp {
                 if let Some(session) = session {
                     content = content
                         .children(self.render_ssh_identity(session))
-                        .when(session.remote.is_none(), |element| element.child(process_summary(
-                            &session.current_process, self.colors, self.language,
-                        )))
-                        .when(session.remote.is_none() || session.remote_directory().is_some(), |element| element.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(info_row(
-                                    self.language.current_directory(),
-                                    displayed_directory(session),
+                        .when(
+                            session.remote.is_none()
+                                && !self
+                                    .session_feed
+                                    .session_inspections
+                                    .get(&session.id)
+                                    .is_some_and(|inspection| {
+                                        inspection.processes.iter().any(|process| {
+                                            process.pid == session.current_process.pid
+                                        })
+                                    }),
+                            |element| {
+                                element.child(process_summary(
+                                    &session.current_process,
+                                    self.colors,
+                                    self.language,
+                                ))
+                            },
+                        )
+                        .when(
+                            session.remote.is_none() || session.remote_directory().is_some(),
+                            |element| {
+                                element.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(info_row(
+                                            self.language.current_directory(),
+                                            displayed_directory(session),
+                                            self.colors,
+                                        ))
+                                        // A remote path cannot be opened locally, so the Finder/VS Code
+                                        // buttons are omitted for a remote session.
+                                        .when(
+                                            session.remote.is_none()
+                                                && session
+                                                    .reported_location
+                                                    .as_ref()
+                                                    .is_none_or(|location| location.local),
+                                            |element| {
+                                                element.child(self.render_directory_actions(
+                                                    DirectoryField::Current,
+                                                    &session.current_directory,
+                                                    cx,
+                                                ))
+                                            },
+                                        ),
+                                )
+                            },
+                        )
+                        .when(session.remote.is_none(), |element| {
+                            element.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(self.collapsible_header(
+                                        "initial-directory-details".into(),
+                                        self.language.initial_directory(),
+                                        !self.initial_directory_expanded,
+                                        cx,
+                                        |app, _| {
+                                            app.initial_directory_expanded =
+                                                !app.initial_directory_expanded
+                                        },
+                                    ))
+                                    .when(self.initial_directory_expanded, |element| {
+                                        element
+                                            .child(div().child(
+                                                session.initial_directory.display().to_string(),
+                                            ))
+                                            .child(self.render_directory_actions(
+                                                DirectoryField::Initial,
+                                                &session.initial_directory,
+                                                cx,
+                                            ))
+                                    }),
+                            )
+                        })
+                        .when_some(
+                            session
+                                .remote
+                                .as_ref()
+                                .and_then(|remote| remote.initial_directory.as_ref()),
+                            |element, path| {
+                                element.child(info_row(
+                                    self.language.initial_directory(),
+                                    path.clone(),
                                     self.colors,
                                 ))
-                                // A remote path cannot be opened locally, so the Finder/VS Code
-                                // buttons are omitted for a remote session.
-                                .when(
-                                    session.remote.is_none() && session
-                                        .reported_location
-                                        .as_ref()
-                                        .is_none_or(|location| location.local),
-                                    |element| {
-                                        element.child(self.render_directory_actions(
-                                            DirectoryField::Current,
-                                            &session.current_directory,
-                                            cx,
-                                        ))
-                                    },
-                                ),
-                        ))
-                        .when(session.remote.is_none(), |element| element.child(
-                            div().flex().flex_col().gap_2()
-                                .child(info_row(self.language.initial_directory(), session.initial_directory.display().to_string(), self.colors))
-                                .child(self.render_directory_actions(DirectoryField::Initial, &session.initial_directory, cx)),
-                        ))
-                        .when_some(session.remote.as_ref().and_then(|remote| remote.initial_directory.as_ref()), |element, path| {
-                            element.child(info_row(self.language.initial_directory(), path.clone(), self.colors))
-                        });
+                            },
+                        );
                     if let Some(inspection) = self.session_feed.session_inspections.get(&session.id)
                     {
                         let is_remote = inspection.port_mappings.is_some()
@@ -211,8 +267,16 @@ impl EggieApp {
                                 .reported_location
                                 .as_ref()
                                 .is_some_and(|location| !location.local);
-                        if session.remote.as_ref().is_none_or(|remote| remote.phase == eggie_protocol::RemoteSessionPhase::Connected) {
-                            content = content.child(process_section(&inspection.processes, self.colors, self.language, is_remote, cx));
+                        if session.remote.as_ref().is_none_or(|remote| {
+                            remote.phase == eggie_protocol::RemoteSessionPhase::Connected
+                        }) {
+                            content = content.child(process_section(
+                                &inspection.processes,
+                                self.colors,
+                                self.language,
+                                is_remote,
+                                cx,
+                            ));
                         }
                         if !is_remote
                             && let Some(ports) =
@@ -221,11 +285,15 @@ impl EggieApp {
                             content = content.child(ports);
                         }
                         if let Some(connection) = self.active_port_connection(cx)
-                            && (session.remote.as_ref().is_none_or(|remote| remote.phase == eggie_protocol::RemoteSessionPhase::Connected) || !connection.mappings.is_empty())
+                            && (session.remote.as_ref().is_none_or(|remote| {
+                                remote.phase == eggie_protocol::RemoteSessionPhase::Connected
+                            }) || !connection.mappings.is_empty())
                         {
                             content = content.child(self.render_port_section(&connection, cx));
                         }
-                    } else if session.remote.as_ref().is_none_or(|remote| remote.phase == eggie_protocol::RemoteSessionPhase::Connected) {
+                    } else if session.remote.as_ref().is_none_or(|remote| {
+                        remote.phase == eggie_protocol::RemoteSessionPhase::Connected
+                    }) {
                         let status = self
                             .session_feed
                             .session_inspection_errors
@@ -312,6 +380,28 @@ impl EggieApp {
 
         let session_id = self.active_session_id();
         let state = session_id.and_then(|id| self.session_feed.shell_integration.get(&id));
+        let query = self
+            .command_history_search
+            .read(cx)
+            .content()
+            .to_lowercase();
+        section = section.child(
+            div()
+                .id("command-history-search")
+                .w_full()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(self.colors.border))
+                .child(self.command_history_search.clone()),
+        );
+        let matches = |command: &Option<String>| {
+            command
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&query)
+        };
         match state {
             None => {
                 section = section.child(placeholder(
@@ -324,11 +414,15 @@ impl EggieApp {
                 let now_ms = unix_now_ms();
                 let mut list = div().flex().flex_col().gap_1();
                 let mut any = false;
-                if let Some(current) = &state.current_command {
+                if state.phase == eggie_protocol::TerminalSemanticPhase::Output
+                    && let Some(current) = &state.current_command
+                    && matches(&current.command_line)
+                {
                     any = true;
                     list = list.child(self.render_command_row(
                         session_id,
                         "cmd-current".into(),
+                        current.id,
                         current.command_line.clone(),
                         current.exit_code,
                         current.started_at_unix_ms,
@@ -337,6 +431,9 @@ impl EggieApp {
                     ));
                 }
                 for record in state.history.iter().rev() {
+                    if !matches(&record.command_line) {
+                        continue;
+                    }
                     any = true;
                     list = list.child(self.render_command_row(
                         session_id,
@@ -344,6 +441,7 @@ impl EggieApp {
                             let s: SharedString = format!("cmd-{}", record.id).into();
                             s
                         },
+                        record.id,
                         record.command_line.clone(),
                         record.exit_code,
                         record.started_at_unix_ms,
@@ -355,7 +453,13 @@ impl EggieApp {
                     section = section.child(list);
                 } else {
                     section = section.child(placeholder(
-                        self.language.command_history_empty(),
+                        if query.is_empty() {
+                            self.language.command_history_empty()
+                        } else if self.language == Language::SimplifiedChinese {
+                            "没有匹配的命令"
+                        } else {
+                            "No matching commands"
+                        },
                         self.colors,
                     ));
                 }
@@ -369,6 +473,7 @@ impl EggieApp {
         &self,
         session_id: Option<SessionId>,
         id: SharedString,
+        command_id: u64,
         command_line: Option<String>,
         exit_code: Option<i32>,
         started_at_unix_ms: u64,
@@ -401,6 +506,7 @@ impl EggieApp {
         };
         let relative = format_relative_time(started_at_unix_ms, now_ms);
         let colors = self.colors;
+        let menu_text = paste_text.clone();
         div()
             .id(id)
             .flex()
@@ -447,7 +553,88 @@ impl EggieApp {
                     app.enqueue_terminal_paste(session_id, paste_text.clone());
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |app, _, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(session_id) = session_id {
+                        app.show_command_output_menu(
+                            session_id,
+                            command_id,
+                            menu_text.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
             .into_any_element()
+    }
+
+    fn show_command_output_menu(
+        &mut self,
+        session_id: SessionId,
+        command_id: u64,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::native_menu::{NativeCommandOutputMenuCommand, prepare_command_output_menu};
+        let Some(menu) = prepare_command_output_menu(window, self.language) else {
+            return;
+        };
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let Some(choice) = menu.show() else {
+                return;
+            };
+            let request = if choice == NativeCommandOutputMenuCommand::Locate {
+                ClientRequest::LocateCommandOutput {
+                    session_id,
+                    command_id,
+                }
+            } else {
+                ClientRequest::ReadCommandOutput {
+                    session_id,
+                    command_id,
+                    max_bytes: 1024 * 1024,
+                }
+            };
+            let response = executor
+                .spawn(async move { client.request_with_timeout(request, Duration::from_secs(5)) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                match response {
+                    Ok(DaemonResponse::TerminalText {
+                        text, truncated, ..
+                    }) => {
+                        let text = if choice == NativeCommandOutputMenuCommand::CopyWithCommand {
+                            format!("{command}\n{text}")
+                        } else {
+                            text
+                        };
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        if truncated {
+                            app.poll_error = Some(
+                                if app.language == Language::SimplifiedChinese {
+                                    "输出过长，仅复制前 1 MiB"
+                                } else {
+                                    "Copied the first 1 MiB of output"
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                    Ok(DaemonResponse::Ok) => {}
+                    Ok(DaemonResponse::Error { message }) => app.poll_error = Some(message),
+                    Err(error) => app.poll_error = Some(error.to_string()),
+                    _ => app.poll_error = Some("Unexpected command output response".into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     // ----- Snippets --------------------------------------------------------------------------

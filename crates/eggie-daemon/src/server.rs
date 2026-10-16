@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::OpenOptionsExt;
 
 pub(super) struct DaemonState {
     pub(super) sessions: RwLock<HashMap<SessionId, Arc<TerminalSession>>>,
@@ -21,6 +22,12 @@ impl DaemonState {
 
     pub(super) fn try_handle(&self, request: ClientRequest) -> Result<DaemonResponse> {
         match request {
+            ClientRequest::ListSshHosts => Ok(DaemonResponse::SshHosts {
+                hosts: ssh::config::hosts()?,
+            }),
+            ClientRequest::ResolveSshConfig { target } => Ok(DaemonResponse::SshEffectiveConfig {
+                config: ssh::config::resolve(target)?,
+            }),
             ClientRequest::Handshake { protocol_version } => {
                 if protocol_version != PROTOCOL_VERSION {
                     bail!(
@@ -140,11 +147,18 @@ impl DaemonState {
                 if let Some(id) = *replacement
                     && let Ok(session) = self.session(id)
                 {
-                    return Ok(DaemonResponse::SessionCreated { session: session.summary() });
+                    return Ok(DaemonResponse::SessionCreated {
+                        session: session.summary(),
+                    });
                 }
                 let config = previous.reconnect_config()?;
-                let connection = self.ssh_connections.connection(config.remote.as_ref().context("Not an SSH session")?)?;
-                let session = Arc::new(TerminalSession::spawn_with_connection(config, Some(connection))?);
+                let connection = self
+                    .ssh_connections
+                    .connection(config.remote.as_ref().context("Not an SSH session")?)?;
+                let session = Arc::new(TerminalSession::spawn_with_connection(
+                    config,
+                    Some(connection),
+                )?);
                 let summary = session.summary();
                 self.sessions.write().insert(session.id, session);
                 *replacement = Some(summary.id);
@@ -155,6 +169,39 @@ impl DaemonState {
                 Ok(DaemonResponse::Sessions {
                     sessions: sessions.iter().map(|s| s.summary()).collect(),
                 })
+            }
+            ClientRequest::ReadTerminalText {
+                session_id,
+                tail_lines,
+            } => {
+                let (text, truncated) = self.session(session_id)?.read_terminal_text(tail_lines)?;
+                Ok(DaemonResponse::TerminalText {
+                    session_id,
+                    text,
+                    truncated,
+                })
+            }
+            ClientRequest::ReadCommandOutput {
+                session_id,
+                command_id,
+                max_bytes,
+            } => {
+                let (text, truncated) = self
+                    .session(session_id)?
+                    .read_command_output(command_id, max_bytes)?;
+                Ok(DaemonResponse::TerminalText {
+                    session_id,
+                    text,
+                    truncated,
+                })
+            }
+            ClientRequest::LocateCommandOutput {
+                session_id,
+                command_id,
+            } => {
+                self.session(session_id)?
+                    .locate_command_output(command_id)?;
+                Ok(DaemonResponse::Ok)
             }
             ClientRequest::InspectSession { session_id } => {
                 let session = self.session(session_id)?;
@@ -525,10 +572,34 @@ impl DaemonState {
     }
 }
 
-pub fn run_daemon(socket_path: &Path, build_id: &str) -> Result<()> {
+fn bind_daemon_listener(socket_path: &Path) -> Result<(UnixListener, fs::File)> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(socket_path.with_extension("lock"))?;
+    anyhow::ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "Eggie daemon already owns {}",
+        socket_path.display()
+    );
+    match UnixStream::connect(socket_path) {
+        Ok(_) => bail!(
+            "Eggie daemon is already listening at {}",
+            socket_path.display()
+        ),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(error) => return Err(error.into()),
     }
     if socket_path.exists() {
         fs::remove_file(socket_path)
@@ -537,6 +608,33 @@ pub fn run_daemon(socket_path: &Path, build_id: &str) -> Result<()> {
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind daemon socket {}", socket_path.display()))?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
+    Ok((listener, lock))
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    #[test]
+    fn startup_cannot_replace_a_live_listener_or_its_lock() {
+        let directory =
+            std::env::temp_dir().join(format!("el-{:x}", SessionId::new_v4().as_u128() as u64));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("daemon.sock");
+        let legacy = UnixListener::bind(&path).unwrap();
+        assert!(bind_daemon_listener(&path).is_err());
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(legacy);
+        let (listener, lock) = bind_daemon_listener(&path).unwrap();
+        assert!(bind_daemon_listener(&path).is_err());
+        assert!(UnixStream::connect(&path).is_ok());
+        drop((listener, lock));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+pub fn run_daemon(socket_path: &Path, build_id: &str) -> Result<()> {
+    let (listener, _lock) = bind_daemon_listener(socket_path)?;
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::new()),
         build_id: Arc::from(build_id),
