@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use eggie_domain::{Profile, ProfileId, DEFAULT_PROFILE_ID};
+use eggie_domain::{DEFAULT_PROFILE_ID, Profile, ProfileId};
 use gpui::Context;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,7 @@ pub(crate) struct ProfileStore {
     /// 每次变更自增。渲染路径据此判断「profile 定义有没有动过」,从而跳过昂贵的重解析 ——
     /// 比逐字段比对整张列表便宜得多。
     revision: u64,
+    remote_drafts: std::collections::HashMap<ProfileId, [String; 3]>,
 }
 
 impl ProfileStore {
@@ -94,6 +95,7 @@ impl ProfileStore {
                     profiles: persisted.profiles,
                     path,
                     revision: 0,
+                    remote_drafts: Default::default(),
                 };
                 // 文件存在但内容不满足不变式(手工编辑、旧版本、部分损坏)时修复,不做迁移:
                 // 迁移只属于「首次创建」这一刻。
@@ -115,6 +117,7 @@ impl ProfileStore {
                     profiles: vec![migrated_default_profile(legacy)],
                     path,
                     revision: 0,
+                    remote_drafts: Default::default(),
                 };
                 // 落盘让迁移只发生一次:下次启动读到文件就走上面的分支。写失败时不能假装迁移完成 ——
                 // 否则下次启动会再迁一遍,把用户这一轮对 Default 的编辑覆盖掉。这里只能报错,
@@ -144,7 +147,10 @@ impl ProfileStore {
     fn quarantined_fallback(path: PathBuf) -> Self {
         match eggie_storage::quarantine_corrupt_file(&path) {
             Some(quarantined) => {
-                eprintln!("preserved the previous profiles file at {}", quarantined.display());
+                eprintln!(
+                    "preserved the previous profiles file at {}",
+                    quarantined.display()
+                );
             }
             None => {
                 eprintln!(
@@ -158,6 +164,7 @@ impl ProfileStore {
             profiles: vec![Profile::default_builtin()],
             path,
             revision: 0,
+            remote_drafts: Default::default(),
         }
     }
 
@@ -193,6 +200,39 @@ impl ProfileStore {
     /// 变更计数器。渲染路径用它判断 profile 定义是否动过,而不必比对整张列表。
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn remote_draft(&self, id: ProfileId) -> Option<&[String; 3]> {
+        self.remote_drafts.get(&id)
+    }
+
+    pub(crate) fn set_remote_draft(
+        &mut self,
+        id: ProfileId,
+        draft: Option<[String; 3]>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = draft {
+            self.remote_drafts.insert(id, draft);
+        } else {
+            self.remote_drafts.remove(&id);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn launch_error(
+        &self,
+        id: ProfileId,
+    ) -> Option<crate::profile_editor::RemoteInputError> {
+        self.profile(id)?.remote.as_ref()?;
+        if let Some([host, user, port]) = self.remote_draft(id) {
+            return crate::profile_editor::parse_remote(host, user, port).err();
+        }
+        self.profile(id)?
+            .remote
+            .as_ref()
+            .filter(|target| !target.is_usable())
+            .map(|_| crate::profile_editor::RemoteInputError::Target)
     }
 
     /// 内置 Default profile。所有失效引用的兜底目标,因此永远存在。
@@ -254,6 +294,7 @@ impl ProfileStore {
         }
         let before = self.profiles.len();
         self.profiles.retain(|profile| profile.id != id);
+        self.remote_drafts.remove(&id);
         let removed = self.profiles.len() != before;
         if removed {
             // 当前的守卫已保证 Default 不会被删,但删除是唯一会缩短列表的路径 —— 让它自己收尾,
@@ -325,7 +366,41 @@ fn migrated_default_profile(legacy: LegacyShellSettings) -> Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
     use std::fs;
+
+    #[gpui::test]
+    fn invalid_remote_drafts_block_launch_without_overwriting_saved_connections(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = temp_path("remote-draft");
+        let store =
+            cx.new(|_| ProfileStore::load_from(path.clone(), LegacyShellSettings::default()));
+        let mut profile = Profile::new("Remote".into());
+        profile.remote = Some(eggie_domain::RemoteTarget::new("devbox".into()));
+        let id = profile.id;
+        store.update(cx, |store, cx| {
+            store.add(profile.clone(), cx);
+            store.set_remote_draft(id, Some(["devbox".into(), "".into(), "70000".into()]), cx);
+            assert_eq!(
+                store.launch_error(id),
+                Some(crate::profile_editor::RemoteInputError::Port)
+            );
+            assert_eq!(store.profile(id).unwrap().remote, profile.remote);
+        });
+        let loaded = ProfileStore::load_from(path.clone(), LegacyShellSettings::default());
+        assert_eq!(loaded.profile(id).unwrap().remote, profile.remote);
+        store.update(cx, |store, cx| {
+            store.set_remote_draft(id, None, cx);
+            assert_eq!(store.launch_error(id), None);
+            store.update(id, |profile| profile.remote = Some(eggie_domain::RemoteTarget::new(String::new())), cx);
+            assert_eq!(store.launch_error(id), Some(crate::profile_editor::RemoteInputError::Target));
+            store.set_remote_draft(id, Some([String::new(), String::new(), "70000".into()]), cx);
+            store.update(id, |profile| profile.remote = None, cx);
+            assert_eq!(store.launch_error(id), None, "explicit local mode ignores inactive SSH input");
+        });
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
 
     /// 每个测试独占一个目录(label 进目录名)。整目录先清空再建:隔离文件带时间戳,上一轮跑剩的
     /// 残留会让「隔离区里应该只有一个文件」的断言假失败。
@@ -359,11 +434,17 @@ mod tests {
         assert!(default.builtin);
         assert_eq!(default.shell_program, "/opt/homebrew/bin/fish");
         assert_eq!(default.shell_args, vec!["-l".to_owned()]);
-        assert!(!default.shell_integration_path, "legacy toggle must carry over");
+        assert!(
+            !default.shell_integration_path,
+            "legacy toggle must carry over"
+        );
 
         // 迁移必须已落盘,这样第二次加载不会重跑迁移(否则用户对 Default 的编辑会被旧设置覆盖)。
         let reloaded = ProfileStore::load_from(path.clone(), LegacyShellSettings::default());
-        assert_eq!(reloaded.default_profile().shell_program, "/opt/homebrew/bin/fish");
+        assert_eq!(
+            reloaded.default_profile().shell_program,
+            "/opt/homebrew/bin/fish"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -403,7 +484,9 @@ mod tests {
         profile.appearance.terminal_dark_theme = Some("Builtin Dark".to_owned());
         profile.appearance.font_size = Some(16.);
         profile.badge_color = Some(0xff0000);
-        profile.env.insert("AWS_PROFILE".to_owned(), "prod".to_owned());
+        profile
+            .env
+            .insert("AWS_PROFILE".to_owned(), "prod".to_owned());
         // 关掉 path 特性:这是唯一「默认 true + skip_serializing_if = is_true」的字段,
         // 只有取 false 时才真正写进 JSON,所以只有这样才验证到它的往返。
         profile.shell_integration_path = false;
@@ -420,8 +503,14 @@ mod tests {
         assert_eq!(remote.port, Some(2222));
         assert_eq!(loaded.appearance.font_size, Some(16.));
         assert_eq!(loaded.badge_color, Some(0xff0000));
-        assert_eq!(loaded.env.get("AWS_PROFILE").map(String::as_str), Some("prod"));
-        assert!(!loaded.shell_integration_path, "an explicit false must round-trip");
+        assert_eq!(
+            loaded.env.get("AWS_PROFILE").map(String::as_str),
+            Some("prod")
+        );
+        assert!(
+            !loaded.shell_integration_path,
+            "an explicit false must round-trip"
+        );
         // 反向:内置 Default 的 true 被 skip,靠 serde default 读回来。
         assert!(
             reloaded.default_profile().shell_integration_path,
@@ -453,7 +542,10 @@ mod tests {
             "a corrupt file must not re-run the legacy migration"
         );
         assert_eq!(recovered.profiles().len(), 1);
-        assert!(recovered.profile(prod_id).is_none(), "the custom profile is gone from memory");
+        assert!(
+            recovered.profile(prod_id).is_none(),
+            "the custom profile is gone from memory"
+        );
 
         // 2. 损坏的原文件必须被保留在隔离区,而不是被盖写 —— 那是用户数据的唯一副本。
         let dir = path.parent().expect("temp dir");
@@ -463,7 +555,11 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains("profiles.json.corrupt-"))
             .collect();
-        assert_eq!(quarantined.len(), 1, "the unreadable file must be preserved aside");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the unreadable file must be preserved aside"
+        );
         let preserved = fs::read(dir.join(&quarantined[0])).expect("quarantined file readable");
         assert_eq!(
             preserved,
@@ -471,7 +567,10 @@ mod tests {
             "the preserved bytes must be exactly what was on disk"
         );
         // 原文件已挪走,不会留下一份被盖写的残骸。
-        assert!(!path.exists(), "the corrupt file is moved, not overwritten in place");
+        assert!(
+            !path.exists(),
+            "the corrupt file is moved, not overwritten in place"
+        );
 
         let _ = fs::remove_file(dir.join(&quarantined[0]));
         let _ = fs::remove_file(&path);
@@ -484,12 +583,19 @@ mod tests {
         // 未来版本写的文件:能解析,但 version 更高 —— 可能有本版本不认识的字段。
         let persisted = PersistedProfiles {
             version: PERSIST_VERSION + 1,
-            profiles: vec![Profile::default_builtin(), Profile::new("Future".to_owned())],
+            profiles: vec![
+                Profile::default_builtin(),
+                Profile::new("Future".to_owned()),
+            ],
         };
         eggie_storage::save_json_atomic(&path, &persisted).expect("seed file");
 
         let store = ProfileStore::load_from(path.clone(), legacy());
-        assert_eq!(store.profiles().len(), 1, "unknown-format contents are not adopted");
+        assert_eq!(
+            store.profiles().len(),
+            1,
+            "unknown-format contents are not adopted"
+        );
         assert!(
             store.default_profile().shell_program.is_empty(),
             "a newer file must not trigger the legacy migration either"
@@ -502,7 +608,11 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains("profiles.json.corrupt-"))
             .collect();
-        assert_eq!(quarantined.len(), 1, "the newer file must be preserved for a future build");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the newer file must be preserved for a future build"
+        );
 
         for name in &quarantined {
             let _ = fs::remove_file(dir.join(name));
@@ -551,7 +661,11 @@ mod tests {
         // 重复的 Default 与重复的自定义 id 都只保留首个:否则第二份永远不可达也删不掉。
         assert_eq!(store.profiles().len(), 2);
         assert_eq!(store.default_profile().id, DEFAULT_PROFILE_ID);
-        assert_eq!(store.profiles()[1].name, "Shared", "the first occurrence wins");
+        assert_eq!(
+            store.profiles()[1].name,
+            "Shared",
+            "the first occurrence wins"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -584,7 +698,11 @@ mod tests {
             profile.shell_program = "/bin/zsh".to_owned();
             profile.builtin = false;
         });
-        assert_eq!(store.default_profile().name, "My Shell", "renaming Default is allowed");
+        assert_eq!(
+            store.default_profile().name,
+            "My Shell",
+            "renaming Default is allowed"
+        );
         assert_eq!(store.default_profile().shell_program, "/bin/zsh");
         assert!(store.default_profile().builtin, "builtin must be restored");
 
@@ -593,9 +711,14 @@ mod tests {
             profile.id = ProfileId::new_v4();
             profile.name = "Renamed".to_owned();
         });
-        let custom = store.profile(custom_id).expect("identity must survive the closure");
+        let custom = store
+            .profile(custom_id)
+            .expect("identity must survive the closure");
         assert_eq!(custom.name, "Renamed", "other fields still change");
-        assert!(!custom.builtin, "a custom profile is not promoted to builtin");
+        assert!(
+            !custom.builtin,
+            "a custom profile is not promoted to builtin"
+        );
         // 改自定义 profile 不会动 Default 的位置。
         assert_eq!(store.profiles()[0].id, DEFAULT_PROFILE_ID);
 
@@ -653,7 +776,11 @@ mod tests {
         let id = profile.id;
         store.profiles.push(profile);
 
-        assert_eq!(store.resolve(Some(id)).id, id, "a live id resolves to itself");
+        assert_eq!(
+            store.resolve(Some(id)).id,
+            id,
+            "a live id resolves to itself"
+        );
         assert_eq!(
             store.resolve(Some(ProfileId::new_v4())).id,
             DEFAULT_PROFILE_ID,
@@ -687,7 +814,8 @@ mod tests {
         store.profiles[0].appearance.terminal_dark_theme = Some("Builtin Light".to_owned());
 
         assert_eq!(
-            store.appearance_override(themed_id)
+            store
+                .appearance_override(themed_id)
                 .and_then(|appearance| appearance.terminal_dark_theme),
             Some("Builtin Dark".to_owned()),
         );
@@ -718,10 +846,16 @@ mod tests {
         );
         assert_eq!(store.profiles().len(), 2, "nothing was removed");
 
-        assert!(!store.remove_inner(ProfileId::new_v4()), "unknown id is a no-op");
+        assert!(
+            !store.remove_inner(ProfileId::new_v4()),
+            "unknown id is a no-op"
+        );
         assert_eq!(store.profiles().len(), 2);
 
-        assert!(store.remove_inner(custom_id), "a custom profile is removable");
+        assert!(
+            store.remove_inner(custom_id),
+            "a custom profile is removable"
+        );
         assert_eq!(store.profiles().len(), 1);
         assert_eq!(store.default_profile().id, DEFAULT_PROFILE_ID);
 

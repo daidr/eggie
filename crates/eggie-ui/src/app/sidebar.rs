@@ -18,6 +18,14 @@ impl EggieApp {
             .into_any_element()
     }
 
+    pub(in crate::app) fn render_session_end_tag(&self, remote: Option<eggie_protocol::RemoteSessionPhase>) -> AnyElement {
+        if let Some(phase) = remote.filter(|phase| phase.needs_recovery()) {
+            self.render_terminal_status_tag(ssh::phase_label(phase, self.language), self.interface_theme.palette[1])
+        } else {
+            self.render_exited_terminal_tag()
+        }
+    }
+
     pub(in crate::app) fn render_exited_terminal_tag(&self) -> AnyElement {
         self.render_terminal_status_tag(
             if self.language == Language::SimplifiedChinese {
@@ -300,43 +308,6 @@ impl EggieApp {
             .gap_2()
             .child(copy_button)
             .child(open_button)
-            .into_any_element()
-    }
-
-    /// A button that opens a prompt for a port forward spec, for a remote session. The spec is a
-    /// single line: `L 8080 localhost:80` for local, `R 8080 localhost:80` for remote, or
-    /// `D 1080` for dynamic.
-    pub(super) fn render_forward_port_button(
-        &self,
-        session_id: SessionId,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = self.colors;
-        let language = self.language;
-        div()
-            .id(format!("forward-port-{session_id}"))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .h(px(28.))
-            .px_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(colors.border))
-            .text_size(px(12.))
-            .text_color(rgb(colors.muted))
-            .cursor_pointer()
-            .hover(move |element| {
-                element
-                    .bg(rgb(colors.panel_alt))
-                    .text_color(rgb(colors.text))
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |app, _, window, cx| {
-                app.prompt_forward_port(session_id, window, cx);
-            }))
-            .child(language.forward_port())
             .into_any_element()
     }
 
@@ -687,7 +658,7 @@ impl EggieApp {
                         label_background,
                         cx,
                     ))
-                    .child(self.render_exited_terminal_tag())
+                     .child(self.render_session_end_tag(session.remote.as_ref().map(|remote| remote.phase)))
                     .into_any_element()
             } else if let Some(status) = program_status {
                 let state_label = program_state_label(status.state, self.language);

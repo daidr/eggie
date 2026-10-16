@@ -247,24 +247,6 @@ impl Language {
         }
     }
 
-    pub(crate) fn forward_port(self) -> &'static str {
-        match self {
-            Self::English => "Forward Port…",
-            Self::SimplifiedChinese => "端口映射…",
-        }
-    }
-
-    pub(crate) fn forward_port_prompt(self) -> &'static str {
-        match self {
-            Self::English => {
-                "Enter a port forward: L 8080 localhost:80, R 8080 localhost:80, or D 1080"
-            }
-            Self::SimplifiedChinese => {
-                "输入端口映射：L 8080 localhost:80（本地）、R 8080 localhost:80（远程）或 D 1080（动态）"
-            }
-        }
-    }
-
     pub(crate) fn processes_label(self) -> &'static str {
         match self {
             Self::English => "PROCESSES",
@@ -329,13 +311,6 @@ impl Language {
         match self {
             Self::English => "VS Code",
             Self::SimplifiedChinese => "VS Code",
-        }
-    }
-
-    pub(crate) fn loading_ports(self) -> &'static str {
-        match self {
-            Self::English => "Loading ports…",
-            Self::SimplifiedChinese => "正在加载端口…",
         }
     }
 
@@ -2337,8 +2312,8 @@ impl Language {
 
     pub(crate) fn profile_remote_host_description(self) -> &'static str {
         match self {
-            Self::English => "SSH host; Leave empty for a local terminal",
-            Self::SimplifiedChinese => "SSH 主机，留空使用本地终端",
+            Self::English => "Host name or SSH alias",
+            Self::SimplifiedChinese => "主机名或 SSH 别名",
         }
     }
 
@@ -2377,14 +2352,19 @@ impl Language {
         }
     }
 
-    /// Shown when host/user would be parsed by ssh as an option rather than a destination. This is a
-    /// refusal, not a cosmetic hint: such a target is dropped at launch.
     pub(crate) fn profile_remote_invalid(self) -> &'static str {
         match self {
             Self::English => {
-                "Ignored: a host or user cannot be empty, start with “-”, or contain spaces."
+                "Enter a valid SSH host and user"
             }
-            Self::SimplifiedChinese => "已忽略：主机或用户不能为空、不能以“-”开头，也不能含空格。",
+            Self::SimplifiedChinese => "请输入有效的 SSH 主机和用户",
+        }
+    }
+
+    pub(crate) fn profile_remote_port_invalid(self) -> &'static str {
+        match self {
+            Self::English => "Port must be between 1 and 65535",
+            Self::SimplifiedChinese => "端口需在 1–65535 之间",
         }
     }
 

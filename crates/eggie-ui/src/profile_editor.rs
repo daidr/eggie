@@ -88,22 +88,43 @@ pub(crate) fn parse_args(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
 }
 
-/// 从三个远程字段构造 [`RemoteTarget`];host 为空表示「这是本地 profile」,返回 `None`。
-///
-/// 端口解析失败(非数字、越界)按未设置处理,而不是把整个远程目标丢掉:用户正在输入 `2` 想打 `22` 的
-/// 中间态不应该让主机名凭空消失。真正会导致目标被拒的是 host/user 本身不合法,那由
-/// [`RemoteTarget::is_usable`] 判定,并由 UI 显式提示。
-pub(crate) fn parse_remote(host: &str, user: &str, port: &str) -> Option<RemoteTarget> {
+/// Validate SSH input without turning a typo into a different connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteInputError {
+    Target,
+    Port,
+}
+
+pub(crate) fn parse_remote(
+    host: &str,
+    user: &str,
+    port: &str,
+) -> Result<RemoteTarget, RemoteInputError> {
     let host = host.trim();
     if host.is_empty() {
-        return None;
+        return Err(RemoteInputError::Target);
     }
     let user = user.trim();
-    Some(RemoteTarget {
+    let port = if port.trim().is_empty() {
+        None
+    } else {
+        Some(
+            port.trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or(RemoteInputError::Port)?,
+        )
+    };
+    let target = RemoteTarget {
         host: host.to_owned(),
         user: (!user.is_empty()).then(|| user.to_owned()),
-        port: port.trim().parse::<u16>().ok().filter(|port| *port != 0),
-    })
+        port,
+    };
+    if !target.is_usable() {
+        return Err(RemoteInputError::Target);
+    }
+    Ok(target)
 }
 
 /// 一个 profile 的全部文本字段快照,用于把 store 里的值播种进各个输入框。
@@ -163,7 +184,10 @@ mod tests {
         assert_eq!(env.get("AWS_PROFILE").map(String::as_str), Some("prod"));
         assert_eq!(env.get("_private").map(String::as_str), Some("1"));
         // 空行与注释是排版,不算错误;其余四行都要被计入,否则手误会静默消失。
-        assert_eq!(rejected, 4, "malformed lines are counted, blanks and comments are not");
+        assert_eq!(
+            rejected, 4,
+            "malformed lines are counted, blanks and comments are not"
+        );
     }
 
     #[test]
@@ -171,18 +195,25 @@ mod tests {
         // 这些名字在远程 bootstrap 里会脱离赋值、变成独立命令(上一步实测可执行任意命令)。
         // 编辑器是第一道关,必须在这里就拒掉,而不是留给 daemon。
         let (env, rejected) = parse_env("X;id=v\nX$(id)=v\nX`id`=v\n");
-        assert!(env.is_empty(), "no injection-shaped name may become a variable");
+        assert!(
+            env.is_empty(),
+            "no injection-shaped name may become a variable"
+        );
         assert_eq!(rejected, 3);
 
         // 含换行的名字无法从「每行一条」的文本里产生 —— 换行本身就是行分隔符,所以
         // `X\nid > /tmp/pwned` 会被读成两行,各自单独判定。这里确认它不会意外拼出一个变量。
         let (env, _) = parse_env("X\nid > /tmp/pwned\n");
-        assert!(env.is_empty(), "neither half of a split line forms a variable");
+        assert!(
+            env.is_empty(),
+            "neither half of a split line forms a variable"
+        );
     }
 
     #[test]
     fn env_values_keep_everything_after_the_first_equals() {
-        let (env, rejected) = parse_env("URL=https://example.com/?a=1&b=2\nEMPTY=\nSPACED= two words \n");
+        let (env, rejected) =
+            parse_env("URL=https://example.com/?a=1&b=2\nEMPTY=\nSPACED= two words \n");
         assert_eq!(rejected, 0);
         // 只在**首个** `=` 处切分:value 里的 `=` 属于 value。
         assert_eq!(
@@ -209,47 +240,48 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_host_means_a_local_profile() {
-        assert!(parse_remote("", "deploy", "22").is_none(), "no host = local");
-        assert!(parse_remote("   ", "", "").is_none(), "whitespace-only host = local");
+    fn an_empty_ssh_host_is_invalid() {
+        assert_eq!(
+            parse_remote("", "deploy", "22"),
+            Err(RemoteInputError::Target)
+        );
+        assert_eq!(parse_remote("   ", "", ""), Err(RemoteInputError::Target));
     }
 
     #[test]
     fn remote_fields_parse_into_a_target() {
-        let target = parse_remote(" prod.example.com ", " deploy ", " 2222 ")
-            .expect("a host makes it remote");
-        assert_eq!(target.host, "prod.example.com", "surrounding whitespace is layout");
+        let target =
+            parse_remote(" prod.example.com ", " deploy ", " 2222 ").expect("valid remote fields");
+        assert_eq!(
+            target.host, "prod.example.com",
+            "surrounding whitespace is layout"
+        );
         assert_eq!(target.user.as_deref(), Some("deploy"));
         assert_eq!(target.port, Some(2222));
         assert!(target.is_usable());
 
         // 空 user/port 表示「交给 ssh 决定」,不是空串。
-        let bare = parse_remote("host", "", "").expect("host only");
+        let bare = parse_remote("host", "", "").unwrap();
         assert_eq!(bare.user, None);
         assert_eq!(bare.port, None);
     }
 
     #[test]
-    fn a_half_typed_port_keeps_the_host() {
-        // 用户想打 22,已经打了 2 —— 中间态不应让主机名消失。同理非数字、越界、以及 0
-        // (0 号端口不是可连接的目标)都按「未设置」处理,而不是丢掉整个目标。
-        for port in ["", "  ", "not-a-number", "70000", "-1", "0"] {
-            let target = parse_remote("host", "", port)
-                .unwrap_or_else(|| panic!("host must survive port {port:?}"));
-            assert_eq!(target.host, "host");
-            assert_eq!(target.port, None, "port {port:?} falls back to the ssh default");
+    fn invalid_ssh_fields_are_errors_instead_of_default_connections() {
+        for port in ["not-a-number", "70000", "-1", "0"] {
+            assert_eq!(parse_remote("host", "", port), Err(RemoteInputError::Port));
         }
-    }
-
-    #[test]
-    fn an_ssh_option_shaped_target_is_built_but_reports_itself_unusable() {
-        // 编辑器仍然照实构造 —— 用户正在输入,不该被半路改写成别的主机。是否可用由
-        // `is_usable` 判定,UI 据此提示,启动路径据此丢弃。这样「所见」与「所得」一致。
-        let target = parse_remote("-oProxyCommand=touch /tmp/pwned", "", "")
-            .expect("a non-empty host still builds");
-        assert!(
-            !target.is_usable(),
-            "a host that ssh would parse as an option must report itself unusable"
+        for port in ["", "  "] {
+            assert_eq!(parse_remote("host", "", port).unwrap().port, None);
+        }
+        assert_eq!(parse_remote("host", "", "2").unwrap().port, Some(2));
+        assert_eq!(
+            parse_remote("-oProxyCommand=touch /tmp/pwned", "", ""),
+            Err(RemoteInputError::Target)
+        );
+        assert_eq!(
+            parse_remote("host", "-user", "22"),
+            Err(RemoteInputError::Target)
         );
     }
 
@@ -265,10 +297,16 @@ mod tests {
         profile.env.insert("GOOD".to_owned(), "v".to_owned());
 
         let seeded = ProfileFields::from_profile(&profile).env;
-        assert_eq!(seeded, "BAD KEY=v\nGOOD=v", "the editor shows the stored text verbatim");
+        assert_eq!(
+            seeded, "BAD KEY=v\nGOOD=v",
+            "the editor shows the stored text verbatim"
+        );
         let (parsed, rejected) = parse_env(&seeded);
         assert_eq!(rejected, 1, "the pane can tell the user a line was ignored");
-        assert_ne!(parsed, profile.env, "so the round trip must not be treated as an identity");
+        assert_ne!(
+            parsed, profile.env,
+            "so the round trip must not be treated as an identity"
+        );
         assert!(!parsed.contains_key("BAD KEY"));
 
         // Same shape for an unusable port: shown as typed, parsed back to None.
@@ -291,7 +329,9 @@ mod tests {
         profile.shell_program = "/bin/bash".to_owned();
         profile.shell_args = vec!["-l".to_owned()];
         profile.cwd = Some(std::path::PathBuf::from("/srv/app"));
-        profile.env.insert("AWS_PROFILE".to_owned(), "prod".to_owned());
+        profile
+            .env
+            .insert("AWS_PROFILE".to_owned(), "prod".to_owned());
         profile.remote = Some(RemoteTarget {
             host: "prod.example.com".to_owned(),
             user: Some("deploy".to_owned()),
@@ -304,8 +344,13 @@ mod tests {
         assert_eq!(env, profile.env);
         assert_eq!(parse_args(&fields.shell_args), profile.shell_args);
         assert_eq!(
-            parse_remote(&fields.remote_host, &fields.remote_user, &fields.remote_port),
-            profile.remote,
+            parse_remote(
+                &fields.remote_host,
+                &fields.remote_user,
+                &fields.remote_port
+            )
+            .unwrap(),
+            profile.remote.clone().unwrap(),
         );
         assert_eq!(fields.shell_program.trim(), profile.shell_program);
         assert_eq!(
@@ -321,27 +366,40 @@ mod tests {
         // compares *text* rather than the parsed profile: the seed echo must be blocked even when it
         // parses to something different from what is stored, and a real keystroke must still pass.
         let mut profile = Profile::new("Prod".to_owned());
-        profile.env.insert("AWS_PROFILE".to_owned(), "prod".to_owned());
+        profile
+            .env
+            .insert("AWS_PROFILE".to_owned(), "prod".to_owned());
         // The line the parser refuses. Only reachable by hand-editing profiles.json — which is exactly
         // why the pane must not "clean" it silently.
-        profile.env.insert("BAD KEY".to_owned(), "keep me".to_owned());
+        profile
+            .env
+            .insert("BAD KEY".to_owned(), "keep me".to_owned());
 
         let seeded = ProfileFields::from_profile(&profile).env;
         // 1. The echo GPUI delivers after seeding. Re-derive the text the way the pane does, rather
         // than comparing a value to its own clone — that would pass against any code at all.
         let echoed = ProfileFields::from_profile(&profile).env;
-        assert_eq!(seeded, echoed, "seeding twice yields identical text, so the echo is a no-op");
+        assert_eq!(
+            seeded, echoed,
+            "seeding twice yields identical text, so the echo is a no-op"
+        );
         // Had the guard compared parsed-vs-stored instead, this is what it would have seen — different,
         // hence a write, hence "BAD KEY" deleted from disk. Verified live before the fix.
         let (parsed, _) = parse_env(&seeded);
-        assert_ne!(parsed, profile.env, "parsed-vs-stored would have looked like a real edit");
+        assert_ne!(
+            parsed, profile.env,
+            "parsed-vs-stored would have looked like a real edit"
+        );
 
         // 2. A real keystroke: the text differs from the seed, so the write must go through.
         let typed = format!("{seeded}\nNEW_VAR=1");
         assert_ne!(typed, seeded, "a keystroke changes the text");
         let (typed_env, rejected) = parse_env(&typed);
         assert_eq!(typed_env.get("NEW_VAR").map(String::as_str), Some("1"));
-        assert_eq!(rejected, 1, "the bad line is still reported, not silently dropped");
+        assert_eq!(
+            rejected, 1,
+            "the bad line is still reported, not silently dropped"
+        );
         // The bad line is still lost from the *parsed* result — unavoidable, since the user is now
         // editing this text. What matters is that it took a deliberate edit, not merely opening the pane.
         assert!(!typed_env.contains_key("BAD KEY"));
@@ -362,13 +420,19 @@ mod tests {
         let text = format_env(&env);
         assert_eq!(text, "Z_OK=ok", "only representable entries are shown");
         let (parsed, rejected) = parse_env(&text);
-        assert_eq!(rejected, 0, "no spurious warning: nothing malformed is shown");
+        assert_eq!(
+            rejected, 0,
+            "no spurious warning: nothing malformed is shown"
+        );
         assert_eq!(parsed.len(), 1);
 
         // The hidden ones are reported separately so the write-through can merge them back.
         let hidden = unrepresentable_env(&env);
         assert_eq!(hidden.len(), 2, "both the LF and CRLF values are withheld");
-        assert_eq!(hidden.get("SCRIPT").map(String::as_str), Some("line1\nline2"));
+        assert_eq!(
+            hidden.get("SCRIPT").map(String::as_str),
+            Some("line1\nline2")
+        );
         assert_eq!(hidden.get("CRLF").map(String::as_str), Some("a\r\nb"));
         assert!(!hidden.contains_key("Z_OK"));
 
@@ -388,7 +452,10 @@ mod tests {
         // would trade a bug only hand-editing can reach for one ordinary typing hits.
         let (env, rejected) = parse_env(r"WINPATH=C:\new\table");
         assert_eq!(rejected, 0);
-        assert_eq!(env.get("WINPATH").map(String::as_str), Some(r"C:\new\table"));
+        assert_eq!(
+            env.get("WINPATH").map(String::as_str),
+            Some(r"C:\new\table")
+        );
         // And it survives a round trip untouched.
         assert_eq!(format_env(&env), r"WINPATH=C:\new\table");
     }
@@ -449,7 +516,9 @@ mod tests {
         // variable would delete every newline-valued entry the editor never displayed.
         let mut stored = Profile::new("P".to_owned());
         stored.env.insert("VISIBLE".to_owned(), "1".to_owned());
-        stored.env.insert("SCRIPT".to_owned(), "line1\nline2".to_owned());
+        stored
+            .env
+            .insert("SCRIPT".to_owned(), "line1\nline2".to_owned());
 
         // The editor shows only VISIBLE, so the user's text starts there.
         let seeded = ProfileFields::from_profile(&stored).env;
@@ -463,7 +532,11 @@ mod tests {
             env.entry(key).or_insert(value);
         }
 
-        assert_eq!(env.get("NEW_VAR").map(String::as_str), Some("2"), "the edit lands");
+        assert_eq!(
+            env.get("NEW_VAR").map(String::as_str),
+            Some("2"),
+            "the edit lands"
+        );
         assert_eq!(env.get("VISIBLE").map(String::as_str), Some("1"));
         assert_eq!(
             env.get("SCRIPT").map(String::as_str),
@@ -478,7 +551,9 @@ mod tests {
         // If the user types a name that also exists as a hidden entry, the visible line must win:
         // that is the one they can see, and `or_insert` must not resurrect the invisible value.
         let mut stored = Profile::new("P".to_owned());
-        stored.env.insert("SCRIPT".to_owned(), "old\nmultiline".to_owned());
+        stored
+            .env
+            .insert("SCRIPT".to_owned(), "old\nmultiline".to_owned());
 
         let (mut env, _) = parse_env("SCRIPT=now-single-line");
         for (key, value) in unrepresentable_env(&stored.env) {
@@ -495,7 +570,10 @@ mod tests {
     #[test]
     fn args_split_on_whitespace() {
         assert_eq!(parse_args("  -l   --login "), vec!["-l", "--login"]);
-        assert!(parse_args("   ").is_empty(), "blank means Eggie's default args");
+        assert!(
+            parse_args("   ").is_empty(),
+            "blank means Eggie's default args"
+        );
     }
 
     #[test]

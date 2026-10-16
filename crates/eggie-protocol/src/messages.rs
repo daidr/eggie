@@ -81,6 +81,9 @@ pub enum ClientRequest {
         remote_cwd: Option<String>,
     },
     ListSessions,
+    ReconnectSession {
+        session_id: SessionId,
+    },
     InspectSession {
         session_id: SessionId,
     },
@@ -270,14 +273,28 @@ pub enum ClientRequest {
         session_id: SessionId,
     },
     /// Open a port forward on a session's ssh master. The daemon replies with [`DaemonResponse::Ok`].
-    ForwardPort {
-        session_id: SessionId,
-        spec: PortForwardSpec,
+    SshConnections,
+    PortMappings {
+        connection_id: String,
+        discover: bool,
     },
-    /// Cancel a port forward on a session's ssh master. The daemon replies with [`DaemonResponse::Ok`].
-    CancelPort {
-        session_id: SessionId,
-        spec: PortForwardSpec,
+    CreatePortMapping {
+        connection_id: String,
+        request: PortMappingRequest,
+    },
+    StartPortMapping {
+        connection_id: String,
+        id: String,
+    },
+    StopPortMapping {
+        connection_id: String,
+        id: String,
+        remove: bool,
+    },
+    RememberPortMapping {
+        connection_id: String,
+        id: String,
+        remember: bool,
     },
 }
 
@@ -345,6 +362,17 @@ fn default_shell_features() -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    SshConnections {
+        revision: u64,
+        connections: Vec<PortMappingsSnapshot>,
+    },
+    PortMappings {
+        snapshot: PortMappingsSnapshot,
+    },
+    PortMapping {
+        mapping: PortMapping,
+        snapshot: PortMappingsSnapshot,
+    },
     HandshakeAccepted {
         protocol_version: u32,
         #[serde(default, skip_serializing_if = "String::is_empty")]

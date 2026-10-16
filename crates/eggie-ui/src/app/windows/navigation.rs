@@ -68,6 +68,7 @@ impl EggieApp {
                 rows.push(self.render_terminal_section_label(label));
                 previous_location = Some(location);
             }
+            let remote_phase = manager.sessions.iter().find(|s| s.id == session).and_then(|s| s.remote.as_ref()).map(|remote| remote.phase);
             let exited = manager
                 .sessions
                 .iter()
@@ -105,7 +106,7 @@ impl EggieApp {
                             .line_height(px(17.))
                             .child(title),
                     )
-                    .when(exited, |row| row.child(self.render_exited_terminal_tag()))
+                    .when(exited, |row| row.child(self.render_session_end_tag(remote_phase)))
                     .child(
                         div()
                             .id(format!("bring-terminal-{session}"))

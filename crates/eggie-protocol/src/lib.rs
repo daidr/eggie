@@ -16,7 +16,10 @@ pub use snapshot::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
+
+mod ports;
+pub use ports::*;
 
 mod paste;
 pub use paste::*;

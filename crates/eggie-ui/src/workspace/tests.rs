@@ -181,6 +181,7 @@ fn a_stale_catalog_cannot_resurrect_a_terminated_terminal(cx: &mut TestAppContex
         },
         active_command: None,
         program_status: None,
+        remote: None,
         status: eggie_protocol::SessionStatus::Running,
     };
     manager.update(cx, |m, cx| {
@@ -225,6 +226,7 @@ fn session_summary(id: SessionId, project: ProjectId, exited: bool) -> SessionSu
         },
         active_command: None,
         program_status: None,
+        remote: None,
         status: if exited {
             eggie_protocol::SessionStatus::Exited { code: Some(0) }
         } else {
@@ -408,6 +410,131 @@ fn failed_exit_cleanup_keeps_the_tab_for_retry(cx: &mut TestAppContext) {
     assert_eq!(worker.join().unwrap(), vec![session]);
     manager.read_with(cx, |m, _| assert!(m.state.locate(session).is_none()));
     std::fs::remove_file(retry_socket).ok();
+    std::fs::remove_file(socket).ok();
+    std::fs::remove_file(path).ok();
+}
+
+#[gpui::test]
+fn late_port_snapshots_cannot_undo_a_completed_operation(cx: &mut TestAppContext) {
+    let (manager, path) = manager(cx);
+    let snapshot = eggie_protocol::PortMappingsSnapshot {
+        revision: 2,
+        registry_revision: 1,
+        connection_id: "ssh".into(),
+        destination: "test".into(),
+        target: eggie_domain::RemoteTarget::new("test".into()),
+        connected: true,
+        mappings: Vec::new(),
+        services: Vec::new(),
+        discovery_error: None,
+    };
+    manager.update(cx, |m, _| {
+        m.merge_port_snapshot(snapshot.clone());
+        let mut stale = snapshot.clone();
+        stale.revision = 1;
+        stale.connected = false;
+        m.merge_port_snapshot(stale);
+        assert!(m.port_connections[0].connected);
+        assert_eq!(m.port_connections[0].revision, 2);
+    });
+    std::fs::remove_file(path).ok();
+}
+
+#[gpui::test]
+fn reconnect_preserves_tab_identity_and_rejects_stale_catalogs(cx: &mut TestAppContext) {
+    let (manager, path) = manager(cx);
+    let (window, _, previous, location, _) = setup(cx, &manager);
+    let replacement = SessionId::new_v4();
+    manager.update(cx, |manager, cx| {
+        let profile = manager.state.item(location).unwrap().profile_id;
+        manager.state.windows.get_mut(&window).unwrap().views.get_mut(&location.project_id).unwrap()
+            .layout.find_group_mut(location.group_id).unwrap().items.iter_mut().find(|item| item.id == location.item_id).unwrap().custom_title = Some("Build server".into());
+        let session = session_summary(replacement, location.project_id, false);
+        manager.set_sessions(vec![session_summary(previous, location.project_id, true), session.clone()], cx);
+        manager.replace_session(previous, session.clone(), cx);
+        let placed = manager.state.locate(replacement).unwrap();
+        assert_eq!(placed.window_id, window);
+        assert_eq!(placed.item_id, location.item_id);
+        assert_eq!(placed.group_id, location.group_id);
+        assert_eq!(manager.state.item(placed).unwrap().profile_id, profile);
+        assert_eq!(manager.state.item(placed).unwrap().custom_title.as_deref(), Some("Build server"));
+        assert!(!manager.state.background.contains_key(&replacement));
+        manager.set_sessions(vec![session_summary(previous, location.project_id, true), session], cx);
+        assert!(!manager.sessions.iter().any(|session| session.id == previous));
+        assert_eq!(manager.state.locate(replacement).unwrap(), placed);
+    });
+    std::fs::remove_file(path).ok();
+}
+
+#[gpui::test]
+fn failed_ssh_tabs_survive_automatic_exit_cleanup(cx: &mut TestAppContext) {
+    let (manager, path) = manager(cx);
+    let (_, _, id, location, _) = setup(cx, &manager);
+    let client = DaemonClient::new("/tmp/eggie-no-requests-expected.sock".into(), "test");
+    manager.update(cx, |manager, cx| {
+        let mut session = session_summary(id, location.project_id, true);
+        session.remote = Some(eggie_protocol::RemoteSessionInfo {
+            target: eggie_domain::RemoteTarget::new("devbox".into()),
+            phase: eggie_protocol::RemoteSessionPhase::Failed,
+            initial_directory: None,
+        });
+        manager.set_sessions(vec![session], cx);
+        manager.set_terminal_exit_behavior(TerminalExitBehavior::RemoveTab, client, cx);
+        assert!(manager.pending_termination.is_empty());
+        assert!(manager.state.locate(id).is_some());
+    });
+    std::fs::remove_file(path).ok();
+}
+
+#[gpui::test]
+fn reconnect_acknowledgement_replaces_once_and_releases_the_previous_process(cx: &mut TestAppContext) {
+    use std::os::unix::net::UnixListener;
+    let (manager, path) = manager(cx);
+    let (_, _, previous, location, _) = setup(cx, &manager);
+    let next = session_summary(SessionId::new_v4(), location.project_id, false);
+    let next_id = next.id;
+    let socket = std::path::PathBuf::from(format!("/tmp/egg-retry-{}.sock", SessionId::new_v4()));
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut count = 0;
+        while count < 2 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut buffer = Vec::new();
+                    let request = eggie_ipc::wire::read_wire_message::<ClientRequest>(&mut stream, &mut buffer).unwrap().unwrap();
+                    let response = if count == 0 {
+                        assert_eq!(request, ClientRequest::ReconnectSession { session_id: previous });
+                        DaemonResponse::SessionCreated { session: next.clone() }
+                    } else {
+                        assert_eq!(request, ClientRequest::Terminate { session_id: previous });
+                        DaemonResponse::Ok
+                    };
+                    eggie_ipc::wire::write_wire_message(&mut stream, &mut buffer, &response).unwrap();
+                    count += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    });
+    let client = DaemonClient::new(socket.clone(), "reconnect-test");
+    manager.update(cx, |manager, cx| {
+        manager.reconnect(previous, client.clone(), cx);
+        manager.reconnect(previous, client, cx);
+    });
+    cx.run_until_parked();
+    worker.join().unwrap();
+    manager.update(cx, |manager, _| {
+        assert!(manager.pending_termination.is_empty());
+        assert_eq!(manager.state.locate(next_id).unwrap().item_id, location.item_id);
+        assert!(manager.state.locate(previous).is_none());
+    });
     std::fs::remove_file(socket).ok();
     std::fs::remove_file(path).ok();
 }

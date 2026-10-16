@@ -296,6 +296,7 @@ fn serve_connection_delivers_images_through_shared_memory() {
     let session_id = session.id;
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
+        ssh_connections: Arc::new(ssh::SshConnections::default()),
         build_id: Arc::from("shm-test"),
         config: test_config_service(),
         events: Arc::new(event_bus::EventBus::new()),
@@ -1012,6 +1013,7 @@ fn sustained_full_screen_snapshot_transport_benchmark() {
     let session_id = session.id;
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
+        ssh_connections: Arc::new(ssh::SshConnections::default()),
         build_id: Arc::from("benchmark"),
         config: test_config_service(),
         events: Arc::new(event_bus::EventBus::new()),
@@ -1182,6 +1184,7 @@ fn image_generation_wire_transport_benchmark() {
     let session_id = session.id;
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(session_id, session.clone())])),
+        ssh_connections: Arc::new(ssh::SshConnections::default()),
         build_id: Arc::from("benchmark"),
         config: test_config_service(),
         events: Arc::new(event_bus::EventBus::new()),
@@ -4871,6 +4874,7 @@ fn presentation_moves_and_window_closes_preserve_the_original_pty_and_output() {
     let pid = session.shell_pid;
     let state = DaemonState {
         sessions: RwLock::new(HashMap::from([(id, session.clone())])),
+        ssh_connections: Arc::new(ssh::SshConnections::default()),
         build_id: Arc::from("window-lifecycle-test"),
         config: test_config_service(),
         events: Arc::new(event_bus::EventBus::new()),
@@ -5125,6 +5129,7 @@ fn serve_connection_shares_text_rows_and_reconnects_with_a_full_frame() {
     let id = session.id;
     let state = Arc::new(DaemonState {
         sessions: RwLock::new(HashMap::from([(id, session.clone())])),
+        ssh_connections: Arc::new(ssh::SshConnections::default()),
         build_id: Arc::from("shared-grid-test"),
         config: test_config_service(),
         events: Arc::new(event_bus::EventBus::new()),
@@ -5207,6 +5212,7 @@ fn shared_grid_pty_echo_ab_benchmark() {
         let id = session.id;
         let state = Arc::new(DaemonState {
             sessions: RwLock::new(HashMap::from([(id, session.clone())])),
+            ssh_connections: Arc::new(ssh::SshConnections::default()),
             build_id: Arc::from("echo-benchmark"),
             config: test_config_service(),
             events: Arc::new(event_bus::EventBus::new()),
@@ -5291,4 +5297,30 @@ fn shared_grid_pty_echo_ab_benchmark() {
         drop(connection);
         worker.join().unwrap().unwrap();
     }
+}
+
+#[test]
+fn ssh_bootstrap_ready_and_child_exit_are_retained_without_shell_integration() {
+    use std::os::unix::process::ExitStatusExt;
+    let state = Arc::new(osc_listener_state());
+    let path = "/home/user/work tree";
+    state.handle_iterm2_command(&format!("SetUserVar=eggie_remote_ready={}", BASE64.encode(path)), "\x07");
+    assert_eq!(state.remote_ready_directory.read().as_deref(), Some(path));
+    let listener = DaemonEventListener(state.clone());
+    listener.send_event(Event::ChildExit(std::process::ExitStatus::from_raw(0)));
+    listener.send_event(Event::Exit);
+    assert_eq!(*state.status.read(), SessionStatus::Exited { code: Some(0) });
+}
+
+#[test]
+fn invalid_remote_configuration_never_opens_a_local_shell() {
+    let result = TerminalSession::spawn(SessionSpawnConfig {
+        project_id: ProjectId::new_v4(), cwd: std::env::temp_dir(),
+        size: TerminalSize::default(), appearance: TerminalAppearance::default(),
+        scrollback_limit: 10, shell_program: None, shell_args: None,
+        shell_features: String::new(), profile_env: BTreeMap::new(),
+        remote: Some(RemoteTarget::new("-invalid".into())),
+        remote_install_consented: false, remote_cwd: None, event_bus: None,
+    });
+    assert!(result.err().unwrap().to_string().contains("Invalid SSH target"));
 }

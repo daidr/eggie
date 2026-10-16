@@ -595,6 +595,11 @@ impl EggieApp {
                                     )
                                 },
                             )
+                            .when_some(item.session_id.and_then(|id| self.session_feed.global_sessions.iter().find(|session| session.id == id)).and_then(|session| session.remote.as_ref()), |element, remote| {
+                                element.child(div().id(format!("ssh-host-{item_id}"))
+                                    .text_size(px(9.)).text_color(rgb(self.colors.muted))
+                                    .tooltip(tooltip_text(remote.target.consent_key(), self.colors)).child("SSH"))
+                            })
                             .child(self.render_marquee(
                                 title_key,
                                 item.display_title().to_owned(),
@@ -1104,6 +1109,10 @@ impl EggieApp {
             .and_then(|session| self.render_paste_progress(session, cx))
         {
             content_region = content_region.child(paste);
+        }
+
+        if let Some(status) = self.render_ssh_status(group, cx) {
+            content_region = content_region.child(status);
         }
 
         // Overlay the search bar when it is bound to this group's active session.

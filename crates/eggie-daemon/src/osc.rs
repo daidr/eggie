@@ -28,6 +28,7 @@ pub(super) struct ListenerState {
     pub(super) published_images: RwLock<HashMap<TerminalImageKey, PublishedTerminalImage>>,
     pub(super) progress: ProgressTracker,
     pub(super) reported_location: RwLock<Option<TerminalReportedLocation>>,
+    pub(super) remote_ready_directory: RwLock<Option<String>>,
     pub(super) shell_integration: Mutex<ShellIntegrationTracker>,
     pub(super) program_status: Mutex<ProgramStatusTracker>,
     pub(super) osc_events: OscEventTracker,
@@ -224,6 +225,7 @@ impl ListenerState {
             published_images: RwLock::new(HashMap::new()),
             progress: ProgressTracker::new(session_id),
             reported_location: RwLock::new(None),
+            remote_ready_directory: RwLock::new(None),
             shell_integration: Mutex::new(ShellIntegrationTracker::default()),
             program_status: Mutex::new(ProgramStatusTracker::default()),
             osc_events: OscEventTracker::new(session_id),
@@ -548,6 +550,9 @@ impl ListenerState {
                 let name = sanitize_osc_text(name, 256);
                 if name.is_empty() {
                     return;
+                }
+                if name == "eggie_remote_ready" {
+                    *self.remote_ready_directory.write() = Some(sanitize_osc_text(&decoded, 4_096));
                 }
                 let mut shell = self.shell_integration.lock();
                 if shell.user_variables.len() >= 64

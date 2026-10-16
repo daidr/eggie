@@ -1036,6 +1036,7 @@ impl EggieApp {
             terminal_search: None,
             command_palette: None,
             paste_preview_open: false,
+            ports_ui: PortsUi::default(),
             paste_transfers: HashMap::new(),
             hyperlink_mouse_down: false,
             terminal_hovered_link: None,

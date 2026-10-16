@@ -119,37 +119,12 @@ fn test_session() -> eggie_protocol::SessionSummary {
         },
         active_command: None,
         program_status: None,
+        remote: None,
         status: eggie_protocol::SessionStatus::Running,
     }
 }
 
-#[test]
-fn forward_spec_parses_each_kind() {
-    let local = parse_forward_spec("L 8080 localhost:80").expect("local parses");
-    assert_eq!(local.kind, eggie_protocol::PortForwardKind::Local);
-    assert_eq!(local.port, 8080);
-    assert_eq!(local.destination.as_deref(), Some("localhost:80"));
 
-    let remote = parse_forward_spec("R 9090 example.com:443").expect("remote parses");
-    assert_eq!(remote.kind, eggie_protocol::PortForwardKind::Remote);
-    assert_eq!(remote.port, 9090);
-
-    let dynamic = parse_forward_spec("D 1080").expect("dynamic parses");
-    assert_eq!(dynamic.kind, eggie_protocol::PortForwardKind::Dynamic);
-    assert_eq!(dynamic.port, 1080);
-    assert!(dynamic.destination.is_none(), "dynamic has no destination");
-}
-
-#[test]
-fn forward_spec_rejects_malformed_input() {
-    // A local or remote forward requires a destination.
-    assert!(parse_forward_spec("L 8080").is_none());
-    assert!(parse_forward_spec("R 8080").is_none());
-    // Unknown kind, missing port, non-numeric port.
-    assert!(parse_forward_spec("X 8080 localhost:80").is_none());
-    assert!(parse_forward_spec("L").is_none());
-    assert!(parse_forward_spec("L not-a-port localhost:80").is_none());
-}
 
 #[test]
 fn scrollbar_thumb_sits_at_bottom_and_top_at_the_extremes() {
@@ -465,6 +440,7 @@ fn listening_port_owners_use_compact_process_pid_format() {
 #[test]
 fn ports_section_is_omitted_when_nothing_is_listening() {
     let inspection = SessionInspection {
+        port_mappings: None,
         session_id: Uuid::nil(),
         processes: Vec::new(),
         ports: Vec::new(),
@@ -964,4 +940,27 @@ fn a_remote_profiles_cwd_is_not_used_as_the_local_working_directory() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ssh_directory_inheritance_requires_the_same_target_and_uses_remote_paths() {
+    let mut source = test_session();
+    let target = eggie_domain::RemoteTarget::new("devbox".into());
+    source.remote = Some(eggie_protocol::RemoteSessionInfo {
+        target: target.clone(), phase: eggie_protocol::RemoteSessionPhase::Connected,
+        initial_directory: Some("/home/remote".into()),
+    });
+    source.current_directory = "/Users/local".into();
+    let mut profile = Profile::new("SSH".into());
+    profile.remote = Some(target);
+    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)).as_deref(), Some("/home/remote"));
+    source.reported_location = Some(eggie_protocol::TerminalReportedLocation {
+        path: "/srv/project/subdir".into(), host: Some("devbox".into()), user: None, local: false,
+    });
+    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)).as_deref(), Some("/srv/project/subdir"));
+    assert_eq!(displayed_directory(&source), "/srv/project/subdir");
+    profile.remote.as_mut().unwrap().host = "another-host".into();
+    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)), None);
+    profile.remote = None;
+    assert_eq!(ssh::inherited_remote_directory(&profile, Some(&source)), None);
 }

@@ -70,7 +70,9 @@ pub(crate) fn remote_launch(
     install: bool,
     control_path: Option<&Path>,
 ) -> RemoteLaunch {
-    let mut args = vec!["-t".to_owned()];
+    let mut args = vec!["-t".to_owned(), "-o".to_owned(), "ConnectTimeout=15".to_owned(),
+        "-o".to_owned(), "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(), "ServerAliveCountMax=3".to_owned()];
     if let Some(port) = target.port {
         args.push("-p".to_owned());
         args.push(port.to_string());
@@ -81,6 +83,8 @@ pub(crate) fn remote_launch(
     if let Some(path) = control_path {
         args.push("-o".to_owned());
         args.push("ControlMaster=auto".to_owned());
+        args.push("-o".to_owned());
+        args.push("ControlPersist=60".to_owned());
         args.push("-o".to_owned());
         args.push(format!("ControlPath={}", path.display()));
     }
@@ -114,6 +118,9 @@ fn remote_command(
         // 不安装:仍然要处理 env 与 cwd,并 exec 用户的 shell。
         degraded_script(env, cwd)
     };
+    // Report the shell PID before exec so process inspection can distinguish tabs sharing a master.
+    let payload = format!(r#"printf "\033]1337;SetUserVar=eggie_shell_pid=%s\007" "$(printf %s $$ | base64 | tr -d '\r\n')";
+{payload}"#);
     let encoded = BASE64.encode(payload.as_bytes());
     // `printf %s` 而非 `echo`:后者对反斜杠的处理各家不同。base64 字母表里没有 shell 元字符,
     // 所以这里的单引号包裹是安全的(不存在需要转义的引号)。
@@ -305,6 +312,8 @@ fn launch_tail(env: &BTreeMap<String, String>, cwd: Option<&str>) -> String {
         // `cd` 失败不算致命:远端目录可能已不存在,那就在 home 起 shell。
         script.push_str(&format!("cd {} 2>/dev/null || true\n", single_quote(cwd)));
     }
+    script.push_str(r#"printf '\033]1337;SetUserVar=eggie_remote_ready=%s\007' "$(printf %s "$PWD" | base64 | tr -d '\r\n')"
+"#);
     // `exec` 失败会**直接杀掉 shell**,不会走到 `||` 分支 —— 实测 `sh -c 'exec /nonexistent || echo x'`
     // 以 126 退出且不打印任何东西。所以不能用 `exec A || exec B` 做兜底:必须在 exec 之前先验证。
     //

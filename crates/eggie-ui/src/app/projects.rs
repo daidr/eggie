@@ -279,42 +279,6 @@ impl EggieApp {
             .ok();
     }
 
-    /// Prompt for a port forward spec and open it on the session's ssh master. The spec is a single
-    /// line parsed by [`parse_forward_spec`].
-    pub(super) fn prompt_forward_port(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let language = self.language;
-        let client = self.client.clone();
-        let executor = cx.background_executor().clone();
-        let receiver = prompt_for_text(
-            window,
-            language.forward_port(),
-            Some(language.forward_port_prompt()),
-            None,
-            None,
-            language.ok(),
-            language.cancel(),
-        );
-        cx.spawn(async move |_, _| {
-            let text = receiver.await.ok()??;
-            let Some(spec) = parse_forward_spec(text.trim()) else {
-                return None;
-            };
-            let request_client = client.clone();
-            let _ = executor
-                .spawn(async move {
-                    request_client.request(ClientRequest::ForwardPort { session_id, spec })
-                })
-                .await;
-            Some(())
-        })
-        .detach();
-    }
-
     pub(super) fn close_project_tabs(&mut self, project: ProjectId, cx: &mut Context<Self>) {
         self.confirm_project_operation(project, false, cx);
     }

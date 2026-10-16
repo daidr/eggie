@@ -608,6 +608,7 @@ mod tests {
             current_process: process("ssh", &["ssh", "example.com"]),
             active_command: Some("git diff --stat".into()),
             program_status: None,
+        remote: None,
             status: eggie_protocol::SessionStatus::Running,
         };
         assert_eq!(for_session(&session), ProcessIcon::GitDiff);

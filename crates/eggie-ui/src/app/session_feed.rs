@@ -1107,7 +1107,11 @@ impl EggieApp {
                 // A dead weak entity (window closed) must end the loop; `Ok(None)` only means there
                 // is no active session right now, so keep polling. Folding both into `None` here
                 // would make the `break` below unreachable and leak this 1Hz task forever.
-                let session_id = match this.update(cx, |app, _| app.active_session_id()) {
+                let session_id = match this.update(cx, |app, _| {
+                    app.sidebar.sidebar_preview.as_ref().map(|preview| preview.session_id)
+                        .or_else(|| (!app.right_sidebar_collapsed && app.right_tab == RightTab::Info).then(|| app.active_session_id()).flatten())
+                        .filter(|id| app.session_feed.sessions.iter().any(|session| session.id == *id && matches!(session.status, SessionStatus::Running)))
+                }) {
                     Ok(session_id) => session_id,
                     Err(_) => break,
                 };
@@ -1121,6 +1125,11 @@ impl EggieApp {
                     let update = this.update_in(cx, |app, _window, cx| match result {
                         Ok(DaemonResponse::SessionInspection { mut inspection }) => {
                             app.fill_missing_process_metrics(&mut inspection);
+                            if let Some(snapshot) = inspection.port_mappings.clone() {
+                                app.window_manager.update(cx, |manager, cx| {
+                                    if manager.merge_port_snapshot(snapshot) { cx.notify(); }
+                                });
+                            }
                             let error_cleared = app
                                 .session_feed
                                 .session_inspection_errors

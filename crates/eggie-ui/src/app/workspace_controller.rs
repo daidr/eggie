@@ -126,7 +126,7 @@ impl EggieApp {
                 .sessions
                 .iter()
                 .find(|session| session.id == id)
-                .map(|session| matches!(session.status, SessionStatus::Exited { .. }))
+                .map(|session| matches!(session.status, SessionStatus::Exited { .. }) && !session.needs_remote_recovery())
                 .unwrap_or(true),
         }
     }
@@ -396,14 +396,27 @@ impl EggieApp {
         {
             return;
         }
+        if let Some(error) = self.profile_store.read(cx).launch_error(profile.id)
+            .or_else(|| profile.remote.as_ref().filter(|target| !target.is_usable()).map(|_| crate::profile_editor::RemoteInputError::Target)) {
+            let message = match error {
+                crate::profile_editor::RemoteInputError::Port => self.language.profile_remote_port_invalid(),
+                crate::profile_editor::RemoteInputError::Target => self.language.profile_remote_invalid(),
+            };
+            self.show_ssh_error(message.to_owned(), window, cx);
+            return;
+        }
         let project = self.workspace_state.active_project_data().clone();
         let scrollback_limit = self.settings.read(cx).config().scrollback_lines;
         // Launch fields come from the profile; scrollback stays global (it is a resource limit, not
         // part of a terminal's identity). The cwd resolution needs the same source-item lookup the
         // inheritance path uses, so compute it here and let the profile override it.
         let active_cwd = self.active_session_cwd(group_id, source_item);
-        let spawn =
+        let mut spawn =
             resolve_spawn_config(&profile, active_cwd.as_deref(), &project.effective_root());
+        if spawn.remote_cwd.is_none() {
+            let source = self.source_session(group_id, source_item);
+            spawn.remote_cwd = ssh::inherited_remote_directory(&profile, source);
+        }
         // Spawn with the profile's own palette, so a themed terminal is born in its colors instead of
         // painting the global theme for the frame before the render reconcile catches up.
         let appearance = crate::settings::resolve_appearance(
@@ -446,8 +459,7 @@ impl EggieApp {
                 == Some(&true)
         });
 
-        let Ok(DaemonResponse::SessionCreated { session }) =
-            self.client.request(ClientRequest::CreateSession {
+        let response = self.client.request(ClientRequest::CreateSession {
                 project_id: project.id,
                 cwd: spawn.cwd,
                 size: TerminalSize::default(),
@@ -460,9 +472,18 @@ impl EggieApp {
                 remote: spawn.remote,
                 remote_cwd: spawn.remote_cwd,
                 remote_install_consented,
-            })
-        else {
-            return;
+            });
+        let session = match response {
+            Ok(DaemonResponse::SessionCreated { session }) => session,
+            Ok(DaemonResponse::Error { message }) => {
+                self.show_ssh_error(message, window, cx);
+                return;
+            }
+            Err(error) => {
+                self.show_ssh_error(error.to_string(), window, cx);
+                return;
+            }
+            _ => return,
         };
         // Record what the daemon now has, so the render reconcile does not immediately re-send it.
         self.session_appearances.insert(session.id, appearance);
@@ -877,6 +898,10 @@ impl EggieApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.port_editor_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.cancel_active_paste(cx) {
             cx.stop_propagation();
             return;

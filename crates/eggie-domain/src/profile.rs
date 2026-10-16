@@ -272,6 +272,6 @@ impl RemoteTarget {
                 && !value.contains(char::is_whitespace)
                 && !value.contains('\0')
         };
-        sane(&self.host) && self.user.as_deref().is_none_or(sane)
+        sane(&self.host) && self.user.as_deref().is_none_or(sane) && self.port != Some(0)
     }
 }
