@@ -18,7 +18,7 @@ impl EggieApp {
     ) {
         self.dismiss_project_selector(cx);
         self.dismiss_project_popover(cx);
-        self.dismiss_sidebar_preview(cx);
+        self.dismiss_terminal_preview(cx);
         self.activate_project(project, cx);
         self.sidebar
             .project_drag
@@ -72,7 +72,7 @@ impl EggieApp {
             return;
         };
         self.dismiss_project_popover(cx);
-        self.dismiss_sidebar_preview(cx);
+        self.dismiss_terminal_preview(cx);
         self.focus_handle.focus(window, cx);
         let parent = Window::window_handle(window)
             .downcast::<Self>()

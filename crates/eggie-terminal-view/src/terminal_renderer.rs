@@ -127,6 +127,7 @@ pub struct TerminalRenderOptions {
     url_hover: Option<TerminalLinkRange>,
     /// Whether the cursor should be painted this frame. `false` during the "off" half of a blink.
     cursor_visible: bool,
+    fit_to_viewport: bool,
     /// Font-metric adjustments (`adjust-*`) applied to decoration/cursor/box positions.
     adjustments: ResolvedMetricAdjustments,
     /// Resolved per-style font families + synthetic-style policy.
@@ -187,6 +188,7 @@ impl TerminalRenderOptions {
             search: None,
             url_hover: None,
             cursor_visible: true,
+            fit_to_viewport: false,
             adjustments: ResolvedMetricAdjustments::default(),
             font_families: None,
             font_features: Arc::from(&[][..]),
@@ -210,6 +212,12 @@ impl TerminalRenderOptions {
 
     pub fn with_cursor_visible(mut self, cursor_visible: bool) -> Self {
         self.cursor_visible = cursor_visible;
+        self
+    }
+
+    /// Fit the complete grid into a preview without changing the terminal's rows or columns.
+    pub fn with_fit_to_viewport(mut self) -> Self {
+        self.fit_to_viewport = true;
         self
     }
 
@@ -358,6 +366,7 @@ impl MetalTerminalRenderer {
             search: options.search,
             url_hover: options.url_hover,
             cursor_visible: options.cursor_visible,
+            fit_to_viewport: options.fit_to_viewport,
             adjustments: options.adjustments,
             font_families: options.font_families,
             font_features: options.font_features,
@@ -412,6 +421,7 @@ pub struct MetalTerminalElement {
     search: Option<TerminalSearchHighlights>,
     url_hover: Option<TerminalLinkRange>,
     cursor_visible: bool,
+    fit_to_viewport: bool,
     adjustments: ResolvedMetricAdjustments,
     font_families: Option<eggie_config::font::ResolvedFontFamilies>,
     font_features: Arc<[eggie_config::font::FontFeature]>,
@@ -707,17 +717,41 @@ impl TerminalPalette {
     }
 }
 
+fn preview_grid_scale(
+    viewport: gpui::Size<Pixels>,
+    grid: eggie_protocol::TerminalSize,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> f32 {
+    (f32::from(viewport.width) / (f32::from(grid.columns.max(1)) * f32::from(cell_width)))
+        .min(f32::from(viewport.height) / (f32::from(grid.rows.max(1)) * f32::from(line_height)))
+        .clamp(f32::EPSILON, 1.)
+}
+
 pub fn terminal_cell_metrics(
     window: &mut Window,
     adjustments: ResolvedMetricAdjustments,
 ) -> (Pixels, Pixels) {
     let text_style = window.text_style();
     let font_size = text_style.font_size.to_pixels(window.rem_size());
-    let (cell_width, line_height) = crate::metal_terminal::font_metrics(
+    terminal_font_metrics(
         text_style.font_family.as_ref(),
-        f32::from(font_size),
+        font_size,
         window.scale_factor(),
-    );
+        adjustments,
+    )
+}
+
+/// Measure explicit terminal typography without reading or mutating the window's drawing stack.
+/// Hover timers and other non-drawing callbacks use the same metrics as grid prepaint.
+pub fn terminal_font_metrics(
+    family: &str,
+    font_size: Pixels,
+    scale_factor: f32,
+    adjustments: ResolvedMetricAdjustments,
+) -> (Pixels, Pixels) {
+    let (cell_width, line_height) =
+        crate::metal_terminal::font_metrics(family, f32::from(font_size), scale_factor);
     // `adjust-cell-width` / `adjust-cell-height` scale the font-derived cell box (Ghostty
     // semantics). Clamp to ≥1px so a hostile percent never collapses the grid.
     let cell_width = ResolvedMetricAdjustments::adjust(adjustments.cell_width, cell_width, 1.);
@@ -898,8 +932,14 @@ impl Element for MetalTerminalElement {
         _cx: &mut App,
     ) -> Self::PrepaintState {
         let text_style = window.text_style();
-        let font_size = f32::from(text_style.font_size.to_pixels(window.rem_size()));
-        let (cell_width, line_height) = terminal_cell_metrics(window, self.adjustments);
+        let mut font_size = f32::from(text_style.font_size.to_pixels(window.rem_size()));
+        let (mut cell_width, mut line_height) = terminal_cell_metrics(window, self.adjustments);
+        if self.fit_to_viewport {
+            let scale = preview_grid_scale(bounds.size, self.snapshot.size, cell_width, line_height);
+            font_size *= scale;
+            cell_width = cell_width * scale;
+            line_height = line_height * scale;
+        }
         let scale_factor = window.scale_factor();
         let started = Instant::now();
         let family = Arc::from(text_style.font_family.as_ref());
@@ -2233,6 +2273,17 @@ mod tests {
     use eggie_protocol::{TerminalCellPosition, TerminalColorOverride, TerminalSize};
     use eggie_themes::theme_catalog;
     use uuid::Uuid;
+
+    #[test]
+    fn preview_fits_the_entire_grid_without_a_minimum_font_size_crop() {
+        for (columns, rows, width, height) in [(300, 100, 294., 118.), (80, 240, 294., 118.), (80, 24, 150., 118.)] {
+            let grid = TerminalSize { columns, rows, ..TerminalSize::default() };
+            let scale = preview_grid_scale(size(px(width), px(height)), grid, px(8.5), px(20.));
+            assert!(f32::from(columns) * 8.5 * scale <= width + 0.001);
+            assert!(f32::from(rows) * 20. * scale <= height + 0.001);
+            assert!(scale > 0. && scale <= 1.);
+        }
+    }
 
     #[cfg(unix)]
     #[test]

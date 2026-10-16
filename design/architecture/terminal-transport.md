@@ -2,7 +2,8 @@
 
 ## 通信与归属
 
-协议 v4 保留 Unix domain socket：输入、尺寸、查询、配置、OSC 和图片控制仍走它。
+文字共享行从协议 v4 引入；当前协议版本以 `eggie-protocol::PROTOCOL_VERSION` 为准。
+通信保留 Unix domain socket：输入、尺寸、查询、配置、OSC 和图片控制仍走它。
 GUI 的可见终端使用 `WaitForRenderFrame` 长轮询；只有变化的文字行写入 POSIX 共享内存，
 socket 发送大小、版本、行租约和光标、选择区、颜色、图片布局等帧元数据。原有
 `WaitForSnapshot` 保留为可测量的 socket 路径，CLI、预览和其他控制请求可继续使用普通快照。
@@ -103,7 +104,7 @@ env -u NO_COLOR cargo test -p eggie-daemon shared_grid_pty_echo_ab_benchmark -- 
 颜色/UTF-8、Unicode/wide/combining/link，以及 damage 快照与完整内核投影在清屏、行插入删除、
 滚动、备用屏幕、尺寸和选择区变化下的一致性。
 
-## 本次开发构建验证
+## 历史开发构建验证（2026-10-11）
 
 原生 dev Eggie GUI PID 73766、daemon PID 73345（v4），新终端 shell PID 73939。
 通过 GUI 输入验证红/绿/蓝、中文、组合重音和 emoji；显示 `NO_COLOR=UNSET`。

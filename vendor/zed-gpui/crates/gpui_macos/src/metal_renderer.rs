@@ -1673,7 +1673,8 @@ impl MetalRenderer {
                 &instance_buffer.metal_buffer,
                 instance_buffer.size,
                 instance_offset,
-            );
+            )
+            .with_opacity(primitive.opacity);
             primitive.renderer.paint(&mut context);
             if context.buffer_overflowed() {
                 command_encoder.set_scissor_rect(full_scissor);

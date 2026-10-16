@@ -4611,10 +4611,12 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintMetal {
             order: 0,
             bounds,
             content_mask,
+            opacity,
             renderer,
         });
     }
@@ -6397,6 +6399,12 @@ impl Window {
             pressed_button: None,
         });
         let _ = self.dispatch_event(event, cx);
+    }
+
+    /// Inspect the last painted scene when testing custom rendering and compositing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_scene(&self) -> &crate::Scene {
+        &self.rendered_frame.scene
     }
 }
 

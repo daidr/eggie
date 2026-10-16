@@ -8,6 +8,7 @@ use native_alert::*;
 mod chrome;
 mod completion;
 mod hover;
+mod terminal_preview;
 mod layout;
 use completion::CompletionUi;
 mod palette;
@@ -147,8 +148,8 @@ const SIDEBAR_STATUS_ROW_HEIGHT: f32 = 42.;
 const SIDEBAR_STATUS_TRANSITION: Duration = Duration::from_millis(260);
 const PROJECT_POPOVER_LEAVE_DELAY: Duration = Duration::from_millis(220);
 const PROJECT_POPOVER_ROW_HEIGHT: f32 = 40.;
-const SIDEBAR_PREVIEW_HOVER_DELAY: Duration = Duration::from_millis(850);
-const SIDEBAR_PREVIEW_LEAVE_DELAY: Duration = Duration::from_millis(180);
+const TERMINAL_PREVIEW_HOVER_DELAY: Duration = Duration::from_millis(850);
+const TERMINAL_PREVIEW_LEAVE_DELAY: Duration = Duration::from_millis(180);
 
 pub struct EggieApp {
     workspace_state: WorkspaceState,

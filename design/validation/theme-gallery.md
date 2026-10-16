@@ -1,5 +1,7 @@
 # Theme gallery design QA
 
+> Historical verification record, migrated on 2026-10-16. Temporary screenshot paths below may no longer exist. These observations describe the tested build, not a fresh validation of the current interface. Current requirements live in the [design principles](../philosophy/README.md).
+
 **Source visual truth:** `/var/folders/22/f701zzws39x66b6xwcynvf5w0000gn/T/codex-clipboard-0b98a739-0001-40a2-b0ec-2b6e823feb3d.png` (1852 × 976 pixels; source display density unknown).
 
 **Implementation:** `/tmp/eggie-theme-dots-ring-v2-dark.png` (3456 × 2234 physical pixels, 1728 × 1117 macOS points at 2×). Eggie Settings initially opens at 920 × 740 points. The focused comparison is `/tmp/eggie-theme-dots-ring-v2-compare.png`; both content crops were normalized to 900 pixels wide. State: dark interface with both light and dark theme galleries visible. Theme names and colors come from Eggie's installed catalog, so they differ from the reference catalog.

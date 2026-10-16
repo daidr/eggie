@@ -234,6 +234,11 @@ impl MetalBackend {
         if instances.is_empty() {
             return Ok(());
         }
+        if context.opacity() < 1. {
+            for instance in instances.iter_mut() {
+                instance.color[3] *= context.opacity();
+            }
+        }
         let byte_length = instances.len() * mem::size_of::<Instance>();
         let bytes =
             unsafe { std::slice::from_raw_parts(instances.as_ptr().cast::<u8>(), byte_length) };
@@ -292,7 +297,7 @@ impl MetalBackend {
             instances.push(Instance {
                 origin: pixel_origin,
                 size: pixel_size,
-                color: [1.; 4],
+                color: [1., 1., 1., context.opacity()],
                 uv_origin: [source[0], source[1]],
                 uv_size: [source[2], source[3]],
                 metadata: [3, 0, 0, 0],

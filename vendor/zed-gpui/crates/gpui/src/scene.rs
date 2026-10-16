@@ -39,10 +39,21 @@ pub struct MetalRenderContext<'a> {
     instance_buffer_size: usize,
     instance_offset: &'a mut usize,
     buffer_overflowed: bool,
+    opacity: f32,
 }
 
 #[cfg(target_os = "macos")]
 impl<'a> MetalRenderContext<'a> {
+    /// Opacity inherited from the primitive's enclosing GPUI elements.
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    #[doc(hidden)]
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity;
+        self
+    }
     /// The Metal device used by GPUI's renderer.
     pub fn device(&self) -> &metal::DeviceRef {
         self.device
@@ -119,6 +130,7 @@ impl<'a> MetalRenderContext<'a> {
             instance_buffer_size,
             instance_offset,
             buffer_overflowed: false,
+            opacity: 1.,
         }
     }
 
@@ -958,6 +970,8 @@ pub struct PaintMetal {
     pub bounds: Bounds<ScaledPixels>,
     /// Active GPUI content mask.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Opacity inherited from the element tree, matching GPUI's built-in primitives.
+    pub opacity: f32,
     /// Renderer invoked by the macOS compositor.
     pub renderer: Arc<dyn MetalPrimitiveRenderer>,
 }

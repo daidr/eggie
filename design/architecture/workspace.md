@@ -27,10 +27,12 @@ flowchart TD
   ui --> update[eggie-update]
   daemon --> ipc
   daemon --> lua
+  daemon --> completion[eggie-completion]
   daemon --> storage
   ipc --> protocol[eggie-protocol]
   protocol --> config[eggie-config]
   protocol --> domain[eggie-domain]
+  protocol --> completion
   lua --> config
   lua --> themes
   themes --> domain
@@ -57,6 +59,7 @@ flowchart TD
 | `eggie-protocol` | 可序列化的请求、响应、事件、会话与终端快照契约 | 不导入 Lua VM、GPUI 或终端内核 |
 | `eggie-domain` | 项目、布局、profile、标识、终端颜色与 cell 属性 | 纯数据和规则 |
 | `eggie-config` | 共享配置契约、字体参数与解析 | 纯数据，不执行 Lua，也不加载 GUI 资源 |
+| `eggie-completion` | 补全输入契约、解析、编辑与排序；daemon 侧可选 provider | UI 与协议只使用数据契约，文件扫描和子进程能力由 daemon 启用 |
 | `eggie-lua` | Lua 注册 API、配置求值、校验、事件回调 | 返回配置契约，不管理 UI |
 | `eggie-themes` | 内置主题资源、目录、解析、语义 UI 配色、配色审计 | 无 GPUI 或 Lua 依赖 |
 | `eggie-storage` | 配置路径、状态目录、JSON 原子写入、损坏文件隔离 | 不依赖 updater 或 GUI |
@@ -84,7 +87,7 @@ UI 的 `div` 统一来自 `eggie-ui-kit::continuous_corners`，普通 radius 辅
 
 `TerminalInputTarget` 定义读取 composition、提交文字、更新 composition 和取消 composition 四个操作。工作区实现接口，渲染器只持有一个弱 Entity 适配器；窗口销毁后更新自然失效，不形成引用环。
 
-cell 属性由 `eggie-domain::TerminalCellFlags` 定义。daemon 在编译期检查 Alacritty 的各个属性位与稳定协议一致，随后直接发送原有 `u16`，无需每个 cell 执行映射循环。终端视图不再依赖 Alacritty，cell 的序列化形式保持不变。窗口重构删除 daemon 中的窗口归属、认领与分离接口；文字共享行将应用协议升级为 v4。
+cell 属性由 `eggie-domain::TerminalCellFlags` 定义。daemon 在编译期检查 Alacritty 的各个属性位与稳定协议一致，随后直接发送原有 `u16`，无需每个 cell 执行映射循环。终端视图不再依赖 Alacritty，cell 的序列化形式保持不变。daemon 不管理窗口归属、认领与分离；当前协议版本以 `crates/eggie-protocol/src/lib.rs` 的 `PROTOCOL_VERSION` 为准。
 
 Metal 内部按字形 atlas/cache、后端与图片上传、字体 shaping/rasterizer 分模块，shader 是独立 `.metal` 资源。共享内存的句柄与帧解析属于 IPC，共享内存映射和回收也属于 IPC，GPU 消费属于视图。协议只定义不可变行存储和借用 cell 视图；`eggie-ipc` 实现映射行租约，视图无需依赖 IPC 或 daemon。传输与生命周期见 [terminal-transport.md](terminal-transport.md)。
 
@@ -109,3 +112,5 @@ cargo build -p eggie
 原有的协议、PTY、OSC、配置、图形、项目排序和 UI 状态测试继续运行；纯字体解析、主题审计、颜色解析和客户端队列测试随实现移动到其归属 crate。
 
 新建 crate 的判断标准是独立职责、清晰依赖和可独立验证的 API。当前无需为每个设置页面、侧栏控件或标签栏单独建 crate；多个应用级消费者或独立生命周期出现时，再提升完整模块。
+
+相关设计：[多窗口](multi-window.md)、[配置](lua-configuration.md)、[补全](completion.md)、[终端预览](../features/terminal-preview.md)。
