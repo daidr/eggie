@@ -47,4 +47,5 @@ raw-window-handle = "0.6.2"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dev-dependencies]
+eggie-ui-kit = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

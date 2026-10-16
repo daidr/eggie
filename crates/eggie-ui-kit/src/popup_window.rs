@@ -3,16 +3,16 @@
 //! GPUI's parent-anchored popup is not implemented on macOS yet. This shell keeps placement,
 //! window lifetime, and motion independent of the content rendered inside it.
 
+mod platform;
+
 use crate::continuous_corners::div;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, Context, Pixels, Point, Render, Size,
-    Subscription, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, point, prelude::*, px, rgb, size,
+    AnyElement, App, Bounds, Context, Pixels, Render, Size, Subscription, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, point,
+    prelude::*, px, rgb, size,
 };
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use platform::PopupSurface;
+use std::{rc::Rc, time::Duration};
 
 const IN_DURATION: Duration = Duration::from_millis(180);
 const OUT_DURATION: Duration = Duration::from_millis(160);
@@ -22,27 +22,6 @@ const GAP: f32 = 5.;
 
 type Content = Rc<dyn Fn(&mut Window, &mut Context<PopupWindow>) -> AnyElement>;
 type Hover = Rc<dyn Fn(bool, &mut Window, &mut App)>;
-
-#[derive(Clone, Copy)]
-struct PopupVisibility {
-    from: f32,
-    to: f32,
-    started_at: Instant,
-    duration: Duration,
-}
-impl PopupVisibility {
-    fn value(self, now: Instant) -> f32 {
-        let progress = (now.saturating_duration_since(self.started_at).as_secs_f32()
-            / self.duration.as_secs_f32())
-        .clamp(0., 1.);
-        let eased = if self.to > self.from {
-            gpui::ease_out_quint()(progress)
-        } else {
-            gpui::ease_in_out(progress)
-        };
-        self.from + (self.to - self.from) * eased
-    }
-}
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // The window shell supports menu and tooltip placement before those callers exist.
@@ -61,24 +40,6 @@ pub struct PopupWindowOptions {
     pub border: u32,
 }
 
-#[derive(Clone, Copy)]
-struct PopupMotion {
-    from: Point<Pixels>,
-    to: Point<Pixels>,
-    started_at: Instant,
-}
-
-impl PopupMotion {
-    fn progress(self, now: Instant) -> f32 {
-        (now.saturating_duration_since(self.started_at).as_secs_f32() / MOVE_DURATION.as_secs_f32())
-            .clamp(0., 1.)
-    }
-
-    fn origin(self, now: Instant) -> Point<Pixels> {
-        self.from + (self.to - self.from) * gpui::ease_out_quint()(self.progress(now))
-    }
-}
-
 pub struct PopupWindow {
     content: Content,
     on_hover: Hover,
@@ -88,10 +49,10 @@ pub struct PopupWindow {
     anchor: Bounds<Pixels>,
     placement: PopupPlacement,
     closing: bool,
-    visibility: PopupVisibility,
+    bounds: Bounds<Pixels>,
+    surface: Option<PopupSurface>,
     pointer_pressed: bool,
     revision: u64,
-    motion: Option<PopupMotion>,
     _parent_closed: Option<Subscription>,
 }
 
@@ -114,6 +75,7 @@ impl PopupWindow {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 kind: WindowKind::PopUp,
                 focus: false,
+                show: !platform::NATIVE,
                 is_movable: false,
                 is_resizable: false,
                 is_minimizable: false,
@@ -131,19 +93,36 @@ impl PopupWindow {
                     anchor: options.anchor,
                     placement: options.placement,
                     closing: false,
-                    visibility: PopupVisibility {
-                        from: 0.,
-                        to: 1.,
-                        started_at: Instant::now(),
-                        duration: IN_DURATION,
-                    },
+                    bounds,
+                    surface: None,
                     pointer_pressed: false,
                     revision: 0,
-                    motion: None,
                     _parent_closed: None,
                 })
             },
         )?;
+        let initialized = handle.update(cx, |popup, window, cx| -> anyhow::Result<()> {
+            popup.surface = Some(PopupSurface::new(window)?);
+            // open_window has drawn the scene; submit it before exposing the native surface.
+            window.present_if_needed();
+            let duration = if cx.reduce_motion() {
+                Duration::ZERO
+            } else {
+                IN_DURATION
+            };
+            let _ = popup
+                .surface
+                .as_mut()
+                .unwrap()
+                .transition(bounds, 1., duration, cx);
+            Ok(())
+        });
+        if let Err(error) = initialized.and_then(|result| result) {
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+            return Err(error);
+        }
         let subscription = cx.on_window_closed(move |cx, closed| {
             if closed == parent_id {
                 handle
@@ -209,19 +188,17 @@ impl PopupWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.bounds().size != bounds.size {
+        self.bounds = bounds;
+        if !platform::NATIVE && window.bounds().size != bounds.size {
             window.resize(bounds.size);
         }
-        if cx.reduce_motion() {
-            self.motion = None;
-            set_popup_origin(window, bounds.origin, cx);
-        } else {
-            // Interrupt from the painted position so rapid reversals stay continuous.
-            self.motion = Some(PopupMotion {
-                from: window.bounds().origin,
-                to: bounds.origin,
-                started_at: Instant::now(),
-            });
+        if let Some(surface) = &mut self.surface {
+            let duration = if cx.reduce_motion() {
+                Duration::ZERO
+            } else {
+                MOVE_DURATION
+            };
+            let _ = surface.transition(bounds, 1., duration, cx);
         }
         cx.notify();
     }
@@ -231,32 +208,32 @@ impl PopupWindow {
             return;
         }
         self.closing = true;
-        if cx.reduce_motion() {
+        if cx.reduce_motion() || self.surface.is_none() {
             window.remove_window();
             return;
         }
         self.revision += 1;
-        let now = Instant::now();
-        self.visibility = PopupVisibility {
-            from: self.visibility.value(now),
-            to: 0.,
-            started_at: now,
-            duration: OUT_DURATION,
-        };
         let revision = self.revision;
-        cx.notify();
-        let executor = cx.background_executor().clone();
+        let mut exit_bounds = self.bounds;
+        exit_bounds.origin.y += px(6.);
+        let completed =
+            self.surface
+                .as_mut()
+                .unwrap()
+                .transition(exit_bounds, 0., OUT_DURATION, cx);
         cx.spawn_in(window, async move |popup, cx| {
-            executor.timer(OUT_DURATION).await;
-            let _ = cx.update(|window, cx| {
-                popup
-                    .update(cx, |popup, _| {
-                        if popup.closing && popup.revision == revision {
-                            window.remove_window();
-                        }
-                    })
-                    .ok();
-            });
+            if completed.await.is_ok() {
+                let _ = cx.update(|window, cx| {
+                    popup
+                        .update(cx, |popup, _| {
+                            // AppKit also completes cancelled animations, which may belong to an old dismissal.
+                            if popup.closing && popup.revision == revision {
+                                window.remove_window();
+                            }
+                        })
+                        .ok();
+                });
+            }
         })
         .detach();
     }
@@ -264,14 +241,15 @@ impl PopupWindow {
     pub fn restore(&mut self, cx: &mut Context<Self>) {
         if self.closing {
             self.closing = false;
-            let now = Instant::now();
-            self.visibility = PopupVisibility {
-                from: self.visibility.value(now),
-                to: 1.,
-                started_at: now,
-                duration: IN_DURATION,
-            };
             self.revision += 1;
+            if let Some(surface) = &mut self.surface {
+                let duration = if cx.reduce_motion() {
+                    Duration::ZERO
+                } else {
+                    IN_DURATION
+                };
+                let _ = surface.transition(self.bounds, 1., duration, cx);
+            }
             cx.notify();
         }
     }
@@ -282,22 +260,9 @@ impl PopupWindow {
 
 impl Render for PopupWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(motion) = self.motion {
-            let now = Instant::now();
-            set_popup_origin(window, motion.origin(now), cx);
-            if motion.progress(now) < 1. {
-                let entity = cx.entity_id();
-                window.on_next_frame(move |_, cx| cx.notify(entity));
-            } else {
-                self.motion = None;
-            }
-        }
         let content = (self.content.clone())(window, cx);
-        let visibility = self.visibility;
-        let revision = self.revision;
         let hover = self.on_hover.clone();
         let release_outside = self.on_hover.clone();
-        let reduced_motion = cx.reduce_motion();
         div()
             .id("popup-window-root")
             .size_full()
@@ -328,23 +293,8 @@ impl Render for PopupWindow {
                     .shadow_md()
                     .overflow_hidden()
                     .child(content)
-                    .with_animation(
-                        format!("popup-window-{revision}"),
-                        Animation::new(visibility.duration),
-                        move |surface, progress| {
-                            let visible = if reduced_motion {
-                                visibility.to
-                            } else if progress >= 1. {
-                                visibility.to
-                            } else {
-                                visibility.value(Instant::now())
-                            };
-                            surface
-                                .opacity(visible)
-                                .ml(px(INSET))
-                                .mt(px(INSET + (1. - visible) * 6.))
-                        },
-                    ),
+                    .ml(px(INSET))
+                    .mt(px(INSET)),
             )
     }
 }
@@ -369,51 +319,6 @@ fn popup_bounds(parent: &Window, options: &PopupWindowOptions, cx: &App) -> Boun
         extent,
     )
 }
-
-// GPUI exposes resizing but no positioning API; keep the AppKit bridge in the popup shell.
-#[cfg(all(target_os = "macos", not(test)))]
-fn set_popup_origin(window: &mut Window, origin: Point<Pixels>, cx: &App) {
-    use cocoa::{
-        base::{id, nil},
-        foundation::NSPoint,
-    };
-    use objc::{msg_send, rc::StrongPtr, sel, sel_impl};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let delta = origin - window.bounds().origin;
-    if delta.x.abs() < px(0.01) && delta.y.abs() < px(0.01) {
-        return;
-    }
-    let native_window: id = match HasWindowHandle::window_handle(window) {
-        Ok(handle) => match handle.as_raw() {
-            RawWindowHandle::AppKit(appkit) => unsafe {
-                msg_send![appkit.ns_view.as_ptr() as id, window]
-            },
-            _ => return,
-        },
-        Err(_) => return,
-    };
-    if native_window == nil {
-        return;
-    }
-    unsafe {
-        let frame: cocoa::foundation::NSRect = msg_send![native_window, frame];
-        let origin = NSPoint::new(
-            frame.origin.x + delta.x.as_f32() as f64,
-            frame.origin.y - delta.y.as_f32() as f64,
-        );
-        let native_window = StrongPtr::retain(native_window);
-        // AppKit sends moved callbacks synchronously, so apply the frame after GPUI releases App.
-        cx.foreground_executor()
-            .spawn(async move {
-                let _: () = msg_send![*native_window, setFrameOrigin: origin];
-            })
-            .detach();
-    }
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn set_popup_origin(_window: &mut Window, _origin: Point<Pixels>, _cx: &App) {}
 
 fn place_popup(
     parent_origin: gpui::Point<Pixels>,
@@ -470,36 +375,6 @@ fn place_popup(
 mod tests {
     use super::*;
 
-    #[test]
-    fn reversing_popup_visibility_keeps_opacity_and_translation_continuous() {
-        let start = Instant::now();
-        let entering = PopupVisibility {
-            from: 0.,
-            to: 1.,
-            started_at: start,
-            duration: IN_DURATION,
-        };
-        let dismissed = start + IN_DURATION / 3;
-        let exiting = PopupVisibility {
-            from: entering.value(dismissed),
-            to: 0.,
-            started_at: dismissed,
-            duration: OUT_DURATION,
-        };
-        assert_eq!(entering.value(dismissed), exiting.value(dismissed));
-        let middle = dismissed + OUT_DURATION / 2;
-        assert!(exiting.value(middle) < exiting.from && exiting.value(middle) > 0.);
-        let restored = PopupVisibility {
-            from: exiting.value(middle),
-            to: 1.,
-            started_at: middle,
-            duration: IN_DURATION,
-        };
-        assert_eq!(exiting.value(middle), restored.value(middle));
-        assert_eq!(exiting.value(dismissed + OUT_DURATION), 0.);
-        assert_eq!(restored.value(middle + IN_DURATION), 1.);
-    }
-
     struct Parent;
 
     impl Render for Parent {
@@ -516,6 +391,97 @@ mod tests {
             background: 0xffffff,
             border: 0xdddddd,
         }
+    }
+
+    fn open_popup(cx: &mut gpui::TestAppContext) -> WindowHandle<PopupWindow> {
+        let parent = cx.add_window(|_, _| Parent);
+        cx.update(|cx| {
+            parent
+                .update(cx, |_, window, cx| {
+                    PopupWindow::open(
+                        cx,
+                        window,
+                        options(20.),
+                        |_, _| div().into_any_element(),
+                        |_, _, _| {},
+                    )
+                    .unwrap()
+                })
+                .unwrap()
+        })
+    }
+
+    #[gpui::test]
+    fn native_completion_closes_once_without_scheduling_content_animation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let popup = open_popup(cx);
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            popup
+                .update(cx, |popup, window, cx| {
+                    assert_eq!(window.simulate_next_frame(cx), 0);
+                    popup.dismiss(window, cx);
+                    popup.dismiss(window, cx);
+                    assert_eq!(popup.revision, 1);
+                })
+                .unwrap();
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        cx.executor().advance_clock(OUT_DURATION);
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+    }
+
+    #[gpui::test]
+    fn restored_window_ignores_old_completion_and_can_be_dismissed_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let popup = open_popup(cx);
+        cx.update(|cx| {
+            popup
+                .update(cx, |popup, window, cx| popup.dismiss(window, cx))
+                .unwrap();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(OUT_DURATION / 2);
+        cx.update(|cx| {
+            popup
+                .update(cx, |popup, _, cx| {
+                    popup.restore(cx);
+                    assert!(!popup.closing);
+                    assert_eq!(popup.revision, 2);
+                })
+                .unwrap();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(OUT_DURATION);
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        cx.update(|cx| {
+            popup
+                .update(cx, |popup, window, cx| popup.dismiss(window, cx))
+                .unwrap();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(OUT_DURATION);
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+    }
+
+    #[gpui::test]
+    fn reduce_motion_dismisses_without_waiting_for_animation(cx: &mut gpui::TestAppContext) {
+        let popup = open_popup(cx);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            popup
+                .update(cx, |popup, window, cx| popup.dismiss(window, cx))
+                .unwrap();
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
     }
 
     #[gpui::test]
@@ -541,10 +507,10 @@ mod tests {
                 .update(cx, |_, parent, cx| {
                     popup
                         .update(cx, |popup, window, cx| {
-                            let visibility = popup.visibility;
+                            assert!(popup.surface.is_some());
                             popup.resize_content(parent, size(px(240.), px(250.)), window, cx);
                             assert_eq!(popup.content_size, size(px(240.), px(250.)));
-                            assert_eq!(popup.visibility.started_at, visibility.started_at);
+                            assert_eq!(popup.bounds.size, size(px(264.), px(274.)));
                             assert_eq!(popup.revision, 0);
                             assert!(!popup.closing);
                             popup.dismiss(window, cx);
@@ -765,32 +731,6 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.update(|cx| popup.update(cx, |popup, _, _| !popup.closing).unwrap()));
         assert_eq!(cx.read(|cx| cx.windows().len()), 2);
-    }
-
-    #[test]
-    fn interrupted_motion_starts_at_the_visible_position_and_settles_without_overshoot() {
-        let now = Instant::now();
-        let first = PopupMotion {
-            from: point(px(50.), px(100.)),
-            to: point(px(50.), px(250.)),
-            started_at: now,
-        };
-        let interrupted_at = now + MOVE_DURATION / 3;
-        let painted = first.origin(interrupted_at);
-        assert!(painted.y > first.from.y && painted.y < first.to.y);
-        let reversed = PopupMotion {
-            from: painted,
-            to: first.from,
-            started_at: interrupted_at,
-        };
-        assert_eq!(reversed.origin(interrupted_at), painted);
-        let mut previous = painted.y;
-        for elapsed in 1..=15 {
-            let current = reversed.origin(interrupted_at + Duration::from_millis(elapsed * 10));
-            assert!(current.y <= previous && current.y >= reversed.to.y);
-            previous = current.y;
-        }
-        assert_eq!(reversed.origin(interrupted_at + MOVE_DURATION), reversed.to);
     }
 
     #[test]

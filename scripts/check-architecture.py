@@ -22,8 +22,8 @@ allowed = {
     "eggie-config": {"serde", "serde_json"},
     "eggie-storage": {"serde", "serde_json"},
     "eggie-themes": {"eggie-domain"},
-    # Native popup positioning stays in the UI shell, independent of terminal/workspace state.
-    "eggie-ui-kit": {"gpui", "anyhow", "cocoa", "objc", "raw-window-handle"},
+    # Native popup motion and completion stay independent of terminal/workspace state.
+    "eggie-ui-kit": {"gpui", "anyhow", "cocoa", "objc", "raw-window-handle", "block", "futures"},
     "eggie-build-info": set(),
 }
 # Views consume the domain cell contract, never the parser or a live daemon/client.
