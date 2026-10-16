@@ -135,6 +135,10 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Net full-screen row displacement, independent of retained scrollback capacity.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    scroll_position: i64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,7 +151,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            scroll_position: 0,
         }
+    }
+
+    pub fn scroll_position(&self) -> i64 {
+        self.scroll_position
     }
 
     /// Update the size of the scrollback history.
@@ -194,6 +203,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        if region.start == 0 && region.end == self.lines {
+            self.scroll_position = self.scroll_position.wrapping_sub(positions as i64);
+        }
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -255,6 +267,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        if region.start == 0 && region.end == self.lines {
+            self.scroll_position = self.scroll_position.wrapping_add(positions as i64);
+        }
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
             for i in (region.start.0..region.end.0).map(Line::from) {

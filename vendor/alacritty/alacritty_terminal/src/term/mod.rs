@@ -2966,6 +2966,7 @@ impl<T: EventListener> Handler for Term<T> {
             cursor_line,
             history_size,
             self.grid.cursor.point.column.0,
+            self.grid.scroll_position(),
         ));
     }
 

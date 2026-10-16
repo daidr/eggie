@@ -20,6 +20,7 @@ pub(super) struct ShellIntegrationTracker {
     /// reported with the OSC 133 A/prompt-start marker). Used to clear exactly the prompt region on
     /// resize. `None` when not currently on a prompt.
     pub(super) prompt_start_line: Option<i32>,
+    last_grid_scroll_position: i64,
     pub(super) current_command: Option<TerminalCommandRecord>,
     pub(super) history: VecDeque<TerminalCommandRecord>,
     pub(super) next_command_id: u64,
@@ -48,6 +49,7 @@ impl Default for ShellIntegrationTracker {
             completion_environment: None,
             phase: TerminalSemanticPhase::None,
             prompt_start_line: None,
+            last_grid_scroll_position: 0,
             current_command: None,
             history: VecDeque::with_capacity(COMMAND_HISTORY),
             next_command_id: 1,
@@ -207,6 +209,31 @@ impl ShellIntegrationTracker {
                 .saturating_sub((self.last_history_size - history_size) as u64);
         }
         self.last_history_size = history_size;
+    }
+
+    pub(super) fn follow_grid_scroll(&mut self, position: i64) {
+        let delta = position.wrapping_sub(self.last_grid_scroll_position);
+        if let Some(start) = &mut self.prompt_start_line {
+            // Viewport-relative anchors follow scrolling even with full or disabled history.
+            *start = i64::from(*start)
+                .saturating_sub(delta)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+        self.last_grid_scroll_position = position;
+    }
+
+    /// Geometry changes move the cursor and prompt together; their scroll delta is not new output.
+    pub(super) fn rebase_after_resize(
+        &mut self,
+        cursor_delta: i32,
+        history_size: usize,
+        scroll_position: i64,
+    ) {
+        self.advance_scroll_base(history_size);
+        self.prompt_start_line = self
+            .prompt_start_line
+            .map(|start| start.saturating_add(cursor_delta));
+        self.last_grid_scroll_position = scroll_position;
     }
 
     /// Keep `total_scrolled_lines` current and prune jump points that have scrolled out of the

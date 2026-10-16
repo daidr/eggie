@@ -56,6 +56,9 @@ pub enum Msg {
 
     /// Instruction to resize the PTY.
     Resize(WindowSize),
+
+    /// Resize in parser stream order, replacing pending geometry until the settle interval expires.
+    ResizeQueued(WindowSize, Duration),
 }
 
 /// The main event loop.
@@ -63,6 +66,7 @@ pub enum Msg {
 /// Handles all the PTY I/O and runs the PTY parser which updates terminal
 /// state.
 type TerminalUpdate<U> = Box<dyn Fn(&mut Term<U>) + Send + 'static>;
+type TerminalResize<U> = Box<dyn Fn(&mut Term<U>, WindowSize) + Send + 'static>;
 
 pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     poll: Arc<Poller>,
@@ -72,6 +76,7 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     terminal: Arc<FairMutex<Term<U>>>,
     event_proxy: U,
     terminal_update: Option<TerminalUpdate<U>>,
+    terminal_resize: Option<TerminalResize<U>>,
     terminal_update_interval: Duration,
     drain_on_exit: bool,
     ref_test: bool,
@@ -100,6 +105,7 @@ where
             terminal,
             event_proxy,
             terminal_update: None,
+            terminal_resize: None,
             terminal_update_interval: Duration::ZERO,
             drain_on_exit,
             ref_test,
@@ -127,6 +133,15 @@ where
         self
     }
 
+    /// Apply geometry changes between the PTY bytes preceding and following a resize.
+    pub fn with_terminal_resize(
+        mut self,
+        callback: impl Fn(&mut Term<U>, WindowSize) + Send + 'static,
+    ) -> Self {
+        self.terminal_resize = Some(Box::new(callback));
+        self
+    }
+
     pub fn channel(&self) -> EventLoopSender {
         EventLoopSender {
             sender: self.tx.clone(),
@@ -137,10 +152,19 @@ where
     /// Drain the channel.
     ///
     /// Returns `false` when a shutdown message was received.
-    fn drain_recv_channel(&mut self, state: &mut State) -> bool {
+    fn drain_recv_channel(
+        &mut self,
+        state: &mut State,
+        parser_tx: &SyncSender<ParserMsg>,
+        recycle_rx: &Receiver<Vec<u8>>,
+        read_buffer: &mut Vec<u8>,
+        mut pipe: Option<&mut File>,
+    ) -> bool {
         while let Some(msg) = self.rx.recv() {
             match msg {
-                Msg::Input(input) => state.write_list.push_back(Writing::new(input)),
+                Msg::Input(input) => {
+                    state.write_list.push_back(Writing::new(input));
+                },
                 Msg::TrackedInput {
                     bytes,
                     written,
@@ -158,7 +182,39 @@ where
                     });
                 }
                 Msg::Resize(window_size) => self.pty.on_resize(window_size),
+                Msg::ResizeQueued(window_size, settle) => {
+                    state.pending_resize = Some((window_size, Instant::now() + settle));
+                }
                 Msg::Shutdown => return false,
+            }
+        }
+
+        if state.needs_write() {
+            state.flush_resize();
+        }
+        if state
+            .pending_resize
+            .as_ref()
+            .is_some_and(|(_, deadline)| *deadline <= Instant::now())
+        {
+            let (window_size, _) = state.pending_resize.take().unwrap();
+            // Geometry and old-width PTY bytes share one ordered parser stream.
+            if let Err(err) = self.pty_read(
+                parser_tx,
+                recycle_rx,
+                read_buffer,
+                MAX_PTY_DRAIN,
+                pipe.as_deref_mut(),
+            ) {
+                // A Linux PTY hangup is delivered by the child-exit event below.
+                if !(cfg!(target_os = "linux") && err.raw_os_error() == Some(libc::EIO)) {
+                    error!("Error reading from PTY before resize: {err}");
+                    return false;
+                }
+            }
+            self.pty.on_resize(window_size);
+            if parser_tx.send(ParserMsg::Resize(window_size)).is_err() {
+                return false;
             }
         }
 
@@ -273,6 +329,7 @@ where
                 terminal: Arc::clone(&self.terminal),
                 event_proxy: self.event_proxy.clone(),
                 terminal_update: self.terminal_update.take(),
+                terminal_resize: self.terminal_resize.take(),
                 terminal_update_interval: self.terminal_update_interval,
                 last_terminal_update: Cell::new(None),
                 terminal_update_pending: Cell::new(false),
@@ -300,7 +357,11 @@ where
 
             'event_loop: loop {
                 events.clear();
-                if let Err(err) = self.poll.wait(&mut events, None) {
+                let resize_timeout = state
+                    .pending_resize
+                    .as_ref()
+                    .map(|(_, deadline)| deadline.saturating_duration_since(Instant::now()));
+                if let Err(err) = self.poll.wait(&mut events, resize_timeout) {
                     match err.kind() {
                         ErrorKind::Interrupted => continue,
                         _ => {
@@ -311,7 +372,13 @@ where
                 }
 
                 // Handle channel events, if there are any.
-                if !self.drain_recv_channel(&mut state) {
+                if !self.drain_recv_channel(
+                    &mut state,
+                    &parser_tx,
+                    &recycle_rx,
+                    &mut read_buffer,
+                    pipe.as_mut(),
+                ) {
                     break;
                 }
 
@@ -421,6 +488,7 @@ fn send_parser_bytes(
 
 enum ParserMsg {
     Bytes(Vec<u8>),
+    Resize(WindowSize),
     ChildExit(Option<std::process::ExitStatus>),
     Shutdown,
 }
@@ -437,6 +505,7 @@ struct ParserDriver<U: EventListener> {
     terminal: Arc<FairMutex<Term<U>>>,
     event_proxy: U,
     terminal_update: Option<TerminalUpdate<U>>,
+    terminal_resize: Option<TerminalResize<U>>,
     terminal_update_interval: Duration,
     last_terminal_update: Cell<Option<Instant>>,
     terminal_update_pending: Cell<bool>,
@@ -576,6 +645,15 @@ impl<U: EventListener> ParserDriver<U> {
                     self.process_bytes(&buffer);
                     let _ = recycle_tx.send(buffer);
                 }
+                ParserMsg::Resize(size) => {
+                    let mut terminal = self.terminal.lock();
+                    self.state.parser.stop_sync(&mut *terminal);
+                    if let Some(resize) = &self.terminal_resize {
+                        resize(&mut terminal, size);
+                    }
+                    self.publish_terminal_update(&mut terminal, true);
+                    self.event_proxy.send_event(Event::Wakeup);
+                }
                 ParserMsg::ChildExit(status) => {
                     let mut terminal = self.terminal.lock();
                     terminal.flush_kitty_graphics_commands();
@@ -699,9 +777,15 @@ impl EventLoopSender {
 pub struct State {
     write_list: VecDeque<Writing>,
     writing: Option<Writing>,
+    pending_resize: Option<(WindowSize, Instant)>,
 }
 
 impl State {
+    fn flush_resize(&mut self) {
+        if let Some((_, deadline)) = &mut self.pending_resize {
+            *deadline = Instant::now();
+        }
+    }
     fn abort_writes(&mut self) {
         if let Some(writing) = self.writing.take() {
             writing.complete();

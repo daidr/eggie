@@ -230,4 +230,6 @@ fn window_size(size: TerminalSize) -> WindowSize {
 }
 
 #[cfg(test)]
+mod resize_tests;
+#[cfg(test)]
 mod tests;

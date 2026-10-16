@@ -257,9 +257,11 @@ impl ListenerState {
         // existing ownership and only take the snapshot lock for the final Arc swap.
         let started = Instant::now();
         // Keep the jump-to-prompt coordinate base current with the live scrollback depth.
-        self.shell_integration
-            .lock()
-            .observe_scroll(terminal.grid().history_size(), TERMINAL_SCROLLBACK_LIMIT);
+        {
+            let mut shell = self.shell_integration.lock();
+            shell.follow_grid_scroll(terminal.grid().scroll_position());
+            shell.observe_scroll(terminal.grid().history_size(), TERMINAL_SCROLLBACK_LIMIT);
+        }
         let revision = self.revision.load(Ordering::Relaxed).wrapping_add(1);
         let base = self.published_snapshots.read().back().cloned();
         let mut snapshot = snapshot_terminal_incremental(
