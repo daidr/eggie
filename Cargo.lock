@@ -1577,7 +1577,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "eggie"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1600,11 +1600,11 @@ dependencies = [
 
 [[package]]
 name = "eggie-build-info"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 
 [[package]]
 name = "eggie-completion"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "libc",
  "serde",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-config"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-daemon"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-domain"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "bitflags 2.13.1",
  "serde",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-ipc"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "eggie-domain",
@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-lua"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "eggie-config",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-protocol"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "base64",
  "eggie-completion",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-storage"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-terminal-view"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "block",
@@ -1735,14 +1735,14 @@ dependencies = [
 
 [[package]]
 name = "eggie-themes"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "eggie-domain",
 ]
 
 [[package]]
 name = "eggie-ui"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "block",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-ui-kit"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "block",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-update"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "eggie-protocol",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "eggie-updater"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "eggie-ipc",

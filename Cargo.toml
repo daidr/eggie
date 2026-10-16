@@ -21,7 +21,7 @@ exclude = ["vendor/alacritty", "vendor/zed-gpui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 edition = "2024"
 publish = false
 rust-version = "1.96"
